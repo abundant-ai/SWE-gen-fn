@@ -1,0 +1,366 @@
+diff --git a/src/reason-parser/reason_parser.mly b/src/reason-parser/reason_parser.mly
+index ae7a2f99..b0dba518 100644
+--- a/src/reason-parser/reason_parser.mly
++++ b/src/reason-parser/reason_parser.mly
+@@ -1732,7 +1732,8 @@ structure_item:
+     | item_attributes MODULE TYPE OF? as_loc(ident) module_type_body(EQUAL)
+       { let loc = mklocation $symbolstartpos $endpos in
+         mkstr(Pstr_modtype (Ast_helper.Mtd.mk $5 ~typ:$6 ~attrs:$1 ~loc)) }
+-    | open_declaration { $1 }
++    | open_declaration
++      { mkstr(Pstr_open $1) }
+     | item_attributes CLASS class_declaration_details and_class_declaration*
+       { let (ident, binding, virt, params) = $3 in
+         let loc = mklocation $symbolstartpos $endpos($3) in
+@@ -1981,7 +1982,8 @@ signature_item:
+     { let loc = mklocation $symbolstartpos $endpos in
+       Psig_modtype (Ast_helper.Mtd.mk $4 ~typ:$5 ~loc ~attrs:$1)
+     }
+-  | open_description { $1 }
++  | open_description
++    { Psig_open $1 }
+   | item_attributes INCLUDE module_type
+     { let loc = mklocation $symbolstartpos $endpos in
+       Ppxlib.Parsetree.Psig_include (Ast_helper.Incl.mk $3 ~attrs:$1 ~loc)
+@@ -2003,28 +2005,13 @@ signature_items:
+ ;
+ 
+ open_declaration:
+-  item_attributes OPEN override_flag item_extension_sugar? module_expr
+-  {
+-    let loc = mklocation $symbolstartpos $endpos in
+-    let opn =
+-      Ppxlib.Pstr_open
+-        (Ast_helper.Opn.mk $5 ~override:$3 ~attrs:$1 ~loc)
+-    in
+-    wrap_str_ext
+-     ~loc
+-     (mkstr opn)
+-     $4
+-  }
++  item_attributes OPEN override_flag module_expr
++  { Ast_helper.Opn.mk $4 ~override:$3 ~attrs:$1 ~loc:(mklocation $symbolstartpos $endpos) }
+ ;
+ 
+ open_description:
+-  item_attributes OPEN override_flag item_extension_sugar? as_loc(mod_longident)
+-  { let loc = mklocation $symbolstartpos $endpos in
+-    let opn =
+-      Ppxlib.Psig_open (Ast_helper.Opn.mk $5 ~override:$3 ~attrs:$1 ~loc)
+-    in
+-    wrap_sig_ext ~loc opn $4
+-  }
++  item_attributes OPEN override_flag as_loc(mod_longident)
++  { Ast_helper.Opn.mk $4 ~override:$3 ~attrs:$1 ~loc:(mklocation $symbolstartpos $endpos) }
+ ;
+ 
+ module_declaration:
+@@ -2587,16 +2574,6 @@ seq_expr_no_seq [@recover.expr default_expr ()] (semi):
+     let exp = mkexp (Pexp_open(od, $7)) in
+     { exp with pexp_attributes = $1 }
+   }
+-| item_attributes LET? OPEN item_extension_sugar module_expr SEMI seq_expr(SEMI?)
+-  { let loc = (mklocation $startpos($1) $endpos($4)) in
+-    let od = Ast_helper.Opn.mk ~override:Fresh ~loc $5 in
+-    let exp =
+-      let exp = mkexp (Pexp_open(od, $7)) in
+-      { exp with pexp_attributes = $1 }
+-    in
+-    let (ext_attrs, ext_id)  = $4 in
+-    mkexp ~loc (Pexp_extension (ext_id, PStr [mkstrexp exp ext_attrs]))
+-  }
+ | str_exception_declaration SEMI seq_expr(SEMI?) {
+    mkexp (Pexp_letexception ($1, $3)) }
+ | let_bindings SEMI seq_expr(SEMI?)
+diff --git a/src/reason-parser/reason_pprint_ast.ml b/src/reason-parser/reason_pprint_ast.ml
+index 356d030e..7845341f 100644
+--- a/src/reason-parser/reason_pprint_ast.ml
++++ b/src/reason-parser/reason_pprint_ast.ml
+@@ -169,20 +169,6 @@ let add_extension_sugar keyword = function
+   | None -> keyword
+   | Some str -> keyword ^ "%" ^ str.txt
+ 
+-let override = function
+-  | Override -> "!"
+-  | Fresh -> ""
+-
+-let add_open_extension_sugar ~override:open_override extension =
+-  let base = "open" in
+-  match extension, open_override with
+-  | extension, Fresh -> add_extension_sugar base extension
+-  | None, Override -> base ^ (override open_override)
+-  | Some _, Override ->
+-    (* need to add a space between `!` and `%foo` otherwise it can't be
+-       parsed back *)
+-    add_extension_sugar (base ^ (override open_override) ^ " ") extension
+-
+ let string_equal : string -> string -> bool = (=)
+ 
+ let string_loc_equal: string Asttypes.loc -> string Asttypes.loc -> bool =
+@@ -730,6 +716,10 @@ let rec orList = function (* only consider ((A|B)|C)*)
+   | {ppat_desc = Ppat_or (p1, p2)} -> (orList p1) @ (orList p2)
+   | x -> [x]
+ 
++let override = function
++  | Override -> "!"
++  | Fresh -> ""
++
+ (* variance encoding: need to sync up with the [parser.mly] *)
+ let type_variance = function
+   | NoVariance -> ""
+@@ -5576,29 +5566,6 @@ let printer = object(self:'self)
+         ~inline:(true, true)
+         itemsLayout
+ 
+-  method pexp_open ~attrs ?extension expr me =
+-    let openLayout = label ~space:true
+-      (atom (add_open_extension_sugar ~override:me.popen_override extension))
+-      (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
+-    in
+-    let attrsOnOpen =
+-      makeList ~inline:(true, true) ~postSpace:true ~break:Always
+-      ((self#attributes attrs)@[openLayout])
+-    in
+-    (* Just like the bindings, have to synthesize a location since the
+-    * Pexp location is parsed (potentially) beginning with the open
+-    * brace {} in the let sequence. *)
+-    let layout = source_map ~loc:me.popen_loc attrsOnOpen in
+-    let loc = {
+-      me.popen_loc with
+-      loc_start = {
+-        me.popen_loc.loc_start with
+-        pos_lnum = expr.pexp_loc.loc_start.pos_lnum
+-      }
+-    }
+-    in
+-    loc, layout
+-
+   method letList expr =
+     let letModuleBinding ?extension s me =
+       let prefixText = add_extension_sugar "module" extension in
+@@ -5658,6 +5625,7 @@ let printer = object(self:'self)
+         | (attrs, Pexp_open (me, e))
+             (* Add this when check to make sure these are handled as regular "simple expressions" *)
+             when not (self#isSeriesOfOpensFollowedByNonSequencyExpression {expr with pexp_attributes = []}) ->
++          let overrideStr = match me.popen_override with | Override -> "!" | Fresh -> "" in
+           if (Reason_attributes.has_open_notation_attr stylisticAttrs) then (
+             (Location.none, label
+               (label
+@@ -5666,7 +5634,25 @@ let printer = object(self:'self)
+               (makeLetSequence ~wrap:("(", ")") (self#letList e))) :: acc
+           )
+           else (
+-            let loc, layout = self#pexp_open ~attrs expr me in
++            let openLayout = label ~space:true
++              (atom ("open" ^ overrideStr))
++              (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
++            in
++            let attrsOnOpen =
++              makeList ~inline:(true, true) ~postSpace:true ~break:Always
++              ((self#attributes attrs)@[openLayout])
++            in
++            (* Just like the bindings, have to synthesize a location since the
++            * Pexp location is parsed (potentially) beginning with the open
++            * brace {} in the let sequence. *)
++            let layout = source_map ~loc:me.popen_loc attrsOnOpen in
++            let loc = {
++              me.popen_loc with
++              loc_start = {
++                me.popen_loc.loc_start with
++                pos_lnum = expr.pexp_loc.loc_start.pos_lnum
++              }
++            } in
+             processLetList ((loc, layout)::acc) e
+           )
+         | ([], Pexp_letmodule (s, me, e)) ->
+@@ -5702,9 +5688,6 @@ let printer = object(self:'self)
+           | Some (extension, {pexp_attributes = []; pexp_desc = Pexp_letmodule (s, me, e)}) ->
+             let loc, layout = letModuleBinding ~extension s me in
+             processLetList ((loc, layout)::acc) e
+-          | Some (extension, {pexp_attributes = attrs; pexp_desc = Pexp_open (me, e)}) ->
+-            let loc, layout = self#pexp_open ~attrs ~extension expr me in
+-            processLetList ((loc, layout)::acc) e
+           | Some (extension, e) ->
+             let layout = self#attach_std_item_attrs ~extension [] (self#unparseExpr e) in
+             (expr.pexp_loc, layout)::acc
+@@ -7305,7 +7288,6 @@ let printer = object(self:'self)
+           | Psig_value vd -> self#val_binding ~extension vd
+           | Psig_module pmd -> self#psig_module ~extension pmd
+           | Psig_recmodule pmd -> self#psig_recmodule ~extension pmd
+-          | Psig_open od -> self#psig_open ~extension od
+           | _ -> self#payload "%%" extension (PSig [item])
+         end
+     | _ -> self#signature_item' item
+@@ -7396,26 +7378,6 @@ let printer = object(self:'self)
+         ~comments:self#comments
+         items)
+ 
+-  method psig_open ?extension od =
+-    let {Reason_attributes.stdAttrs; docAttrs} =
+-      Reason_attributes.partitionAttributes ~partDoc:true od.popen_attributes
+-    in
+-    let layout =
+-      let open_prefix =
+-        add_open_extension_sugar ~override:od.popen_override extension
+-      in
+-      self#attach_std_item_attrs stdAttrs @@
+-      label ~space:true
+-        (atom open_prefix)
+-        (self#longident_loc od.popen_expr)
+-    in
+-    self#attachDocAttrsToLayout
+-      ~stdAttrs
+-      ~docAttrs
+-      ~loc:od.popen_expr.loc
+-      ~layout
+-      ()
+-
+   method signature_item' x : Layout.t =
+     let item: Layout.t =
+       match x.psig_desc with
+@@ -7464,7 +7426,22 @@ let printer = object(self:'self)
+                  (List.map class_description xs)
+             )
+         | Psig_module pmd -> self#psig_module pmd
+-        | Psig_open od -> self#psig_open od
++        | Psig_open od ->
++          let {Reason_attributes.stdAttrs; docAttrs} =
++            Reason_attributes.partitionAttributes ~partDoc:true od.popen_attributes
++          in
++          let layout =
++            self#attach_std_item_attrs stdAttrs @@
++            label ~space:true
++              (atom ("open" ^ (override od.popen_override)))
++              (self#longident_loc od.popen_expr)
++          in
++          self#attachDocAttrsToLayout
++            ~stdAttrs
++            ~docAttrs
++            ~loc:od.popen_expr.loc
++            ~layout
++            ()
+         | Psig_include incl ->
+           let {Reason_attributes.stdAttrs; docAttrs} =
+             Reason_attributes.partitionAttributes ~partDoc:true incl.pincl_attributes
+@@ -7756,15 +7733,6 @@ let printer = object(self:'self)
+         ~comments:self#comments
+         items)
+ 
+-  method pstr_open ?extension od =
+-    let open_prefix =
+-      add_open_extension_sugar ~override:od.popen_override extension
+-    in
+-    self#attach_std_item_attrs od.popen_attributes @@
+-    label ~space:true
+-      (atom open_prefix)
+-      (self#moduleExpressionToFormattedApplicationItems od.popen_expr)
+-
+   method structure ?(indent=Some 0) ?wrap structureItems =
+     (* We don't have any way to know if an extension is placed at the top level by the parsetree
+     while there's a difference syntactically (% for structure_items/expressons and %% for top_level).
+@@ -7785,7 +7753,6 @@ let printer = object(self:'self)
+                   self#let_module_binding prefix bindingName binding.pmb_expr in
+                 self#attach_std_item_attrs binding.pmb_attributes module_binding
+             | Pstr_recmodule decls -> self#recmodule ~extension decls
+-            | Pstr_open od -> self#pstr_open ~extension od
+             | _ -> self#attach_std_item_attrs attrs (self#payload "%%" extension (PStr [item]))
+           end
+       | _ -> self#structure_item item
+@@ -7923,7 +7890,11 @@ let printer = object(self:'self)
+             let bindingName = atom ~loc:binding.pmb_name.loc (moduleIdent binding.pmb_name) in
+             let module_binding = self#let_module_binding "module" bindingName binding.pmb_expr in
+             self#attach_std_item_attrs binding.pmb_attributes module_binding
+-        | Pstr_open od -> self#pstr_open od
++        | Pstr_open od ->
++            self#attach_std_item_attrs od.popen_attributes @@
++            label ~space:true
++              (atom ("open" ^ (override od.popen_override)))
++              (self#moduleExpressionToFormattedApplicationItems od.popen_expr)
+         | Pstr_modtype x ->
+             let name = atom x.pmtd_name.txt in
+             let letPattern = makeList ~postSpace:true [atom "module type"; name; atom "="] in
+diff --git a/test/general-syntax-re.t/input.re b/test/general-syntax-re.t/input.re
+index 87c17adc..07c20ffd 100644
+--- a/test/general-syntax-re.t/input.re
++++ b/test/general-syntax-re.t/input.re
+@@ -1299,26 +1299,3 @@ let%foo Foo.{
+   destruct4,
+   destruct5,
+ } = fooBar;
+-
+-open%foo Bar;
+-open! %foo Bar;
+-
+-let () = {
+-  let open%foo Bar;
+-  switch (1 + 1) {
+-  | 2 => ()
+-  | _ => ()
+-  };
+-};
+-
+-let () = {
+-  let open%foo Bar;
+-  3
+-};
+-
+-let () = {
+-  let open%foo Bar;
+-  let x = 1;
+-  3
+-};
+-
+diff --git a/test/general-syntax-re.t/run.t b/test/general-syntax-re.t/run.t
+index 197ee609..483b6f38 100644
+--- a/test/general-syntax-re.t/run.t
++++ b/test/general-syntax-re.t/run.t
+@@ -1523,25 +1523,3 @@ Format general implementation syntax
+     destruct4,
+     destruct5,
+   } = fooBar;
+-  
+-  open%foo Bar;
+-  open! %foo Bar;
+-  
+-  let () = {
+-    open%foo Bar;
+-    switch (1 + 1) {
+-    | 2 => ()
+-    | _ => ()
+-    };
+-  };
+-  
+-  let () = {
+-    open%foo Bar;
+-    3;
+-  };
+-  
+-  let () = {
+-    open%foo Bar;
+-    let x = 1;
+-    3;
+-  };
+diff --git a/test/general-syntax-rei.t/input.rei b/test/general-syntax-rei.t/input.rei
+index d3b80cae..493a662a 100644
+--- a/test/general-syntax-rei.t/input.rei
++++ b/test/general-syntax-rei.t/input.rei
+@@ -64,7 +64,3 @@ let wrapReasonForJs:
+   ) =>
+   reactClass;
+ 
+-open%foo Bar;
+-
+-open! %foo Bar;
+-
+diff --git a/test/general-syntax-rei.t/run.t b/test/general-syntax-rei.t/run.t
+index 8e63aec0..0d95d4ed 100644
+--- a/test/general-syntax-rei.t/run.t
++++ b/test/general-syntax-rei.t/run.t
+@@ -73,7 +73,3 @@ Format general interface syntax
+         )
+     ) =>
+     reactClass;
+-  
+-  open%foo Bar;
+-  
+-  open! %foo Bar;

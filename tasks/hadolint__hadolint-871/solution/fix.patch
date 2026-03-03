@@ -1,0 +1,136 @@
+diff --git a/README.md b/README.md
+index 047695a..48e5a3f 100644
+--- a/README.md
++++ b/README.md
+@@ -333,6 +333,19 @@ RUN cd /tmp && echo "hello!"
+ 
+ The comment "inline ignores" applies only to the statement following it.
+ 
++## Global ignores
++
++Rules can also be ignored on a per-file basis using the global ignore pragma.
++It works just like inline ignores, excep that it applies to the whole file
++instead of just the next line.
++
++```dockerfile
++# hadolint global ignore=DL3003,DL3006,SC1035
++FROM ubuntu
++
++RUN cd /tmp && echo "foo"
++```
++
+ ## Linting Labels
+ 
+ Hadolint is able to check if specific labels are present and conform
+diff --git a/src/Hadolint/Pragma.hs b/src/Hadolint/Pragma.hs
+index f50fde2..8baa5be 100644
+--- a/src/Hadolint/Pragma.hs
++++ b/src/Hadolint/Pragma.hs
+@@ -1,5 +1,6 @@
+ module Hadolint.Pragma
+   ( ignored,
++    globalIgnored,
+     parseIgnorePragma,
+     parseShell
+   )
+@@ -26,19 +27,32 @@ ignored = Foldl.Fold parse mempty id
+         _ -> acc
+     parse acc _ = acc
+ 
++globalIgnored :: Foldl.Fold (InstructionPos Text) (Set.Set RuleCode)
++globalIgnored = Foldl.Fold parse mempty id
++  where
++    parse acc InstructionPos { instruction = Comment comment } =
++      case parseGlobalIgnorePragma comment of
++        Just ignores@(_ : _) -> Set.union ( Set.fromList . fmap RuleCode $ ignores ) acc
++        _ -> acc
++    parse acc _ = acc
++
+ parseIgnorePragma :: Text -> Maybe [Text]
+-parseIgnorePragma =
+-  Megaparsec.parseMaybe commentParser
+-
+-commentParser :: Megaparsec.Parsec Void Text [Text]
+-commentParser =
+-  do
+-    spaces
+-    >> string "hadolint"
+-    >> spaces1
+-    >> string "ignore="
+-    >> spaces
+-    >> Megaparsec.sepBy1 ruleName (spaces >> string "," >> spaces)
++parseIgnorePragma = Megaparsec.parseMaybe ignoreParser
++
++parseGlobalIgnorePragma :: Text -> Maybe [Text]
++parseGlobalIgnorePragma = Megaparsec.parseMaybe globalIgnoreParser
++
++ignoreParser :: Megaparsec.Parsec Void Text [Text]
++ignoreParser = hadolintPragma >> ignore
++
++globalIgnoreParser :: Megaparsec.Parsec Void Text [Text]
++globalIgnoreParser = hadolintPragma >> string "global" >> spaces1 >> ignore
++
++ignore :: Megaparsec.Parsec Void Text [Text]
++ignore = string "ignore" >> spaces >> string "=" >> spaces >> ruleList
++
++ruleList :: Megaparsec.Parsec Void Text [Text]
++ruleList = Megaparsec.sepBy1 ruleName ( spaces >> string "," >> spaces )
+ 
+ ruleName :: Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ ruleName = Megaparsec.takeWhile1P Nothing (\c -> c `elem` Set.fromList "DLSC0123456789")
+@@ -48,21 +62,16 @@ parseShell :: Text -> Maybe Text
+ parseShell = Megaparsec.parseMaybe shellParser
+ 
+ shellParser :: Megaparsec.Parsec Void Text Text
+-shellParser =
+-  do
+-    spaces
+-    >> string "hadolint"
+-    >> spaces1
+-    >> string "shell"
+-    >> spaces
+-    >> string "="
+-    >> spaces
+-    >> shellName
++shellParser = hadolintPragma >> string "shell" >> spaces >> string "=" >> spaces >> shellName
+ 
+ shellName :: Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ shellName = Megaparsec.takeWhile1P Nothing (/= '\n')
+ 
+ 
++hadolintPragma :: Megaparsec.Parsec Void Text Text
++hadolintPragma = spaces >> string "hadolint" >> spaces1
++
++
+ string :: Megaparsec.Tokens Text
+   -> Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ string = Megaparsec.string
+diff --git a/src/Hadolint/Process.hs b/src/Hadolint/Process.hs
+index ec6fb4b..3d3c682 100644
+--- a/src/Hadolint/Process.hs
++++ b/src/Hadolint/Process.hs
+@@ -82,6 +82,8 @@ import qualified Hadolint.Shell as Shell
+ data AnalisisResult = AnalisisResult
+   { -- | The set of ignored rules per line
+     ignored :: SMap.IntMap (Set.Set RuleCode),
++    -- | The set of globally ignored rules
++    globalIgnored :: Set.Set RuleCode,
+     -- | A set of failures collected for reach rule
+     failed :: Failures
+   }
+@@ -93,6 +95,7 @@ run config dockerfile = Seq.filter shouldKeep failed
+ 
+     shouldKeep CheckFailure {line, code}
+       | disableIgnorePragma config = True
++      | code `Set.member` globalIgnored = False
+       | otherwise = Just True /= do
+           ignoreList <- SMap.lookup line ignored
+           return $ code `Set.member` ignoreList
+@@ -103,6 +106,7 @@ analyze ::
+ analyze config =
+   AnalisisResult
+     <$> Hadolint.Pragma.ignored
++    <*> Hadolint.Pragma.globalIgnored
+     <*> Foldl.premap parseShell (failures config)
+ 
+ parseShell :: InstructionPos Text.Text -> InstructionPos Shell.ParsedShell

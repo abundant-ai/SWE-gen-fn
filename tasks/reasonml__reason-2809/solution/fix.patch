@@ -1,0 +1,110 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index de58570e..f3b73f90 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,3 +1,8 @@
++## Unreleased
++
++- Fix: don't print all extension strings as quoted extensions (@anmonteiro,
++  [#2809](https://github.com/reasonml/reason/pull/2809))
++
+ ## 3.13.0
+ 
+ - Support `module%ppx` syntax (@anmonteiro,
+diff --git a/src/reason-parser/reason_attributes.ml b/src/reason-parser/reason_attributes.ml
+index e1f555a0..a379459a 100644
+--- a/src/reason-parser/reason_attributes.ml
++++ b/src/reason-parser/reason_attributes.ml
+@@ -54,6 +54,9 @@ let rec partitionAttributes ?(partDoc = false) ?(allowUncurry = true) attrs :
+     ->
+     let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
+     { partition with stylisticAttrs = attr :: partition.stylisticAttrs }
++  | ({ attr_name = { txt = "reason.quoted_extension" }; _ } as attr) :: atTl ->
++    let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
++    { partition with stylisticAttrs = attr :: partition.stylisticAttrs }
+   | atHd :: atTl ->
+     let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
+     { partition with stdAttrs = atHd :: partition.stdAttrs }
+@@ -100,6 +103,12 @@ let has_preserve_braces_attrs =
+   in
+   fun stylisticAttrs -> List.exists is_preserve_braces_attr stylisticAttrs
+ 
++let has_quoted_extension_attrs =
++  let is_quoted_extension_attr { attr_name = { txt }; _ } =
++    txt = "reason.quoted_extension"
++  in
++  fun stylisticAttrs -> List.exists is_quoted_extension_attr stylisticAttrs
++
+ let maybe_remove_stylistic_attrs attrs ~should_preserve =
+   if should_preserve
+   then attrs
+diff --git a/src/reason-parser/reason_parser.mly b/src/reason-parser/reason_parser.mly
+index 42bcae9f..b9024fb5 100644
+--- a/src/reason-parser/reason_parser.mly
++++ b/src/reason-parser/reason_parser.mly
+@@ -797,7 +797,13 @@ let wrap_sig_ext ~loc body ext =
+ let mk_quotedext ~loc (id, idloc, str, delim) =
+   let exp_id = mkloc id idloc in
+   let e =
+-    mkexp ~loc ~ghost:true (Pexp_constant (Pconst_string (str, loc, delim)))
++    let attrs =
++      [ { Ppxlib.attr_name = mkloc "reason.quoted_extension" loc
++        ; attr_payload = PStr []
++        ; attr_loc = Location.none
++      } ]
++    in
++    mkexp ~loc ~ghost:true ~attrs (Pexp_constant (Pconst_string (str, loc, delim)))
+   in
+   (exp_id, Ppxlib.PStr [mkstrexp e []])
+ 
+diff --git a/src/reason-parser/reason_pprint_ast.ml b/src/reason-parser/reason_pprint_ast.ml
+index 0ded1d59..6dd18583 100644
+--- a/src/reason-parser/reason_pprint_ast.ml
++++ b/src/reason-parser/reason_pprint_ast.ml
+@@ -7729,7 +7729,17 @@ let createFormatter () =
+                     | Pexp_let _ | Pexp_letop _ | Pexp_letmodule _ ->
+                       Some (makeLetSequence (self#letList x))
+                     | Pexp_constant (Pconst_string (i, _, Some delim)) ->
+-                      Some (quoted_ext ext i delim)
++                      let { Reason_attributes.stylisticAttrs; _ } =
++                        Reason_attributes.partitionAttributes
++                          ~allowUncurry:
++                            (Reason_heuristics.bsExprCanBeUncurried x')
++                          x'.pexp_attributes
++                      in
++                      if
++                        Reason_attributes.has_quoted_extension_attrs
++                          stylisticAttrs
++                      then Some (quoted_ext ext i delim)
++                      else Some (self#extension e)
+                     | _ -> Some (self#extension e))))
+               | Pexp_open (me, e) ->
+                 if self#isSeriesOfOpensFollowedByNonSequencyExpression x
+@@ -9229,11 +9239,23 @@ let createFormatter () =
+               | Pstr_type (rf, l) -> self#type_def_list ~extension rf l
+               | Pstr_typext te -> self#type_extension ~extension te
+               | Pstr_eval
+-                  ( { pexp_desc =
+-                        Pexp_constant (Pconst_string (i, _, Some delim))
+-                    }
++                  ( ({ pexp_desc =
++                         Pexp_constant (Pconst_string (i, _, Some delim))
++                     ; pexp_attributes
++                     ; _
++                     } as expr)
+                   , _ ) ->
+-                quoted_ext ~pct:"%%" extension i delim
++                let { Reason_attributes.stylisticAttrs; _ } =
++                  Reason_attributes.partitionAttributes
++                    ~allowUncurry:(Reason_heuristics.bsExprCanBeUncurried expr)
++                    pexp_attributes
++                in
++                if Reason_attributes.has_quoted_extension_attrs stylisticAttrs
++                then quoted_ext ~pct:"%%" extension i delim
++                else
++                  self#attach_std_item_attrs
++                    attrs
++                    (self#payload "%%" extension (PStr [ item ]))
+               | _ ->
+                 self#attach_std_item_attrs
+                   attrs

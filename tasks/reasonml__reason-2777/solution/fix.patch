@@ -1,0 +1,99 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index c4952c94..5961e75f 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -12,6 +12,8 @@
+   [#2686](https://github.com/reasonml/reason/pull/2686))
+ - Improve printing of destructuring with local open (@Sander Spies,
+   [#2684](https://github.com/reasonml/reason/pull/2684)).
++- Parse and print attributes in binding `let` ops (@anmonteiro,
++  [#2777](https://github.com/reasonml/reason/pull/2777)).
+ 
+ ## 3.12.0
+ 
+diff --git a/src/reason-parser/reason_parser.mly b/src/reason-parser/reason_parser.mly
+index 104a0a70..61575221 100644
+--- a/src/reason-parser/reason_parser.mly
++++ b/src/reason-parser/reason_parser.mly
+@@ -2584,12 +2584,12 @@ seq_expr_no_seq [@recover.expr default_expr ()] (semi):
+   { let loc = mklocation $symbolstartpos $endpos in
+     expr_of_let_bindings ~loc $1 (ghunit ~loc ())
+   }
+-| as_loc(LETOP) letop_bindings SEMI seq_expr(SEMI?)
+-  { let (pbop_pat, pbop_exp, rev_ands) = $2 in
++| item_attributes as_loc(LETOP) letop_bindings SEMI seq_expr(SEMI?)
++  { let (pbop_pat, pbop_exp, rev_ands) = $3 in
+     let ands = List.rev rev_ands in
+-    let pbop_loc = mklocation $symbolstartpos $endpos($2) in
+-    let let_ = {Ppxlib.Parsetree.pbop_op = $1; pbop_pat; pbop_exp; pbop_loc} in
+-    mkexp ~loc:pbop_loc (Pexp_letop { let_; ands; body = $4}) }
++    let pbop_loc = mklocation $startpos($2) $endpos($3) in
++    let let_ = {Ppxlib.Parsetree.pbop_op = $2; pbop_pat; pbop_exp; pbop_loc} in
++    mkexp ~attrs:$1 ~loc:pbop_loc (Pexp_letop { let_; ands; body = $5}) }
+ ;
+ 
+ seq_expr(semi):
+diff --git a/src/reason-parser/reason_pprint_ast.ml b/src/reason-parser/reason_pprint_ast.ml
+index f3a25029..8d1dd625 100644
+--- a/src/reason-parser/reason_pprint_ast.ml
++++ b/src/reason-parser/reason_pprint_ast.ml
+@@ -4048,9 +4048,17 @@ let printer = object(self:'self)
+     let x = {x with pexp_attributes = (stylisticAttrs @ arityAttrs @ stdAttrs @ jsxAttrs) } in
+     (* If there's any attributes, recurse without them, then apply them to
+        the ends of functions, or simplify infix printings then append. *)
+-    if stdAttrs != [] then
++    match stdAttrs, x.pexp_desc with
++    | _, Pexp_letop _ ->
++      (* `Pexp_letop` is a bit different than `let` bindings because the
++         attributes are in `Pexp_letop` rather than the `value_binding` type
++         (check https://github.com/ocaml/ocaml/issues/9301 too), so we must
++         treat it a bit differently if we want to print the attributes inside
++         the braces. *)
++      FunctionApplication [ makeLetSequence (self#letList x) ]
++    | _ :: _, _ ->
+       let withoutVisibleAttrs = {x with pexp_attributes=(stylisticAttrs @ arityAttrs @ jsxAttrs)} in
+-      let attributesAsList = (List.map self#attribute stdAttrs) in
++      let attributesAsList = List.map self#attribute stdAttrs in
+       let itms = match self#unparseExprRecurse withoutVisibleAttrs with
+         | SpecificInfixPrecedence ({reducePrecedence}, wrappedRule) ->
+             let itm = self#unparseResolvedRule wrappedRule in
+@@ -4070,7 +4078,7 @@ let printer = object(self:'self)
+           ~postSpace:true
+           (List.concat [attributesAsList; itms])
+       ]
+-    else
++    | [], _ ->
+     match self#simplest_expression x with
+     | Some se -> Simple se
+     | None ->
+@@ -5588,13 +5596,20 @@ let printer = object(self:'self)
+            let bindingsLoc = self#bindingsLocationRange l in
+            let layout = source_map ~loc:bindingsLoc bindingsLayout in
+            processLetList ((bindingsLoc, layout)::acc) e
+-        | ([], Pexp_letop ( {body; _} as op)) ->
++        | (attrs, Pexp_letop ( {body; _} as op)) ->
+           (* For "letList" bindings, the start/end isn't as simple as with
+            * module value bindings. For "let lists", the sequences were formed
+            * within braces {}. The parser relocates the first let binding to the
+            * first brace. *)
+            let bindingsLayout = self#letop_bindings op in
+            let bindingsLoc = self#bindingOpsLocationRange op in
++           let bindingsLayout =
++            makeList
++              ~break:IfNeed
++              ~inline:(true, true)
++              ~postSpace:true
++              ((self#attributes attrs) @ [ bindingsLayout  ])
++           in
+            let layout = source_map ~loc:bindingsLoc bindingsLayout in
+            processLetList ((bindingsLoc, layout)::acc) body
+         | (attrs, Pexp_open (me, e))
+@@ -6499,7 +6514,7 @@ let printer = object(self:'self)
+               | None -> Some (self#extension e)
+               | Some (_, x') ->
+                 match x'.pexp_desc with
+-                | Pexp_let _ | Pexp_letmodule _  ->
++                | Pexp_let _ | Pexp_letop _ | Pexp_letmodule _  ->
+                   Some (makeLetSequence (self#letList x))
+                 | _ -> Some (self#extension e)
+           end

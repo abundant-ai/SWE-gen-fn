@@ -1,0 +1,213 @@
+diff --git a/README.md b/README.md
+index 48e5a3f..047695a 100644
+--- a/README.md
++++ b/README.md
+@@ -333,19 +333,6 @@ RUN cd /tmp && echo "hello!"
+ 
+ The comment "inline ignores" applies only to the statement following it.
+ 
+-## Global ignores
+-
+-Rules can also be ignored on a per-file basis using the global ignore pragma.
+-It works just like inline ignores, excep that it applies to the whole file
+-instead of just the next line.
+-
+-```dockerfile
+-# hadolint global ignore=DL3003,DL3006,SC1035
+-FROM ubuntu
+-
+-RUN cd /tmp && echo "foo"
+-```
+-
+ ## Linting Labels
+ 
+ Hadolint is able to check if specific labels are present and conform
+diff --git a/src/Hadolint/Pragma.hs b/src/Hadolint/Pragma.hs
+index 8baa5be..f50fde2 100644
+--- a/src/Hadolint/Pragma.hs
++++ b/src/Hadolint/Pragma.hs
+@@ -1,6 +1,5 @@
+ module Hadolint.Pragma
+   ( ignored,
+-    globalIgnored,
+     parseIgnorePragma,
+     parseShell
+   )
+@@ -27,32 +26,19 @@ ignored = Foldl.Fold parse mempty id
+         _ -> acc
+     parse acc _ = acc
+ 
+-globalIgnored :: Foldl.Fold (InstructionPos Text) (Set.Set RuleCode)
+-globalIgnored = Foldl.Fold parse mempty id
+-  where
+-    parse acc InstructionPos { instruction = Comment comment } =
+-      case parseGlobalIgnorePragma comment of
+-        Just ignores@(_ : _) -> Set.union ( Set.fromList . fmap RuleCode $ ignores ) acc
+-        _ -> acc
+-    parse acc _ = acc
+-
+ parseIgnorePragma :: Text -> Maybe [Text]
+-parseIgnorePragma = Megaparsec.parseMaybe ignoreParser
+-
+-parseGlobalIgnorePragma :: Text -> Maybe [Text]
+-parseGlobalIgnorePragma = Megaparsec.parseMaybe globalIgnoreParser
+-
+-ignoreParser :: Megaparsec.Parsec Void Text [Text]
+-ignoreParser = hadolintPragma >> ignore
+-
+-globalIgnoreParser :: Megaparsec.Parsec Void Text [Text]
+-globalIgnoreParser = hadolintPragma >> string "global" >> spaces1 >> ignore
+-
+-ignore :: Megaparsec.Parsec Void Text [Text]
+-ignore = string "ignore" >> spaces >> string "=" >> spaces >> ruleList
+-
+-ruleList :: Megaparsec.Parsec Void Text [Text]
+-ruleList = Megaparsec.sepBy1 ruleName ( spaces >> string "," >> spaces )
++parseIgnorePragma =
++  Megaparsec.parseMaybe commentParser
++
++commentParser :: Megaparsec.Parsec Void Text [Text]
++commentParser =
++  do
++    spaces
++    >> string "hadolint"
++    >> spaces1
++    >> string "ignore="
++    >> spaces
++    >> Megaparsec.sepBy1 ruleName (spaces >> string "," >> spaces)
+ 
+ ruleName :: Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ ruleName = Megaparsec.takeWhile1P Nothing (\c -> c `elem` Set.fromList "DLSC0123456789")
+@@ -62,16 +48,21 @@ parseShell :: Text -> Maybe Text
+ parseShell = Megaparsec.parseMaybe shellParser
+ 
+ shellParser :: Megaparsec.Parsec Void Text Text
+-shellParser = hadolintPragma >> string "shell" >> spaces >> string "=" >> spaces >> shellName
++shellParser =
++  do
++    spaces
++    >> string "hadolint"
++    >> spaces1
++    >> string "shell"
++    >> spaces
++    >> string "="
++    >> spaces
++    >> shellName
+ 
+ shellName :: Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ shellName = Megaparsec.takeWhile1P Nothing (/= '\n')
+ 
+ 
+-hadolintPragma :: Megaparsec.Parsec Void Text Text
+-hadolintPragma = spaces >> string "hadolint" >> spaces1
+-
+-
+ string :: Megaparsec.Tokens Text
+   -> Megaparsec.ParsecT Void Text Identity (Megaparsec.Tokens Text)
+ string = Megaparsec.string
+diff --git a/src/Hadolint/Process.hs b/src/Hadolint/Process.hs
+index 3d3c682..ec6fb4b 100644
+--- a/src/Hadolint/Process.hs
++++ b/src/Hadolint/Process.hs
+@@ -82,8 +82,6 @@ import qualified Hadolint.Shell as Shell
+ data AnalisisResult = AnalisisResult
+   { -- | The set of ignored rules per line
+     ignored :: SMap.IntMap (Set.Set RuleCode),
+-    -- | The set of globally ignored rules
+-    globalIgnored :: Set.Set RuleCode,
+     -- | A set of failures collected for reach rule
+     failed :: Failures
+   }
+@@ -95,7 +93,6 @@ run config dockerfile = Seq.filter shouldKeep failed
+ 
+     shouldKeep CheckFailure {line, code}
+       | disableIgnorePragma config = True
+-      | code `Set.member` globalIgnored = False
+       | otherwise = Just True /= do
+           ignoreList <- SMap.lookup line ignored
+           return $ code `Set.member` ignoreList
+@@ -106,7 +103,6 @@ analyze ::
+ analyze config =
+   AnalisisResult
+     <$> Hadolint.Pragma.ignored
+-    <*> Hadolint.Pragma.globalIgnored
+     <*> Foldl.premap parseShell (failures config)
+ 
+ parseShell :: InstructionPos Text.Text -> InstructionPos Shell.ParsedShell
+diff --git a/test/Hadolint/PragmaSpec.hs b/test/Hadolint/PragmaSpec.hs
+index e9325f7..a3e4485 100644
+--- a/test/Hadolint/PragmaSpec.hs
++++ b/test/Hadolint/PragmaSpec.hs
+@@ -11,7 +11,6 @@ spec = do
+   let ?config = def
+ 
+   describe "Rules can be ignored with inline comments" $ do
+-
+     it "ignores single rule" $
+       let dockerFile =
+             [ "FROM ubuntu",
+@@ -19,7 +18,6 @@ spec = do
+               "USER root"
+             ]
+        in ruleCatchesNot "DL3002" $ Text.unlines dockerFile
+-
+     it "ignores only the given rule" $
+       let dockerFile =
+             [ "FROM scratch",
+@@ -27,7 +25,6 @@ spec = do
+               "USER root"
+             ]
+        in ruleCatches "DL3002" $ Text.unlines dockerFile
+-
+     it "ignores only the given rule, when multiple passed" $
+       let dockerFile =
+             [ "FROM scratch",
+@@ -35,7 +32,6 @@ spec = do
+               "USER root"
+             ]
+        in ruleCatchesNot "DL3002" $ Text.unlines dockerFile
+-
+     it "ignores the rule only if directly above the instruction" $
+       let dockerFile =
+             [ "# hadolint ignore=DL3001,DL3002",
+@@ -43,7 +39,6 @@ spec = do
+               "USER root"
+             ]
+        in ruleCatches "DL3002" $ Text.unlines dockerFile
+-
+     it "won't ignore the rule if passed invalid rule names" $
+       let dockerFile =
+             [ "FROM scratch",
+@@ -51,7 +46,6 @@ spec = do
+               "USER root"
+             ]
+        in ruleCatches "DL3002" $ Text.unlines dockerFile
+-
+     it "ignores multiple rules correctly, even with some extra whitespace" $
+       let dockerFile =
+             [ "FROM node as foo",
+@@ -61,24 +55,3 @@ spec = do
+        in do
+             ruleCatchesNot "DL3023" $ Text.unlines dockerFile
+             ruleCatchesNot "DL3021" $ Text.unlines dockerFile
+-
+-
+-  describe "Rules can be ignored globally with global ignore pragma" $ do
+-
+-    it "ignores single rule" $
+-      let dockerFile =
+-            [ "# hadolint global ignore=DL3002",
+-              "FROM ubuntu",
+-              "USER root"
+-            ]
+-       in ruleCatchesNot "DL3002" $ Text.unlines dockerFile
+-
+-    it "ignores multiple rules correctly, even with some extra whitespace" $
+-      let dockerFile =
+-            [ "# hadolint global ignore = DL3023 , DL3021",
+-              "FROM node as foo",
+-              "COPY --from=foo bar baz ."
+-            ]
+-       in do
+-            ruleCatchesNot "DL3023" $ Text.unlines dockerFile
+-            ruleCatchesNot "DL3021" $ Text.unlines dockerFile
