@@ -1,0 +1,127 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b317e0a7..6fbac109 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,9 +14,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+ - Fix jwt error returning HTTP status `400` for invalid role by @taimoorzaeem in #3601
+-- Fix `db-extra-search-path` cannot be set to nothing by @taimoorzaeem in #4074
+-  + It can now be disabled by setting it to empty string.
+-  + Schema Cache load error is now logged including `db-schemas` and `db-extra-search-path` config values.
++- Allow `db-extra-search-path` to accept empty value by @taimoorzaeem in #4074
+ 
+ ## [13.0.0] - 2025-05-08
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index c06ecdcf..3e2a588f 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -407,7 +407,7 @@ retryingSchemaCacheLoad appState@AppState{stateObserver=observer, stateMainThrea
+         Left e -> do
+           putSCacheStatus appState SCPending
+           putSchemaCache appState Nothing
+-          observer $ SchemaCacheErrorObs configDbSchemas configDbExtraSearchPath e
++          observer $ SchemaCacheErrorObs e
+           return Nothing
+ 
+         Right sCache -> do
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index bc0025c4..e481d428 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -60,7 +60,7 @@ dumpSchema appState = do
+   case result of
+     Left e -> do
+       let observer = AppState.getObserver appState
+-      observer $ SchemaCacheErrorObs configDbSchemas configDbExtraSearchPath e
++      observer $ SchemaCacheErrorObs e
+       exitFailure
+     Right sCache -> return $ JSON.encode sCache
+ 
+diff --git a/src/PostgREST/Metrics.hs b/src/PostgREST/Metrics.hs
+index b314e2c3..3999e43d 100644
+--- a/src/PostgREST/Metrics.hs
++++ b/src/PostgREST/Metrics.hs
+@@ -52,7 +52,7 @@ observationMetrics (MetricsState poolTimeouts poolAvailable poolWaiting _ schema
+   SchemaCacheLoadedObs resTime -> do
+     withLabel schemaCacheLoads "SUCCESS" incCounter
+     setGauge schemaCacheQueryTime resTime
+-  SchemaCacheErrorObs{} -> do
++  SchemaCacheErrorObs _ -> do
+     withLabel schemaCacheLoads "FAIL" incCounter
+   _ ->
+     pure ()
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 2b5f3361..1b333571 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -14,7 +14,6 @@ module PostgREST.Observation
+   ) where
+ 
+ import qualified Data.ByteString.Lazy       as LBS
+-import           Data.List.NonEmpty         (toList)
+ import qualified Data.Text                  as T
+ import qualified Data.Text.Encoding         as T
+ import qualified Hasql.Connection           as SQL
+@@ -26,7 +25,7 @@ import           Numeric                    (showFFloat)
+ import           PostgREST.Config.PgVersion
+ import qualified PostgREST.Error            as Error
+ 
+-import Protolude         hiding (toList)
++import Protolude
+ import Protolude.Partial (fromJust)
+ 
+ data Observation
+@@ -38,7 +37,7 @@ data Observation
+   | ExitDBNoRecoveryObs
+   | ExitDBFatalError ObsFatalError SQL.UsageError
+   | DBConnectedObs Text
+-  | SchemaCacheErrorObs (NonEmpty Text) [Text] SQL.UsageError
++  | SchemaCacheErrorObs SQL.UsageError
+   | SchemaCacheQueriedObs Double
+   | SchemaCacheSummaryObs Text
+   | SchemaCacheLoadedObs Double
+@@ -89,12 +88,8 @@ observationMessage = \case
+     "If you are using connection poolers in transaction mode, try setting db-prepared-statements to false. " <> jsonMessage usageErr
+   ExitDBFatalError ServerError08P01 usageErr ->
+     "Connection poolers in statement mode are not supported." <> jsonMessage usageErr
+-  SchemaCacheErrorObs dbSchemas extraPaths usageErr ->
+-    "Failed to load the schema cache using "
+-      <> "db-schemas=" <> T.intercalate "," (toList dbSchemas)
+-      <> " and "
+-      <> "db-extra-search-path=" <> T.intercalate "," extraPaths
+-      <> ". " <> jsonMessage usageErr
++  SchemaCacheErrorObs usageErr ->
++    "Failed to load the schema cache. " <> jsonMessage usageErr
+   SchemaCacheQueriedObs resultTime ->
+     "Schema cache queried in " <> showMillis resultTime  <> " milliseconds"
+   SchemaCacheSummaryObs summary ->
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index e45a7132..79531668 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1909,23 +1909,3 @@ def test_allow_configs_to_be_set_to_empty(defaultenv):
+     with run(env=env) as postgrest:
+         response = postgrest.session.get("/projects")
+         assert response.status_code == 200
+-
+-
+-def test_schema_cache_error_observation(defaultenv):
+-    "schema cache error observation should be logged with invalid db-schemas or db-extra-search-path"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_EXTRA_SEARCH_PATH": "x",
+-    }
+-
+-    with run(env=env, no_startup_stdout=False, wait_for_readiness=False) as postgrest:
+-        # TODO: postgrest should exit here, instead it keeps retrying
+-        # exitCode = wait_until_exit(postgrest)
+-        # assert exitCode == 1
+-
+-        output = postgrest.read_stdout(nlines=9)
+-        assert (
+-            "Failed to load the schema cache using db-schemas=public and db-extra-search-path=x"
+-            in output[7]
+-        )

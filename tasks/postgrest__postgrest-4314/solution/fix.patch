@@ -1,0 +1,442 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2dc67012..420bf603 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Fixed
++
++- Fix not logging OpenAPI queries when `log-query=main-query` is enabled by @steve-chavez in #4226
++
+ ### Added
+ 
+ - Improve the `PGRST106` error when the requested schema is invalid by @laurenceisla in #4089
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index e6974b43..01a29b3a 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -142,21 +142,30 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthRe
+   (parseTime, apiReq@ApiRequest{..}) <- withTiming $ liftEither . mapLeft Error.ApiRequestError $ ApiRequest.userApiRequest conf prefs req body
+   (planTime, plan)                   <- withTiming $ liftEither $ Plan.actionPlan iAction conf apiReq sCache
+ 
+-  let query = Query.query conf authResult apiReq plan sCache
+-      logSQL = lift . AppState.getObserver appState . DBQuery (Query.getSQLQuery query)
++  let mainQ = Query.mainQuery plan conf apiReq authResult configDbPreRequest
++      query = Query.mainTx mainQ conf authResult apiReq plan sCache
++      observer = AppState.getObserver appState
++      obsQuery s = when (configLogQuery /= LogQueryDisabled) $ observer $ QueryObs mainQ s
+ 
+   (queryTime, queryResult) <- withTiming $ do
+     case query of
+       Query.NoDbQuery r -> pure r
+       Query.DbQuery{..} -> do
+         dbRes <- lift $ AppState.usePool appState (dqTransaction dqIsoLevel dqTxMode $ runExceptT dqDbHandler)
+-        let eitherResp = mapLeft Error.PgErr . mapLeft (Error.PgError (Just authRole /= configDbAnonRole)) $ dbRes
+-        when (configLogQuery /= LogQueryDisabled) $ whenLeft eitherResp $ logSQL . Error.status
+-        liftEither eitherResp >>= liftEither
++        let eitherResp = join $ mapLeft (Error.PgErr . Error.PgError (Just authRole /= configDbAnonRole)) dbRes
++
++        -- TODO: we use obsQuery twice, one here and one below because in case of an error with the usePool above, the request will finish here and return an error message.
++        -- This is because of a combination of ExceptT + our Error module which has Wai.responseLBS.
++        -- This needs refactoring so only the below obsQuery is used.
++        lift $ whenLeft eitherResp $ obsQuery . Error.status
++        liftEither eitherResp
+ 
+   (respTime, resp) <- withTiming $ do
+     let response = Response.actionResponse queryResult apiReq (T.decodeUtf8 prettyVersion, docsVersion) conf sCache iSchema iNegotiatedByProfile
+-    when (configLogQuery /= LogQueryDisabled) $ logSQL $ either Error.status Response.pgrstStatus response
++        status' = either Error.status Response.pgrstStatus response
++
++    -- TODO: see above obsQuery, only this obsQuery should remain after refactoring (because the QueryObs depends on the status)
++    lift $ obsQuery status'
+     liftEither response
+ 
+   return $ toWaiResponse (ServerTiming jwtTime parseTime planTime queryTime respTime) resp
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index a66fae65..de71b48c 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -1,3 +1,4 @@
++{-# LANGUAGE RecordWildCards #-}
+ {-|
+ Module      : PostgREST.Logger
+ Description : Logging based on the Observation.hs module. Access logs get sent to stdout and server diagnostic get sent to stderr.
+@@ -10,10 +11,16 @@ module PostgREST.Logger
+   , LoggerState
+   ) where
+ 
+-import           Control.AutoUpdate    (defaultUpdateSettings,
+-                                        mkAutoUpdate, updateAction)
++import           Control.AutoUpdate                (defaultUpdateSettings,
++                                                    mkAutoUpdate,
++                                                    updateAction)
+ import           Control.Debounce
+-import qualified Data.ByteString.Char8 as BS
++import qualified Data.ByteString.Char8             as BS
++import qualified Data.Text.Encoding                as T
++import qualified Hasql.Decoders                    as HD
++import qualified Hasql.DynamicStatements.Snippet   as SQL hiding (sql)
++import qualified Hasql.DynamicStatements.Statement as SQL
++import qualified Hasql.Statement                   as SQL
+ 
+ import Data.Time (ZonedTime, defaultTimeLocale, formatTime,
+                   getZonedTime)
+@@ -26,6 +33,7 @@ import System.IO.Unsafe          (unsafePerformIO)
+ 
+ import PostgREST.Config      (LogLevel (..))
+ import PostgREST.Observation
++import PostgREST.Query       (MainQuery (..))
+ 
+ import Protolude
+ 
+@@ -90,10 +98,9 @@ observationLogger loggerState logLevel obs = case obs of
+   o@(HasqlPoolObs _) -> do
+     when (logLevel >= LogDebug) $ do
+       logWithZTime loggerState $ observationMessage o
+-  o@(DBQuery sql status) -> do
+-    -- Does not log SQL when it's empty (for OPTIONS requests or for the default OpenAPI output)
+-    when (sql /= mempty && shouldLogResponse logLevel status) $ do
+-      logWithZTime loggerState $ observationMessage o
++  QueryObs gq status -> do
++    when (shouldLogResponse logLevel status) $
++      logMainQ loggerState gq
+   o@PoolRequest ->
+     when (logLevel >= LogDebug) $ do
+       logWithZTime loggerState $ observationMessage o
+@@ -113,3 +120,20 @@ logWithZTime :: LoggerState -> Text -> IO ()
+ logWithZTime loggerState txt = do
+   zTime <- stateGetZTime loggerState
+   hPutStrLn stderr $ toS (formatTime defaultTimeLocale "%d/%b/%Y:%T %z: " zTime) <> txt
++
++logMainQ :: LoggerState -> MainQuery -> IO ()
++logMainQ loggerState MainQuery{mqOpenAPI=(x, y, z),..} =
++  let snipts  = renderSnippet <$> [mqMain, x, y, z]
++      -- Does not log SQL when it's empty (happens on OPTIONS requests and when the openapi queries are not generated)
++      logQ q = when (q /= mempty) $ logWithZTime loggerState $ showOnSingleLine '\n' $ T.decodeUtf8 q in
++  mapM_ logQ snipts
++
++-- TODO: maybe patch upstream hasql-dynamic-statements so we have a less hackish way to convert
++-- the SQL.Snippet or maybe don't use hasql-dynamic-statements and resort to plain strings for the queries and use regular hasql
++renderSnippet :: SQL.Snippet -> ByteString
++renderSnippet snippet =
++  let SQL.Statement sql _ _ _ = SQL.dynamicallyParameterized snippet decoder prepared
++      decoder = HD.noResult -- unused
++      prepared = False  -- unused
++  in
++    sql
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 481f9ff8..34b11b5e 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -11,6 +11,7 @@ module PostgREST.Observation
+   , ObsFatalError(..)
+   , observationMessage
+   , ObservationHandler
++  , showOnSingleLine
+   ) where
+ 
+ import qualified Data.ByteString.Lazy       as LBS
+@@ -24,6 +25,7 @@ import           Network.HTTP.Types.Status  (Status)
+ import           Numeric                    (showFFloat)
+ import           PostgREST.Config.PgVersion
+ import qualified PostgREST.Error            as Error
++import           PostgREST.Query            (MainQuery)
+ 
+ import Protolude hiding (toList)
+ 
+@@ -45,7 +47,7 @@ data Observation
+   | DBListenRetry Int
+   | DBListenerGotSCacheMsg ByteString
+   | DBListenerGotConfigMsg ByteString
+-  | DBQuery ByteString Status
++  | QueryObs MainQuery Status
+   | ConfigReadErrorObs SQL.UsageError
+   | ConfigInvalidObs Text
+   | ConfigSucceededObs
+@@ -113,8 +115,8 @@ observationMessage = \case
+     "Received a schema cache reload message on the " <> show channel <> " channel"
+   DBListenerGotConfigMsg channel ->
+     "Received a config reload message on the " <> show channel <> " channel"
+-  DBQuery sql _ ->
+-    T.decodeUtf8 sql
++  QueryObs{} ->
++    mempty -- TODO pending refactor: The logic for printing the query cannot be done here. Join the observationMessage function into observationLogger to avoid this mempty.
+   ConfigReadErrorObs usageErr ->
+     "Failed to query database settings for the config parameters." <> jsonMessage usageErr
+   QueryRoleSettingsErrorObs usageErr ->
+@@ -155,11 +157,14 @@ observationMessage = \case
+ 
+     jsonMessage err = T.decodeUtf8 . LBS.toStrict . Error.errorPayload $ Error.PgError False err
+ 
+-    showOnSingleLine txt = T.intercalate " " $ T.filter (/= '\t') <$> T.lines txt -- the errors from hasql-notifications come intercalated with "\t\n"
+ 
+     showListenerConnError :: SQL.ConnectionError -> Text
+-    showListenerConnError = maybe "Connection error" (showOnSingleLine . T.decodeUtf8)
++    showListenerConnError = maybe "Connection error" (showOnSingleLine '\t' . T.decodeUtf8)
+ 
+     showListenerException :: Either SomeException () -> Text
+     showListenerException (Right _) = "Failed getting notifications" -- should not happen as the listener will never finish (hasql-notifications uses `forever` internally) with a Right result
+-    showListenerException (Left e)  = showOnSingleLine $ show e
++    showListenerException (Left e)  = showOnSingleLine '\t' $ show e
++
++
++showOnSingleLine :: Char -> Text -> Text
++showOnSingleLine split txt = T.intercalate " " $ T.filter (/= split) <$> T.lines txt -- the errors from hasql-notifications come intercalated with "\t\n"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 649dd7b7..37871900 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -7,18 +7,19 @@ Description : PostgREST query executor
+ This module parametrizes, prepares, executes SQL queries and decodes their results.
+ 
+ TODO: This module shouldn't depend on SchemaCache: once OpenAPI is removed, this can be done
++TOOD: Split the SQL transaction concerns module into another one so Query.hs is pure
+ -}
+ module PostgREST.Query
+   ( Query (..)
+   , QueryResult (..)
+   , ResultSet (..)
+-  , query
+-  , getSQLQuery
++  , mainTx
++  , mainQuery
++  , MainQuery (..)
+   ) where
+ 
+ import           Control.Lens                      ((^?))
+-import qualified Data.Aeson                        as JSON
+-import qualified Data.Aeson.KeyMap                 as KM
++import           Control.Monad.Extra               (whenJust)
+ import qualified Data.Aeson.Lens                   as L
+ import qualified Data.ByteString                   as BS hiding
+                                                          (break)
+@@ -29,7 +30,6 @@ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL hiding (sql)
+ import qualified Hasql.DynamicStatements.Statement as SQL
+ import qualified Hasql.Session                     as SQL (Session)
+-import qualified Hasql.Statement                   as SQL
+ import qualified Hasql.Transaction                 as SQL
+ import qualified Hasql.Transaction.Sessions        as SQL
+ 
+@@ -74,7 +74,6 @@ data Query
+     , dqTxMode      :: SQL.Mode
+     , dqDbHandler   :: DbHandler QueryResult
+     , dqTransaction :: SQL.IsolationLevel -> SQL.Mode -> SQL.Transaction (Either Error QueryResult) -> SQL.Session (Either Error QueryResult)
+-    , dqSQL         :: ByteString
+     }
+   | NoDbQuery QueryResult
+ 
+@@ -84,6 +83,16 @@ data QueryResult
+   | MaybeDbResult InspectPlan  (Maybe (TablesMap, RoutineMap, Maybe Text))
+   | NoDbResult    InfoPlan
+ 
++-- The Queries that run on every request
++data MainQuery = MainQuery
++  { mqTxVars  :: SQL.Snippet       -- ^ the transaction variables that always run on each query
++  , mqPreReq  :: Maybe SQL.Snippet -- ^ the pre-request function that runs if enabled
++  , mqCount   :: SQL.Snippet       -- ^ this count query is actually a fragment of the main query, but the same count query also runs after the main one in the case of `count=estimated`, so it's cached here.
++  -- TODO only one of the following queries actually runs on each request, once OpenAPI is removed from core it will be easier to refactor this
++  , mqMain    :: SQL.Snippet
++  , mqOpenAPI :: (SQL.Snippet, SQL.Snippet, SQL.Snippet)
++  }
++
+ -- | Standard result set format used for all queries
+ data ResultSet
+   = RSStandard
+@@ -105,19 +114,21 @@ data ResultSet
+   }
+   | RSPlan BS.ByteString -- ^ the plan of the query
+ 
+-query :: AppConfig -> AuthResult -> ApiRequest -> ActionPlan -> SchemaCache -> Query
+-query _ _ _ (NoDb x) _ = NoDbQuery $ NoDbResult x
+-query config AuthResult{..} apiReq (Db plan) sCache =
+-  DbQuery isoLvl txMode dbHandler transaction mainSQLQuery
++mainTx :: MainQuery -> AppConfig -> AuthResult -> ApiRequest -> ActionPlan -> SchemaCache -> Query
++mainTx _ _ _ _ (NoDb x) _ = NoDbQuery $ NoDbResult x
++mainTx genQ@MainQuery{..} conf@AppConfig{..} AuthResult{..} apiReq (Db plan) sCache =
++  DbQuery isoLvl txMode dbHandler transaction
+   where
+-    transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
+-    prepared = configDbPreparedStatements config
+-    isoLvl = planIsoLvl config authRole plan
++    transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction
++    isoLvl = planIsoLvl conf authRole plan
+     txMode = planTxMode plan
+-    (mainActionQuery, mainSQLQuery) = actionQuery plan config apiReq sCache
++    mainActionQuery = actionQuery genQ plan conf apiReq sCache
+     dbHandler = do
+-      runTxVarQuery plan config authClaims authRole apiReq
+-      runPreReqQuery config
++      lift $ SQL.statement mempty $ SQL.dynamicallyParameterized mqTxVars
++          HD.noResult configDbPreparedStatements
++      lift $ whenJust mqPreReq $ \q ->
++        SQL.statement mempty $ SQL.dynamicallyParameterized q
++          HD.noResult configDbPreparedStatements
+       mainActionQuery
+ 
+ planTxMode :: DbActionPlan -> SQL.Mode
+@@ -132,32 +143,42 @@ planIsoLvl AppConfig{configRoleIsoLvl} role actPlan = case actPlan of
+   where
+     roleIsoLvl = HM.findWithDefault SQL.ReadCommitted role configRoleIsoLvl
+ 
++mainQuery :: ActionPlan -> AppConfig -> ApiRequest -> AuthResult -> Maybe QualifiedIdentifier -> MainQuery
++mainQuery (NoDb _) _ _ _ _ = MainQuery mempty Nothing mempty mempty (mempty, mempty, mempty)
++mainQuery (Db plan) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} authRes preReq =
++  let genQ = MainQuery (PreQuery.txVarQuery plan conf authRes apiReq) (PreQuery.preReqQuery <$> preReq) in
++  case plan of
++    DbCrud WrappedReadPlan{..} ->
++      let countQuery = QueryBuilder.readPlanToCountQuery wrReadPlan in
++      genQ countQuery (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows wrMedia wrHandler) (mempty, mempty, mempty)
++    DbCrud MutateReadPlan{..} ->
++      genQ mempty (Statements.mainWrite mrReadPlan mrMutatePlan mrMedia mrHandler preferRepresentation preferResolution) (mempty, mempty, mempty)
++    DbCall CallReadPlan{..} ->
++      genQ mempty (Statements.mainCall crProc crCallPlan crReadPlan preferCount crMedia crHandler) (mempty, mempty, mempty)
++    MayUseDb InspectPlan{ipSchema=tSchema} ->
++      genQ mempty mempty (SqlFragment.accessibleTables tSchema, SqlFragment.accessibleFuncs tSchema, SqlFragment.schemaDescription tSchema)
++
+ -- TODO: Generate the Hasql Statement in a diferent module after the OpenAPI functionality is removed
+-actionQuery :: DbActionPlan -> AppConfig -> ApiRequest -> SchemaCache -> (DbHandler QueryResult, ByteString)
+-actionQuery (DbCrud plan@WrappedReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
+-  (mainActionQuery, mainSQLQuery)
++actionQuery :: MainQuery -> DbActionPlan -> AppConfig -> ApiRequest -> SchemaCache -> DbHandler QueryResult
++actionQuery MainQuery{..} (DbCrud plan@WrappedReadPlan{..}) conf@AppConfig{..} apiReq _ =
++  mainActionQuery
+   where
+-    countQuery = QueryBuilder.readPlanToCountQuery wrReadPlan
+-    result@(SQL.Statement mainSQLQuery _ _ _) = SQL.dynamicallyParameterized
+-      (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows wrMedia wrHandler)
+-      decodeIt configDbPreparedStatements
++    result = SQL.dynamicallyParameterized mqMain decodeIt configDbPreparedStatements
+     mainActionQuery = do
+       resultSet <- lift $ SQL.statement mempty result
+       failNotSingular wrMedia resultSet
+       optionalRollback conf apiReq
+-      DbCrudResult plan <$> resultSetWTotal conf apiReq resultSet countQuery
++      DbCrudResult plan <$> resultSetWTotal conf apiReq resultSet mqCount
+ 
+     decodeIt :: HD.Result ResultSet
+     decodeIt = case wrMedia of
+       MTVndPlan{} -> planRow
+       _           -> HD.singleRow $ standardRow True
+ 
+-actionQuery (DbCrud plan@MutateReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
+-  (mainActionQuery, mainSQLQuery)
++actionQuery MainQuery{..} (DbCrud plan@MutateReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
++  mainActionQuery
+   where
+-    result@(SQL.Statement mainSQLQuery _ _ _) = SQL.dynamicallyParameterized
+-      (Statements.mainWrite mrReadPlan mrMutatePlan mrMedia mrHandler preferRepresentation preferResolution)
+-      decodeIt configDbPreparedStatements
++    result = SQL.dynamicallyParameterized mqMain decodeIt configDbPreparedStatements
+     failMutation resultSet = case mrMutation of
+       MutationCreate -> do
+         failNotSingular mrMedia resultSet
+@@ -180,12 +201,10 @@ actionQuery (DbCrud plan@MutateReadPlan{..}) conf@AppConfig{..} apiReq@ApiReques
+       MTVndPlan{} -> planRow
+       _           -> fromMaybe (RSStandard Nothing 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow False)
+ 
+-actionQuery (DbCall plan@CallReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
+-  (mainActionQuery, mainSQLQuery)
++actionQuery MainQuery{..} (DbCall plan@CallReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
++  mainActionQuery
+   where
+-    result@(SQL.Statement mainSQLQuery _ _ _) = SQL.dynamicallyParameterized
+-      (Statements.mainCall crProc crCallPlan crReadPlan preferCount crMedia crHandler)
+-      decodeIt configDbPreparedStatements
++    result = SQL.dynamicallyParameterized mqMain decodeIt configDbPreparedStatements
+ 
+     mainActionQuery = do
+       resultSet <- lift $ SQL.statement mempty result
+@@ -199,15 +218,15 @@ actionQuery (DbCall plan@CallReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{
+       MTVndPlan{} -> planRow
+       _           -> fromMaybe (RSStandard (Just 0) 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow True)
+ 
+-actionQuery (MayUseDb plan@InspectPlan{ipSchema=tSchema}) AppConfig{..} _ sCache =
+-  (mainActionQuery, mempty)
++actionQuery MainQuery{mqOpenAPI=(tblsQ, funcsQ, schQ)} (MayUseDb plan@InspectPlan{ipSchema=tSchema}) AppConfig{..} _ sCache =
++  mainActionQuery
+   where
+     mainActionQuery = lift $
+       case configOpenApiMode of
+         OAFollowPriv -> do
+-          tableAccess <- SQL.statement mempty $ SQL.dynamicallyParameterized (SqlFragment.accessibleTables tSchema) decodeAccessibleIdentifiers configDbPreparedStatements
+-          accFuncs <-  SQL.statement mempty $ SQL.dynamicallyParameterized (SqlFragment.accessibleFuncs tSchema) SchemaCache.decodeFuncs configDbPreparedStatements
+-          schDesc <- SQL.statement mempty $ SQL.dynamicallyParameterized (SqlFragment.schemaDescription tSchema) decodeSchemaDesc configDbPreparedStatements
++          tableAccess <- SQL.statement mempty $ SQL.dynamicallyParameterized tblsQ  decodeAccessibleIdentifiers configDbPreparedStatements
++          accFuncs <-  SQL.statement mempty $ SQL.dynamicallyParameterized   funcsQ   SchemaCache.decodeFuncs configDbPreparedStatements
++          schDesc <- SQL.statement mempty $ SQL.dynamicallyParameterized     schQ decodeSchemaDesc configDbPreparedStatements
+           let tbls = HM.filterWithKey (\qi _ -> S.member qi tableAccess) $ SchemaCache.dbTables sCache
+ 
+           pure $ MaybeDbResult plan (Just (tbls, accFuncs, schDesc))
+@@ -303,24 +322,6 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+     shouldRollback =
+       preferTransaction == Just Rollback
+ 
+-runTxVarQuery :: DbActionPlan -> AppConfig -> KM.KeyMap JSON.Value -> BS.ByteString -> ApiRequest -> DbHandler ()
+-runTxVarQuery dbActPlan conf@AppConfig{..} claims role apireq = lift $
+-  SQL.statement mempty $ SQL.dynamicallyParameterized
+-    (PreQuery.txVarQuery dbActPlan conf claims role apireq)
+-    HD.noResult configDbPreparedStatements
+-
+-runPreReqQuery :: AppConfig -> DbHandler ()
+-runPreReqQuery conf = lift $ traverse_ (SQL.statement mempty . stmt) (configDbPreRequest conf)
+-  where
+-    stmt req = SQL.dynamicallyParameterized
+-      (PreQuery.preReqQuery req)
+-      HD.noResult
+-      (configDbPreparedStatements conf)
+-
+-getSQLQuery :: Query -> ByteString
+-getSQLQuery DbQuery{dqSQL} = dqSQL
+-getSQLQuery _              = mempty
+-
+ -- | We use rowList because when doing EXPLAIN (FORMAT TEXT), the result comes as many rows. FORMAT JSON comes as one.
+ planRow :: HD.Result ResultSet
+ planRow = RSPlan . BS.unlines <$> HD.rowList (column HD.bytea)
+diff --git a/src/PostgREST/Query/PreQuery.hs b/src/PostgREST/Query/PreQuery.hs
+index 271f9c81..5587fdd0 100644
+--- a/src/PostgREST/Query/PreQuery.hs
++++ b/src/PostgREST/Query/PreQuery.hs
+@@ -10,8 +10,6 @@ module PostgREST.Query.PreQuery
+   ) where
+ 
+ import qualified Data.Aeson                      as JSON
+-import qualified Data.Aeson.KeyMap               as KM
+-import qualified Data.ByteString                 as BS
+ import qualified Data.ByteString.Lazy.Char8      as LBS
+ import qualified Data.HashMap.Strict             as HM
+ import qualified Hasql.DynamicStatements.Snippet as SQL hiding (sql)
+@@ -21,6 +19,7 @@ import qualified Hasql.DynamicStatements.Snippet as SQL hiding (sql)
+ import PostgREST.ApiRequest              (ApiRequest (..))
+ import PostgREST.ApiRequest.Preferences  (PreferTimezone (..),
+                                           Preferences (..))
++import PostgREST.Auth.Types              (AuthResult (..))
+ import PostgREST.Config                  (AppConfig (..))
+ import PostgREST.Plan                    (CallReadPlan (..),
+                                           DbActionPlan (..))
+@@ -35,8 +34,8 @@ import PostgREST.SchemaCache.Routine     (Routine (..))
+ import Protolude hiding (Handler)
+ 
+ -- sets transaction variables
+-txVarQuery :: DbActionPlan -> AppConfig -> KM.KeyMap JSON.Value -> BS.ByteString -> ApiRequest -> SQL.Snippet
+-txVarQuery dbActPlan AppConfig{..} claims role ApiRequest{..} =
++txVarQuery :: DbActionPlan -> AppConfig -> AuthResult -> ApiRequest -> SQL.Snippet
++txVarQuery dbActPlan AppConfig{..} AuthResult{..} ApiRequest{..} =
+     -- To ensure `GRANT SET ON PARAMETER <superuser_setting> TO authenticator` works, the role settings must be set before the impersonated role.
+     -- Otherwise the GRANT SET would have to be applied to the impersonated role. See https://github.com/PostgREST/postgrest/issues/3045
+     "select " <> intercalateSnippet ", " (
+@@ -47,9 +46,9 @@ txVarQuery dbActPlan AppConfig{..} claims role ApiRequest{..} =
+     pathSql = setConfigWithConstantName ("request.path", iPath)
+     headersSql = setConfigWithConstantNameJSON "request.headers" iHeaders
+     cookiesSql = setConfigWithConstantNameJSON "request.cookies" iCookies
+-    claimsSql = [setConfigWithConstantName ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+-    roleSql = [setConfigWithConstantName ("role", role)]
+-    roleSettingsSql = setConfigWithDynamicName <$> HM.toList (fromMaybe mempty $ HM.lookup role configRoleSettings)
++    claimsSql = [setConfigWithConstantName ("request.jwt.claims", LBS.toStrict $ JSON.encode authClaims)]
++    roleSql = [setConfigWithConstantName ("role", authRole)]
++    roleSettingsSql = setConfigWithDynamicName <$> HM.toList (fromMaybe mempty $ HM.lookup authRole configRoleSettings)
+     appSettingsSql = setConfigWithDynamicName . join bimap toUtf8 <$> configAppSettings
+     timezoneSql = maybe mempty (\(PreferTimezone tz) -> [setConfigWithConstantName ("timezone", tz)]) $ preferTimezone iPreferences
+     funcSettingsSql = setConfigWithDynamicName . join bimap toUtf8 <$> funcSettings

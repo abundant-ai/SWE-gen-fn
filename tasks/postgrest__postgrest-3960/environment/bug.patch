@@ -1,0 +1,235 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 83b1f3ce..70a2392f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -49,7 +49,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Return `PGRST301` error when `Bearer` in auth header is sent empty
+    + Diagnostic error messages instead of exposed internals
+    + Return new `PGRST303` error when jwt claims decoding fails
+- - #3906, Return `PGRST125` and `PGRST126` errors instead of empty json - @taimoorzaeem
+ 
+ ## [12.2.8] - 2025-02-10
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 735b3086..a6f04a6b 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -257,15 +257,6 @@ Related to the HTTP request elements.
+ |               |             | See :ref:`prefer_max_affected`.                             |
+ | PGRST124      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+-| .. _pgrst125: | 404         | Invalid path is specified in request URL.                   |
+-|               |             |                                                             |
+-| PGRST125      |             |                                                             |
+-+---------------+-------------+-------------------------------------------------------------+
+-| .. _pgrst126: | 404         | Open API config is disabled but API root path is            |
+-|               |             | accessed. See :ref:`openapi-mode`.                          |
+-| PGRST126      |             |                                                             |
+-+---------------+-------------+-------------------------------------------------------------+
+-
+ 
+ .. _pgrst2**:
+ 
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 57413ba6..ae9a3e79 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -165,15 +165,13 @@ userApiRequest conf req reqBody timezones = do
+ 
+ getResource :: AppConfig -> [Text] -> Either ApiRequestError Resource
+ getResource AppConfig{configOpenApiMode, configDbRootSpec} = \case
+-  []             ->
+-      case (configOpenApiMode,configDbRootSpec) of
+-        (OADisabled,_) -> Left OpenAPIDisabled
+-        (_, Just qi)   -> Right $ ResourceRoutine (qiName qi)
+-        (_, Nothing)   -> Right ResourceSchema
+-
++  []             -> case configDbRootSpec of
++                      Just (QualifiedIdentifier _ pathName)     -> Right $ ResourceRoutine pathName
++                      Nothing | configOpenApiMode == OADisabled -> Left NotFound
++                              | otherwise                       -> Right ResourceSchema
+   [table]        -> Right $ ResourceRelation table
+   ["rpc", pName] -> Right $ ResourceRoutine pName
+-  _              -> Left InvalidResourcePath
++  _              -> Left NotFound
+ 
+ getAction :: Resource -> Schema -> ByteString -> Either ApiRequestError Action
+ getAction resource schema method =
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index f8b8f488..5be99e04 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -72,6 +72,7 @@ data ApiRequestError
+   | InvalidPreferences [ByteString]
+   | InvalidRange RangeError
+   | InvalidRpcMethod ByteString
++  | NotFound
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] MediaType Bool [QualifiedIdentifier] [Routine]
+   | NotEmbedded Text
+@@ -90,8 +91,6 @@ data ApiRequestError
+   | SingularityError Integer
+   | PGRSTParseError RaiseError
+   | MaxAffectedViolationError Integer
+-  | InvalidResourcePath
+-  | OpenAPIDisabled
+   deriving Show
+ 
+ data QPError = QPError Text Text
+@@ -119,6 +118,7 @@ instance PgrstError ApiRequestError where
+   status InvalidPreferences{}        = HTTP.status400
+   status InvalidRpcMethod{}          = HTTP.status405
+   status InvalidRange{}              = HTTP.status416
++  status NotFound                    = HTTP.status404
+ 
+   status NoRelBetween{}              = HTTP.status400
+   status NoRpc{}                     = HTTP.status404
+@@ -138,8 +138,6 @@ instance PgrstError ApiRequestError where
+   status SingularityError{}          = HTTP.status406
+   status PGRSTParseError{}           = HTTP.status500
+   status MaxAffectedViolationError{} = HTTP.status400
+-  status InvalidResourcePath         = HTTP.status404
+-  status OpenAPIDisabled             = HTTP.status404
+ 
+   headers _ = mempty
+ 
+@@ -179,6 +177,8 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON (MediaTypeError cts) = toJsonPgrstError
+     ApiRequestErrorCode07 ("None of these media types are available: " <> T.intercalate ", " (map T.decodeUtf8 cts)) Nothing Nothing
+ 
++  toJSON NotFound = JSON.object []
++
+   toJSON (NotEmbedded resource) = toJsonPgrstError
+     ApiRequestErrorCode08
+     ("'" <> resource <> "' is not an embedded resource in this request")
+@@ -245,18 +245,6 @@ instance JSON.ToJSON ApiRequestError where
+     (Just $ JSON.String $ T.unwords ["The query affects", show n, "rows"])
+     Nothing
+ 
+-  toJSON InvalidResourcePath = toJsonPgrstError
+-    ApiRequestErrorCode25
+-    "Invalid path specified in request URL"
+-    Nothing
+-    Nothing
+-
+-  toJSON OpenAPIDisabled = toJsonPgrstError
+-    ApiRequestErrorCode26
+-    "Root endpoint metadata is disabled"
+-    Nothing
+-    Nothing
+-
+   toJSON (NoRelBetween parent child embedHint schema allRels) = toJsonPgrstError
+     SchemaCacheErrorCode00
+     ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache")
+@@ -718,8 +706,6 @@ data ErrorCode
+   | ApiRequestErrorCode22
+   | ApiRequestErrorCode23
+   | ApiRequestErrorCode24
+-  | ApiRequestErrorCode25
+-  | ApiRequestErrorCode26
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -769,8 +755,6 @@ buildErrorCode code = case code of
+   ApiRequestErrorCode22  -> "PGRST122"
+   ApiRequestErrorCode23  -> "PGRST123"
+   ApiRequestErrorCode24  -> "PGRST124"
+-  ApiRequestErrorCode25  -> "PGRST125"
+-  ApiRequestErrorCode26  -> "PGRST126"
+ 
+   SchemaCacheErrorCode00 -> "PGRST200"
+   SchemaCacheErrorCode01 -> "PGRST201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index d14a2fcc..df40c248 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -33,7 +33,6 @@ import qualified PostgREST.SchemaCache.Routine as Routine
+ 
+ import Data.Either.Combinators (mapLeft, mapRight)
+ import Data.List               (delete, lookup)
+-import Data.Maybe              (fromJust)
+ import Data.Tree               (Tree (..))
+ 
+ import PostgREST.ApiRequest                  (Action (..),
+@@ -965,18 +964,18 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+       if preferRepresentation == Just None || isNothing preferRepresentation
+         then []
+         else inferColsEmbedNeeds readReq pkCols
+-    -- TODO: remove fromJust by refactoring later
+-    -- we can use fromJust, we have already looked up the table before building mutatePlan
+-    tbl = fromJust $ HM.lookup qi dbTables
+-    pkCols = maybe mempty tablePKCols (Just tbl)
++    tbl = HM.lookup qi dbTables
++    pkCols = maybe mempty tablePKCols tbl
+     logic = map (resolveLogicTree ctx . snd) qsLogic
+     combinedLogic = foldr (addFilterToLogicForest . resolveFilter ctx) logic qsFiltersRoot
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+     applyDefaults = preferMissing == Just ApplyDefaults
+     typedColumnsOrError = resolveOrError ctx tbl `traverse` S.toList iColumns
+ 
+-resolveOrError :: ResolverContext -> Table -> FieldName -> Either ApiRequestError CoercibleField
+-resolveOrError ctx table field = case resolveTableFieldName table field Nothing of
++resolveOrError :: ResolverContext -> Maybe Table -> FieldName -> Either ApiRequestError CoercibleField
++resolveOrError _ Nothing _ = Left NotFound -- TODO: control never reaches here since #3869, should be fixed when fixing #3906
++resolveOrError ctx (Just table) field =
++  case resolveTableFieldName table field Nothing of
+     CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+     cf                          -> Right $ withJsonParse ctx cf
+ 
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 5b098bf2..2666001d 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -228,10 +228,10 @@ actionResponse (MaybeDbResult InspectPlan{ipHdrsOnly=headersOnly} body) _ versio
+     (MediaType.toContentType MTOpenAPI : maybeToList (profileHeader schema negotiatedByProfile))
+     (maybe mempty (\(x, y, z) -> if headersOnly then mempty else OpenAPI.encode versions conf sCache x y z) body)
+ 
+-actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ SchemaCache{dbTables} _ _ =
+-  case HM.lookup qi dbTables of
++actionResponse (NoDbResult (RelInfoPlan identifier)) _ _ _ sCache _ _ =
++  case HM.lookup identifier (dbTables sCache) of
+     Just tbl -> respondInfo $ allowH tbl
+-    Nothing  -> Left $ Error.ApiRequestError $ Error.TableNotFound qiSchema qiName (HM.elems dbTables)
++    Nothing  -> Left $ Error.ApiRequestError Error.NotFound
+   where
+     allowH table =
+       let hasPK = not . null $ tablePKCols table in
+diff --git a/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs b/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
+index 75ececd7..f962409d 100644
+--- a/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
+@@ -3,9 +3,8 @@ module Feature.OpenApi.DisabledOpenApiSpec where
+ import Network.HTTP.Types
+ import Network.Wai        (Application)
+ 
+-import Test.Hspec
++import Test.Hspec     hiding (pendingWith)
+ import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+ 
+ import Protolude
+ 
+@@ -14,7 +13,4 @@ spec =
+   describe "Disabled OpenApi" $ do
+     it "responds with 404" $
+       request methodGet "/"
+-        [("Accept","application/openapi+json")] ""
+-        `shouldRespondWith`
+-        [json| {"code":"PGRST126","details":null,"hint":null,"message":"Root endpoint metadata is disabled"} |]
+-        { matchStatus = 404 }
++        [("Accept","application/openapi+json")] "" `shouldRespondWith` 404
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index d341ad07..682ca7f3 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1625,10 +1625,3 @@ spec = do
+       get "/infinite_recursion?select=*" `shouldRespondWith`
+         [json|{"code":"42P17","message":"infinite recursion detected in rules for relation \"infinite_recursion\"","details":null,"hint":null}|]
+         { matchStatus = 500 }
+-
+-  context "invalid resource path" $ do
+-    it "return http status 404" $
+-      get "/first/second/third?select=*"
+-      `shouldRespondWith`
+-      [json| {"code":"PGRST125","details":null,"hint":null,"message":"Invalid path specified in request URL"} |]
+-      { matchStatus = 404 }

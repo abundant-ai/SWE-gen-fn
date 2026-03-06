@@ -1,0 +1,241 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index afeeeec7..88c4e2f6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,6 +28,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3727, Clarify "listening" logs - @steve-chavez
+  - #3795, Clarify `Accept: vnd.pgrst.object` error message - @steve-chavez
+  - #3697, #3602, Handle queries on non-existing table gracefully - @taimoorzaeem
++ - #3600, #3926, Improve JWT errors - @taimoorzaeem
+ 
+ ### Changed
+ 
+@@ -43,6 +44,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3013, Drop support for Limited updates/deletes
+    + The feature was complicated and largely unused.
+  - #3697, #3602, Querying non-existent table now returns `PGRST205` error instead of empty json - @taimoorzaeem
++ - #3600, #3926, Improve JWT errors - @taimoorzaeem
++   + Return `PGRST301` error when `Bearer` in auth header is sent empty
++   + Diagnostic error messages instead of exposed internals
++   + Return new `PGRST303` error when jwt claims decoding fails
+ 
+ ## [12.2.8] - 2025-02-10
+ 
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index 93af2bf7..eab4f7b3 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -156,6 +156,8 @@ You can specify the literal value as we saw earlier, or reference a filename to
+ 
+   jwt-secret = "@rsa.jwk.pub"
+ 
++.. _jwt_claims_validation:
++
+ JWT Claims Validation
+ ~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 20091a7c..246d6ad9 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -305,14 +305,18 @@ Related to the authentication process using JWT. You can follow the :ref:`tut1`
+ |               |             | configuration.                                              |
+ | PGRST300      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+-| .. _pgrst301: | 401         | Any error related to the verification of the JWT,           |
+-|               |             | which means that the JWT provided is invalid in some way.   |
++| .. _pgrst301: | 401         | Provided JWT couldn't be decoded or it is invalid.          |
++|               |             |                                                             |
+ | PGRST301      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+ | .. _pgrst302: | 401         | Attempted to do a request without                           |
+ |               |             | :ref:`authentication <client_auth>` when the anonymous role |
+ | PGRST302      |             | is disabled by not setting it in :ref:`db-anon-role`.       |
+ +---------------+-------------+-------------------------------------------------------------+
++| .. _pgrst303: | 401         | :ref:`JWT claims validation <jwt_claims_validation>`        |
++|               |             | or parsing failed.                                          |
++| PGRST303      |             |                                                             |
+++---------------+-------------+-------------------------------------------------------------+
+ 
+ .. The Internal Errors Group X** is always at the end
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 70eccc8e..cbcef6b5 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -23,6 +23,7 @@ import qualified Data.Aeson.Key                  as K
+ import qualified Data.Aeson.KeyMap               as KM
+ import qualified Data.Aeson.Types                as JSON
+ import qualified Data.ByteString                 as BS
++import qualified Data.ByteString.Internal        as BS
+ import qualified Data.ByteString.Lazy.Char8      as LBS
+ import qualified Data.Scientific                 as Sci
+ import qualified Data.Text                       as T
+@@ -54,33 +55,42 @@ import Protolude
+ 
+ -- | Receives the JWT secret and audience (from config) and a JWT and returns a
+ -- JSON object of JWT claims.
+-parseToken :: AppConfig -> ByteString -> UTCTime -> ExceptT Error IO JSON.Value
+-parseToken _ "" _ = return JSON.emptyObject
+-parseToken AppConfig{..} token time = do
+-  secret <- liftEither . maybeToRight (JwtErr JwtTokenMissing) $ configJWKS
+-  eitherContent <- liftIO $ JWT.decode (JWT.keys secret) Nothing token
++parseToken :: AppConfig -> Maybe ByteString -> UTCTime -> ExceptT Error IO JSON.Value
++parseToken _ Nothing _ = return JSON.emptyObject
++parseToken _ (Just "") _ = throwE . JwtErr $ JwtDecodeError "Empty JWT is sent in Authorization header"
++parseToken AppConfig{..} (Just tkn) time = do
++  secret <- liftEither . maybeToRight (JwtErr JwtSecretMissing) $ configJWKS
++  tknWith3Parts <- liftEither $ hasThreeParts tkn
++  eitherContent <- liftIO $ JWT.decode (JWT.keys secret) Nothing tknWith3Parts
+   content <- liftEither . mapLeft (JwtErr . jwtDecodeError) $ eitherContent
+   liftEither $ mapLeft JwtErr $ verifyClaims content
+   where
+-      -- TODO: Improve errors, those were just taken as-is from hs-jose to avoid
+-      -- breaking changes.
++      hasThreeParts :: ByteString -> Either Error ByteString
++      hasThreeParts token = case length $ BS.split (BS.c2w '.') token of
++        3 -> Right token
++        n -> Left $ JwtErr $ JwtDecodeError ("Expected 3 parts in JWT; got " <> show n)
+       jwtDecodeError :: JWT.JwtError -> JwtError
+-      jwtDecodeError (JWT.KeyError _)     = JwtTokenInvalid "JWSError JWSInvalidSignature"
+-      jwtDecodeError JWT.BadCrypto        = JwtTokenInvalid "JWSError (CompactDecodeError Invalid number of parts: Expected 3 parts; got 2)"
+-      jwtDecodeError (JWT.BadAlgorithm _) = JwtTokenInvalid "JWSError JWSNoSignatures"
+-      jwtDecodeError e                    = JwtTokenInvalid $ show e
++      -- The only errors we can get from JWT.decode function are:
++      --   BadAlgorithm
++      --   KeyError
++      --   BadCrypto
++      jwtDecodeError (JWT.KeyError _)     = JwtDecodeError "No suitable key or wrong key type"
++      jwtDecodeError (JWT.BadAlgorithm _) = JwtDecodeError "Wrong or unsupported encoding algorithm"
++      jwtDecodeError JWT.BadCrypto        = JwtDecodeError "JWT cryptographic operation failed"
++      -- Control never reaches here, the decode function only returns the above three
++      jwtDecodeError _                    = JwtDecodeError "JWT couldn't be decoded"
+ 
+       verifyClaims :: JWT.JwtContent -> Either JwtError JSON.Value
+       verifyClaims (JWT.Jws (_, claims)) = case JSON.decodeStrict claims of
+-        Nothing                    -> Left $ JwtTokenInvalid "Parsing claims failed"
++        Nothing                    -> Left $ JwtClaimsError "Parsing claims failed"
+         Just (JSON.Object mclaims)
+-          | failedExpClaim mclaims -> Left $ JwtTokenInvalid "JWT expired"
+-          | failedNbfClaim mclaims -> Left $ JwtTokenInvalid "JWTNotYetValid"
+-          | failedIatClaim mclaims -> Left $ JwtTokenInvalid "JWTIssuedAtFuture"
+-          | failedAudClaim mclaims -> Left $ JwtTokenInvalid "JWTNotInAudience"
++          | failedExpClaim mclaims -> Left $ JwtClaimsError "JWT expired"
++          | failedNbfClaim mclaims -> Left $ JwtClaimsError "JWT not yet valid"
++          | failedIatClaim mclaims -> Left $ JwtClaimsError "JWT issued at future"
++          | failedAudClaim mclaims -> Left $ JwtClaimsError "JWT not in audience"
+         Just jclaims               -> Right jclaims
+       -- TODO: We could enable JWE support here (encrypted tokens)
+-      verifyClaims _                = Left $ JwtTokenInvalid "Unsupported token type"
++      verifyClaims _                = Left $ JwtDecodeError "Unsupported token type"
+ 
+       allowedSkewSeconds = 30 :: Int64
+       now = floor . nominalDiffTimeToSeconds $ utcTimeToPOSIXSeconds time
+@@ -148,7 +158,7 @@ middleware appState app req respond = do
+   conf <- getConfig appState
+   time <- getTime appState
+ 
+-  let token  = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
++  let token  = Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
+       parseJwt = runExceptT $ parseToken conf token time >>= parseClaims conf
+       jwtCacheState = getJwtCacheState appState
+ 
+@@ -160,7 +170,9 @@ middleware appState app req respond = do
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult & Vault.insert jwtDurKey dur }
+ 
+     (True, maxLifetime)  -> do
+-          (dur, authResult) <- timeItT $ lookupJwtCache jwtCacheState token maxLifetime parseJwt time
++          (dur, authResult) <- timeItT $ case token of
++            Just tkn -> lookupJwtCache jwtCacheState tkn maxLifetime parseJwt time
++            Nothing  -> parseJwt
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult & Vault.insert jwtDurKey dur }
+ 
+     (False, 0)           -> do
+@@ -168,7 +180,9 @@ middleware appState app req respond = do
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
+ 
+     (False, maxLifetime) -> do
+-          authResult <- lookupJwtCache jwtCacheState token maxLifetime parseJwt time
++          authResult <- case token of
++            Just tkn -> lookupJwtCache jwtCacheState tkn maxLifetime parseJwt time
++            Nothing -> parseJwt
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
+ 
+   app req' respond
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 58c178d4..5be99e04 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -577,9 +577,10 @@ data Error
+   | PgErr PgError
+ 
+ data JwtError
+-  = JwtTokenInvalid Text
+-  | JwtTokenMissing
++  = JwtDecodeError Text
++  | JwtSecretMissing
+   | JwtTokenRequired
++  | JwtClaimsError Text
+ 
+ instance PgrstError Error where
+   status (ApiRequestError err) = status err
+@@ -593,13 +594,15 @@ instance PgrstError Error where
+   headers _                     = mempty
+ 
+ instance PgrstError JwtError where
+-  status JwtTokenInvalid{} = HTTP.unauthorized401
+-  status JwtTokenMissing   = HTTP.status500
+-  status JwtTokenRequired  = HTTP.unauthorized401
++  status JwtDecodeError{} = HTTP.unauthorized401
++  status JwtSecretMissing = HTTP.status500
++  status JwtTokenRequired = HTTP.unauthorized401
++  status JwtClaimsError{} = HTTP.unauthorized401
+ 
+-  headers (JwtTokenInvalid m) = [invalidTokenHeader m]
+-  headers JwtTokenRequired    = [requiredTokenHeader]
+-  headers _                   = mempty
++  headers (JwtDecodeError m) = [invalidTokenHeader m]
++  headers JwtTokenRequired   = [requiredTokenHeader]
++  headers (JwtClaimsError m) = [invalidTokenHeader m]
++  headers _                  = mempty
+ 
+ instance JSON.ToJSON Error where
+   toJSON (ApiRequestError err) = JSON.toJSON err
+@@ -608,16 +611,20 @@ instance JSON.ToJSON Error where
+   toJSON NoSchemaCacheError    = toJsonPgrstError
+       ConnectionErrorCode02 "Could not query the database for the schema cache. Retrying." Nothing Nothing
+ 
++-- Should we provide hints and description or explain the error in docs or both?
+ instance JSON.ToJSON JwtError where
+-  toJSON JwtTokenMissing = toJsonPgrstError
++  toJSON JwtSecretMissing = toJsonPgrstError
+       JWTErrorCode00 "Server lacks JWT secret" Nothing Nothing
+ 
+-  toJSON (JwtTokenInvalid message) = toJsonPgrstError
++  toJSON (JwtDecodeError message) = toJsonPgrstError
+       JWTErrorCode01 message Nothing Nothing
+ 
+   toJSON JwtTokenRequired = toJsonPgrstError
+       JWTErrorCode02 "Anonymous access is disabled" Nothing Nothing
+ 
++  toJSON (JwtClaimsError message) = toJsonPgrstError
++      JWTErrorCode03 message Nothing Nothing
++
+ 
+ invalidTokenHeader :: Text -> Header
+ invalidTokenHeader m =
+@@ -710,6 +717,7 @@ data ErrorCode
+   | JWTErrorCode00
+   | JWTErrorCode01
+   | JWTErrorCode02
++  | JWTErrorCode03
+   -- Internal errors related to the Hasql library
+   | InternalErrorCode00
+ 
+@@ -758,5 +766,6 @@ buildErrorCode code = case code of
+   JWTErrorCode00         -> "PGRST300"
+   JWTErrorCode01         -> "PGRST301"
+   JWTErrorCode02         -> "PGRST302"
++  JWTErrorCode03         -> "PGRST303"
+ 
+   InternalErrorCode00    -> "PGRSTX00"

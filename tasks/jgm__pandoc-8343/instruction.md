@@ -1,0 +1,9 @@
+Pandoc’s new-style custom Lua writers currently produce corrupt output when used for binary formats like DOCX/ODT. A minimal custom writer that simply delegates to the built-in writer (e.g., `function Writer(doc, opts) return pandoc.write(doc, 'docx', opts) end`) should produce a valid `.docx` file, but instead the generated file is corrupt (and even renaming it to `.zip` yields an invalid zip archive). This indicates that pandoc is treating the custom writer’s return value as text and applying text encoding/newline transformations or otherwise mishandling it, which breaks binary container formats.
+
+Update the custom writer interface so that Lua writers can explicitly return binary output without being re-encoded as text. In addition to the existing `Writer(doc, opts)` entry point (text output), support an alternative Lua entry function named `ByteStringWriter(doc, opts)`. When `ByteStringWriter` is defined in the Lua writer script, pandoc must use it instead of `Writer`, and must treat the returned Lua string as raw bytes (binary) rather than as UTF-8 text. This should allow custom writers to generate valid binary formats by delegating to `pandoc.write` for formats like `docx`.
+
+The API that loads custom Lua writers must reflect that a custom writer can be either a text writer or a byte-string (binary) writer. In particular, `Text.Pandoc.Lua.writeCustom` must be able to return a writer value that represents binary output in addition to the existing text writer case. Calling code must be able to distinguish these cases so that binary output is written without any text conversion.
+
+Expected behavior: with a custom Lua writer that delegates to `pandoc.write(doc, 'docx', opts)`, the produced `.docx` is valid and opens correctly; the produced bytes form a valid zip container.
+
+Actual behavior: the `.docx` produced via such a custom Lua writer is corrupt, indicating the bytes were altered during handling of the writer result.

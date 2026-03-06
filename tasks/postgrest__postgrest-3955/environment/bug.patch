@@ -1,0 +1,192 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 28425938..b0a336cb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,7 +20,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3041, Allow spreading one-to-many and many-to-many embedded resources - @laurenceisla
+    + The selected columns in the embedded resources are aggregated into arrays
+    + Aggregates are not supported
+- - #2967, Add `Proxy-Status` header for better error response - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 780aa4ad..045684f0 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -5,8 +5,6 @@ Errors
+ 
+ PostgREST error messages follow the PostgreSQL error structure. It includes ``MESSAGE``, ``DETAIL``, ``HINT``, ``ERRCODE`` and will add an HTTP status code to the response.
+ 
+-.. _postgresql_errors:
+-
+ Errors from PostgreSQL
+ ======================
+ 
+@@ -350,8 +348,6 @@ Internal errors. If you encounter any of these, you may have stumbled on a Postg
+ | PGRSTX00      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+ 
+-.. _custom_errors:
+-
+ Custom Errors
+ =============
+ 
+@@ -448,24 +444,3 @@ For non standard HTTP status, you can optionally add ``status_text`` to describe
+   detail = '{"status":419,"status_text":"Page Expired","headers":{"X-Powered-By":"Nerd Rage"}}';
+ 
+ If PostgREST can't parse the JSON objects ``message`` and ``detail``, it will throw a ``PGRST121`` error. See :ref:`Errors from PostgREST<pgrst1**>`.
+-
+-.. _proxy-status_header:
+-
+-Proxy-Status Header
+-===================
+-
+-For error cases, the standard `Proxy-Status <https://www.rfc-editor.org/rfc/rfc9209.html#name-the-proxy-status-http-field>`_ header is returned with the error code. The error code comes from either :ref:`PostgREST <pgrst_errors>`, :ref:`PostgreSQL <postgresql_errors>` or :ref:`Custom <custom_errors>` errors. This is useful when doing ``HEAD`` requests where the HTTP status is not descriptive enough.
+-
+-For example, doing a request on a table with high count (say 30_000_000), we get:
+-
+-.. code-block:: http
+-
+-  HEAD /table HTTP/1.1
+-  Prefer: count=exact
+-
+-.. code-block:: http
+-
+-  HTTP/1.1 500 Internal Server Error
+-  Proxy-Status: PostgREST; error=57014
+-
+-The PostgreSQL error code ``57014`` (`ref <https://www.postgresql.org/docs/current/errcodes-appendix.html>`_) reveals that the error is due to a short ``statement_timeout`` value.
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index 2ace309b..37abc8c3 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -236,11 +236,6 @@ You can enable tracing HTTP requests by setting :ref:`server-trace-header`. Spec
+   HTTP/1.1 200 OK
+   X-Request-Id: 123
+ 
+-Proxy-Status Header
+--------------------
+-
+-See :ref:`proxy-status_header`.
+-
+ .. _server-timing_header:
+ 
+ Server-Timing Header
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index e269d157..a6f99843 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -478,9 +478,6 @@ instance PgrstError PgError where
+        then [("WWW-Authenticate", "Bearer") :: Header]
+        else mempty
+ 
+-proxyStatusHeader :: Text -> Header
+-proxyStatusHeader code' = ("Proxy-Status", "PostgREST; error=" <> T.encodeUtf8 code')
+-
+ instance JSON.ToJSON PgError where
+   toJSON (PgError _ usageError) = toJsonPgrstError
+     (code usageError) (message usageError) (details usageError) (hint usageError)
+@@ -628,10 +625,10 @@ instance PgrstError Error where
+   status NoSchemaCacheError    = HTTP.status503
+   status (PgErr err)           = status err
+ 
+-  headers (ApiRequestError err)  = proxyStatusHeader (code err) : headers err
+-  headers (JwtErr err)           = proxyStatusHeader (code err) : headers err
+-  headers (PgErr err)            = proxyStatusHeader (code err) : headers err
+-  headers err@NoSchemaCacheError = proxyStatusHeader (code err) : mempty
++  headers (ApiRequestError err) = headers err
++  headers (JwtErr err)          = headers err
++  headers (PgErr err)           = headers err
++  headers _                     = mempty
+ 
+ instance JSON.ToJSON Error where
+   toJSON err = toJsonPgrstError
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 32ec3b0b..bb6ea9e5 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1830,23 +1830,3 @@ def test_log_pool_req_observation(level, defaultenv):
+         else:
+             output = postgrest.read_stdout(nlines=4)
+             assert len(output) == 0
+-
+-
+-def test_proxy_status_header(defaultenv, metapostgrest):
+-    "Test Proxy-Status header in statement timeout error"
+-
+-    role = "timeout_authenticator"
+-    set_statement_timeout(metapostgrest, role, 1000)  # 1 second
+-
+-    env = {
+-        **defaultenv,
+-        "PGUSER": role,
+-        "PGRST_DB_ANON_ROLE": role,
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/rpc/sleep?seconds=2")
+-        assert response.status_code == 500
+-        assert response.headers["Proxy-Status"] == "PostgREST; error=57014"
+-        data = response.json()
+-        assert data["message"] == "canceling statement due to statement timeout"
+diff --git a/test/spec/Feature/Query/ErrorSpec.hs b/test/spec/Feature/Query/ErrorSpec.hs
+index 0f207746..a41f371f 100644
+--- a/test/spec/Feature/Query/ErrorSpec.hs
++++ b/test/spec/Feature/Query/ErrorSpec.hs
+@@ -7,8 +7,7 @@ import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get)
+-import SpecHelper
++import Protolude hiding (get)
+ 
+ pgErrorCodeMapping :: SpecWith ((), Application)
+ pgErrorCodeMapping = do
+@@ -27,45 +26,3 @@ pgErrorCodeMapping = do
+            "hint": "Increase the configuration parameter \"max_stack_depth\" (currently 2048kB), after ensuring the platform's stack depth limit is adequate.",
+             "message": "stack depth limit exceeded"}|]
+         { matchStatus = 500 }
+-
+-    context "includes the proxy-status header on the response" $ do
+-      it "works with ApiRequest error" $
+-        get "/invalid/nested/paths"
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST125","details":null,"hint":null,"message":"Invalid path specified in request URL"} |]
+-          { matchStatus  = 404
+-          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST125"]
+-          }
+-
+-      it "works with SchemaCache error" $
+-        get "/non_existent_table"
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.json_table'","message":"Could not find the table 'test.non_existent_table' in the schema cache"} |]
+-          { matchStatus  = 404
+-          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST205"]
+-          }
+-
+-      it "works with Jwt error" $ do
+-        let auth = authHeaderJWT "ey9zdGdyZXN0X3Rlc3RfYXV0aG9yIiwiaWQiOiJqZG9lIn0.y4vZuu1dDdwAl0-S00MCRWRYMlJ5YAMSir6Es6WtWx0"
+-        request methodGet "/authors_only" [auth] ""
+-          `shouldRespondWith`
+-          [json| {"message":"Expected 3 parts in JWT; got 2","code":"PGRST301","hint":null,"details":null} |]
+-          { matchStatus = 401
+-          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST301"]
+-          }
+-
+-      it "works with raise sqlstate custom error" $
+-        get "/rpc/raise_pt402"
+-          `shouldRespondWith`
+-          [json| {"code":"PT402","details":"Quota exceeded","hint":"Upgrade your plan","message":"Payment Required"} |]
+-          { matchStatus  = 402
+-          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PT402"]
+-          }
+-
+-      it "works with sqlstate PGRST custom error" $
+-        get "/rpc/raise_sqlstate_test1"
+-          `shouldRespondWith`
+-          [json| {"code":"123","details":"DEF","hint":"XYZ","message":"ABC"} |]
+-          { matchStatus  = 332
+-          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=123"]
+-          }

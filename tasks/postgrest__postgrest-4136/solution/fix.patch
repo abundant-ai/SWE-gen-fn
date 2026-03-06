@@ -1,0 +1,211 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b138a98e..adbc01ff 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+ - Fix `max-affected` preference not failing with RPC when `handling=strict` by @taimoorzaeem in #4100
++- Fix a property definition's type in OpenAPI not showing the correct base type of a recursive domain by @laurenceisla in #4136
++- Fix regression that makes full-text search not work on domain types based on `tsvector` by @laurenceisla in #4135
+ 
+ ## [13.0.2] - 2025-06-02
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a5cb2519..f808476d 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -278,7 +278,7 @@ data ResolverContext = ResolverContext
+   }
+ 
+ resolveColumnField :: Column -> Maybe ToTsVector -> CoercibleField
+-resolveColumnField col toTsV = CoercibleField (colName col) mempty False toTsV (colNominalType col) Nothing (colDefault col) False
++resolveColumnField col toTsV = CoercibleField (colName col) mempty False toTsV (colNominalType col) (colType col) Nothing (colDefault col) False
+ 
+ resolveTableFieldName :: Table -> FieldName -> Maybe ToTsVector -> CoercibleField
+ resolveTableFieldName table fieldName toTsV=
+@@ -291,12 +291,12 @@ resolveTypeOrUnknown ResolverContext{..} (fn, jp) toTsV =
+   case res of
+     -- types that are already json/jsonb don't need to be converted with `to_jsonb` for using arrow operators `data->attr`
+     -- this prevents indexes not applying https://github.com/PostgREST/postgrest/issues/2594
+-    cf@CoercibleField{cfIRType="json"}     -> cf{cfJsonPath=jp, cfToJson=False}
+-    cf@CoercibleField{cfIRType="jsonb"}    -> cf{cfJsonPath=jp, cfToJson=False}
++    cf@CoercibleField{cfIRType="json"}       -> cf{cfJsonPath=jp, cfToJson=False}
++    cf@CoercibleField{cfIRType="jsonb"}      -> cf{cfJsonPath=jp, cfToJson=False}
+     -- Do not apply to_tsvector to tsvector types
+-    cf@CoercibleField{cfIRType="tsvector"} -> cf{cfJsonPath=jp, cfToJson=True, cfToTsVector=Nothing}
++    cf@CoercibleField{cfBaseType="tsvector"} -> cf{cfJsonPath=jp, cfToJson=True, cfToTsVector=Nothing}
+     -- other types will get converted `to_jsonb(col)->attr`, even unknown types
+-    cf                                     -> cf{cfJsonPath=jp, cfToJson=True}
++    cf                                       -> cf{cfJsonPath=jp, cfToJson=True}
+   where
+     res = fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
+           Just . (\t -> resolveTableFieldName t fn toTsV)
+@@ -891,7 +891,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --       where_ = [
+ --         CoercibleStmnt (
+ --           CoercibleFilter {
+---            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
++--            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfToTsVector = Nothing, cfIRType = "", cfBaseType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
+ --            opExpr = op
+ --           }
+ --         )
+@@ -907,7 +907,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfToTsVector = Nothing, cfIRType = "", cfBaseType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -926,7 +926,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+     newNullFilters rPlans = \case
+       (CoercibleExpr b lOp trees) ->
+         CoercibleExpr b lOp <$> (newNullFilters rPlans `traverse` trees)
+-      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _ _) opExpr)) ->
++      flt@(CoercibleStmnt (CoercibleFilter CoercibleField{cfName=fld, cfJsonPath=[]} opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+           (Just ReadPlan{relAggAlias}, OpExpr b (Is IsNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index 59bf52e3..92eedf37 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -44,13 +44,14 @@ data CoercibleField = CoercibleField
+   , cfToJson     :: Bool
+   , cfToTsVector :: Maybe ToTsVector      -- ^ If the field should be converted using to_tsvector(<language>, <field>)
+   , cfIRType     :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
++  , cfBaseType   :: Text                  -- ^ The base type of the field in case of domains, or just the type otherwise (without modifiers in case of pg_catalog types)
+   , cfTransform  :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+   , cfDefault    :: Maybe Text
+   , cfFullRow    :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
+   } deriving (Eq, Show)
+ 
+ unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path False Nothing "" Nothing Nothing False
++unknownField name path = CoercibleField name path False Nothing "" "" Nothing Nothing False
+ 
+ -- | Like an API request LogicTree, but with coercible field information.
+ data CoercibleLogicTree
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 2e07cc32..5a65f56a 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -182,7 +182,7 @@ callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScal
+       KeyParams []    -> "FROM " <> callIt mempty
+       KeyParams prms  -> case arguments of
+         DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
+-        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False Nothing (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False Nothing (ppTypeMaxLength p) mempty Nothing Nothing False) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 70502ffd..df21aede 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -375,32 +375,40 @@ accessibleFuncs = SQL.Statement sql params decodeFuncs
+       (snd >$< arrayParam HE.text)
+     sql = funcsSqlQuery <> " AND has_function_privilege(p.oid, 'execute')"
+ 
+-funcsSqlQuery :: SqlQuery
+-funcsSqlQuery = encodeUtf8 [trimming|
+- -- Recursively get the base types of domains
+-  WITH
++baseTypesCte :: Text
++baseTypesCte = [trimming|
++  -- Recursively get the base types of domains
+   base_types AS (
+     WITH RECURSIVE
+     recurse AS (
+       SELECT
+         oid,
+         typbasetype,
+-        COALESCE(NULLIF(typbasetype, 0), oid) AS base
++        typnamespace AS base_namespace,
++        COALESCE(NULLIF(typbasetype, 0), oid) AS base_type
+       FROM pg_type
+       UNION
+       SELECT
+         t.oid,
+         b.typbasetype,
+-        COALESCE(NULLIF(b.typbasetype, 0), b.oid) AS base
++        b.typnamespace AS base_namespace,
++        COALESCE(NULLIF(b.typbasetype, 0), b.oid) AS base_type
+       FROM recurse t
+       JOIN pg_type b ON t.typbasetype = b.oid
+     )
+     SELECT
+       oid,
+-      base
++      base_namespace,
++      base_type
+     FROM recurse
+     WHERE typbasetype = 0
+-  ),
++  )
++|]
++
++funcsSqlQuery :: SqlQuery
++funcsSqlQuery = encodeUtf8 [trimming|
++  WITH
++  $baseTypesCte,
+   arguments AS (
+     SELECT
+       oid,
+@@ -440,7 +448,7 @@ funcsSqlQuery = encodeUtf8 [trimming|
+      -- if any TABLE, INOUT or OUT arguments present, treat as composite
+      or COALESCE(proargmodes::text[] && '{t,b,o}', false)
+     ) AS rettype_is_composite,
+-    bt.oid <> bt.base as rettype_is_composite_alias,
++    bt.oid <> bt.base_type as rettype_is_composite_alias,
+     p.provolatile,
+     p.provariadic > 0 as hasvariadic,
+     lower((regexp_split_to_array((regexp_split_to_array(iso_config, '='))[2], ','))[1]) AS transaction_isolation_level,
+@@ -449,7 +457,7 @@ funcsSqlQuery = encodeUtf8 [trimming|
+   LEFT JOIN arguments a ON a.oid = p.oid
+   JOIN pg_namespace pn ON pn.oid = p.pronamespace
+   JOIN base_types bt ON bt.oid = p.prorettype
+-  JOIN pg_type t ON t.oid = bt.base
++  JOIN pg_type t ON t.oid = bt.base_type
+   JOIN pg_namespace tn ON tn.oid = t.typnamespace
+   LEFT JOIN pg_class comp ON comp.oid = t.typrelid
+   LEFT JOIN pg_description as d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass
+@@ -615,6 +623,7 @@ tablesSqlQuery =
+   -- generated columns are only available from pg >= 10 but the query is agnostic to versions. dep.deptype = 'i' is done because there are other 'a' dependencies on PKs
+   encodeUtf8 [trimming|
+   WITH
++  $baseTypesCte,
+   columns AS (
+       SELECT
+           c.oid AS relid,
+@@ -631,7 +640,7 @@ tablesSqlQuery =
+           CASE
+               WHEN t.typtype = 'd' THEN
+               CASE
+-                  WHEN bt.typnamespace = 'pg_catalog'::regnamespace THEN format_type(t.typbasetype, NULL::integer)
++                  WHEN bt.base_namespace = 'pg_catalog'::regnamespace THEN format_type(bt.base_type, NULL::integer)
+                   ELSE format_type(a.atttypid, a.atttypmod)
+               END
+               ELSE
+@@ -645,7 +654,7 @@ tablesSqlQuery =
+               information_schema._pg_truetypid(a.*, t.*),
+               information_schema._pg_truetypmod(a.*, t.*)
+           )::integer AS character_maximum_length,
+-          COALESCE(bt.oid, t.oid) AS base_type,
++          bt.base_type,
+           a.attnum::integer AS position
+       FROM pg_attribute a
+           LEFT JOIN pg_description AS d
+@@ -656,8 +665,8 @@ tablesSqlQuery =
+               ON a.attrelid = c.oid
+           JOIN pg_type t
+               ON a.atttypid = t.oid
+-          LEFT JOIN pg_type bt
+-              ON t.typtype = 'd' AND t.typbasetype = bt.oid
++          LEFT JOIN base_types bt
++              ON t.oid = bt.oid
+           LEFT JOIN pg_depend seq
+               ON seq.refobjid = a.attrelid and seq.refobjsubid = a.attnum and seq.deptype = 'i'
+       WHERE

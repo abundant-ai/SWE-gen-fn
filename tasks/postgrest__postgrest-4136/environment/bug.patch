@@ -1,0 +1,310 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index adbc01ff..b138a98e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,8 +15,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+ - Fix `max-affected` preference not failing with RPC when `handling=strict` by @taimoorzaeem in #4100
+-- Fix a property definition's type in OpenAPI not showing the correct base type of a recursive domain by @laurenceisla in #4136
+-- Fix regression that makes full-text search not work on domain types based on `tsvector` by @laurenceisla in #4135
+ 
+ ## [13.0.2] - 2025-06-02
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index f808476d..a5cb2519 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -278,7 +278,7 @@ data ResolverContext = ResolverContext
+   }
+ 
+ resolveColumnField :: Column -> Maybe ToTsVector -> CoercibleField
+-resolveColumnField col toTsV = CoercibleField (colName col) mempty False toTsV (colNominalType col) (colType col) Nothing (colDefault col) False
++resolveColumnField col toTsV = CoercibleField (colName col) mempty False toTsV (colNominalType col) Nothing (colDefault col) False
+ 
+ resolveTableFieldName :: Table -> FieldName -> Maybe ToTsVector -> CoercibleField
+ resolveTableFieldName table fieldName toTsV=
+@@ -291,12 +291,12 @@ resolveTypeOrUnknown ResolverContext{..} (fn, jp) toTsV =
+   case res of
+     -- types that are already json/jsonb don't need to be converted with `to_jsonb` for using arrow operators `data->attr`
+     -- this prevents indexes not applying https://github.com/PostgREST/postgrest/issues/2594
+-    cf@CoercibleField{cfIRType="json"}       -> cf{cfJsonPath=jp, cfToJson=False}
+-    cf@CoercibleField{cfIRType="jsonb"}      -> cf{cfJsonPath=jp, cfToJson=False}
++    cf@CoercibleField{cfIRType="json"}     -> cf{cfJsonPath=jp, cfToJson=False}
++    cf@CoercibleField{cfIRType="jsonb"}    -> cf{cfJsonPath=jp, cfToJson=False}
+     -- Do not apply to_tsvector to tsvector types
+-    cf@CoercibleField{cfBaseType="tsvector"} -> cf{cfJsonPath=jp, cfToJson=True, cfToTsVector=Nothing}
++    cf@CoercibleField{cfIRType="tsvector"} -> cf{cfJsonPath=jp, cfToJson=True, cfToTsVector=Nothing}
+     -- other types will get converted `to_jsonb(col)->attr`, even unknown types
+-    cf                                       -> cf{cfJsonPath=jp, cfToJson=True}
++    cf                                     -> cf{cfJsonPath=jp, cfToJson=True}
+   where
+     res = fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
+           Just . (\t -> resolveTableFieldName t fn toTsV)
+@@ -891,7 +891,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --       where_ = [
+ --         CoercibleStmnt (
+ --           CoercibleFilter {
+---            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfToTsVector = Nothing, cfIRType = "", cfBaseType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
++--            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
+ --            opExpr = op
+ --           }
+ --         )
+@@ -907,7 +907,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfToTsVector = Nothing, cfIRType = "", cfBaseType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -926,7 +926,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+     newNullFilters rPlans = \case
+       (CoercibleExpr b lOp trees) ->
+         CoercibleExpr b lOp <$> (newNullFilters rPlans `traverse` trees)
+-      flt@(CoercibleStmnt (CoercibleFilter CoercibleField{cfName=fld, cfJsonPath=[]} opExpr)) ->
++      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _ _) opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+           (Just ReadPlan{relAggAlias}, OpExpr b (Is IsNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index 92eedf37..59bf52e3 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -44,14 +44,13 @@ data CoercibleField = CoercibleField
+   , cfToJson     :: Bool
+   , cfToTsVector :: Maybe ToTsVector      -- ^ If the field should be converted using to_tsvector(<language>, <field>)
+   , cfIRType     :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
+-  , cfBaseType   :: Text                  -- ^ The base type of the field in case of domains, or just the type otherwise (without modifiers in case of pg_catalog types)
+   , cfTransform  :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+   , cfDefault    :: Maybe Text
+   , cfFullRow    :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
+   } deriving (Eq, Show)
+ 
+ unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path False Nothing "" "" Nothing Nothing False
++unknownField name path = CoercibleField name path False Nothing "" Nothing Nothing False
+ 
+ -- | Like an API request LogicTree, but with coercible field information.
+ data CoercibleLogicTree
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 5a65f56a..2e07cc32 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -182,7 +182,7 @@ callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScal
+       KeyParams []    -> "FROM " <> callIt mempty
+       KeyParams prms  -> case arguments of
+         DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
+-        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False Nothing (ppTypeMaxLength p) mempty Nothing Nothing False) <$> prms) False True False <> ", " <>
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False Nothing (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index df21aede..70502ffd 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -375,40 +375,32 @@ accessibleFuncs = SQL.Statement sql params decodeFuncs
+       (snd >$< arrayParam HE.text)
+     sql = funcsSqlQuery <> " AND has_function_privilege(p.oid, 'execute')"
+ 
+-baseTypesCte :: Text
+-baseTypesCte = [trimming|
+-  -- Recursively get the base types of domains
++funcsSqlQuery :: SqlQuery
++funcsSqlQuery = encodeUtf8 [trimming|
++ -- Recursively get the base types of domains
++  WITH
+   base_types AS (
+     WITH RECURSIVE
+     recurse AS (
+       SELECT
+         oid,
+         typbasetype,
+-        typnamespace AS base_namespace,
+-        COALESCE(NULLIF(typbasetype, 0), oid) AS base_type
++        COALESCE(NULLIF(typbasetype, 0), oid) AS base
+       FROM pg_type
+       UNION
+       SELECT
+         t.oid,
+         b.typbasetype,
+-        b.typnamespace AS base_namespace,
+-        COALESCE(NULLIF(b.typbasetype, 0), b.oid) AS base_type
++        COALESCE(NULLIF(b.typbasetype, 0), b.oid) AS base
+       FROM recurse t
+       JOIN pg_type b ON t.typbasetype = b.oid
+     )
+     SELECT
+       oid,
+-      base_namespace,
+-      base_type
++      base
+     FROM recurse
+     WHERE typbasetype = 0
+-  )
+-|]
+-
+-funcsSqlQuery :: SqlQuery
+-funcsSqlQuery = encodeUtf8 [trimming|
+-  WITH
+-  $baseTypesCte,
++  ),
+   arguments AS (
+     SELECT
+       oid,
+@@ -448,7 +440,7 @@ funcsSqlQuery = encodeUtf8 [trimming|
+      -- if any TABLE, INOUT or OUT arguments present, treat as composite
+      or COALESCE(proargmodes::text[] && '{t,b,o}', false)
+     ) AS rettype_is_composite,
+-    bt.oid <> bt.base_type as rettype_is_composite_alias,
++    bt.oid <> bt.base as rettype_is_composite_alias,
+     p.provolatile,
+     p.provariadic > 0 as hasvariadic,
+     lower((regexp_split_to_array((regexp_split_to_array(iso_config, '='))[2], ','))[1]) AS transaction_isolation_level,
+@@ -457,7 +449,7 @@ funcsSqlQuery = encodeUtf8 [trimming|
+   LEFT JOIN arguments a ON a.oid = p.oid
+   JOIN pg_namespace pn ON pn.oid = p.pronamespace
+   JOIN base_types bt ON bt.oid = p.prorettype
+-  JOIN pg_type t ON t.oid = bt.base_type
++  JOIN pg_type t ON t.oid = bt.base
+   JOIN pg_namespace tn ON tn.oid = t.typnamespace
+   LEFT JOIN pg_class comp ON comp.oid = t.typrelid
+   LEFT JOIN pg_description as d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass
+@@ -623,7 +615,6 @@ tablesSqlQuery =
+   -- generated columns are only available from pg >= 10 but the query is agnostic to versions. dep.deptype = 'i' is done because there are other 'a' dependencies on PKs
+   encodeUtf8 [trimming|
+   WITH
+-  $baseTypesCte,
+   columns AS (
+       SELECT
+           c.oid AS relid,
+@@ -640,7 +631,7 @@ tablesSqlQuery =
+           CASE
+               WHEN t.typtype = 'd' THEN
+               CASE
+-                  WHEN bt.base_namespace = 'pg_catalog'::regnamespace THEN format_type(bt.base_type, NULL::integer)
++                  WHEN bt.typnamespace = 'pg_catalog'::regnamespace THEN format_type(t.typbasetype, NULL::integer)
+                   ELSE format_type(a.atttypid, a.atttypmod)
+               END
+               ELSE
+@@ -654,7 +645,7 @@ tablesSqlQuery =
+               information_schema._pg_truetypid(a.*, t.*),
+               information_schema._pg_truetypmod(a.*, t.*)
+           )::integer AS character_maximum_length,
+-          bt.base_type,
++          COALESCE(bt.oid, t.oid) AS base_type,
+           a.attnum::integer AS position
+       FROM pg_attribute a
+           LEFT JOIN pg_description AS d
+@@ -665,8 +656,8 @@ tablesSqlQuery =
+               ON a.attrelid = c.oid
+           JOIN pg_type t
+               ON a.atttypid = t.oid
+-          LEFT JOIN base_types bt
+-              ON t.oid = bt.oid
++          LEFT JOIN pg_type bt
++              ON t.typtype = 'd' AND t.typbasetype = bt.oid
+           LEFT JOIN pg_depend seq
+               ON seq.refobjid = a.attrelid and seq.refobjsubid = a.attnum and seq.deptype = 'i'
+       WHERE
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index ca51eaca..43cb4672 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -294,20 +294,6 @@ spec = do
+               ]|]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+-          it "works when the column type is a tsvector domain" $ do
+-            get "tsearch_to_tsvector?select=text_search_domain&text_search_domain=fts(simple).of" `shouldRespondWith`
+-              [json| [
+-                {"text_search_domain":"'do':7 'fun':5 'impossible':9 'it':1 'kind':3 'of':4 's':2 'the':8 'to':6"}
+-              ]|]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "works when the column type is a recursive tsvector domain" $ do
+-            get "tsearch_to_tsvector?select=text_search_rec_domain&text_search_rec_domain=fts(simple).of" `shouldRespondWith`
+-              [json| [
+-                {"text_search_rec_domain":"'do':7 'fun':5 'impossible':9 'it':1 'kind':3 'of':4 's':2 'the':8 'to':6"}
+-              ]|]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+       context "text and json columns" $ do
+         it "finds matches with to_tsquery" $ do
+           get "/tsearch_to_tsvector?select=text_search&text_search=fts.impossible" `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index c3745e0f..b78c2de9 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -998,22 +998,6 @@ spec =
+           |]
+           { matchHeaders = [matchContentTypeJson] }
+ 
+-      it "should work with filters that use the fts operator when the column type is a tsvector domain" $
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search_domain&text_search_domain=fts(simple).impossible" `shouldRespondWith`
+-          [json|[
+-            {"text_search_domain":"'do':7 'fun':5 'impossible':9 'it':1 'kind':3 'of':4 's':2 'the':8 'to':6"},
+-            {"text_search_domain":"'amusant':5 'c':1 'de':6 'est':2 'faire':7 'impossible':9 'l':8 'peu':4 'un':3"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "should work with filters that use the fts operator when the column type is a recursive tsvector domain" $
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search_rec_domain&text_search_rec_domain=fts(simple).impossible" `shouldRespondWith`
+-          [json|[
+-            {"text_search_rec_domain":"'do':7 'fun':5 'impossible':9 'it':1 'kind':3 'of':4 's':2 'the':8 'to':6"},
+-            {"text_search_rec_domain":"'amusant':5 'c':1 'de':6 'est':2 'faire':7 'impossible':9 'l':8 'peu':4 'un':3"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+       it "should work with the phraseto_tsquery function" $
+         get "/rpc/get_tsearch?text_search_vector=phfts(english).impossible" `shouldRespondWith`
+           [json|[{"text_search_vector":"'fun':5 'imposs':9 'kind':3"}]|]
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index b0304ae0..62404021 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -957,16 +957,15 @@ INSERT INTO tsearch_to_tsvector(text_search) VALUES ('C''est un peu amusant de f
+ INSERT INTO tsearch_to_tsvector(text_search) VALUES ('Es ist eine Art Spaß, das Unmögliche zu machen');
+ 
+ UPDATE tsearch_to_tsvector SET jsonb_search = jsonb_build_object('text_search', text_search);
+-UPDATE tsearch_to_tsvector SET text_search_domain = to_tsvector('simple', text_search);
+-UPDATE tsearch_to_tsvector SET text_search_rec_domain = to_tsvector('simple', text_search);
++
+ 
+ TRUNCATE TABLE artists CASCADE;
+ INSERT INTO artists
+ VALUES (1, 'duster'), (2, 'black country, new road'), (3, 'bjork');
+ 
+ TRUNCATE TABLE albums CASCADE;
+-INSERT INTO albums
++INSERT INTO albums 
+ VALUES (1, 'stratosphere', 1),
+-       (2, 'ants from up above',2),
++       (2, 'ants from up above',2), 
+        (3, 'vespertine',3),
+        (4, 'contemporary movement', 1);
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index e9e1e70a..770c1e5d 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3757,17 +3757,9 @@ create table "Surr_Gen_Default_Upsert" (
+   extra text
+ );
+ 
+-create domain tsvector_not_null as tsvector
+-  constraint "tsvector is required" check (value is not null);
+-
+-create domain tsvector_not_empty as tsvector_not_null
+-  constraint "tsvector is required and not empty" check (value <> '');
+-
+ create table tsearch_to_tsvector (
+   text_search text,
+-  jsonb_search jsonb,
+-  text_search_domain tsvector_not_null default '',
+-  text_search_rec_domain tsvector_not_empty default '.'
++  jsonb_search jsonb
+ );
+ 
+ create function test.get_tsearch_to_tsvector() returns setof test.tsearch_to_tsvector AS $$

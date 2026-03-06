@@ -1,0 +1,129 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 511819b9..0de150b7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,7 +35,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3600, #3926, Improve JWT errors - @taimoorzaeem
+  - #3013, Fix `order=` with POST, PATCH, PUT and DELETE requests - @taimoorzaeem
+  - #3498, Fix incorrect parsing of the `for` parameter of the `application/vnd.pgrst.plan` media type - @taimoorzaeem
+- - #4014, Fix JWT cache allows old tokens after the jwt-secret is changed in a config reload - @taimoorzaeem
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 3e2a588f..27131f25 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -438,11 +438,11 @@ retryingSchemaCacheLoad appState@AppState{stateObserver=observer, stateMainThrea
+ -- | We don't retry reading the in-db config after it fails immediately, because it could have user errors. We just report the error and continue.
+ readInDbConfig :: Bool -> AppState -> IO ()
+ readInDbConfig startingUp appState@AppState{stateObserver=observer} = do
+-  conf <- getConfig appState
++  AppConfig{..} <- getConfig appState
+   pgVer <- getPgVersion appState
+   dbSettings <-
+-    if configDbConfig conf then do
+-      qDbSettings <- usePool appState (queryDbSettings (dumpQi <$> configDbPreConfig conf) (configDbPreparedStatements conf))
++    if configDbConfig then do
++      qDbSettings <- usePool appState (queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements)
+       case qDbSettings of
+         Left e -> do
+           observer $ ConfigReadErrorObs e
+@@ -451,8 +451,8 @@ readInDbConfig startingUp appState@AppState{stateObserver=observer} = do
+     else
+       pure mempty
+   (roleSettings, roleIsolationLvl) <-
+-    if configDbConfig conf then do
+-      rSettings <- usePool appState (queryRoleSettings pgVer (configDbPreparedStatements conf))
++    if configDbConfig then do
++      rSettings <- usePool appState (queryRoleSettings pgVer configDbPreparedStatements)
+       case rSettings of
+         Left e -> do
+           observer $ QueryRoleSettingsErrorObs e
+@@ -460,7 +460,7 @@ readInDbConfig startingUp appState@AppState{stateObserver=observer} = do
+         Right x -> pure x
+     else
+       pure mempty
+-  readAppConfig dbSettings (configFilePath conf) (Just $ configDbUri conf) roleSettings roleIsolationLvl >>= \case
++  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings roleIsolationLvl >>= \case
+     Left err   ->
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up
+@@ -468,14 +468,6 @@ readInDbConfig startingUp appState@AppState{stateObserver=observer} = do
+         observer $ ConfigInvalidObs err
+     Right newConf -> do
+       putConfig appState newConf
+-      -- After the config has reloaded, jwt-secret might have changed, so
+-      -- if it has changed, it is important to invalidate the jwt cache
+-      -- entries, because they were cached using the old secret
+-      if configJwtSecret conf == configJwtSecret newConf then
+-        pass
+-      else
+-        JwtCache.emptyCache (getJwtCacheState appState) -- atomic O(1) operation
+-
+       if startingUp then
+         pass
+       else
+diff --git a/src/PostgREST/Auth/JwtCache.hs b/src/PostgREST/Auth/JwtCache.hs
+index c95dea6f..e02193a9 100644
+--- a/src/PostgREST/Auth/JwtCache.hs
++++ b/src/PostgREST/Auth/JwtCache.hs
+@@ -9,7 +9,6 @@ module PostgREST.Auth.JwtCache
+   ( init
+   , JwtCacheState
+   , lookupJwtCache
+-  , emptyCache
+   ) where
+ 
+ import qualified Data.Aeson        as JSON
+@@ -78,7 +77,3 @@ getTimeSpec res maxLifetime utc = do
+   case expireJSON of
+     Just (JSON.Number seconds) -> TimeSpec (sciToInt seconds - utcToSecs utc) 0
+     _                          -> TimeSpec (fromIntegral maxLifetime :: Int64) 0
+-
+--- | Empty the cache (done when the config is reloaded)
+-emptyCache :: JwtCacheState -> IO ()
+-emptyCache JwtCacheState{jwtCache} = C.purge jwtCache
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 02d31349..32ec3b0b 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1850,38 +1850,3 @@ def test_proxy_status_header(defaultenv, metapostgrest):
+         assert response.headers["Proxy-Status"] == "PostgREST; error=57014"
+         data = response.json()
+         assert data["message"] == "canceling statement due to statement timeout"
+-
+-
+-def test_invalidate_jwt_cache_when_secret_changes(tmp_path, defaultenv):
+-    "JWT cache should be emptied after jwt-secret is changed in a config reload"
+-
+-    headers = jwtauthheader({"role": "postgrest_test_author"}, SECRET)
+-
+-    external_secret_file = tmp_path / "jwt-secret-config"
+-    external_secret_file.write_text(SECRET)
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_JWT_SECRET": f"@{external_secret_file}",
+-        "PGRST_DB_CHANNEL_ENABLED": "true",
+-        "PGRST_JWT_CACHE_MAX_LIFETIME": "86400",  # enable cache
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",  # required for NOTIFY
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/authors_only", headers=headers)
+-        assert response.status_code == 200  # jwt gets cached
+-
+-        # change external file
+-        external_secret_file.write_text("invalid" * 5)
+-
+-        # reload config and external file with NOTIFY
+-        # jwt-cache should get empty
+-        response = postgrest.session.post("/rpc/reload_pgrst_config")
+-        assert response.text == ""
+-        assert response.status_code == 204
+-        sleep_until_postgrest_config_reload()
+-
+-        # now the request should fail because the cached token is removed
+-        response = postgrest.session.get("/authors_only", headers=headers)
+-        assert response.status_code == 401

@@ -1,0 +1,99 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6fbac109..b317e0a7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,7 +14,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+ - Fix jwt error returning HTTP status `400` for invalid role by @taimoorzaeem in #3601
+-- Allow `db-extra-search-path` to accept empty value by @taimoorzaeem in #4074
++- Fix `db-extra-search-path` cannot be set to nothing by @taimoorzaeem in #4074
++  + It can now be disabled by setting it to empty string.
++  + Schema Cache load error is now logged including `db-schemas` and `db-extra-search-path` config values.
+ 
+ ## [13.0.0] - 2025-05-08
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 3e2a588f..c06ecdcf 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -407,7 +407,7 @@ retryingSchemaCacheLoad appState@AppState{stateObserver=observer, stateMainThrea
+         Left e -> do
+           putSCacheStatus appState SCPending
+           putSchemaCache appState Nothing
+-          observer $ SchemaCacheErrorObs e
++          observer $ SchemaCacheErrorObs configDbSchemas configDbExtraSearchPath e
+           return Nothing
+ 
+         Right sCache -> do
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index e481d428..bc0025c4 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -60,7 +60,7 @@ dumpSchema appState = do
+   case result of
+     Left e -> do
+       let observer = AppState.getObserver appState
+-      observer $ SchemaCacheErrorObs e
++      observer $ SchemaCacheErrorObs configDbSchemas configDbExtraSearchPath e
+       exitFailure
+     Right sCache -> return $ JSON.encode sCache
+ 
+diff --git a/src/PostgREST/Metrics.hs b/src/PostgREST/Metrics.hs
+index 3999e43d..b314e2c3 100644
+--- a/src/PostgREST/Metrics.hs
++++ b/src/PostgREST/Metrics.hs
+@@ -52,7 +52,7 @@ observationMetrics (MetricsState poolTimeouts poolAvailable poolWaiting _ schema
+   SchemaCacheLoadedObs resTime -> do
+     withLabel schemaCacheLoads "SUCCESS" incCounter
+     setGauge schemaCacheQueryTime resTime
+-  SchemaCacheErrorObs _ -> do
++  SchemaCacheErrorObs{} -> do
+     withLabel schemaCacheLoads "FAIL" incCounter
+   _ ->
+     pure ()
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 1b333571..2b5f3361 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -14,6 +14,7 @@ module PostgREST.Observation
+   ) where
+ 
+ import qualified Data.ByteString.Lazy       as LBS
++import           Data.List.NonEmpty         (toList)
+ import qualified Data.Text                  as T
+ import qualified Data.Text.Encoding         as T
+ import qualified Hasql.Connection           as SQL
+@@ -25,7 +26,7 @@ import           Numeric                    (showFFloat)
+ import           PostgREST.Config.PgVersion
+ import qualified PostgREST.Error            as Error
+ 
+-import Protolude
++import Protolude         hiding (toList)
+ import Protolude.Partial (fromJust)
+ 
+ data Observation
+@@ -37,7 +38,7 @@ data Observation
+   | ExitDBNoRecoveryObs
+   | ExitDBFatalError ObsFatalError SQL.UsageError
+   | DBConnectedObs Text
+-  | SchemaCacheErrorObs SQL.UsageError
++  | SchemaCacheErrorObs (NonEmpty Text) [Text] SQL.UsageError
+   | SchemaCacheQueriedObs Double
+   | SchemaCacheSummaryObs Text
+   | SchemaCacheLoadedObs Double
+@@ -88,8 +89,12 @@ observationMessage = \case
+     "If you are using connection poolers in transaction mode, try setting db-prepared-statements to false. " <> jsonMessage usageErr
+   ExitDBFatalError ServerError08P01 usageErr ->
+     "Connection poolers in statement mode are not supported." <> jsonMessage usageErr
+-  SchemaCacheErrorObs usageErr ->
+-    "Failed to load the schema cache. " <> jsonMessage usageErr
++  SchemaCacheErrorObs dbSchemas extraPaths usageErr ->
++    "Failed to load the schema cache using "
++      <> "db-schemas=" <> T.intercalate "," (toList dbSchemas)
++      <> " and "
++      <> "db-extra-search-path=" <> T.intercalate "," extraPaths
++      <> ". " <> jsonMessage usageErr
+   SchemaCacheQueriedObs resultTime ->
+     "Schema cache queried in " <> showMillis resultTime  <> " milliseconds"
+   SchemaCacheSummaryObs summary ->

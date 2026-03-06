@@ -1,0 +1,206 @@
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index c21065b0..d0486984 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -1,3 +1,5 @@
++{-# LANGUAGE NamedFieldPuns #-}
++
+ module PostgREST.Admin
+   ( runAdmin
+   ) where
+@@ -7,14 +9,16 @@ import qualified Network.HTTP.Types.Status as HTTP
+ import qualified Network.Wai               as Wai
+ import qualified Network.Wai.Handler.Warp  as Warp
+ 
+-import Control.Monad.Extra       (whenJust)
+-import Network.Socket            hiding (addrFamily)
++import Control.Monad.Extra (whenJust)
++
++import Network.Socket
+ import Network.Socket.ByteString
+ 
+ import PostgREST.AppState    (AppState)
++import PostgREST.Config      (AppConfig (..))
+ import PostgREST.MediaType   (MediaType (..), toContentType)
+ import PostgREST.Metrics     (metricsToText)
+-import PostgREST.Network     (resolveSocketToAddress)
++import PostgREST.Network     (resolveHost)
+ import PostgREST.Observation (Observation (..))
+ 
+ import qualified PostgREST.AppState as AppState
+@@ -23,9 +27,10 @@ import Protolude
+ 
+ runAdmin :: AppState -> Warp.Settings -> IO ()
+ runAdmin appState settings = do
++  AppConfig{configAdminServerPort} <- AppState.getConfig appState
+   whenJust (AppState.getSocketAdmin appState) $ \adminSocket -> do
+-    address <- resolveSocketToAddress adminSocket
+-    observer $ AdminStartObs address
++    host <- resolveHost adminSocket
++    observer $ AdminStartObs host configAdminServerPort
+     void . forkIO $ Warp.runSettingsSocket settings adminSocket adminApp
+   where
+     adminApp = admin appState
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index e6974b43..095cdc3d 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -46,7 +46,7 @@ import PostgREST.Auth.Types           (AuthResult (..))
+ import PostgREST.Config               (AppConfig (..), LogLevel (..),
+                                        LogQuery (..))
+ import PostgREST.Error                (Error)
+-import PostgREST.Network              (resolveSocketToAddress)
++import PostgREST.Network              (resolveHost)
+ import PostgREST.Observation          (Observation (..))
+ import PostgREST.Response.Performance (ServerTiming (..),
+                                        serverTimingHeader)
+@@ -56,6 +56,7 @@ import PostgREST.Version              (docsVersion, prettyVersion)
+ import qualified Data.ByteString.Char8 as BS
+ import qualified Data.List             as L
+ import qualified Network.HTTP.Types    as HTTP
++import qualified Network.Socket        as NS
+ import           Protolude             hiding (Handler)
+ import           System.TimeIt         (timeItT)
+ 
+@@ -75,9 +76,13 @@ run appState = do
+ 
+   let app = postgrest configLogLevel appState (AppState.schemaCacheLoader appState)
+ 
+-  do
+-    address <- resolveSocketToAddress (AppState.getSocketREST appState)
+-    observer $ AppServerAddressObs address
++  case configServerUnixSocket of
++    Just path -> do
++      observer $ AppServerUnixObs path
++    Nothing   -> do
++      port <- NS.socketPort $ AppState.getSocketREST appState
++      host <- resolveHost $ AppState.getSocketREST appState
++      observer $ AppServerPortObs (fromJust host) port
+ 
+   Warp.runSettingsSocket (serverSettings conf) (AppState.getSocketREST appState) app
+ 
+diff --git a/src/PostgREST/Network.hs b/src/PostgREST/Network.hs
+index fc14d62b..c3107a6f 100644
+--- a/src/PostgREST/Network.hs
++++ b/src/PostgREST/Network.hs
+@@ -1,37 +1,21 @@
+ module PostgREST.Network
+-  ( resolveSocketToAddress
++  ( resolveHost
+   ) where
+ 
++import           Data.IP        (fromHostAddress, fromHostAddress6)
+ import           Data.String    (IsString (..))
+ import qualified Network.Socket as NS
+ 
+ import Protolude
+ 
+--- | Resolves the socket to an address depending on the socket type. The Show
+---   instance of the socket types automatically resolves it to the correct
+---   address. Example resolution:
+--- -----------------------------------------------------
+--- | IPv4         | IPv6             | Unix            |
+--- -----------------------------------------------------
+--- | 127.0.0.1:80 | [2001:db8::1]:80 | /tmp/pgrst.sock |
+--- -----------------------------------------------------
+-resolveSocketToAddress :: NS.Socket -> IO Text
+-resolveSocketToAddress sock = do
++resolveHost :: NS.Socket -> IO (Maybe Text)
++resolveHost sock = do
+   sn <- NS.getSocketName sock
+-  return $ showSocketAddr sn
+-
+--- |
+--- >>> let addr_ipv4 = NS.SockAddrInet 80 (NS.tupleToHostAddress (127,0,0,1))
+--- >>> let addr_ipv6 = NS.SockAddrInet6 80 0 (0,0,0,1) 0
+--- >>> let addr_unix = NS.SockAddrUnix "/tmp/pgrst.sock"
+---
+--- >>> showSocketAddr addr_ipv4
+--- "127.0.0.1:80"
+-
+--- >>> showSocketAddr addr_ipv6
+--- "[::1]:80"
+---
+--- >>> showSocketAddr addr_unix
+--- "/tmp/pgrst.sock"
+-showSocketAddr :: NS.SockAddr -> Text
+-showSocketAddr = fromString . show
++  case sn of
++    NS.SockAddrInet _ hostAddr ->  pure $ Just $ fromString $ show $ fromHostAddress hostAddr
++    -- The IPv6 addresses are wrapped in [] brackets. This is done in accordance
++    -- to RFC 3986 (https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.2).
++    -- In short, we did this to have a clear separation between the port and host
++    -- because the components of an IPv6 are separated with the ':' character.
++    NS.SockAddrInet6 _ _ hostAddr6 _ -> pure $ Just $ fromString $ "[" ++ show (fromHostAddress6 hostAddr6) ++ "]"
++    _ -> pure Nothing
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 481f9ff8..6e0b3551 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -21,16 +21,19 @@ import qualified Hasql.Connection           as SQL
+ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Pool.Observation     as SQL
+ import           Network.HTTP.Types.Status  (Status)
++import qualified Network.Socket             as NS
+ import           Numeric                    (showFFloat)
+ import           PostgREST.Config.PgVersion
+ import qualified PostgREST.Error            as Error
+ 
+-import Protolude hiding (toList)
++import Protolude         hiding (toList)
++import Protolude.Partial (fromJust)
+ 
+ data Observation
+-  = AdminStartObs Text
++  = AdminStartObs (Maybe Text) (Maybe Int)
+   | AppStartObs ByteString
+-  | AppServerAddressObs Text
++  | AppServerPortObs Text NS.PortNumber
++  | AppServerUnixObs FilePath
+   | ExitUnsupportedPgVersion PgVersion PgVersion
+   | ExitDBNoRecoveryObs
+   | ExitDBFatalError ObsFatalError SQL.UsageError
+@@ -66,12 +69,14 @@ type ObservationHandler = Observation -> IO ()
+ 
+ observationMessage :: Observation -> Text
+ observationMessage = \case
+-  AdminStartObs address ->
+-    "Admin server listening on " <> address
++  AdminStartObs host port ->
++    "Admin server listening on " <> fromJust host <> ":" <> show (fromIntegral (fromJust port) :: Integer)
+   AppStartObs ver ->
+     "Starting PostgREST " <> T.decodeUtf8 ver <> "..."
+-  AppServerAddressObs address ->
+-    "API server listening on " <> address
++  AppServerPortObs host port ->
++    "API server listening on " <> host <> ":" <> show port
++  AppServerUnixObs sock ->
++    "API server listening on unix socket " <> show sock
+   DBConnectedObs ver ->
+     "Successfully connected to " <> ver
+   ExitUnsupportedPgVersion pgVer minPgVer ->
+diff --git a/test/doc/Main.hs b/test/doc/Main.hs
+index da60eef5..5db234fd 100644
+--- a/test/doc/Main.hs
++++ b/test/doc/Main.hs
+@@ -18,7 +18,6 @@ main =
+     , "src/PostgREST/Config.hs"
+     , "src/PostgREST/Error.hs"
+     , "src/PostgREST/MediaType.hs"
+-    , "src/PostgREST/Network.hs"
+     , "src/PostgREST/Plan.hs"
+     , "src/PostgREST/Query/SqlFragment.hs"
+     , "src/PostgREST/Response.hs"
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 8c2f4426..9ee6fa64 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1378,7 +1378,7 @@ def test_log_postgrest_host_and_port(host, defaultenv):
+         output = postgrest.read_stdout(nlines=10)
+ 
+         if is_unix:
+-            re.match(r'API server listening on "/tmp/.*\.sock"', output[2])
++            re.match(r'API server listening on unix socket "/tmp/.*\.sock"', output[2])
+         elif is_ipv6(host):
+             assert f"API server listening on [{host}]:{port}" in output[2]
+         else:  # IPv4

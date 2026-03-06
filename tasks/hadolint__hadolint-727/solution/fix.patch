@@ -1,0 +1,212 @@
+diff --git a/hadolint.cabal b/hadolint.cabal
+index 4e7a31b..659ef17 100644
+--- a/hadolint.cabal
++++ b/hadolint.cabal
+@@ -146,7 +146,7 @@ library
+     , foldl
+     , gitrev >=1.3.1
+     , ilist
+-    , language-docker >=10.1.2 && <11
++    , language-docker >=10.3.0 && <11
+     , megaparsec >=9.0.0
+     , mtl
+     , network-uri
+@@ -183,7 +183,7 @@ executable hadolint
+       base >=4.8 && <5
+     , containers
+     , hadolint
+-    , language-docker >=10.1.2 && <11
++    , language-docker >=10.3.0 && <11
+     , megaparsec >=9.0.0
+     , optparse-applicative >=0.14.0
+     , text
+@@ -291,7 +291,7 @@ test-suite hadolint-unit-tests
+     , foldl
+     , hadolint
+     , hspec
+-    , language-docker >=10.1.2 && <11
++    , language-docker >=10.3.0 && <11
+     , megaparsec >=9.0.0
+     , split >=0.2
+     , text
+diff --git a/package.yaml b/package.yaml
+index 6ab578e..c0adcc8 100644
+--- a/package.yaml
++++ b/package.yaml
+@@ -26,7 +26,7 @@ ghc-options:
+ dependencies:
+   - base >=4.8 && <5
+   - megaparsec >= 9.0.0
+-  - language-docker >=10.1.2 && <11
++  - language-docker >=10.3.0 && <11
+ default-extensions:
+   - DeriveAnyClass
+   - DeriveGeneric
+diff --git a/src/Hadolint/Rule/DL3009.hs b/src/Hadolint/Rule/DL3009.hs
+index 305e71c..76bd06a 100644
+--- a/src/Hadolint/Rule/DL3009.hs
++++ b/src/Hadolint/Rule/DL3009.hs
+@@ -1,19 +1,23 @@
+ module Hadolint.Rule.DL3009 (rule) where
+ 
++import Hadolint.Rule
++import Language.Docker.Syntax
+ import qualified Data.Map.Strict as Map
++import qualified Data.Set as Set
+ import qualified Data.Text as Text
+-import Hadolint.Rule
+ import qualified Hadolint.Shell as Shell
+-import Language.Docker.Syntax
++
+ 
+ data Acc
+   = Acc
+       { lastFrom :: BaseImage,
++        dockerClean :: Bool,
+         stages :: Map.Map Text.Text Linenumber,
+         forgets :: Map.Map Linenumber BaseImage
+       }
+   | Empty
+-  deriving (Show)
++  deriving (Eq, Show)
++
+ 
+ rule :: Rule Shell.ParsedShell
+ rule = veryCustomRule check (emptyState Empty) markFailures
+@@ -24,9 +28,14 @@ rule = veryCustomRule check (emptyState Empty) markFailures
+ 
+     check line st (From from) = st |> modify (rememberStage line from)
+     check line st (Run (RunArgs args flags))
+-      | hasNoCacheMount flags && foldArguments forgotToCleanup args =
+-          st |> modify (rememberLine line)
+-      | otherwise = st
++      | not (foldArguments forgotToCleanup args) =
++          if foldArguments disabledDockerClean args
++          then st |> modify rememberDockerClean
++          else st
++      | hasCacheDirectory "/var/lib/apt/lists" flags = st
++      | hasCacheDirectory "/var/lib/apt" flags
++        && hasCacheDirectory "/var/cache/apt" flags = st
++      | otherwise = st |> modify (rememberLine line)
+     check _ st _ = st
+ 
+     -- Convert the final state into failures
+@@ -43,29 +52,53 @@ rule = veryCustomRule check (emptyState Empty) markFailures
+ {-# INLINEABLE rule #-}
+ 
+ rememberStage :: Linenumber -> BaseImage -> Acc -> Acc
+-rememberStage line from@BaseImage {image = Image _ als} (Acc _ stages o) = Acc from (Map.insert als line stages) o
+-rememberStage line from@BaseImage {image = Image _ als} Empty = Acc from (Map.singleton als line) Map.empty
++rememberStage line from@BaseImage {image = Image _ als} (Acc _ _ stages o) = Acc from True (Map.insert als line stages) o
++rememberStage line from@BaseImage {image = Image _ als} Empty = Acc from True (Map.singleton als line) Map.empty
+ 
+ rememberLine :: Linenumber -> Acc -> Acc
+-rememberLine line (Acc from stages o) = Acc from stages (Map.insert line from o)
+-rememberLine line Empty = Acc emptyImage mempty (Map.singleton line emptyImage)
++rememberLine line (Acc from clean stages o) = Acc from clean stages (Map.insert line from o)
++rememberLine line Empty = Acc emptyImage True mempty (Map.singleton line emptyImage)
++
++rememberDockerClean :: Acc -> Acc
++rememberDockerClean Empty = Acc emptyImage False mempty mempty
++rememberDockerClean (Acc from _ stages forget) = Acc from False stages forget
+ 
+ forgotToCleanup :: Shell.ParsedShell -> Bool
+ forgotToCleanup args
+-  | hasUpdate && not hasCleanup = True
++  | hasUpdate args && not hasCleanup = True
+   | otherwise = False
+   where
+     hasCleanup =
+       any (Shell.cmdHasArgs "rm" ["-rf", "/var/lib/apt/lists/*"]) (Shell.presentCommands args)
+ 
+-    hasUpdate = any (Shell.cmdHasArgs "apt-get" ["update"]) (Shell.presentCommands args)
++hasUpdate :: Shell.ParsedShell -> Bool
++hasUpdate args =
++  any (Shell.cmdHasArgs "apt-get" ["update"]) (Shell.presentCommands args)
++
++disabledDockerClean :: Shell.ParsedShell -> Bool
++disabledDockerClean args
++  | removesScript || keepsPackages = True
++  | otherwise = False
++  where
++    removesScript =
++      any
++        (Shell.cmdHasArgs "rm" ["/etc/apt/apt.conf.d/docker-clean"])
++        (Shell.presentCommands args)
++    keepsPackages =
++      any
++        ( Shell.cmdHasArgs
++            "echo"
++            ["\'Binary::apt::APT::Keep-Downloaded-Packages \"true\";\'"]
++        )
++        (Shell.presentCommands args)
++
++hasCacheDirectory :: Text.Text -> RunFlags -> Bool
++hasCacheDirectory dir RunFlags { mount } =
++  not ( null $ Set.filter (isCacheMount dir) mount)
+ 
+-hasNoCacheMount :: RunFlags -> Bool
+-hasNoCacheMount RunFlags
+-  { mount =
+-      Just (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = p}})
+-  } = Text.dropWhileEnd (=='/') p /= "/var/lib/apt/lists"
+-hasNoCacheMount RunFlags {} = True
++isCacheMount :: Text.Text -> RunMount -> Bool
++isCacheMount dir (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = t}}) = dir `Text.isPrefixOf` t
++isCacheMount _ _ = False
+ 
+ -- | Even though dockerfiles without a FROM are not valid, we still want to provide some feedback for this rule
+ -- so we pretend there is a base image at the start of the file if there is none
+diff --git a/src/Hadolint/Rule/DL3019.hs b/src/Hadolint/Rule/DL3019.hs
+index a55a6e2..8523596 100644
+--- a/src/Hadolint/Rule/DL3019.hs
++++ b/src/Hadolint/Rule/DL3019.hs
+@@ -1,10 +1,11 @@
+ module Hadolint.Rule.DL3019 (rule) where
+ 
+-import qualified Data.Text as Text
+ import Hadolint.Rule
+ import Hadolint.Shell (ParsedShell)
+-import qualified Hadolint.Shell as Shell
+ import Language.Docker.Syntax
++import qualified Data.Set as Set
++import qualified Data.Text as Text
++import qualified Hadolint.Shell as Shell
+ 
+ rule :: Rule ParsedShell
+ rule = simpleRule code severity message check
+@@ -20,11 +21,16 @@ rule = simpleRule code severity message check
+ {-# INLINEABLE rule #-}
+ 
+ hasCacheMount :: RunFlags -> Bool
+-hasCacheMount RunFlags
+-  { mount =
+-      Just (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = p}})
+-  } = Text.dropWhileEnd (=='/') p == "/var/cache/apk"
+-hasCacheMount RunFlags {} = False
++hasCacheMount RunFlags { mount } =
++  not (null $ Set.filter isCacheMount mount)
++
++isCacheMount :: RunMount -> Bool
++isCacheMount (CacheMount CacheOpts { cTarget = t })= isVarCacheApk t
++isCacheMount _ = False
++
++isVarCacheApk :: TargetPath -> Bool
++isVarCacheApk TargetPath { unTargetPath = p }
++  = Text.dropWhileEnd (=='/') p == "/var/cache/apk"
+ 
+ forgotCacheOption :: Shell.Command -> Bool
+ forgotCacheOption cmd = Shell.cmdHasArgs "apk" ["add"] cmd
+diff --git a/stack.yaml b/stack.yaml
+index 2ae044c..ca53bee 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -6,7 +6,7 @@ resolver: lts-17.5
+ extra-deps:
+   - ShellCheck-0.7.1@sha256:94a6ee5a38e2668204bc95fdc7539a9a4ca7230984157694409444530c23b5a4,3170
+   - colourista-0.1.0.0
+-  - language-docker-10.1.2
++  - language-docker-10.3.0
+   - megaparsec-9.0.0@sha256:920d1e469056c746b532333a078c2a9a195fab5e860e0c9734ee92a28c2bfb65,3117
+   - spdx-1.0.0.2@sha256:7dfac9b454ff2da0abb7560f0ffbe00ae442dd5cb76e8be469f77e6988a70fed,2008
+ ghc-options:

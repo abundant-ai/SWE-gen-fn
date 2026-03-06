@@ -1,0 +1,1511 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31c54269..3bb2cf82 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,7 +21,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + The selected columns in the embedded resources are aggregated into arrays
+    + Aggregates are not supported
+  - #2967, Add `Proxy-Status` header for better error response - @taimoorzaeem
+- - #4016, Add `Content-Length` response header - @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index 4ebc2485..2ace309b 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -15,14 +15,14 @@ Observability allows measuring a system's current state based on the data it gen
+ Logs
+ ====
+ 
+-PostgREST logs basic request information to ``stdout``, including the authenticated user if available, the requesting IP address and user agent, the URL requested, the HTTP response status and the response body size in bytes if available.
++PostgREST logs basic request information to ``stdout``, including the authenticated user if available, the requesting IP address and user agent, the URL requested, and HTTP response status.
+ 
+ With :ref:`log-level` set to ``info``, we get:
+ 
+ .. code::
+ 
+-   127.0.0.1 - user [26/Jul/2021:01:56:38 -0500] "GET /clients HTTP/1.1" 200 56 "" "curl/7.64.0"
+-   127.0.0.1 - anonymous [26/Jul/2021:01:56:48 -0500] "GET /unexistent HTTP/1.1" 404 162 "" "curl/7.64.0"
++   127.0.0.1 - user [26/Jul/2021:01:56:38 -0500] "GET /clients HTTP/1.1" 200 - "" "curl/7.64.0"
++   127.0.0.1 - anonymous [26/Jul/2021:01:56:48 -0500] "GET /unexistent HTTP/1.1" 404 - "" "curl/7.64.0"
+ 
+ For diagnostic information about the server itself, PostgREST logs to ``stderr``:
+ 
+@@ -73,7 +73,7 @@ This will be logged by PostgREST:
+ .. code::
+ 
+   17/Feb/2025:17:28:15 -0500: WITH pgrst_source AS ( SELECT "public"."protected_table".* FROM "public"."protected_table"  )  SELECT null::bigint AS total_result_set, pg_catalog.count(_postgrest_t) AS page_total, coalesce(json_agg(_postgrest_t), '[]') AS body, nullif(current_setting('response.headers', true), '') AS response_headers, nullif(current_setting('response.status', true), '') AS response_status, '' AS response_inserted FROM ( SELECT * FROM pgrst_source ) _postgrest_t
+-  127.0.0.1 - web_anon [17/Feb/2025:17:28:15 -0500] "GET /protected_table HTTP/1.1" 401 99 "" "curl/8.7.1"
++  127.0.0.1 - web_anon [17/Feb/2025:17:28:15 -0500] "GET /protected_table HTTP/1.1" 401 - "" "curl/8.7.1"
+ 
+ Database Logs
+ -------------
+@@ -270,27 +270,6 @@ This header communicates metrics of the different phases in the request-response
+ 
+   We're working on lowering the duration of the ``parse`` and ``plan`` stages on https://github.com/PostgREST/postgrest/issues/2816.
+ 
+-.. _content-length_header:
+-
+-Content-Length Header
+----------------------
+-
+-You can verify the response body size in bytes in the `Content-Length header <https://httpwg.org/specs/rfc9110.html#field.content-length>`_.
+-
+-.. code-block:: bash
+-
+-  curl -i 'localhost:3000/users'
+-
+-.. code-block:: http
+-
+-  HTTP/1.1 200 OK
+-  Content-Length: 104
+-
+-Note that this header won't be returned on ``HEAD`` requests for optimization purposes (see :ref:`head_req`).
+-This is in line with `RFC 9110 <https://httpwg.org/specs/rfc9110.html#field.content-length>`_.
+-
+-The body size is also present in the :ref:`PostgREST logs <pgrst_logging>`.
+-
+ .. _explain_plan:
+ 
+ Execution plan
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 9335032c..abc1b0e4 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -20,7 +20,6 @@ module PostgREST.Error
+ 
+ import qualified Data.Aeson                as JSON
+ import qualified Data.ByteString.Char8     as BS
+-import qualified Data.ByteString.Lazy      as LBS
+ import qualified Data.CaseInsensitive      as CI
+ import qualified Data.FuzzySet             as Fuzzy
+ import qualified Data.HashMap.Strict       as HM
+@@ -60,11 +59,8 @@ class (ErrorBody a, JSON.ToJSON a) => PgrstError a where
+ 
+   errorResponseFor :: a -> Response
+   errorResponseFor err =
+-    let
+-      baseHeader = MediaType.toContentType MTApplicationJSON
+-      cLHeader body = (,) "Content-Length" (show $ LBS.length body) :: Header
+-    in
+-    responseLBS (status err) (baseHeader : cLHeader (errorPayload err) : headers err) $ errorPayload err
++    let baseHeader = MediaType.toContentType MTApplicationJSON in
++    responseLBS (status err) (baseHeader : headers err) $ errorPayload err
+ 
+ class ErrorBody a where
+   code    :: a -> Text
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index f374a60a..0d595536 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -68,7 +68,6 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+     RSStandard{..} -> do
+       let
+         (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        cLHeader = if headersOnly then mempty else [contentLengthHeaderStrict rsBody]
+         prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
+         headers =
+           [ contentRange
+@@ -78,7 +77,6 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+                 <> if BS.null (qsCanonical iQueryParams) then mempty else "?" <> qsCanonical iQueryParams
+             )
+           ]
+-          ++ cLHeader
+           ++ contentTypeHeaders wrMedia ctxApiRequest
+           ++ prefHeader
+ 
+@@ -92,7 +90,7 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+       Right $ PgrstResponse ovStatus ovHeaders bod
+ 
+     RSPlan plan ->
+-      Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders wrMedia ctxApiRequest) $ LBS.fromStrict plan
++      Right $ PgrstResponse HTTP.status200 (contentTypeHeaders wrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutatePlan, mrMedia, crudQi=QualifiedIdentifier{..}} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} _ _ _ _ _ = case resultSet of
+   RSStandard{..} -> do
+@@ -114,7 +112,6 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutateP
+                 )
+           , Just . RangeQuery.contentRangeH 1 0 $
+               if shouldCount preferCount then Just rsQueryTotal else Nothing
+-          , Just $ contentLengthHeaderStrict rsBody
+           , prefHeader ]
+ 
+     let isInsertIfGTZero i =
+@@ -133,7 +130,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutateP
+ 
+     Right $ PgrstResponse ovStatus ovHeaders bod
+   RSPlan plan ->
+-    Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
++    Right $ PgrstResponse HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = case resultSet of
+   RSStandard{..} -> do
+@@ -146,7 +143,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+ 
+     let (status, headers', body) =
+           case preferRepresentation of
+-            Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++            Just Full -> (HTTP.status200, headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
+             Just None -> (HTTP.status204, headers, mempty)
+             _         -> (HTTP.status204, headers, mempty)
+ 
+@@ -155,20 +152,19 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+     Right $ PgrstResponse ovStatus ovHeaders body
+ 
+   RSPlan plan ->
+-    Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
++    Right $ PgrstResponse HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, mrMedia} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = case resultSet of
+   RSStandard {..} -> do
+     let
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
+-      cLHeader = [contentLengthHeaderStrict rsBody]
+       cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+     let isInsertIfGTZero i = if i > 0 then HTTP.status201 else HTTP.status200
+         upsertStatus       = isInsertIfGTZero $ fromJust rsInserted
+         (status, headers, body) =
+           case preferRepresentation of
+-            Just Full -> (upsertStatus, cLHeader ++ cTHeader ++ prefHeader, LBS.fromStrict rsBody)
++            Just Full -> (upsertStatus, cTHeader ++ prefHeader, LBS.fromStrict rsBody)
+             Just None -> (HTTP.status204,  prefHeader, mempty)
+             _ -> (HTTP.status204, prefHeader, mempty)
+     (ovStatus, ovHeaders) <- overrideStatusHeaders rsGucStatus rsGucHeaders status headers
+@@ -176,7 +172,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, mrM
+     Right $ PgrstResponse ovStatus ovHeaders body
+ 
+   RSPlan plan ->
+-    Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
++    Right $ PgrstResponse HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = case resultSet of
+   RSStandard {..} -> do
+@@ -189,7 +185,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia}
+ 
+     let (status, headers', body) =
+           case preferRepresentation of
+-              Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++              Just Full -> (HTTP.status200, headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
+               Just None -> (HTTP.status204, headers, mempty)
+               _ -> (HTTP.status204, headers, mempty)
+ 
+@@ -198,7 +194,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia}
+     Right $ PgrstResponse ovStatus ovHeaders body
+ 
+   RSPlan plan ->
+-    Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
++    Right $ PgrstResponse HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=proc} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} _ _ _ _ _ = case resultSet of
+   RSStandard {..} -> do
+@@ -209,9 +205,7 @@ actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=p
+         then Error.errorPayload $ Error.ApiRequestError $ Error.InvalidRange
+           $ Error.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+-      isHeadMethod = invMethod == InvRead True
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
+-      cLHeader = if isHeadMethod then mempty else [contentLengthHeaderLazy rsOrErrBody]
+       headers = contentRange : prefHeader
+ 
+     let (status', headers', body) =
+@@ -219,22 +213,20 @@ actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=p
+               (HTTP.status204, headers, mempty)
+             else
+               (status,
+-                headers ++ cLHeader ++ contentTypeHeaders crMedia ctxApiRequest,
+-                if isHeadMethod then mempty else rsOrErrBody)
++                headers ++ contentTypeHeaders crMedia ctxApiRequest,
++                if invMethod == InvRead True then mempty else rsOrErrBody)
+ 
+     (ovStatus, ovHeaders) <- overrideStatusHeaders rsGucStatus rsGucHeaders status' headers'
+ 
+     Right $ PgrstResponse ovStatus ovHeaders body
+ 
+   RSPlan plan ->
+-    Right $ PgrstResponse HTTP.status200 (contentLengthHeaderStrict plan : contentTypeHeaders crMedia ctxApiRequest) $ LBS.fromStrict plan
++    Right $ PgrstResponse HTTP.status200 (contentTypeHeaders crMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ actionResponse (MaybeDbResult InspectPlan{ipHdrsOnly=headersOnly} body) _ versions conf sCache schema negotiatedByProfile =
+-  let
+-    rsBody = maybe mempty (\(x, y, z) -> if headersOnly then mempty else OpenAPI.encode versions conf sCache x y z) body
+-    cLHeader = if headersOnly then mempty else [contentLengthHeaderLazy rsBody]
+-  in
+-  Right $ PgrstResponse HTTP.status200 (MediaType.toContentType MTOpenAPI : cLHeader ++ maybeToList (profileHeader schema negotiatedByProfile)) rsBody
++  Right $ PgrstResponse HTTP.status200
++    (MediaType.toContentType MTOpenAPI : maybeToList (profileHeader schema negotiatedByProfile))
++    (maybe mempty (\(x, y, z) -> if headersOnly then mempty else OpenAPI.encode versions conf sCache x y z) body)
+ 
+ actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ SchemaCache{dbTables} _ _ =
+   case HM.lookup qi dbTables of
+@@ -259,7 +251,7 @@ actionResponse (NoDbResult SchemaInfoPlan) _ _ _ _ _ _ = respondInfo "OPTIONS,GE
+ respondInfo :: ByteString -> Either Error.Error PgrstResponse
+ respondInfo allowHeader =
+   let allOrigins = ("Access-Control-Allow-Origin", "*") in
+-  Right $ PgrstResponse HTTP.status200 [contentLengthHeaderStrict mempty, allOrigins, (HTTP.hAllow, allowHeader)] mempty
++  Right $ PgrstResponse HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
+ 
+ -- Status and headers can be overridden as per https://postgrest.org/en/stable/references/transactions.html#response-headers
+ overrideStatusHeaders :: Maybe Text -> Maybe BS.ByteString -> HTTP.Status -> [HTTP.Header]-> Either Error.Error (HTTP.Status, [HTTP.Header])
+@@ -276,15 +268,6 @@ decodeGucStatus :: Maybe Text -> Either Error.Error (Maybe HTTP.Status)
+ decodeGucStatus =
+   maybe (Right Nothing) $ first (const . Error.ApiRequestError $ Error.GucStatusError) . fmap (Just . toEnum . fst) . decimal
+ 
+-contentLengthHeader :: Show b => (a -> b) -> a -> HTTP.Header
+-contentLengthHeader lenFn body = ("Content-Length", show (lenFn body))
+-
+-contentLengthHeaderStrict :: BS.ByteString -> HTTP.Header
+-contentLengthHeaderStrict = contentLengthHeader BS.length
+-
+-contentLengthHeaderLazy :: LBS.ByteString -> HTTP.Header
+-contentLengthHeaderLazy = contentLengthHeader LBS.length
+-
+ contentTypeHeaders :: MediaType -> ApiRequest -> [HTTP.Header]
+ contentTypeHeaders mediaType ApiRequest{..} =
+   MediaType.toContentType mediaType : maybeToList (profileHeader iSchema iNegotiatedByProfile)
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 72c2ff89..02d31349 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -964,45 +964,45 @@ def test_log_level(level, defaultenv):
+             assert len(output) == 0
+         elif level == "error":
+             assert re.match(
+-                r'- - - \[.+\] "GET / HTTP/1.1" 500 \d+ "" "python-requests/.+"',
++                r'- - - \[.+\] "GET / HTTP/1.1" 500 - "" "python-requests/.+"',
+                 output[0],
+             )
+             assert len(output) == 1
+         elif level == "warn":
+             assert re.match(
+-                r'- - - \[.+\] "GET / HTTP/1.1" 500 \d+ "" "python-requests/.+"',
++                r'- - - \[.+\] "GET / HTTP/1.1" 500 - "" "python-requests/.+"',
+                 output[0],
+             )
+             assert re.match(
+-                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 \d+ "" "python-requests/.+"',
++                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 - "" "python-requests/.+"',
+                 output[1],
+             )
+             assert len(output) == 2
+         elif level == "info":
+             assert re.match(
+-                r'- - - \[.+\] "GET / HTTP/1.1" 500 \d+ "" "python-requests/.+"',
++                r'- - - \[.+\] "GET / HTTP/1.1" 500 - "" "python-requests/.+"',
+                 output[0],
+             )
+             assert re.match(
+-                r'- - postgrest_test_anonymous \[.+\] "GET / HTTP/1.1" 200 \d+ "" "python-requests/.+"',
++                r'- - postgrest_test_anonymous \[.+\] "GET / HTTP/1.1" 200 - "" "python-requests/.+"',
+                 output[1],
+             )
+             assert re.match(
+-                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 \d+ "" "python-requests/.+"',
++                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 - "" "python-requests/.+"',
+                 output[2],
+             )
+             assert len(output) == 3
+         elif level == "debug":
+             assert re.match(
+-                r'- - - \[.+\] "GET / HTTP/1.1" 500 \d+ "" "python-requests/.+"',
++                r'- - - \[.+\] "GET / HTTP/1.1" 500 - "" "python-requests/.+"',
+                 output[0],
+             )
+             assert re.match(
+-                r'- - postgrest_test_anonymous \[.+\] "GET / HTTP/1.1" 200 \d+ "" "python-requests/.+"',
++                r'- - postgrest_test_anonymous \[.+\] "GET / HTTP/1.1" 200 - "" "python-requests/.+"',
+                 output[1],
+             )
+             assert re.match(
+-                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 \d+ "" "python-requests/.+"',
++                r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 - "" "python-requests/.+"',
+                 output[2],
+             )
+ 
+diff --git a/test/spec/Feature/Auth/AuthSpec.hs b/test/spec/Feature/Auth/AuthSpec.hs
+index f30f7aa4..cb91a2bd 100644
+--- a/test/spec/Feature/Auth/AuthSpec.hs
++++ b/test/spec/Feature/Auth/AuthSpec.hs
+@@ -22,8 +22,7 @@ spec = describe "authorization" $ do
+         "code":"42501",
+         "message":"permission denied for table authors_only"} |]
+       { matchStatus = 401
+-      , matchHeaders = [ "WWW-Authenticate" <:> "Bearer"
+-                       , "Content-Length" <:> "96" ]
++      , matchHeaders = ["WWW-Authenticate" <:> "Bearer"]
+       }
+ 
+   it "denies access to tables that postgrest_test_author does not own" $
+@@ -36,7 +35,7 @@ spec = describe "authorization" $ do
+         "code":"42501",
+         "message":"permission denied for table private_table"} |]
+       { matchStatus = 403
+-      , matchHeaders = ["Content-Length" <:> "97"]
++      , matchHeaders = []
+       }
+ 
+   it "denies execution on functions that anonymous does not own" $
+@@ -93,8 +92,7 @@ spec = describe "authorization" $ do
+       { matchStatus = 401
+       , matchHeaders = [
+           "WWW-Authenticate" <:>
+-          "Bearer error=\"invalid_token\", error_description=\"Empty JWT is sent in Authorization header\"",
+-          "Content-Length" <:> "100"
++          "Bearer error=\"invalid_token\", error_description=\"Empty JWT is sent in Authorization header\""
+         ]
+       }
+ 
+diff --git a/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs b/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
+index ce322da0..75ececd7 100644
+--- a/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/DisabledOpenApiSpec.hs
+@@ -17,5 +17,4 @@ spec =
+         [("Accept","application/openapi+json")] ""
+         `shouldRespondWith`
+         [json| {"code":"PGRST126","details":null,"hint":null,"message":"Root endpoint metadata is disabled"} |]
+-        { matchStatus = 404
+-        , matchHeaders = ["Content-Length" <:> "93"]}
++        { matchStatus = 404 }
+diff --git a/test/spec/Feature/OpenApi/IgnorePrivOpenApiSpec.hs b/test/spec/Feature/OpenApi/IgnorePrivOpenApiSpec.hs
+index 00310b18..f943268f 100644
+--- a/test/spec/Feature/OpenApi/IgnorePrivOpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/IgnorePrivOpenApiSpec.hs
+@@ -25,8 +25,7 @@ spec = describe "OpenAPI Ignore Privileges" $ do
+       `shouldRespondWith`
+         ""
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/openapi+json; charset=utf-8"
+-                         , matchHeaderAbsent hContentLength]
++        , matchHeaders = [ "Content-Type" <:> "application/openapi+json; charset=utf-8" ]
+         }
+ 
+   describe "table" $ do
+diff --git a/test/spec/Feature/OpenApi/OpenApiSpec.hs b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+index fbe227a3..d17b7427 100644
+--- a/test/spec/Feature/OpenApi/OpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+@@ -24,8 +24,7 @@ spec = describe "OpenAPI" $ do
+       `shouldRespondWith`
+         ""
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/openapi+json; charset=utf-8"
+-                         , matchHeaderAbsent hContentLength ]
++        , matchHeaders = ["Content-Type" <:> "application/openapi+json; charset=utf-8"]
+         }
+ 
+   it "should respond to openapi request on none root path with 406" $
+@@ -39,14 +38,11 @@ spec = describe "OpenAPI" $ do
+       `shouldRespondWith` 406
+ 
+   it "includes postgrest.org current version api docs" $ do
+-    r <- get "/"
++    r <- simpleBody <$> get "/"
+ 
+-    let headers = simpleHeaders r
+-        docsUrl = simpleBody r ^? key "externalDocs" . key "url"
++    let docsUrl = r ^? key "externalDocs" . key "url"
+ 
+-    liftIO $ do
+-      headers `shouldSatisfy` notZeroContentLength
+-      docsUrl `shouldBe` Just (String ("https://postgrest.org/en/" <> docsVersion <> "/references/api.html"))
++    liftIO $ docsUrl `shouldBe` Just (String ("https://postgrest.org/en/" <> docsVersion <> "/references/api.html"))
+ 
+   describe "schema" $ do
+ 
+diff --git a/test/spec/Feature/OptionsSpec.hs b/test/spec/Feature/OptionsSpec.hs
+index 44e898fd..e5aa54ab 100644
+--- a/test/spec/Feature/OptionsSpec.hs
++++ b/test/spec/Feature/OptionsSpec.hs
+@@ -15,9 +15,9 @@ spec = describe "Allow header" $ do
+   context "a table" $ do
+     it "includes read/write methods for writeable table" $ do
+       r <- request methodOptions "/items" [] ""
+-      liftIO $ do
+-        simpleHeaders r `shouldSatisfy` matchHeader "Allow" "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+-        simpleHeaders r `shouldSatisfy` matchHeader "Content-Length" "0"
++      liftIO $
++        simpleHeaders r `shouldSatisfy`
++          matchHeader "Allow" "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+ 
+     it "fails with 404 for an unknown table" $
+       request methodOptions "/unknown" [] "" `shouldRespondWith` 404
+diff --git a/test/spec/Feature/Query/CustomMediaSpec.hs b/test/spec/Feature/Query/CustomMediaSpec.hs
+index e20b6da6..1459c55a 100644
+--- a/test/spec/Feature/Query/CustomMediaSpec.hs
++++ b/test/spec/Feature/Query/CustomMediaSpec.hs
+@@ -20,7 +20,6 @@ spec = describe "custom media types" $ do
+       liftIO $ do
+         simpleBody r `shouldBe` readFixtureFile "lines.twkb"
+         simpleHeaders r `shouldContain` [("Content-Type", "application/vnd.twkb")]
+-        simpleHeaders r `shouldContain` [("Content-Length", "30")]
+ 
+     it "can query by id if there's an aggregate defined for the table" $ do
+       r <- request methodGet "/lines?id=eq.1" (acceptHdrs "application/vnd.twkb") ""
+@@ -33,8 +32,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         [json| {"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: text/plain"} |]
+         { matchStatus  = 406
+-        , matchHeaders = [ matchContentTypeJson
+-                         , "Content-Length" <:> "110" ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+     it "can get raw xml output with Accept: text/xml if there's an aggregate defined" $ do
+@@ -42,8 +40,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         "<myxml>foo</myxml>bar<foobar><baz/></foobar>"
+         { matchStatus = 200
+-        , matchHeaders = [ "Content-Type" <:> "text/xml; charset=utf-8"
+-                         , "Content-Length" <:> "44"]
++        , matchHeaders = ["Content-Type" <:> "text/xml; charset=utf-8"]
+         }
+ 
+   -- TODO SOH (start of heading) is being added to results
+@@ -53,8 +50,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         "\SOH{\"type\": \"FeatureCollection\", \"hello\": \"world\"}"
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/vnd.geo2+json"
+-                         , "Content-Length" <:> "48" ]
++        , matchHeaders = ["Content-Type" <:> "application/vnd.geo2+json"]
+         }
+ 
+     it "will use the more specific application/vnd.geo2 handler for this table" $ do
+@@ -87,16 +83,14 @@ spec = describe "custom media types" $ do
+             |</html>
+             |]
+         { matchStatus = 200
+-        , matchHeaders = [ "Content-Type" <:> "text/html"
+-                         , "Content-Length" <:> "117" ]
++        , matchHeaders = ["Content-Type" <:> "text/html"]
+         }
+ 
+     it "can get raw output with Accept: text/plain" $ do
+       request methodGet "/rpc/welcome" (acceptHdrs "text/plain") ""
+         `shouldRespondWith` "Welcome to PostgREST"
+         { matchStatus = 200
+-        , matchHeaders = [ "Content-Type" <:> "text/plain; charset=utf-8"
+-                         , "Content-Length" <:> "20" ]
++        , matchHeaders = ["Content-Type" <:> "text/plain; charset=utf-8"]
+         }
+ 
+     it "can get raw xml output with Accept: text/xml" $ do
+@@ -104,8 +98,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         "<my-xml-tag/>"
+         { matchStatus = 200
+-        , matchHeaders = [ "Content-Type" <:> "text/xml; charset=utf-8"
+-                         , "Content-Length" <:> "13" ]
++        , matchHeaders = ["Content-Type" <:> "text/xml; charset=utf-8"]
+         }
+ 
+     it "can get raw xml output with Accept: text/xml" $ do
+@@ -139,7 +132,6 @@ spec = describe "custom media types" $ do
+       liftIO $ do
+         simpleBody r `shouldBe` readFixtureFile "A.png"
+         simpleHeaders r `shouldContain` [("Content-Type", "image/png")]
+-        simpleHeaders r `shouldContain` [("Content-Length", "138")]
+ 
+   context "Proc that returns set of scalars and Accept: text/plain" $
+     it "will err because only scalars work with media type domains" $ do
+@@ -149,8 +141,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+           [json|{"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: text/plain"}|]
+           { matchStatus = 406
+-          , matchHeaders = [ "Content-Type" <:> "application/json; charset=utf-8"
+-                           , "Content-Length" <:> "110"]
++          , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+           }
+ 
+   context "Proc that returns rows and accepts custom media type" $ do
+@@ -182,8 +173,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         [json| {"overridden": "true"} |]
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/json; charset=utf-8"
+-                         , "Content-Length" <:> "22" ]
++        , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+         }
+ 
+     -- TODO SOH (start of heading) is being added to results
+@@ -192,8 +182,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         "\SOH{\"crs\": {\"type\": \"name\", \"properties\": {\"name\": \"EPSG:4326\"}}, \"type\": \"FeatureCollection\", \"features\": [{\"type\": \"Feature\", \"geometry\": {\"type\": \"LineString\", \"coordinates\": [[1, 1], [5, 5]]}, \"properties\": {\"id\": 1, \"name\": \"line-1\"}}]}"
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/geo+json; charset=utf-8"
+-                         , "Content-Length" <:> "239" ]
++        , matchHeaders = ["Content-Type" <:> "application/geo+json; charset=utf-8"]
+         }
+ 
+     it "will not override vendored media types like application/vnd.pgrst.object" $
+@@ -201,8 +190,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         [json|{"id":1,"name":"Windows 7","client_id":1}|]
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/vnd.pgrst.object+json; charset=utf-8"
+-                         , "Content-Length" <:> "41" ]
++        , matchHeaders = ["Content-Type" <:> "application/vnd.pgrst.object+json; charset=utf-8"]
+         }
+ 
+   context "matches requested media type correctly" $ do
+@@ -212,13 +200,11 @@ spec = describe "custom media types" $ do
+       liftIO $ do
+         simpleBody r1 `shouldBe` readFixtureFile "A.png"
+         simpleHeaders r1 `shouldContain` [("Content-Type", "image/png")]
+-        simpleHeaders r1 `shouldContain` [("Content-Length", "138")]
+ 
+       r2 <- request methodGet "/rpc/ret_image" (acceptHdrs "text/html,application/xhtml+xml,application/xml;q=0.9,image/png,*/*;q=0.8") ""
+       liftIO $ do
+         simpleBody r2 `shouldBe` readFixtureFile "A.png"
+         simpleHeaders r2 `shouldContain` [("Content-Type", "image/png")]
+-        simpleHeaders r2 `shouldContain` [("Content-Length", "138")]
+ 
+     -- https://github.com/PostgREST/postgrest/issues/2170
+     it "will match json in presence of text/plain" $ do
+@@ -233,8 +219,7 @@ spec = describe "custom media types" $ do
+         `shouldRespondWith`
+         "id\tname\tclient_id\n1\tWindows 7\t1\n2\tWindows 10\t1\n"
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "text/tab-separated-values"
+-                         , "Content-Length" <:> "47" ]
++        , matchHeaders = ["Content-Type" <:> "text/tab-separated-values"]
+         }
+ 
+     -- https://github.com/PostgREST/postgrest/issues/1371#issuecomment-519248984
+@@ -244,7 +229,6 @@ spec = describe "custom media types" $ do
+         simpleBody r `shouldBe` readFixtureFile "lines.csv"
+         simpleHeaders r `shouldContain` [("Content-Type", "text/csv; charset=utf-8")]
+         simpleHeaders r `shouldContain` [("Content-Disposition", "attachment; filename=\"lines.csv\"")]
+-        simpleHeaders r `shouldContain` [("Content-Length", "216")]
+ 
+   -- https://github.com/PostgREST/postgrest/issues/3160
+   context "using select query parameter" $ do
+@@ -255,8 +239,7 @@ spec = describe "custom media types" $ do
+             |(2,"Windows 10",1)
+             |]
+         { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "pg/outfunc"
+-                         , "Content-Length" <:> "37" ]
++        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+         }
+ 
+     it "with fewer columns selected" $ do
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 5a3d1892..48644664 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -22,7 +22,6 @@ spec =
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "*/*" ]
+             }
+ 
+@@ -31,7 +30,6 @@ spec =
+           `shouldRespondWith` [json|[{"id":2}]|]
+           { matchStatus  = 200
+           , matchHeaders = ["Content-Range" <:> "*/1"
+-                           , "Content-Length" <:> "10"
+                            , "Preference-Applied" <:> "return=representation, count=exact"]
+           }
+ 
+@@ -43,7 +41,6 @@ spec =
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "*/*" ]
+             }
+         request methodDelete "/items?id=eq.3&select=id"
+@@ -53,7 +50,6 @@ spec =
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "*/*"
+                              , "Preference-Applied" <:> "return=minimal"]
+             }
+@@ -62,8 +58,7 @@ spec =
+         request methodDelete "/complex_items?id=eq.2&select=id,name" [("Prefer", "return=representation")] ""
+           `shouldRespondWith` [json|[{"id":2,"name":"Two"}]|]
+           { matchStatus  = 200
+-          , matchHeaders = [ "Content-Range" <:> "*/*"
+-                           , "Content-Length" <:> "23" ]
++          , matchHeaders = ["Content-Range" <:> "*/*"]
+           }
+ 
+       it "can rename and cast the selected columns" $
+@@ -142,7 +137,6 @@ spec =
+             ""
+             { matchStatus = 204
+             , matchHeaders = [matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Preference-Applied" <:> "return=minimal" ]
+             }
+ 
+@@ -153,8 +147,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength]
++            , matchHeaders = [matchHeaderAbsent hContentType]
+             }
+ 
+     context "with ordering" $
+diff --git a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+index 48bf0819..d99903d1 100644
+--- a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
++++ b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+@@ -40,8 +40,7 @@ spec =
+             }
+           |]
+           { matchStatus  = 300
+-          , matchHeaders = [ matchContentTypeJson
+-                           , "Content-Length" <:> "828" ]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+       it "errs on an ambiguous embed that has a circular reference" $
+diff --git a/test/spec/Feature/Query/ErrorSpec.hs b/test/spec/Feature/Query/ErrorSpec.hs
+index 1c7bb3e2..0f207746 100644
+--- a/test/spec/Feature/Query/ErrorSpec.hs
++++ b/test/spec/Feature/Query/ErrorSpec.hs
+@@ -26,8 +26,7 @@ pgErrorCodeMapping = do
+            "details": null,
+            "hint": "Increase the configuration parameter \"max_stack_depth\" (currently 2048kB), after ensuring the platform's stack depth limit is adequate.",
+             "message": "stack depth limit exceeded"}|]
+-        { matchStatus = 500
+-        , matchHeaders = ["Content-Length" <:> "217"] }
++        { matchStatus = 500 }
+ 
+     context "includes the proxy-status header on the response" $ do
+       it "works with ApiRequest error" $
+@@ -35,8 +34,7 @@ pgErrorCodeMapping = do
+           `shouldRespondWith`
+           [json| {"code":"PGRST125","details":null,"hint":null,"message":"Invalid path specified in request URL"} |]
+           { matchStatus  = 404
+-          , matchHeaders = [ "Proxy-Status" <:> "PostgREST; error=PGRST125"
+-                           , "Content-Length" <:> "96" ]
++          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST125"]
+           }
+ 
+       it "works with SchemaCache error" $
+@@ -44,8 +42,7 @@ pgErrorCodeMapping = do
+           `shouldRespondWith`
+           [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.json_table'","message":"Could not find the table 'test.non_existent_table' in the schema cache"} |]
+           { matchStatus  = 404
+-          , matchHeaders = [ "Proxy-Status" <:> "PostgREST; error=PGRST205"
+-                           , "Content-Length" <:> "172" ]
++          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST205"]
+           }
+ 
+       it "works with Jwt error" $ do
+@@ -54,8 +51,7 @@ pgErrorCodeMapping = do
+           `shouldRespondWith`
+           [json| {"message":"Expected 3 parts in JWT; got 2","code":"PGRST301","hint":null,"details":null} |]
+           { matchStatus = 401
+-          , matchHeaders = [ "Proxy-Status" <:> "PostgREST; error=PGRST301"
+-                           , "Content-Length" <:> "89" ]
++          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PGRST301"]
+           }
+ 
+       it "works with raise sqlstate custom error" $
+@@ -63,8 +59,7 @@ pgErrorCodeMapping = do
+           `shouldRespondWith`
+           [json| {"code":"PT402","details":"Quota exceeded","hint":"Upgrade your plan","message":"Payment Required"} |]
+           { matchStatus  = 402
+-          , matchHeaders = [ "Proxy-Status" <:> "PostgREST; error=PT402"
+-                           , "Content-Length" <:> "99" ]
++          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=PT402"]
+           }
+ 
+       it "works with sqlstate PGRST custom error" $
+@@ -72,6 +67,5 @@ pgErrorCodeMapping = do
+           `shouldRespondWith`
+           [json| {"code":"123","details":"DEF","hint":"XYZ","message":"ABC"} |]
+           { matchStatus  = 332
+-          , matchHeaders = [ "Proxy-Status" <:> "PostgREST; error=123"
+-                           , "Content-Length" <:> "59" ]
++          , matchHeaders = ["Proxy-Status" <:> "PostgREST; error=123"]
+           }
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index b016333a..6d070ca0 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -30,8 +30,7 @@ spec actualPgVersion = do
+           } |] `shouldRespondWith` ""
+           { matchStatus  = 201
+             -- should not have content type set when body is empty
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Length" <:> "0"]
++          , matchHeaders = [matchHeaderAbsent hContentType]
+           }
+ 
+       it "filters columns in result using &select" $
+@@ -43,7 +42,6 @@ spec actualPgVersion = do
+           }] |] `shouldRespondWith` [json|[{"integer":14,"varchar":"testing!"}]|]
+           { matchStatus  = 201
+           , matchHeaders = [matchContentTypeJson
+-                           , "Content-Length" <:> "37"
+                            , "Preference-Applied" <:> "return=representation"]
+           }
+ 
+@@ -189,8 +187,7 @@ spec actualPgVersion = do
+             `shouldRespondWith`
+               ""
+               { matchStatus = 204
+-              , matchHeaders = [  matchHeaderAbsent hContentType
+-                                , matchHeaderAbsent hContentLength ]
++              , matchHeaders = [ matchHeaderAbsent hContentType ]
+               }
+ 
+           request methodPost "/auto_incrementing_pk"
+@@ -214,7 +211,7 @@ spec actualPgVersion = do
+             [json|{"hint":null,"details":"Failing row contains (null, foo).","code":"23502","message":"null value in column \"k\" violates not-null constraint"}|]
+           )
+           { matchStatus  = 400
+-          , matchHeaders = [ matchContentTypeJson]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+       context "into a table with no pk" $ do
+@@ -289,8 +286,7 @@ spec actualPgVersion = do
+         `shouldRespondWith`
+         [json|{"message":"Empty or invalid json","code":"PGRST102","details":null,"hint":null}|]
+         { matchStatus  = 400
+-        , matchHeaders = [ matchContentTypeJson,
+-                           "Content-Length" <:> "80" ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+     context "with no payload" $
+@@ -374,8 +370,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [  matchHeaderAbsent hContentType
+-                              , matchHeaderAbsent hContentLength ]
++            , matchHeaders = [ matchHeaderAbsent hContentType ]
+             }
+ 
+         request methodPost "/items2"
+@@ -393,8 +388,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [  matchHeaderAbsent hContentType
+-                              , matchHeaderAbsent hContentLength ]
++            , matchHeaders = [ matchHeaderAbsent hContentType ]
+             }
+ 
+         request methodPost "/items3?select=id"
+@@ -629,8 +623,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength ]
++            , matchHeaders = [matchHeaderAbsent hContentType]
+             }
+ 
+   describe "CSV insert" $ do
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index c27e2b59..837332b2 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -33,7 +33,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` (if actualPgVersion >= pgVersion170 then 11.32 else 15.63)
+ 
+@@ -141,7 +140,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` 0.06
+ 
+@@ -155,7 +153,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` 8.23
+ 
+@@ -169,7 +166,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` (if actualPgVersion >= pgVersion170 then 11.37 else 15.68)
+ 
+@@ -184,7 +180,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` 3.55
+ 
+@@ -199,7 +194,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` 5.53
+ 
+@@ -254,7 +248,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object+json\"; options=verbose; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         aggCol `shouldBe` Just [aesonQQ| "COALESCE((json_agg(ROW(projects.id, projects.name, projects.client_id)) -> 0), 'null'::json)" |]
+ 
+   describe "function plan" $ do
+@@ -268,7 +261,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` 68.56
+ 
+@@ -283,7 +275,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+text; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         resBody `shouldSatisfy` (\t -> LBS.take 9 t == "Aggregate")
+ 
+@@ -297,7 +288,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+text; for=\"application/json\"; charset=utf-8")
+-        resHeaders `shouldSatisfy` notZeroContentLength
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         resBody `shouldSatisfy` (\t -> LBS.take 9 t == "Aggregate")
+ 
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 43cb4672..d341ad07 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -28,17 +28,14 @@ spec = do
+       `shouldRespondWith`
+       [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.private_table'","message":"Could not find the table 'test.faketable' in the schema cache"} |]
+       { matchStatus = 404
+-      , matchHeaders = ["Content-Length" <:> "166"]
++      , matchHeaders = []
+       }
+ 
+   describe "Filtering response" $ do
+     it "matches with equality" $
+       get "/items?id=eq.5"
+         `shouldRespondWith` [json| [{"id":5}] |]
+-        { matchHeaders = [
+-            "Content-Range" <:> "0-0/*",
+-            "Content-Length" <:> "10"
+-          ] }
++        { matchHeaders = ["Content-Range" <:> "0-0/*"] }
+ 
+     it "matches with equality using not operator" $
+       get "/items?id=not.eq.5&order=id"
+@@ -514,10 +511,7 @@ spec = do
+            "code":"PGRST108",
+            "message":"'non_existent_projects' is not an embedded resource in this request"}|]
+         { matchStatus  = 400
+-        , matchHeaders = [
+-            "Content-Length" <:> "204",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+       get "/clients?select=*,amiga_projects:projects(*)&amiga_projectsss.name=ilike.*Amiga*" `shouldRespondWith`
+         [json|
+@@ -596,7 +590,7 @@ spec = do
+       get "/complex_items?select=id::fakecolumntype"
+         `shouldRespondWith` [json| {"hint":null,"details":null,"code":"42704","message":"type \"fakecolumntype\" does not exist"} |]
+         { matchStatus  = 400
+-        , matchHeaders = ["Content-Length" <:> "94"]
++        , matchHeaders = []
+         }
+ 
+     it "can cast types with underscore and numbers" $
+@@ -609,11 +603,7 @@ spec = do
+     it "requesting parents and children" $
+       get "/projects?id=eq.1&select=id, name, clients(*), tasks(id, name)" `shouldRespondWith`
+         [json|[{"id":1,"name":"Windows 7","clients":{"id":1,"name":"Microsoft"},"tasks":[{"id":1,"name":"Design w7"},{"id":2,"name":"Code w7"}]}]|]
+-        { matchHeaders = [
+-            "Content-Length" <:> "141",
+-            matchContentTypeJson
+-          ]
+-        }
++        { matchHeaders = [matchContentTypeJson] }
+ 
+     it "requesting parent and renaming primary key" $
+       get "/projects?select=name,client:clients(clientId:id,name)" `shouldRespondWith`
+@@ -1155,10 +1145,7 @@ spec = do
+       get "/items?order=id.asc.nullslasttt" `shouldRespondWith`
+         [json|{"details":"unexpected 't' expecting \",\" or end of input","message":"\"failed to parse order (id.asc.nullslasttt)\" (line 1, column 17)","code":"PGRST100","hint":null}|]
+         { matchStatus  = 400
+-        , matchHeaders = [
+-            "Content-Length" <:> "169",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+   describe "Accept headers" $ do
+@@ -1168,10 +1155,7 @@ spec = do
+         `shouldRespondWith`
+         [json|{"message":"None of these media types are available: text/unknowntype","code":"PGRST107","details":null,"hint":null}|]
+         { matchStatus  = 406
+-        , matchHeaders = [
+-            "Content-Length" <:> "116",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+     it "should respond correctly to */* in accept header" $
+@@ -1210,10 +1194,7 @@ spec = do
+               (acceptHdrs "text/csv; version=1") ""
+         `shouldRespondWith` "k,extra\nxyyx,u\nxYYx,v"
+         { matchStatus  = 200
+-        , matchHeaders = [
+-            "Content-Type" <:> "text/csv; charset=utf-8",
+-            "Content-Length" <:> "21"
+-          ]
++        , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
+         }
+ 
+   describe "Canonical location" $ do
+@@ -1531,10 +1512,7 @@ spec = do
+       get "/datarep_todos?select=id,label_color,banana" `shouldRespondWith`
+         [json| {"code":"42703","details":null,"hint":null,"message":"column datarep_todos.banana does not exist"} |]
+         { matchStatus  = 400
+-        , matchHeaders = [
+-            "Content-Length" <:> "98",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+     it "formats columns in views including computed columns" $
+       get "/datarep_todos_computed?select=id,label_color,dark_color" `shouldRespondWith`
+@@ -1570,8 +1548,8 @@ spec = do
+       get "/datarep_todos?id=lt.4" `shouldRespondWith`
+         [json| [
+           {"id":1,"name":"Report","label_color":"#000000","due_at":"2018-01-02T00:00:00Z","icon_image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=","created_at":1513213350,"budget":"12.50"},
+-          {"id":2,"name":"Essay","label_color":"#000100","due_at":"2018-01-03T00:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"},
+-          {"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}
++ {"id":2,"name":"Essay","label_color":"#000100","due_at":"2018-01-03T00:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"},
++ {"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}
+         ] |]
+         { matchHeaders = [matchContentTypeJson] }
+     it "formats star and explicit mix" $
+@@ -1602,10 +1580,7 @@ spec = do
+         -- we prove the parser is not used because it'd replace the Z with `+00:00` and a different error message.
+         [json| {"code":"22007","details":null,"hint":null,"message":"invalid input syntax for type timestamp with time zone: \"Z\""} |]
+         { matchStatus  = 400
+-        , matchHeaders = [
+-            "Content-Length" <:> "117",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+     it "uses text parser for filter with 'IN' predicates" $
+       get "/datarep_todos?select=id,due_at&label_color=in.(000100,01E240)" `shouldRespondWith`
+@@ -1632,10 +1607,7 @@ spec = do
+           {"code":"42883","details":null,"hint":"No operator matches the given name and argument types. You might need to add explicit type casts.","message":"operator does not exist: public.color ~~* unknown"}
+         |]
+         { matchStatus  = 404
+-        , matchHeaders = [
+-            "Content-Length" <:> "200",
+-            matchContentTypeJson
+-          ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+   context "searching for an empty string" $ do
+@@ -1652,13 +1624,11 @@ spec = do
+     it "return http status 500" $
+       get "/infinite_recursion?select=*" `shouldRespondWith`
+         [json|{"code":"42P17","message":"infinite recursion detected in rules for relation \"infinite_recursion\"","details":null,"hint":null}|]
+-        { matchStatus = 500
+-        , matchHeaders = ["Content-Length" <:> "128"] }
++        { matchStatus = 500 }
+ 
+   context "invalid resource path" $ do
+     it "return http status 404" $
+       get "/first/second/third?select=*"
+       `shouldRespondWith`
+       [json| {"code":"PGRST125","details":null,"hint":null,"message":"Invalid path specified in request URL"} |]
+-      { matchStatus = 404
+-      , matchHeaders = ["Content-Length" <:> "96"]}
++      { matchStatus = 404 }
+diff --git a/test/spec/Feature/Query/RangeSpec.hs b/test/spec/Feature/Query/RangeSpec.hs
+index 3086be60..5eb2e177 100644
+--- a/test/spec/Feature/Query/RangeSpec.hs
++++ b/test/spec/Feature/Query/RangeSpec.hs
+@@ -22,10 +22,7 @@ spec = do
+       context "when I don't want the count" $ do
+         it "returns range Content-Range with */* for empty range" $
+           get "/rpc/getitemrange?min=2&max=2"
+-            `shouldRespondWith` [json| [] |]
+-              { matchHeaders = [ "Content-Range" <:> "*/*"
+-                               , "Content-Length" <:> "2" ]
+-              }
++            `shouldRespondWith` [json| [] |] {matchHeaders = ["Content-Range" <:> "*/*"]}
+ 
+         it "returns range Content-Range with range/*" $
+           get "/rpc/getitemrange?order=id&min=0&max=15"
+@@ -45,8 +42,7 @@ spec = do
+                 "hint":null
+               }|]
+             { matchStatus  = 416
+-            , matchHeaders = [ "Content-Range" <:> "*/0"
+-                             , "Content-Length" <:> "144"]
++            , matchHeaders = ["Content-Range" <:> "*/0"]
+             }
+ 
+         it "refuses a range requesting start past last item" $
+@@ -69,8 +65,8 @@ spec = do
+           r <- request methodGet  "/rpc/getitemrange?min=0&max=15"
+                        (rangeHdrs $ ByteRangeFromTo 0 1) mempty
+           liftIO $ do
+-            simpleHeaders r `shouldSatisfy` matchHeader "Content-Range" "0-1/*"
+-            simpleHeaders r `shouldSatisfy` matchHeader "Content-Length" "22"
++            simpleHeaders r `shouldSatisfy`
++              matchHeader "Content-Range" "0-1/*"
+             simpleStatus r `shouldBe` ok200
+ 
+         it "understands open-ended ranges" $
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 50375f9e..7eef4513 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -31,21 +31,18 @@ spec =
+           post "/rpc/getitemrange?limit=1&offset=1" [json| { "min": 2, "max": 4 } |]
+              `shouldRespondWith` [json| [{"id":4}] |]
+               { matchStatus = 200
+-              , matchHeaders = [ "Content-Range" <:> "1-1/*"
+-                               , "Content-Length" <:> "10" ]
++              , matchHeaders = ["Content-Range" <:> "1-1/*"]
+               }
+           get "/rpc/getitemrange?min=2&max=4&limit=1&offset=1"
+              `shouldRespondWith` [json| [{"id":4}] |]
+               { matchStatus = 200
+-              , matchHeaders = [ "Content-Range" <:> "1-1/*"
+-                               , "Content-Length" <:> "10"]
++              , matchHeaders = ["Content-Range" <:> "1-1/*"]
+               }
+           request methodHead "/rpc/getitemrange?min=2&max=4&limit=1&offset=1" mempty mempty
+             `shouldRespondWith`
+               ""
+               { matchStatus = 200
+               , matchHeaders = [ matchContentTypeJson
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "1-1/*" ]
+               }
+ 
+@@ -213,8 +210,7 @@ spec =
+             "code":"PGRST202",
+             "details":"Searched for the function test.sayhell without parameters, but no matches were found in the schema cache."} |]
+           { matchStatus  = 404
+-          , matchHeaders = [ "Content-Length" <:> "291"
+-                           , matchContentTypeJson ]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+       it "should fail with 404 on unknown proc args" $ do
+@@ -272,8 +268,7 @@ spec =
+             "code":"PGRST203",
+             "details":null} |]
+           { matchStatus  = 300
+-          , matchHeaders = [ "Content-Length" <:> "353"
+-                           , matchContentTypeJson ]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+     it "works when having uppercase identifiers" $ do
+@@ -470,8 +465,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength]
++            , matchHeaders = [matchHeaderAbsent hContentType]
+             }
+ 
+       it "returns null for an integer with null value" $
+@@ -619,8 +613,7 @@ spec =
+           `shouldRespondWith`
+           [json|{"message":"Cannot use the DELETE method on RPC","code":"PGRST101","details":null,"hint":null}|]
+           { matchStatus  = 405
+-          , matchHeaders = [ "Content-Length" <:> "94"
+-                           , matchContentTypeJson ]
++          , matchHeaders = [matchContentTypeJson]
+           }
+       it "PATCH fails" $
+         request methodPatch "/rpc/sayhello" [] ""
+@@ -635,8 +628,7 @@ spec =
+         `shouldRespondWith`
+           ""
+           { matchStatus = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , matchHeaderAbsent hContentLength]
++          , matchHeaders = [ matchHeaderAbsent hContentType ]
+           }
+ 
+       -- now the test
+@@ -769,8 +761,7 @@ spec =
+       get "/rpc/raise_pt402"
+         `shouldRespondWith` [json|{ "hint": "Upgrade your plan", "details": "Quota exceeded", "code": "PT402", "message": "Payment Required" }|]
+         { matchStatus  = 402
+-        , matchHeaders = [ "Content-Length" <:> "99"
+-                         , matchContentTypeJson ]
++        , matchHeaders = [matchContentTypeJson]
+         }
+ 
+     it "defaults to status 500 if RAISE code is PT not followed by a number" $
+@@ -778,8 +769,7 @@ spec =
+         `shouldRespondWith`
+         [json|{"hint": null, "details": null, "code": "PT40A", "message": "Wrong"}|]
+         { matchStatus  = 500
+-        , matchHeaders = [ "Content-Length" <:> "61"
+-                         , matchContentTypeJson ]
++        , matchHeaders = [ matchContentTypeJson ]
+         }
+ 
+     context "should work with an overloaded function" $ do
+@@ -1034,8 +1024,7 @@ spec =
+           `shouldRespondWith`
+           [json|{"message":"response.headers guc must be a JSON array composed of objects with a single key and a string value","code":"PGRST111","details":null,"hint":null}|]
+           { matchStatus  = 500
+-          , matchHeaders = [ "Content-Length" <:> "157"
+-                           , matchContentTypeJson ]
++          , matchHeaders = [ matchContentTypeJson ]
+           }
+         get "/rpc/bad_guc_headers_2"
+           `shouldRespondWith`
+@@ -1062,7 +1051,6 @@ spec =
+             ""
+             { matchStatus = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Set-Cookie" <:> "sessionid=38afes7a8; HttpOnly; Path=/"
+                              , "Set-Cookie" <:> "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly" ]
+             }
+@@ -1125,8 +1113,7 @@ spec =
+             `shouldRespondWith`
+             [json|{"message":"response.status guc must be a valid status code","code":"PGRST112","details":null,"hint":null}|]
+             { matchStatus  = 500
+-            , matchHeaders = [ "Content-Length" <:> "106"
+-                             , matchContentTypeJson ]
++            , matchHeaders = [ matchContentTypeJson ]
+             }
+ 
+       context "single unnamed param" $ do
+@@ -1304,8 +1291,7 @@ spec =
+                 "details":"line 1: StartTag: invalid element name\n<\n ^"
+               }|]
+               { matchStatus  = 400
+-              , matchHeaders = [ "Content-Length" <:> "118"
+-                               , matchContentTypeJson ]
++              , matchHeaders = [matchContentTypeJson]
+               }
+ 
+     -- https://github.com/PostgREST/postgrest/issues/1586#issuecomment-696345442
+@@ -1318,10 +1304,7 @@ spec =
+         post "/rpc/char_param_insert" [json| { "char_": "abcdefg", "char_arr": "{abc,abcdefg}" } |]
+            `shouldRespondWith`
+              [json| {"code":"22001","details":null,"hint":null,"message":"value too long for type character(5)"} |]
+-           { matchStatus = 400
+-           , matchHeaders = [ "Content-Length" <:> "92"
+-                            , matchContentTypeJson ]
+-           }
++           { matchStatus = 400 }
+ 
+       it "modifies the param type from bit to bit varying" $ do
+         get "/rpc/bit_param_select?bit_=101010&bit_arr={101,101010}" `shouldRespondWith`
+@@ -1331,10 +1314,7 @@ spec =
+         post "/rpc/bit_param_insert" [json| { "bit_": "101010", "bit_arr": "{101,101010}" } |]
+            `shouldRespondWith`
+              [json| {"code":"22026","details":null,"hint":null,"message":"bit string length 6 does not match type bit(5)"} |]
+-           { matchStatus = 400
+-           , matchHeaders = [ "Content-Length" <:> "102"
+-                            , matchContentTypeJson ]
+-           }
++           { matchStatus = 400 }
+ 
+     context "get message and details from raise sqlstate" $ do
+       it "gets message and details from raise sqlstate PGRST" $ do
+@@ -1389,10 +1369,7 @@ spec =
+             "message":"Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error",
+             "details":"Invalid JSON value for MESSAGE: 'INVALID'",
+             "hint":"MESSAGE must be a JSON object with obligatory keys: 'code', 'message' and optional keys: 'details', 'hint'."}|]
+-          { matchStatus = 500
+-          , matchHeaders = [ "Content-Length" <:> "263"
+-                           , matchContentTypeJson ]
+-           }
++          { matchStatus = 500 }
+ 
+       it "returns error for invalid JSON in the DETAIL option of the RAISE statement" $
+         get "/rpc/raise_sqlstate_invalid_json_details" `shouldRespondWith`
+@@ -1418,7 +1395,4 @@ spec =
+       it "should return http status 500" $
+         request methodGet "/rpc/temp_file_limit" [auth] "" `shouldRespondWith`
+           [json|{"code":"53400","message":"temporary file size exceeds temp_file_limit (1kB)","details":null,"hint":null}|]
+-          { matchStatus = 500
+-          , matchHeaders = [ "Content-Length" <:> "105"
+-                           , matchContentTypeJson ]
+-          }
++          { matchStatus = 500 }
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index ee18e320..43c8ff41 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -20,7 +20,7 @@ spec = do
+           `shouldRespondWith`
+           [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.factories'","message":"Could not find the table 'test.fake' in the schema cache"} |]
+           { matchStatus = 404
+-          , matchHeaders = ["Content-Length" <:> "157"]
++          , matchHeaders = []
+           }
+ 
+ 
+@@ -31,8 +31,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204,
+-              matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength ]
++              matchHeaders = [matchHeaderAbsent hContentType]
+             }
+ 
+     context "with invalid json payload" $
+@@ -41,8 +40,7 @@ spec = do
+           `shouldRespondWith`
+           [json|{"message":"Empty or invalid json","code":"PGRST102","details":null,"hint":null}|]
+           { matchStatus  = 400,
+-            matchHeaders = [ matchContentTypeJson
+-                           , "Content-Length" <:> "80"]
++            matchHeaders = [matchContentTypeJson]
+           }
+ 
+     context "with no payload" $
+@@ -61,7 +59,6 @@ spec = do
+                      "\t \n \r { \"id\": 99 } \t \n \r "
+           `shouldRespondWith` [json|[{"id":99}]|]
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Length" <:> "11"]
+           }
+ 
+     context "in a nonempty table" $ do
+@@ -72,7 +69,6 @@ spec = do
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "0-0/*" ]
+             }
+ 
+@@ -82,8 +78,7 @@ spec = do
+           `shouldRespondWith` "[]"
+           {
+             matchStatus  = 200,
+-            matchHeaders = [ "Preference-Applied" <:> "return=representation"
+-                           , "Content-Length" <:> "2"]
++            matchHeaders = ["Preference-Applied" <:> "return=representation"]
+           }
+ 
+       it "returns status code 200 when no rows updated" $
+@@ -112,7 +107,6 @@ spec = do
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "0-1/*"
+                              , "Preference-Applied" <:> "tx=commit" ]
+             }
+@@ -129,8 +123,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength ]
++            , matchHeaders = [matchHeaderAbsent hContentType]
+             }
+ 
+       it "can set a column to NULL" $ do
+@@ -214,7 +207,6 @@ spec = do
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "0-0/*"
+                              , "Preference-Applied" <:> "return=minimal"]
+             }
+@@ -225,7 +217,6 @@ spec = do
+             ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "0-0/*"
+                              , "Preference-Applied" <:> "return=minimal"]
+             }
+@@ -239,7 +230,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -250,7 +240,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -261,7 +250,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -273,7 +261,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -284,7 +271,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -295,7 +281,6 @@ spec = do
+               ""
+               { matchStatus  = 204
+               , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hContentLength
+                                , "Content-Range" <:> "*/*" ]
+               }
+ 
+@@ -365,7 +350,7 @@ spec = do
+           `shouldRespondWith`
+           [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.articles'","message":"Could not find the table 'test.garlic' in the schema cache"} |]
+           { matchStatus  = 404
+-          , matchHeaders = ["Content-Length" <:> "158"]
++          , matchHeaders = []
+           }
+ 
+       context "apply defaults on missing values" $ do
+@@ -628,7 +613,6 @@ spec = do
+           ""
+           { matchStatus = 204
+           , matchHeaders = [matchHeaderAbsent hContentType
+-                           , matchHeaderAbsent hContentLength
+                            , "Preference-Applied" <:> "return=minimal"]
+           }
+ 
+@@ -639,8 +623,7 @@ spec = do
+         `shouldRespondWith`
+           ""
+           { matchStatus = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , matchHeaderAbsent hContentLength ]
++          , matchHeaders = [matchHeaderAbsent hContentType]
+           }
+ 
+   -- Data representations for payload parsing requires Postgres 10 or above.
+@@ -653,7 +636,6 @@ spec = do
+           ""
+             { matchStatus  = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "Content-Range" <:> "0-0/*" ]
+             }
+ 
+diff --git a/test/spec/Feature/RollbackSpec.hs b/test/spec/Feature/RollbackSpec.hs
+index 35f0b3f8..d8617657 100644
+--- a/test/spec/Feature/RollbackSpec.hs
++++ b/test/spec/Feature/RollbackSpec.hs
+@@ -30,9 +30,7 @@ deleteItems =
+     `shouldRespondWith`
+       ""
+       { matchStatus  = 204
+-      , matchHeaders = [ matchHeaderAbsent hContentType
+-                       , matchHeaderAbsent hContentLength ]
+-      }
++      , matchHeaders = [matchHeaderAbsent hContentType] }
+ 
+ preferDefault  = [("Prefer", "return=representation")]
+ preferCommit   = [("Prefer", "return=representation"), ("Prefer", "tx=commit")]
+@@ -264,3 +262,4 @@ forced = describe "tx-rollback-all = true, tx-allow-override = false" $ do
+     preferRollback `shouldRespondToReads` withoutPreferenceApplied
+     preferRollback `shouldNotPersistMutations` withoutPreferenceApplied
+     preferRollback `shouldRaiseExceptions` withoutPreferenceApplied
++
+diff --git a/test/spec/Feature/RpcPreRequestGucsSpec.hs b/test/spec/Feature/RpcPreRequestGucsSpec.hs
+index d013d601..548ce18e 100644
+--- a/test/spec/Feature/RpcPreRequestGucsSpec.hs
++++ b/test/spec/Feature/RpcPreRequestGucsSpec.hs
+@@ -56,7 +56,6 @@ spec =
+             ""
+             { matchStatus = 204
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hContentLength
+                              , "X-Custom-Header" <:> "mykey=myval" ]
+             }
+ 
+@@ -67,7 +66,6 @@ spec =
+           ""
+           { matchStatus = 204
+           , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , matchHeaderAbsent hContentLength
+                            , "X-Custom-Header" <:> "mykey=myval" ]
+           }
+ 
+@@ -77,7 +75,6 @@ spec =
+           ""
+           { matchStatus = 204
+           , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , matchHeaderAbsent hContentLength
+                            , "X-Custom-Header" <:> "mykey=myval" ]
+           }
+     it "can override the Content-Type header" $ do
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 6ecb7ff6..d3bcc5fd 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -281,9 +281,6 @@ noBlankHeader = notElem mempty
+ noProfileHeader :: [Header] -> Bool
+ noProfileHeader headers = isNothing $ find ((== "Content-Profile") . fst) headers
+ 
+-notZeroContentLength :: [Header] -> Bool
+-notZeroContentLength headers = maybe False (/= "0") $ lookup hContentLength headers
+-
+ authHeader :: BS.ByteString -> BS.ByteString -> Header
+ authHeader typ creds =
+   (hAuthorization, typ <> " " <> creds)

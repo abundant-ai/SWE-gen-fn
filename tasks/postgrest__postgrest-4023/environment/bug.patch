@@ -1,0 +1,261 @@
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 30416cdf..b01b3c81 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -126,15 +126,11 @@ jobs:
+         id: get-latest-tag
+         with:
+           prefix: v
+-      - name: Run loadtest (mixed)
++      - name: Run loadtest
+         run: |
+           postgrest-loadtest-against main ${{ steps.get-latest-tag.outputs.tag }}
+           postgrest-loadtest-report >> "$GITHUB_STEP_SUMMARY"
+ 
+-      - name: Run loadtest (jwt)
+-        # TODO generate a report for this https://github.com/PostgREST/postgrest/issues/4022
+-        run: |
+-          postgrest-loadtest-against -k jwt main ${{ steps.get-latest-tag.outputs.tag }}
+ 
+   flake:
+     strategy:
+diff --git a/.gitignore b/.gitignore
+index 8df91bee..986da150 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -24,4 +24,3 @@ coverage
+ loadtest
+ .history
+ .docs-build
+-test/load/gen_targets.http
+diff --git a/nix/tools/generate_targets.py b/nix/tools/generate_targets.py
+deleted file mode 100755
+index f26734d8..00000000
+--- a/nix/tools/generate_targets.py
++++ /dev/null
+@@ -1,74 +0,0 @@
+-# generates a file to be used by the vegeta load testing tool
+-import time
+-import hmac
+-import hashlib
+-import base64
+-import json
+-import argparse
+-import sys
+-
+-SECRET = b"reallyreallyreallyreallyverysafe"
+-URL = "http://postgrest"
+-JWT_DURATION = 60
+-TOTAL_TARGETS = 40000  # tuned by hand to reduce result variance
+-
+-
+-def base64url_encode(data: bytes) -> str:
+-    """URL-safe Base64 encode without padding."""
+-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+-
+-
+-def generate_jwt() -> str:
+-    """Generate an HS256 JWT"""
+-    # Header & payload
+-    header = {"alg": "HS256", "typ": "JWT"}
+-    now = int(time.time())
+-    payload = {
+-        "iat": now,
+-        "exp": now + JWT_DURATION,
+-        "role": "postgrest_test_author",
+-    }
+-
+-    # Encode to JSON and then to Base64URL
+-    header_b = json.dumps(header, separators=(",", ":")).encode()
+-    payload_b = json.dumps(payload, separators=(",", ":")).encode()
+-    header_b64 = base64url_encode(header_b)
+-    payload_b64 = base64url_encode(payload_b)
+-
+-    # Sign (HMAC‑SHA256) the "<header>.<payload>" string
+-    signing_input = f"{header_b64}.{payload_b64}".encode()
+-    signature = hmac.new(SECRET, signing_input, hashlib.sha256).digest()
+-    signature_b64 = base64url_encode(signature)
+-
+-    return f"{header_b64}.{payload_b64}.{signature_b64}"
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(
+-        description="Generate Vegeta targets with unique JWTs"
+-    )
+-    parser.add_argument(
+-        "output",
+-        help="Path to write the generated targets file",
+-    )
+-    args = parser.parse_args()
+-
+-    lines = []
+-    for _ in range(TOTAL_TARGETS):
+-        token = generate_jwt()
+-        lines.append(f"GET {URL}/authors_only")
+-        lines.append(f"Authorization: Bearer {token}")
+-        lines.append("")  # blank line to separate requests
+-
+-    try:
+-        with open(args.output, "w") as f:
+-            f.write("\n".join(lines))
+-    except IOError as e:
+-        print(f"Error writing to {args.output}: {e}", file=sys.stderr)
+-        sys.exit(1)
+-
+-    print(f"Generated {TOTAL_TARGETS} targets in {args.output}")
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/nix/tools/loadtest.nix b/nix/tools/loadtest.nix
+index 8b934bf2..79347bac 100644
+--- a/nix/tools/loadtest.nix
++++ b/nix/tools/loadtest.nix
+@@ -29,6 +29,7 @@ let
+                                      -max-workers 1 \
+                                      -workers 1 \
+                                      -rate 0 \
++                                     -duration 60s \
+                                      "''${_arg_leftovers[@]}"
+       '';
+ 
+@@ -40,8 +41,6 @@ let
+         args = [
+           "ARG_OPTIONAL_SINGLE([output], [o], [Filename to dump json output to], [./loadtest/result.bin])"
+           "ARG_OPTIONAL_SINGLE([testdir], [t], [Directory to load tests and fixtures from], [./test/load])"
+-          "ARG_OPTIONAL_SINGLE([kind], [k], [Kind of loadtest (mixed: repeat mixed requests, jwt: run once over many requests with unique jwts)], [mixed])"
+-          "ARG_TYPE_GROUP_SET([KIND], [KIND], [kind], [mixed,jwt])"
+           "ARG_LEFTOVERS([additional vegeta arguments])"
+         ];
+         workingDir = "/";
+@@ -62,29 +61,13 @@ let
+         mkdir -p "$(dirname "$_arg_output")"
+         abs_output="$(realpath "$_arg_output")"
+ 
+-        case "$_arg_kind" in
+-          jwt)
+-            ${genTargets} "$_arg_testdir"/gen_targets.http
+-
+-            # shellcheck disable=SC2145
+-            ${withTools.withPg} -f "$_arg_testdir"/fixtures.sql \
+-            ${withTools.withPgrst} \
+-            sh -c "cd \"$_arg_testdir\" && ${runner} -lazy -targets gen_targets.http -output \"$abs_output\" \"''${_arg_leftovers[@]}\""
+-            ${vegeta}/bin/vegeta report -type=text "$_arg_output"
+-            ;;
+-
+-          *)
+-
+-            # shellcheck disable=SC2145
+-            ${withTools.withPg} -f "$_arg_testdir"/fixtures.sql \
+-            ${withTools.withSlowPg} \
+-            ${withTools.withPgrst} \
+-            ${withTools.withSlowPgrst} \
+-            sh -c "cd \"$_arg_testdir\" && ${runner} -duration 60s -targets targets.http -output \"$abs_output\" \"''${_arg_leftovers[@]}\""
+-            ${vegeta}/bin/vegeta report -type=text "$_arg_output"
+-            ;;
+-
+-        esac
++        # shellcheck disable=SC2145
++        ${withTools.withPg} -f "$_arg_testdir"/fixtures.sql \
++        ${withTools.withSlowPg} \
++        ${withTools.withPgrst} \
++        ${withTools.withSlowPgrst} \
++        sh -c "cd \"$_arg_testdir\" && ${runner} -targets targets.http -output \"$abs_output\" \"''${_arg_leftovers[@]}\""
++        ${vegeta}/bin/vegeta report -type=text "$_arg_output"
+       '';
+ 
+   loadtestAgainst =
+@@ -102,7 +85,6 @@ let
+           '';
+         args = [
+           "ARG_POSITIONAL_INF([target], [Commit-ish reference to compare with], 1)"
+-          "ARG_OPTIONAL_SINGLE([kind], [k], [Kind of loadtest], [mixed])"
+         ];
+         positionalCompletion =
+           ''
+@@ -117,7 +99,7 @@ let
+ 
+         cat << EOF
+ 
+-        Running "$_arg_kind" loadtest on "$tgt"...
++        Running loadtest on "$tgt"...
+ 
+         EOF
+ 
+@@ -126,7 +108,7 @@ let
+         # Save the results in the current working tree, too,
+         # otherwise they'd be lost in the temporary working tree
+         # created by withTools.withGit.
+-        ${withTools.withGit} "$tgt" ${loadtest} -k "$_arg_kind" --output "$PWD/loadtest/$tgt.bin" --testdir "$PWD/test/load"
++        ${withTools.withGit} "$tgt" ${loadtest} --output "$PWD/loadtest/$tgt.bin" --testdir "$PWD/test/load"
+ 
+         cat << EOF
+ 
+@@ -138,11 +120,11 @@ let
+ 
+         cat << EOF
+ 
+-        Running $_arg_kind" loadtest on HEAD...
++        Running loadtest on HEAD...
+ 
+         EOF
+ 
+-        ${loadtest} -k "$_arg_kind" --output "$PWD/loadtest/head.bin" --testdir "$PWD/test/load"
++        ${loadtest} --output "$PWD/loadtest/head.bin" --testdir "$PWD/test/load"
+ 
+         cat << EOF
+ 
+@@ -198,7 +180,6 @@ let
+           | ${toMarkdown}
+       '';
+ 
+-  genTargets = writers.writePython3 "postgrest-gen-loadtest-targets" { } (builtins.readFile ./generate_targets.py);
+ in
+ buildToolbox {
+   name = "postgrest-loadtest";
+diff --git a/test/load/fixtures.sql b/test/load/fixtures.sql
+index 158f4fec..eee7dfab 100644
+--- a/test/load/fixtures.sql
++++ b/test/load/fixtures.sql
+@@ -1,7 +1,5 @@
+ CREATE ROLE postgrest_test_anonymous;
+-CREATE ROLE postgrest_test_author;
+ GRANT postgrest_test_anonymous TO :PGUSER;
+-GRANT postgrest_test_author TO :PGUSER;
+ CREATE SCHEMA test;
+ 
+ -- PUT+PATCH target needs one record and column to modify
+@@ -33,18 +31,10 @@ CREATE TABLE test.roles (
+   character TEXT
+ );
+ 
+-CREATE TABLE test.authors_only ();
+-
+ CREATE FUNCTION test.call_me (name TEXT) RETURNS TEXT
+ STABLE LANGUAGE SQL AS $$
+   SELECT 'Hello ' || name || ', how are you?';
+ $$;
+ 
+-GRANT USAGE ON SCHEMA test TO postgrest_test_anonymous, postgrest_test_author;
++GRANT USAGE ON SCHEMA test TO postgrest_test_anonymous;
+ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA test TO postgrest_test_anonymous;
+-
+-REVOKE ALL PRIVILEGES ON TABLE
+-      authors_only
+-FROM postgrest_test_anonymous;
+-
+-GRANT ALL ON TABLE authors_only TO postgrest_test_author;
+diff --git a/test/memory/memory-tests.sh b/test/memory/memory-tests.sh
+index ffb6fd62..5b9a1840 100755
+--- a/test/memory/memory-tests.sh
++++ b/test/memory/memory-tests.sh
+@@ -108,7 +108,7 @@ jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "22M"
+ 
+ jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "32M"
+ jsonKeyTest "10M" "POST" "/leak?columns=blob" "32M"
+-jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "50M"
++jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "32M"
+ 
+ jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "73M"
+ jsonKeyTest "50M" "POST" "/leak?columns=blob" "73M"

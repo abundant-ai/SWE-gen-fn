@@ -1,0 +1,521 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d2afeb22..16ba25da 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+ - Fix not logging OpenAPI queries when `log-query=main-query` is enabled by @steve-chavez in #4226
++- Fix not logging explain query when `log-query=main-query` is enabled by @steve-chavez in #4319
+ 
+ ### Added
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 086cb2fd..55369efb 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -19,6 +19,7 @@ module PostgREST.ApiRequest.Preferences
+   , PreferMaxAffected(..)
+   , fromHeaders
+   , shouldCount
++  , shouldExplainCount
+   , prefAppliedHeader
+   ) where
+ 
+@@ -238,6 +239,10 @@ shouldCount :: Maybe PreferCount -> Bool
+ shouldCount prefCount =
+   prefCount == Just ExactCount || prefCount == Just EstimatedCount
+ 
++shouldExplainCount :: Maybe PreferCount -> Bool
++shouldExplainCount prefCount =
++  prefCount == Just PlannedCount || prefCount == Just EstimatedCount
++
+ -- | Whether to commit or roll back transactions.
+ data PreferTransaction
+   = Commit   -- ^ Commit transaction - the default.
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index de71b48c..c091b802 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -123,7 +123,7 @@ logWithZTime loggerState txt = do
+ 
+ logMainQ :: LoggerState -> MainQuery -> IO ()
+ logMainQ loggerState MainQuery{mqOpenAPI=(x, y, z),..} =
+-  let snipts  = renderSnippet <$> [mqMain, x, y, z]
++  let snipts  = renderSnippet <$> [mqMain, x, y, z, fromMaybe mempty mqExplain]
+       -- Does not log SQL when it's empty (happens on OPTIONS requests and when the openapi queries are not generated)
+       logQ q = when (q /= mempty) $ logWithZTime loggerState $ showOnSingleLine '\n' $ T.decodeUtf8 q in
+   mapM_ logQ snipts
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 5f21b524..df622915 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -23,7 +23,6 @@ module PostgREST.Plan
+   , InspectPlan(..)
+   , InfoPlan(..)
+   , CrudPlan(..)
+-  , CallReadPlan(..)
+   ) where
+ 
+ import qualified Data.HashMap.Strict           as HM
+@@ -97,7 +96,7 @@ data CrudPlan
+   { wrReadPlan :: ReadPlanTree
+   , pTxMode    :: SQL.Mode
+   , wrHandler  :: MediaHandler
+-  , wrMedia    :: MediaType
++  , pMedia     :: MediaType
+   , wrHdrsOnly :: Bool
+   , crudQi     :: QualifiedIdentifier
+   }
+@@ -106,19 +105,17 @@ data CrudPlan
+   , mrMutatePlan :: MutatePlan
+   , pTxMode      :: SQL.Mode
+   , mrHandler    :: MediaHandler
+-  , mrMedia      :: MediaType
++  , pMedia       :: MediaType
+   , mrMutation   :: Mutation
+   , crudQi       :: QualifiedIdentifier
+   }
+-
+--- Plan for calling a function
+-data CallReadPlan = CallReadPlan {
++  | CallReadPlan {
+     crReadPlan :: ReadPlanTree
+   , crCallPlan :: CallPlan
+-  , crTxMode   :: SQL.Mode
++  , pTxMode    :: SQL.Mode
+   , crProc     :: Routine
+   , crHandler  :: MediaHandler
+-  , crMedia    :: MediaType
++  , pMedia     :: MediaType
+   , crInvMthd  :: InvokeMethod
+   , crQi       :: QualifiedIdentifier
+   }
+@@ -136,35 +133,42 @@ data ActionPlan
+   = Db DbActionPlan
+   | NoDb InfoPlan
+ 
++type IsDbExplain = Bool
++
+ -- A db plan can consist on read/write, rpc call or reading metadata (which may use the db or just use cached objects)
+ data DbActionPlan
+-  = DbCrud CrudPlan
+-  | DbCall CallReadPlan
++  = DbCrud   IsDbExplain CrudPlan
+   | MayUseDb InspectPlan
+ 
+ -- Plans that don't use the database
+ data InfoPlan
+   = RelInfoPlan QualifiedIdentifier -- info about relation
+-  | RoutineInfoPlan CallReadPlan -- info about function
++  | RoutineInfoPlan Routine -- info about function
+   | SchemaInfoPlan -- info about schema cache
+ 
+ actionPlan :: Action -> AppConfig -> ApiRequest -> SchemaCache -> Either Error ActionPlan
+ actionPlan act conf apiReq sCache = case act of
+-    ActDb dbAct              -> Db <$> dbActionPlan dbAct conf apiReq sCache
+-    ActRelationInfo ident    -> pure . NoDb $ RelInfoPlan ident
+-    ActRoutineInfo ident inv -> NoDb . RoutineInfoPlan <$> callReadPlan ident conf sCache apiReq inv
+-    ActSchemaInfo            -> pure $ NoDb SchemaInfoPlan
++  ActDb dbAct              -> Db <$> dbActionPlan dbAct conf apiReq sCache
++  ActRelationInfo ident    -> pure . NoDb $ RelInfoPlan ident
++  ActRoutineInfo ident inv ->
++    let crPln = callReadPlan ident conf sCache apiReq inv in
++    NoDb . RoutineInfoPlan . crProc <$> crPln
++  ActSchemaInfo            -> pure $ NoDb SchemaInfoPlan
+ 
+ dbActionPlan :: DbAction -> AppConfig -> ApiRequest -> SchemaCache -> Either Error DbActionPlan
+ dbActionPlan dbAct conf apiReq sCache = case dbAct of
+   ActRelationRead identifier headersOnly ->
+-    DbCrud <$> wrappedReadPlan identifier conf sCache apiReq headersOnly
++    toDbActPlan <$> wrappedReadPlan identifier conf sCache apiReq headersOnly
+   ActRelationMut identifier mut ->
+-    DbCrud <$> mutateReadPlan mut apiReq identifier conf sCache
++    toDbActPlan <$> mutateReadPlan mut apiReq identifier conf sCache
+   ActRoutine identifier invMethod ->
+-    DbCall <$> callReadPlan identifier conf sCache apiReq invMethod
++    toDbActPlan <$> callReadPlan identifier conf sCache apiReq invMethod
+   ActSchemaRead tSchema headersOnly ->
+     MayUseDb <$> inspectPlan apiReq headersOnly tSchema
++  where
++    toDbActPlan pl = case pMedia pl of
++      MTVndPlan{} -> DbCrud True pl
++      _           -> DbCrud False pl
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Bool -> Either Error CrudPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} headersOnly = do
+@@ -183,7 +187,7 @@ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..}
+   (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation qi
+ 
+-callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
++callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CrudPlan
+ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs, preferMaxAffected},..} invMethod = do
+   let paramKeys = case invMethod of
+         InvRead _ -> S.fromList $ fst <$> qsParams'
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 25be85fd..a5655dfb 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -46,7 +46,8 @@ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferHandling (..),
+                                           PreferMaxAffected (..),
+                                           PreferTransaction (..),
+-                                          Preferences (..))
++                                          Preferences (..),
++                                          shouldExplainCount)
+ import PostgREST.ApiRequest.Types        (Mutation (..))
+ import PostgREST.Auth.Types              (AuthResult (..))
+ import PostgREST.Config                  (AppConfig (..),
+@@ -54,7 +55,6 @@ import PostgREST.Config                  (AppConfig (..),
+ import PostgREST.Error                   (Error)
+ import PostgREST.MediaType               (MediaType (..))
+ import PostgREST.Plan                    (ActionPlan (..),
+-                                          CallReadPlan (..),
+                                           CrudPlan (..),
+                                           DbActionPlan (..),
+                                           InfoPlan (..),
+@@ -79,7 +79,6 @@ data Query
+ 
+ data QueryResult
+   = DbCrudResult  CrudPlan ResultSet
+-  | DbCallResult  CallReadPlan  ResultSet
+   | DbPlanResult    MediaType BS.ByteString
+   | MaybeDbResult InspectPlan  (Maybe (TablesMap, RoutineMap, Maybe Text))
+   | NoDbResult    InfoPlan
+@@ -88,10 +87,10 @@ data QueryResult
+ data MainQuery = MainQuery
+   { mqTxVars  :: SQL.Snippet       -- ^ the transaction variables that always run on each query
+   , mqPreReq  :: Maybe SQL.Snippet -- ^ the pre-request function that runs if enabled
+-  , mqCount   :: SQL.Snippet       -- ^ this count query is actually a fragment of the main query, but the same count query also runs after the main one in the case of `count=estimated`, so it's cached here.
+   -- TODO only one of the following queries actually runs on each request, once OpenAPI is removed from core it will be easier to refactor this
+   , mqMain    :: SQL.Snippet
+   , mqOpenAPI :: (SQL.Snippet, SQL.Snippet, SQL.Snippet)
++  , mqExplain :: Maybe SQL.Snippet     -- ^ the explain query that gets generated for the "Prefer: count=estimated" case
+   }
+ 
+ -- | Standard result set format used for the mqMain query
+@@ -132,86 +131,89 @@ mainTx genQ@MainQuery{..} conf@AppConfig{..} AuthResult{..} apiReq (Db plan) sCa
+       mainActionQuery
+ 
+ planTxMode :: DbActionPlan -> SQL.Mode
+-planTxMode (DbCrud x)   = pTxMode x
+-planTxMode (DbCall x)   = crTxMode x
++planTxMode (DbCrud _ x) = pTxMode x
+ planTxMode (MayUseDb x) = ipTxmode x
+ 
+ planIsoLvl :: AppConfig -> ByteString -> DbActionPlan -> SQL.IsolationLevel
+ planIsoLvl AppConfig{configRoleIsoLvl} role actPlan = case actPlan of
+-  DbCall CallReadPlan{crProc} -> fromMaybe roleIsoLvl $ pdIsoLvl crProc
++  DbCrud _ CallReadPlan{crProc} -> fromMaybe roleIsoLvl $ pdIsoLvl crProc
+   _                           -> roleIsoLvl
+   where
+     roleIsoLvl = HM.findWithDefault SQL.ReadCommitted role configRoleIsoLvl
+ 
++
+ mainQuery :: ActionPlan -> AppConfig -> ApiRequest -> AuthResult -> Maybe QualifiedIdentifier -> MainQuery
+-mainQuery (NoDb _) _ _ _ _ = MainQuery mempty Nothing mempty mempty (mempty, mempty, mempty)
++mainQuery (NoDb _) _ _ _ _ = MainQuery mempty Nothing mempty (mempty, mempty, mempty) mempty
+ mainQuery (Db plan) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} authRes preReq =
+   let genQ = MainQuery (PreQuery.txVarQuery plan conf authRes apiReq) (PreQuery.preReqQuery <$> preReq) in
+   case plan of
+-    DbCrud WrappedReadPlan{..} ->
++    DbCrud _ WrappedReadPlan{..} ->
+       let countQuery = QueryBuilder.readPlanToCountQuery wrReadPlan in
+-      genQ countQuery (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows wrMedia wrHandler) (mempty, mempty, mempty)
+-    DbCrud MutateReadPlan{..} ->
+-      genQ mempty (Statements.mainWrite mrReadPlan mrMutatePlan mrMedia mrHandler preferRepresentation preferResolution) (mempty, mempty, mempty)
+-    DbCall CallReadPlan{..} ->
+-      genQ mempty (Statements.mainCall crProc crCallPlan crReadPlan preferCount crMedia crHandler) (mempty, mempty, mempty)
++      genQ (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows pMedia wrHandler) (mempty, mempty, mempty)
++      (if shouldExplainCount preferCount then Just (Statements.postExplain countQuery) else Nothing)
++    DbCrud _ MutateReadPlan{..} ->
++      genQ (Statements.mainWrite mrReadPlan mrMutatePlan pMedia mrHandler preferRepresentation preferResolution) (mempty, mempty, mempty) mempty
++    DbCrud _ CallReadPlan{..} ->
++      genQ (Statements.mainCall crProc crCallPlan crReadPlan preferCount pMedia crHandler) (mempty, mempty, mempty) mempty
+     MayUseDb InspectPlan{ipSchema=tSchema} ->
+-      genQ mempty mempty (SqlFragment.accessibleTables tSchema, SqlFragment.accessibleFuncs tSchema, SqlFragment.schemaDescription tSchema)
++      genQ mempty (SqlFragment.accessibleTables tSchema, SqlFragment.accessibleFuncs tSchema, SqlFragment.schemaDescription tSchema) mempty
+ 
+ -- TODO: Generate the Hasql Statement in a diferent module after the OpenAPI functionality is removed
+-actionQuery :: MainQuery -> DbActionPlan -> AppConfig -> ApiRequest -> SchemaCache -> DbHandler QueryResult
+-actionQuery MainQuery{..} (DbCrud plan@WrappedReadPlan{..}) conf@AppConfig{..} apiReq _ =
+-  case wrMedia of
+-    MTVndPlan{} -> do
+-      explRes <- lift $ SQL.statement mempty $ dynStmt planRow
+-      optionalRollback conf apiReq
+-      pure $ DbPlanResult wrMedia explRes
+-    _ -> do
+-      resultSet <- lift $ SQL.statement mempty $ dynStmt (HD.singleRow $ standardRow True)
+-      failNotSingular wrMedia resultSet
+-      optionalRollback conf apiReq
+-      DbCrudResult plan <$> resultSetWTotal conf apiReq resultSet mqCount
++actionQuery :: MainQuery -> DbActionPlan -> AppConfig -> ApiRequest -> SchemaCache -> ExceptT Error SQL.Transaction QueryResult
++actionQuery MainQuery{..} (DbCrud True plan) conf@AppConfig{..} apiReq _ = do
++  explRes <- lift $ SQL.statement mempty $ SQL.dynamicallyParameterized mqMain planRow configDbPreparedStatements
++  optionalRollback conf apiReq
++  pure $ DbPlanResult (pMedia plan) explRes
++
++actionQuery MainQuery{..} (DbCrud _ plan@WrappedReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ = do
++  resultSet@RSStandard{rsTableTotal=tableTotal} <- lift $ SQL.statement mempty $ dynStmt (HD.singleRow $ standardRow True)
++  failNotSingular pMedia resultSet
++  optionalRollback conf apiReq
++  explainTotal <- lift . fmap join $ traverse (\snip ->
++                    SQL.statement mempty $ SQL.dynamicallyParameterized snip decodeExplain configDbPreparedStatements)
++                    mqExplain
++
++  pure $ DbCrudResult plan
++    resultSet{rsTableTotal=case preferCount of
++      Just PlannedCount   -> explainTotal
++      Just EstimatedCount -> if tableTotal > (fromIntegral <$> configDbMaxRows)
++        then max <$> tableTotal <*> explainTotal
++        else tableTotal
++      _                   -> tableTotal}
+   where
+     dynStmt decod = SQL.dynamicallyParameterized mqMain decod configDbPreparedStatements
+ 
+-actionQuery MainQuery{..} (DbCrud plan@MutateReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
+-  case mrMedia of
+-    MTVndPlan{} -> do
+-      explRes <- lift $ SQL.statement mempty $ dynStmt planRow
+-      optionalRollback conf apiReq
+-      pure $ DbPlanResult mrMedia explRes
+-    _ -> do
+-      resultSet <- lift $ SQL.statement mempty $ dynStmt decodeRow
+-      failMutation resultSet
+-      optionalRollback conf apiReq
+-      pure $ DbCrudResult plan resultSet
++    decodeExplain :: HD.Result (Maybe Int64)
++    decodeExplain =
++      let row = HD.singleRow $ column HD.bytea in
++      (^? L.nth 0 . L.key "Plan" .  L.key "Plan Rows" . L._Integral) <$> row
++
++actionQuery MainQuery{..} (DbCrud _ plan@MutateReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ = do
++  resultSet <- lift $ SQL.statement mempty $ dynStmt decodeRow
++  failMutation resultSet
++  optionalRollback conf apiReq
++  pure $ DbCrudResult plan resultSet
+   where
+     dynStmt decod = SQL.dynamicallyParameterized mqMain decod configDbPreparedStatements
+     failMutation resultSet = case mrMutation of
+       MutationCreate -> do
+-        failNotSingular mrMedia resultSet
++        failNotSingular pMedia resultSet
+       MutationUpdate -> do
+-        failNotSingular mrMedia resultSet
++        failNotSingular pMedia resultSet
+         failExceedsMaxAffectedPref (preferMaxAffected,preferHandling) resultSet
+       MutationSingleUpsert -> do
+         failPut resultSet
+       MutationDelete -> do
+-        failNotSingular mrMedia resultSet
++        failNotSingular pMedia resultSet
+         failExceedsMaxAffectedPref (preferMaxAffected,preferHandling) resultSet
+     decodeRow = fromMaybe (RSStandard Nothing 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow False)
+ 
+-actionQuery MainQuery{..} (DbCall plan@CallReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ =
+-  case crMedia of
+-    MTVndPlan{} -> do
+-      explRes <- lift $ SQL.statement mempty $ dynStmt planRow
+-      optionalRollback conf apiReq
+-      pure $ DbPlanResult crMedia explRes
+-    _ -> do
+-      resultSet <- lift $ SQL.statement mempty $ dynStmt decodeRow
+-      optionalRollback conf apiReq
+-      failNotSingular crMedia resultSet
+-      failExceedsMaxAffectedPref (preferMaxAffected,preferHandling) resultSet
+-      pure $ DbCallResult plan resultSet
++actionQuery MainQuery{..} (DbCrud _ plan@CallReadPlan{..}) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} _ = do
++  resultSet <- lift $ SQL.statement mempty $ dynStmt decodeRow
++  optionalRollback conf apiReq
++  failNotSingular pMedia resultSet
++  failExceedsMaxAffectedPref (preferMaxAffected,preferHandling) resultSet
++  pure $ DbCrudResult plan resultSet
+   where
+     dynStmt decod = SQL.dynamicallyParameterized mqMain decod configDbPreparedStatements
+     decodeRow = fromMaybe (RSStandard (Just 0) 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow True)
+@@ -261,34 +263,6 @@ failPut RSStandard{rsQueryTotal=queryTotal} =
+     lift SQL.condemn
+     throwError $ Error.ApiRequestError Error.PutMatchingPkError
+ 
+-resultSetWTotal :: AppConfig -> ApiRequest -> ResultSet -> SQL.Snippet -> DbHandler ResultSet
+-resultSetWTotal AppConfig{..} ApiRequest{iPreferences=Preferences{..}} rs@RSStandard{rsTableTotal=tableTotal} countQuery =
+-  case preferCount of
+-    Just PlannedCount -> do
+-      total <- explain
+-      return rs{rsTableTotal=total}
+-    Just EstimatedCount ->
+-      if tableTotal > (fromIntegral <$> configDbMaxRows) then do
+-        total <- max tableTotal <$> explain
+-        return rs{rsTableTotal=total}
+-      else
+-        return rs
+-    Just ExactCount ->
+-      return rs
+-    Nothing ->
+-      return rs
+-  where
+-    explain =
+-      lift . SQL.statement mempty $
+-        SQL.dynamicallyParameterized (Statements.postExplain countQuery)
+-        decodeIt
+-        configDbPreparedStatements
+-
+-    decodeIt :: HD.Result (Maybe Int64)
+-    decodeIt =
+-      let row = HD.singleRow $ column HD.bytea in
+-      (^? L.nth 0 . L.key "Plan" .  L.key "Plan Rows" . L._Integral) <$> row
+-
+ -- |
+ -- Fail a response if a single JSON object was requested and not exactly one
+ -- was found.
+diff --git a/src/PostgREST/Query/PreQuery.hs b/src/PostgREST/Query/PreQuery.hs
+index 5587fdd0..d3a35bee 100644
+--- a/src/PostgREST/Query/PreQuery.hs
++++ b/src/PostgREST/Query/PreQuery.hs
+@@ -21,7 +21,7 @@ import PostgREST.ApiRequest.Preferences  (PreferTimezone (..),
+                                           Preferences (..))
+ import PostgREST.Auth.Types              (AuthResult (..))
+ import PostgREST.Config                  (AppConfig (..))
+-import PostgREST.Plan                    (CallReadPlan (..),
++import PostgREST.Plan                    (CrudPlan (..),
+                                           DbActionPlan (..))
+ import PostgREST.Query.SqlFragment       (escapeIdentList, fromQi,
+                                           intercalateSnippet,
+@@ -56,8 +56,8 @@ txVarQuery dbActPlan AppConfig{..} AuthResult{..} ApiRequest{..} =
+       let schemas = escapeIdentList (iSchema : configDbExtraSearchPath) in
+       setConfigWithConstantName ("search_path", schemas)
+     funcSettings = case dbActPlan of
+-      DbCall CallReadPlan{crProc} -> pdFuncSettings crProc
+-      _                           -> mempty
++      DbCrud _ CallReadPlan{crProc} -> pdFuncSettings crProc
++      _                             -> mempty
+ 
+ -- runs the pre-request function
+ preReqQuery :: QualifiedIdentifier -> SQL.Snippet
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 7d4d2b95..603478a9 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -35,8 +35,7 @@ import PostgREST.ApiRequest.Types        (InvokeMethod (..),
+                                           Mutation (..))
+ import PostgREST.Config                  (AppConfig (..))
+ import PostgREST.MediaType               (MediaType (..))
+-import PostgREST.Plan                    (CallReadPlan (..),
+-                                          CrudPlan (..),
++import PostgREST.Plan                    (CrudPlan (..),
+                                           InfoPlan (..),
+                                           InspectPlan (..))
+ import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+@@ -63,7 +62,7 @@ data PgrstResponse = PgrstResponse {
+ 
+ actionResponse :: QueryResult -> ApiRequest -> (Text, Text) -> AppConfig -> SchemaCache -> Schema -> Bool -> Either Error.Error PgrstResponse
+ 
+-actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, crudQi=identifier} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} _ _ _ _ _ = do
++actionResponse (DbCrudResult WrappedReadPlan{pMedia, wrHdrsOnly=headersOnly, crudQi=identifier} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} _ _ _ _ _ = do
+   let
+     (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+     cLHeader = if headersOnly then mempty else [contentLengthHeaderStrict rsBody]
+@@ -77,7 +76,7 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+         )
+       ]
+       ++ cLHeader
+-      ++ contentTypeHeaders wrMedia ctxApiRequest
++      ++ contentTypeHeaders pMedia ctxApiRequest
+       ++ prefHeader
+     bod | status == HTTP.status416 = Error.errorPayload $ Error.ApiRequestError $ Error.InvalidRange $
+                                      Error.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+@@ -88,7 +87,7 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+ 
+   Right $ PgrstResponse ovStatus ovHeaders bod
+ 
+-actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutatePlan, mrMedia, crudQi=QualifiedIdentifier{..}} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} _ _ _ _ _ = do
++actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutatePlan, pMedia, crudQi=QualifiedIdentifier{..}} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} _ _ _ _ _ = do
+   let
+     pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+     prefHeader = prefAppliedHeader $
+@@ -117,7 +116,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutateP
+           HTTP.status201
+     status = maybe HTTP.status200 isInsertIfGTZero rsInserted
+     (headers', bod) = case preferRepresentation of
+-      Just Full -> (headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++      Just Full -> (headers ++ contentTypeHeaders pMedia ctxApiRequest, LBS.fromStrict rsBody)
+       Just None -> (headers, mempty)
+       Just HeadersOnly -> (headers, mempty)
+       Nothing -> (headers, mempty)
+@@ -126,7 +125,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutateP
+ 
+   Right $ PgrstResponse ovStatus ovHeaders bod
+ 
+-actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
++actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, pMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
+   let
+     contentRangeHeader =
+       Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+@@ -136,7 +135,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+ 
+   let (status, headers', body) =
+         case preferRepresentation of
+-          Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++          Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders pMedia ctxApiRequest, LBS.fromStrict rsBody)
+           Just None -> (HTTP.status204, headers, mempty)
+           _         -> (HTTP.status204, headers, mempty)
+ 
+@@ -144,11 +143,11 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+ 
+   Right $ PgrstResponse ovStatus ovHeaders body
+ 
+-actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, mrMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
++actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, pMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
+   let
+     prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
+     cLHeader = [contentLengthHeaderStrict rsBody]
+-    cTHeader = contentTypeHeaders mrMedia ctxApiRequest
++    cTHeader = contentTypeHeaders pMedia ctxApiRequest
+ 
+   let isInsertIfGTZero i = if i > 0 then HTTP.status201 else HTTP.status200
+       upsertStatus       = isInsertIfGTZero $ fromJust rsInserted
+@@ -161,14 +160,14 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, mrM
+ 
+   Right $ PgrstResponse ovStatus ovHeaders body
+ 
+-actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
++actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, pMedia} RSStandard{..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = do
+   let
+     contentRangeHeader = RangeQuery.contentRangeH 1 0 $ if shouldCount preferCount then Just rsQueryTotal else Nothing
+     prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
+     headers = contentRangeHeader : prefHeader
+     (status, headers', body) =
+         case preferRepresentation of
+-            Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++            Just Full -> (HTTP.status200, headers ++ [contentLengthHeaderStrict rsBody] ++ contentTypeHeaders pMedia ctxApiRequest, LBS.fromStrict rsBody)
+             Just None -> (HTTP.status204, headers, mempty)
+             _ -> (HTTP.status204, headers, mempty)
+ 
+@@ -176,7 +175,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia}
+ 
+   Right $ PgrstResponse ovStatus ovHeaders body
+ 
+-actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=proc} RSStandard {..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} _ _ _ _ _ = do
++actionResponse (DbCrudResult CallReadPlan{pMedia, crInvMthd=invMethod, crProc=proc} RSStandard {..}) ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} _ _ _ _ _ = do
+   let
+     (status, contentRange) =
+       RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+@@ -193,7 +192,7 @@ actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=p
+             (HTTP.status204, headers, mempty)
+           else
+             (status,
+-              headers ++ cLHeader ++ contentTypeHeaders crMedia ctxApiRequest,
++              headers ++ cLHeader ++ contentTypeHeaders pMedia ctxApiRequest,
+               if isHeadMethod then mempty else rsOrErrBody)
+ 
+   (ovStatus, ovHeaders) <- overrideStatusHeaders rsGucStatus rsGucHeaders status' headers'
+@@ -224,7 +223,7 @@ actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ Schem
+           ["PATCH" | tableUpdatable table] ++
+           ["DELETE" | tableDeletable table]
+ 
+-actionResponse (NoDbResult (RoutineInfoPlan CallReadPlan{crProc=proc})) _ _ _ _ _ _
++actionResponse (NoDbResult (RoutineInfoPlan proc)) _ _ _ _ _ _
+   | pdVolatility proc == Volatile = respondInfo "OPTIONS,POST"
+   | otherwise                     = respondInfo "OPTIONS,GET,HEAD,POST"
+ 

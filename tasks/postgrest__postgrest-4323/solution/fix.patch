@@ -1,0 +1,268 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a2ef1299..02271daf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Added
++
++- Improve the `PGRST106` error when the requested schema is invalid by @laurenceisla in #4089
++  + It now shows the invalid schema in the `message` field.
++  + The exposed schemas are now listed in the `hint` instead of the `message` field.
++- Improve error details of `PGRST301` error by @taimoorzaeem in #4051
++
+ ## [13.0.6] - 2025-08-30
+ 
+ ### Fixed
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 07222466..0e2b1163 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -207,7 +207,7 @@ getAction resource schema method =
+ getSchema :: AppConfig -> RequestHeaders -> ByteString -> Either ApiRequestError (Schema, Bool)
+ getSchema AppConfig{configDbSchemas} hdrs method = do
+   case profile of
+-    Just p | p `notElem` configDbSchemas -> Left $ UnacceptableSchema $ toList configDbSchemas
++    Just p | p `notElem` configDbSchemas -> Left $ UnacceptableSchema p $ toList configDbSchemas
+            | otherwise                   -> Right (p, True)
+     Nothing -> Right (defaultSchema, length configDbSchemas /= 1) -- if we have many schemas, assume the default schema was negotiated
+   where
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 8febebf4..8a6b3efe 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -50,7 +50,8 @@ import PostgREST.Auth.JwtCache (lookupJwtCache)
+ import PostgREST.Auth.Types    (AuthResult (..))
+ import PostgREST.Config        (AppConfig (..), FilterExp (..),
+                                 JSPath, JSPathExp (..))
+-import PostgREST.Error         (Error (..), JwtError (..))
++import PostgREST.Error         (Error (..), JwtClaimsError (..),
++                                JwtDecodeError (..), JwtError (..))
+ 
+ import Protolude
+ 
+@@ -58,7 +59,7 @@ import Protolude
+ -- JSON object of JWT claims.
+ parseToken :: AppConfig -> Maybe ByteString -> UTCTime -> ExceptT Error IO JSON.Value
+ parseToken _ Nothing _ = return JSON.emptyObject
+-parseToken _ (Just "") _ = throwE . JwtErr $ JwtDecodeError "Empty JWT is sent in Authorization header"
++parseToken _ (Just "") _ = throwE . JwtErr $ JwtDecodeErr EmptyAuthHeader
+ parseToken AppConfig{..} (Just tkn) time = do
+   secret <- liftEither . maybeToRight (JwtErr JwtSecretMissing) $ configJWKS
+   tknWith3Parts <- liftEither $ hasThreeParts tkn
+@@ -69,33 +70,33 @@ parseToken AppConfig{..} (Just tkn) time = do
+       hasThreeParts :: ByteString -> Either Error ByteString
+       hasThreeParts token = case length $ BS.split (BS.c2w '.') token of
+         3 -> Right token
+-        n -> Left $ JwtErr $ JwtDecodeError ("Expected 3 parts in JWT; got " <> show n)
++        n -> Left $ JwtErr $ JwtDecodeErr $ UnexpectedParts n
+       jwtDecodeError :: JWT.JwtError -> JwtError
+       -- The only errors we can get from JWT.decode function are:
+       --   BadAlgorithm
+       --   KeyError
+       --   BadCrypto
+-      jwtDecodeError (JWT.KeyError _)     = JwtDecodeError "No suitable key or wrong key type"
+-      jwtDecodeError (JWT.BadAlgorithm _) = JwtDecodeError "Wrong or unsupported encoding algorithm"
+-      jwtDecodeError JWT.BadCrypto        = JwtDecodeError "JWT cryptographic operation failed"
++      jwtDecodeError (JWT.KeyError m)     = JwtDecodeErr $ KeyError m
++      jwtDecodeError (JWT.BadAlgorithm m) = JwtDecodeErr $ BadAlgorithm m
++      jwtDecodeError JWT.BadCrypto        = JwtDecodeErr BadCrypto
+       -- Control never reaches here, the decode function only returns the above three
+-      jwtDecodeError _                    = JwtDecodeError "JWT couldn't be decoded"
++      jwtDecodeError _                    = JwtDecodeErr UnreachableDecodeError
+ 
+       verifyClaims :: JWT.JwtContent -> Either JwtError JSON.Value
+       verifyClaims (JWT.Jws (_, claims)) = case JSON.decodeStrict claims of
+         Just jclaims@(JSON.Object mclaims) ->
+-          verifyClaim mclaims "exp" isValidExpClaim "JWT expired" >>
+-          verifyClaim mclaims "nbf" isValidNbfClaim "JWT not yet valid" >>
+-          verifyClaim mclaims "iat" isValidIatClaim "JWT issued at future" >>
+-          verifyClaim mclaims "aud" isValidAudClaim "JWT not in audience" >>
++          verifyClaim mclaims "exp" isValidExpClaim JWTExpired >>
++          verifyClaim mclaims "nbf" isValidNbfClaim JWTNotYetValid >>
++          verifyClaim mclaims "iat" isValidIatClaim JWTIssuedAtFuture >>
++          verifyClaim mclaims "aud" isValidAudClaim JWTNotInAudience >>
+           return jclaims
+-        _ -> Left $ JwtClaimsError "Parsing claims failed"
++        _ -> Left $ JwtClaimsErr ParsingClaimsFailed
+       -- TODO: We could enable JWE support here (encrypted tokens)
+-      verifyClaims _ = Left $ JwtDecodeError "Unsupported token type"
++      verifyClaims _ = Left $ JwtDecodeErr UnsupportedTokenType
+ 
+       verifyClaim mclaims claim func err = do
+         isValid <- maybe (Right True) func (KM.lookup claim mclaims)
+-        unless isValid $ Left $ JwtClaimsError err
++        unless isValid $ Left $ JwtClaimsErr err
+ 
+       allowedSkewSeconds = 30 :: Int64
+       now = floor . nominalDiffTimeToSeconds $ utcTimeToPOSIXSeconds time
+@@ -104,15 +105,15 @@ parseToken AppConfig{..} (Just tkn) time = do
+ 
+       isValidExpClaim :: JSON.Value -> Either JwtError Bool
+       isValidExpClaim (JSON.Number secs) = Right $ now <= (sciToInt secs + allowedSkewSeconds)
+-      isValidExpClaim _ = Left $ JwtClaimsError "The JWT 'exp' claim must be a number"
++      isValidExpClaim _ = Left $ JwtClaimsErr ExpClaimNotNumber
+ 
+       isValidNbfClaim :: JSON.Value -> Either JwtError Bool
+       isValidNbfClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
+-      isValidNbfClaim _ = Left $ JwtClaimsError "The JWT 'nbf' claim must be a number"
++      isValidNbfClaim _ = Left $ JwtClaimsErr NbfClaimNotNumber
+ 
+       isValidIatClaim :: JSON.Value -> Either JwtError Bool
+       isValidIatClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
+-      isValidIatClaim _ = Left $ JwtClaimsError "The JWT 'iat' claim must be a number"
++      isValidIatClaim _ = Left $ JwtClaimsErr IatClaimNotNumber
+ 
+       isValidAudClaim :: JSON.Value -> Either JwtError Bool
+       isValidAudClaim JSON.Null = Right True -- {"aud": null} is valid for all audiences
+@@ -120,7 +121,7 @@ parseToken AppConfig{..} (Just tkn) time = do
+       isValidAudClaim (JSON.Array arr)
+         | null arr = Right True              -- {"aud": []} is valid for all audiences
+         | allStrings arr = Right $ maybe True (\a -> JSON.String a `elem` arr) configJwtAudience
+-      isValidAudClaim _ = Left $ JwtClaimsError "The JWT 'aud' claim must be a string or an array of strings"
++      isValidAudClaim _ = Left $ JwtClaimsErr AudClaimNotStringOrArray
+ 
+ parseClaims :: Monad m =>
+   AppConfig -> JSON.Value -> ExceptT Error m AuthResult
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 0fd2be2d..39217610 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -14,6 +14,8 @@ module PostgREST.Error
+   , PgError(..)
+   , Error(..)
+   , JwtError (..)
++  , JwtDecodeError(..)
++  , JwtClaimsError(..)
+   , errorPayload
+   , status
+   ) where
+@@ -86,7 +88,7 @@ data ApiRequestError
+   | QueryParamError QPError
+   | RelatedOrderNotToOne Text Text
+   | UnacceptableFilter Text
+-  | UnacceptableSchema [Text]
++  | UnacceptableSchema Text [Text]
+   | UnsupportedMethod ByteString
+   | GucHeadersError
+   | GucStatusError
+@@ -194,7 +196,7 @@ instance ErrorBody ApiRequestError where
+   message (InvalidBody errorMessage)   = T.decodeUtf8 errorMessage
+   message (InvalidRange _)             = "Requested range not satisfiable"
+   message InvalidFilters               = "Filters must include all and only primary key columns with 'eq' operators"
+-  message (UnacceptableSchema schemas) = "The schema must be one of the following: " <> T.intercalate ", " schemas
++  message (UnacceptableSchema sch _)   = "Invalid schema: " <> sch
+   message (MediaTypeError cts)         = "None of these media types are available: " <> T.intercalate ", " (map T.decodeUtf8 cts)
+   message (NotEmbedded resource)       = "'" <> resource <> "' is not an embedded resource in this request"
+   message GucHeadersError              = "response.headers guc must be a JSON array composed of objects with a single key and a string value"
+@@ -234,6 +236,7 @@ instance ErrorBody ApiRequestError where
+   -- HINT: Maybe JSON.Value
+   hint (NotEmbedded resource) = Just $ JSON.String $ "Verify that '" <> resource <> "' is included in the 'select' query parameter."
+   hint (PGRSTParseError raiseErr) = Just $ JSON.String $ pgrstParseErrorHint raiseErr
++  hint (UnacceptableSchema _ schemas) = Just $ JSON.String $ "Only the following schemas are exposed: "  <> T.intercalate ", " schemas
+ 
+   hint _ = Nothing
+ 
+@@ -647,10 +650,32 @@ data Error
+   deriving Show
+ 
+ data JwtError
+-  = JwtDecodeError Text
++  = JwtDecodeErr JwtDecodeError
+   | JwtSecretMissing
+   | JwtTokenRequired
+-  | JwtClaimsError Text
++  | JwtClaimsErr JwtClaimsError
++  deriving Show
++
++data JwtDecodeError
++  = EmptyAuthHeader
++  | UnexpectedParts Int
++  | KeyError Text
++  | BadAlgorithm Text
++  | BadCrypto
++  | UnsupportedTokenType
++  | UnreachableDecodeError
++  deriving Show
++
++data JwtClaimsError
++  = JWTExpired
++  | JWTNotYetValid
++  | JWTIssuedAtFuture
++  | JWTNotInAudience
++  | ParsingClaimsFailed
++  | ExpClaimNotNumber
++  | NbfClaimNotNumber
++  | IatClaimNotNumber
++  | AudClaimNotStringOrArray
+   deriving Show
+ 
+ instance PgrstError Error where
+@@ -696,14 +721,14 @@ instance ErrorBody Error where
+   hint (PgErr err)           = hint err
+ 
+ instance PgrstError JwtError where
+-  status JwtDecodeError{} = HTTP.unauthorized401
++  status JwtDecodeErr{}   = HTTP.unauthorized401
+   status JwtSecretMissing = HTTP.status500
+   status JwtTokenRequired = HTTP.unauthorized401
+-  status JwtClaimsError{} = HTTP.unauthorized401
++  status JwtClaimsErr{}   = HTTP.unauthorized401
+ 
+-  headers (JwtDecodeError m) = [invalidTokenHeader m]
++  headers e@(JwtDecodeErr _) = [invalidTokenHeader $ message e]
+   headers JwtTokenRequired   = [requiredTokenHeader]
+-  headers (JwtClaimsError m) = [invalidTokenHeader m]
++  headers e@(JwtClaimsErr _) = [invalidTokenHeader $ message e]
+   headers _                  = mempty
+ 
+ instance JSON.ToJSON JwtError where
+@@ -711,16 +736,36 @@ instance JSON.ToJSON JwtError where
+     (code err) (message err) (details err) (hint err)
+ 
+ instance ErrorBody JwtError where
+-  code JwtSecretMissing   = "PGRST300"
+-  code (JwtDecodeError _) = "PGRST301"
+-  code JwtTokenRequired   = "PGRST302"
+-  code (JwtClaimsError _) = "PGRST303"
+-
+-  message JwtSecretMissing     = "Server lacks JWT secret"
+-  message (JwtDecodeError msg) = msg
+-  message JwtTokenRequired     = "Anonymous access is disabled"
+-  message (JwtClaimsError msg) = msg
+-
++  code JwtSecretMissing = "PGRST300"
++  code (JwtDecodeErr _) = "PGRST301"
++  code JwtTokenRequired = "PGRST302"
++  code (JwtClaimsErr _) = "PGRST303"
++
++  message JwtSecretMissing = "Server lacks JWT secret"
++  message (JwtDecodeErr e) = case e of
++    EmptyAuthHeader        -> "Empty JWT is sent in Authorization header"
++    UnexpectedParts n      -> "Expected 3 parts in JWT; got " <> show n
++    KeyError _             -> "No suitable key or wrong key type"
++    BadAlgorithm _         -> "Wrong or unsupported encoding algorithm"
++    BadCrypto              -> "JWT cryptographic operation failed"
++    UnsupportedTokenType   -> "Unsupported token type"
++    UnreachableDecodeError -> "JWT couldn't be decoded"
++  message JwtTokenRequired = "Anonymous access is disabled"
++  message (JwtClaimsErr e) = case e of
++    JWTExpired               -> "JWT expired"
++    JWTNotYetValid           -> "JWT not yet valid"
++    JWTIssuedAtFuture        -> "JWT issued at future"
++    JWTNotInAudience         -> "JWT not in audience"
++    ParsingClaimsFailed      -> "Parsing claims failed"
++    ExpClaimNotNumber        -> "The JWT 'exp' claim must be a number"
++    NbfClaimNotNumber        -> "The JWT 'nbf' claim must be a number"
++    IatClaimNotNumber        -> "The JWT 'iat' claim must be a number"
++    AudClaimNotStringOrArray -> "The JWT 'aud' claim must be a string or an array of strings"
++
++  details (JwtDecodeErr jde) = case jde of
++    KeyError dets     -> Just $ JSON.String dets
++    BadAlgorithm dets -> Just $ JSON.String dets
++    _                 -> Nothing
+   details _ = Nothing
+ 
+   hint _    = Nothing

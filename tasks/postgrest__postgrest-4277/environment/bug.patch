@@ -1,0 +1,136 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e4686349..3f62b756 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,8 +9,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ - Fix OpenAPI broken docs link by @taimoorzaeem in #4048
+ - Fix OpenAPI specification incorrectly exposing GET methods for volatile functions by @joelonsql in #4174
+-- Fix empty spread embeddings return unexpected SQL error by @taimoorzaeem in #3887
+-- Fix `/metrics` endpoint not responding with `Content-Type` header by @taimoorzaeem in #4271
+ 
+ ## [13.0.4] - 2025-06-17
+ 
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index 01d0176f..871e5d1b 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -128,11 +128,6 @@ The ``metrics`` endpoint on the :ref:`admin_server` endpoint provides metrics in
+ 
+   curl "http://localhost:3001/metrics"
+ 
+-.. code-block:: http
+-
+-  HTTP/1.1 200 OK
+-  Content-Type: text/plain; charset=utf-8
+-
+   # HELP pgrst_schema_cache_query_time_seconds The query time in seconds of the last schema cache load
+   # TYPE pgrst_schema_cache_query_time_seconds gauge
+   pgrst_schema_cache_query_time_seconds 1.5937927e-2
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index d0486984..c9fb8c5f 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -16,7 +16,6 @@ import Network.Socket.ByteString
+ 
+ import PostgREST.AppState    (AppState)
+ import PostgREST.Config      (AppConfig (..))
+-import PostgREST.MediaType   (MediaType (..), toContentType)
+ import PostgREST.Metrics     (metricsToText)
+ import PostgREST.Network     (resolveHost)
+ import PostgREST.Observation (Observation (..))
+@@ -59,7 +58,7 @@ admin appState req respond  = do
+       respond $ Wai.responseLBS HTTP.status200 [] (maybe mempty JSON.encode sCache)
+     ["metrics"] -> do
+       mets <- metricsToText
+-      respond $ Wai.responseLBS HTTP.status200 [toContentType MTTextPlain] mets -- Content-Type is required for prometheus compliance
++      respond $ Wai.responseLBS HTTP.status200 [] mets
+     _ ->
+       respond $ Wai.responseLBS HTTP.status404 [] mempty
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 2220180c..5a65f56a 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -70,21 +70,21 @@ readPlanToQuery node@(Node ReadPlan{select,from=mainQi,fromAlias,where_=logicFor
+ 
+ getJoinSelects :: ReadPlanTree -> [SQL.Snippet]
+ getJoinSelects (Node ReadPlan{relSelect} _) =
+-  join $ map relSelectToSnippet relSelect
++  mapMaybe relSelectToSnippet relSelect
+   where
+-    relSelectToSnippet :: RelSelectField -> [SQL.Snippet]
++    relSelectToSnippet :: RelSelectField -> Maybe SQL.Snippet
+     relSelectToSnippet fld =
+       let aggAlias = pgFmtIdent $ rsAggAlias fld
+       in
+         case fld of
+           JsonEmbed{rsEmptyEmbed = True} ->
+-            []
++            Nothing
+           JsonEmbed{rsSelName, rsEmbedMode = JsonObject} ->
+-            ["row_to_json(" <> aggAlias <> ".*)::jsonb AS " <> pgFmtIdent rsSelName]
++            Just $ "row_to_json(" <> aggAlias <> ".*)::jsonb AS " <> pgFmtIdent rsSelName
+           JsonEmbed{rsSelName, rsEmbedMode = JsonArray} ->
+-            ["COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> pgFmtIdent rsSelName]
++            Just $ "COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> pgFmtIdent rsSelName
+           Spread{rsSpreadSel, rsAggAlias} ->
+-            pgFmtSpreadSelectItem rsAggAlias <$> rsSpreadSel
++            Just $ intercalateSnippet ", " (pgFmtSpreadSelectItem rsAggAlias <$> rsSpreadSel)
+ 
+ getJoins :: ReadPlanTree -> [SQL.Snippet]
+ getJoins (Node _ []) = []
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index ad933fa4..29a74d28 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1723,7 +1723,6 @@ def test_admin_metrics(defaultenv):
+     with run(env=defaultenv, port=freeport()) as postgrest:
+         response = postgrest.admin.get("/metrics")
+         assert response.status_code == 200
+-        assert response.headers["Content-Type"] == "text/plain; charset=utf-8"
+         assert "pgrst_schema_cache_query_time_seconds" in response.text
+         assert 'pgrst_schema_cache_loads_total{status="SUCCESS"}' in response.text
+         assert "pgrst_db_pool_max" in response.text
+diff --git a/test/spec/Feature/Query/SpreadQueriesSpec.hs b/test/spec/Feature/Query/SpreadQueriesSpec.hs
+index cfaa7f4c..e584ae1b 100644
+--- a/test/spec/Feature/Query/SpreadQueriesSpec.hs
++++ b/test/spec/Feature/Query/SpreadQueriesSpec.hs
+@@ -600,37 +600,3 @@ spec =
+           { matchStatus  = 200
+           , matchHeaders = [matchContentTypeJson]
+           }
+-
+-    context "empty spreads embeds" $
+-      it "should work return the same as empty embeddings" $ do
+-        get "/actors?select=*,...films()"
+-          `shouldRespondWith`
+-          [json| [{"id":1,"name":"john"}, {"id":2,"name":"mary"}] |]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+-        get "/grandchild_entities?select=name,...child_entities(parent_name:name,...entities())"
+-          `shouldRespondWith`
+-          [json|
+-            [{"name":"grandchild entity 1","parent_name":"child entity 1"},
+-             {"name":"grandchild entity 2","parent_name":"child entity 1"},
+-             {"name":"grandchild entity 3","parent_name":"child entity 2"},
+-             {"name":"(grandchild,entity,4)","parent_name":"child entity 2"},
+-             {"name":"(grandchild,entity,5)","parent_name":"child entity 2"}]
+-          |]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+-        get "/factories?select=factory:name,...processes()"
+-          `shouldRespondWith`
+-          [json|
+-            [{"factory":"Factory A"},
+-             {"factory":"Factory B"},
+-             {"factory":"Factory C"},
+-             {"factory":"Factory D"}]
+-          |]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }

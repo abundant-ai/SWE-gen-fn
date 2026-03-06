@@ -1,0 +1,138 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d276c3f0..502d668b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Fixed
++
++- #3956, Fix exposing admin server `/config` by default - @steve-chavez
++  + The above endpoint is now disabled unless the `admin-server-config-enabled` config is set to `true`
++
+ ## [12.2.11] - 2025-04-21
+ 
+ ### Fixed
+diff --git a/docs/references/admin_server.rst b/docs/references/admin_server.rst
+index 09faecc2..bfaeb715 100644
+--- a/docs/references/admin_server.rst
++++ b/docs/references/admin_server.rst
+@@ -55,10 +55,12 @@ Metrics
+ 
+ Provides :ref:`metrics`.
+ 
++.. _runtime_config:
++
+ Runtime Configuration
+ =====================
+ 
+-Provides a ``config`` endpoint that returns the runtime :ref:`configuration`.
++Provides a ``config`` endpoint that returns the runtime :ref:`configuration`. This requires setting :ref:`admin-server-config-enabled`.
+ 
+ .. code-block:: bash
+ 
+@@ -72,6 +74,8 @@ Provides a ``config`` endpoint that returns the runtime :ref:`configuration`.
+   db-channel-enabled = false
+   ...
+ 
++.. _runtime_schema_cache:
++
+ Runtime Schema Cache
+ ====================
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 8b02d3e1..21058407 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -161,6 +161,30 @@ admin-server-port
+ 
+   Specifies the port for the :ref:`admin_server`.
+ 
++.. _admin-server-config-enabled:
++
++admin-server-config-enabled
++---------------------------
++
++  .. danger::
++
++    The ``/config`` endpoint contains sensitive information, don't enable this if you're exposing the Admin Server publicly.
++
++    To safely enable this you can use a proxy like :ref:`nginx` to:
++
++    - Ensure ``/config`` are only available to local networks.
++    - Only expose ``/live`` and ``/ready`` to public networks.
++
++  =============== =================================
++  **Type**        Boolean
++  **Default**     False
++  **Reloadable**  N
++  **Environment** PGRST_ADMIN_SERVER_CONFIG_ENABLED
++  **In-Database** `n/a`
++  =============== =================================
++
++  Enables the admin server :ref:`runtime_config` and :ref:`runtime_schema_cache` endpoints.
++
+ .. _app.settings.*:
+ 
+ app.settings.*
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 325e95c0..1d2360e4 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -56,8 +56,11 @@ admin appState req respond  = do
+       in
+       respond $ Wai.responseLBS status [] mempty
+     ["config"] -> do
+-      config <- AppState.getConfig appState
+-      respond $ Wai.responseLBS HTTP.status200 [] (LBS.fromStrict $ encodeUtf8 $ Config.toText config)
++      config@Config.AppConfig{configAdminServerConfigEnabled} <- AppState.getConfig appState
++      if configAdminServerConfigEnabled then
++        respond $ Wai.responseLBS HTTP.status200 [] (LBS.fromStrict $ encodeUtf8 $ Config.toText config)
++      else
++        respond $ Wai.responseLBS HTTP.status404 [] mempty
+     ["schema_cache"] -> do
+       sCache <- AppState.getSchemaCache appState
+       respond $ Wai.responseLBS HTTP.status200 [] (maybe mempty JSON.encode sCache)
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 0ba71144..e8e50bcd 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -128,6 +128,9 @@ exampleConfigFile =
+   [str|## Admin server used for checks. It's disabled by default unless a port is specified.
+       |# admin-server-port = 3001
+       |
++      |## Whether to enable the /config endpoint of the admin server
++      |# admin-server-config-enabled = false
++      |
+       |## The database role to use when no client authentication is provided
+       |# db-anon-role = "anon"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 4a885c7f..02e5591c 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -110,6 +110,7 @@ data AppConfig = AppConfig
+   , configServerUnixSocket         :: Maybe FilePath
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
++  , configAdminServerConfigEnabled :: Bool
+   , configRoleSettings             :: RoleSettings
+   , configRoleIsoLvl               :: RoleIsolationLvl
+   , configInternalSCSleep          :: Maybe Int32
+@@ -180,6 +181,7 @@ toText conf =
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
+       ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
++      ,("admin-server-config-enabled",             T.toLower . show . configAdminServerConfigEnabled)
+       ]
+ 
+     -- quote all app.settings
+@@ -286,6 +288,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
++    <*> (fromMaybe False <$> optBool "admin-server-config-enabled")
+     <*> pure roleSettings
+     <*> pure roleIsolationLvl
+     <*> optInt "internal-schema-cache-sleep"

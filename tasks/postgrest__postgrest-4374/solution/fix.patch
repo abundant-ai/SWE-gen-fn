@@ -1,0 +1,166 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 58943a93..d8581c3c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,14 +14,14 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Added
+ 
+ - Bounded JWT cache using the SIEVE algorithm by @mkleczek in #4084
++  + It now uses a fixed size cache instead of arbitrary sized cache.
+ - Add `--ready` flag for postgrest healthcheck by @taimoorzaeem in #4239
+ 
+ ### Changed
+ 
+ - Drop support for PostgreSQL EOL version 12 by @wolfgangwalther in #3865
+-- Bounded JWT cache using the SIEVE algorithm by @mkleczek in #4084
+-  + Replaces `jwt-cache-max-lifetime` config with `jwt-cache-max-entries`.
+-  + It now uses a fixed size cache instead of arbitrary sized cache.
++- Replaced `jwt-cache-max-lifetime` config with `jwt-cache-max-entries` by @mkleczek in #4084
++- `log-query` config now takes a boolean instead of a string value by @steve-chavez in #3934
+ 
+ ## [13.0.7] - 2025-09-14
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index fbdcfb9a..c3b563f1 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -714,23 +714,14 @@ log-query
+ ---------
+ 
+   =============== =================================
+-  **Type**        String
+-  **Default**     "disabled"
++  **Type**        Boolean
++  **Default**     False
+   **Reloadable**  Y
+   **Environment** PGRST_LOG_QUERY
+   **In-Database** `n/a`
+   =============== =================================
+ 
+-  Logs the SQL query for the corresponding request at the current :ref:`log-level`.
+-  See :ref:`sql_query_logs`.
+-
+-    .. code:: bash
+-
+-        # Logs the main SQL query
+-        log-query = "main-query"
+-
+-        # Disables logging the SQL query
+-        log-query = "disabled"
++  Logs the SQL query for the corresponding request at the current :ref:`log-level`. See :ref:`sql_query_logs`.
+ 
+ .. _openapi-mode:
+ 
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index f73890b8..fbc333bd 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -52,14 +52,12 @@ For diagnostic information about the server itself, PostgREST logs to ``stderr``
+ SQL Query Logs
+ --------------
+ 
+-To log the :ref:`main SQL query <main_query>` executed for a request, set the :ref:`log-query` to ``main-query``.
+-It will be logged based on the current :ref:`log-level` setting.
+-For example, with this configuration:
++To log the SQL queries executed for a request, set the :ref:`log-query` to ``true``. It will be logged based on the current :ref:`log-level` setting.
+ 
+ .. code-block:: bash
+ 
+   log-level = "warn"
+-  log-query = "main-query"
++  log-query = "true"
+ 
+ The SQL queries will only be logged on ``400`` HTTP errors and up.
+ So, if the user requests a resource without sufficient privileges:
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index e6d6fd03..c62a2408 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -44,8 +44,7 @@ import qualified PostgREST.Unix       as Unix (installSignalHandlers)
+ import PostgREST.ApiRequest           (ApiRequest (..))
+ import PostgREST.AppState             (AppState)
+ import PostgREST.Auth.Types           (AuthResult (..))
+-import PostgREST.Config               (AppConfig (..), LogLevel (..),
+-                                       LogQuery (..))
++import PostgREST.Config               (AppConfig (..), LogLevel (..))
+ import PostgREST.Error                (Error)
+ import PostgREST.Network              (resolveSocketToAddress)
+ import PostgREST.Observation          (Observation (..))
+@@ -146,7 +145,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthRe
+   let mainQ = Query.mainQuery plan conf apiReq authResult configDbPreRequest
+       tx = MainTx.mainTx mainQ conf authResult apiReq plan sCache
+       observer = AppState.getObserver appState
+-      obsQuery s = when (configLogQuery /= LogQueryDisabled) $ observer $ QueryObs mainQ s
++      obsQuery s = when configLogQuery $ observer $ QueryObs mainQ s
+ 
+   (txTime, txResult) <- withTiming $ do
+     case tx of
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 3f6ea6d3..c316812e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -17,7 +17,6 @@ module PostgREST.Config
+   , JSPathExp(..)
+   , FilterExp(..)
+   , LogLevel(..)
+-  , LogQuery(..)
+   , OpenAPIMode(..)
+   , Proxy(..)
+   , toText
+@@ -99,7 +98,7 @@ data AppConfig = AppConfig
+   , configJwtSecretIsBase64        :: Bool
+   , configJwtCacheMaxEntries       :: Int
+   , configLogLevel                 :: LogLevel
+-  , configLogQuery                 :: LogQuery
++  , configLogQuery                 :: Bool
+   , configOpenApiMode              :: OpenAPIMode
+   , configOpenApiSecurityActive    :: Bool
+   , configOpenApiServerProxyUri    :: Maybe Text
+@@ -128,14 +127,6 @@ dumpLogLevel = \case
+   LogInfo  -> "info"
+   LogDebug -> "debug"
+ 
+-data LogQuery = LogQueryMain | LogQueryDisabled
+-  deriving (Eq)
+-
+-dumpLogQuery :: LogQuery -> Text
+-dumpLogQuery = \case
+-  LogQueryMain     -> "main-query"
+-  LogQueryDisabled -> "disabled"
+-
+ data OpenAPIMode = OAFollowPriv | OAIgnorePriv | OADisabled
+   deriving Eq
+ 
+@@ -179,7 +170,7 @@ toText conf =
+       ,("jwt-secret-is-base64",          T.toLower . show . configJwtSecretIsBase64)
+       ,("jwt-cache-max-entries",         show . configJwtCacheMaxEntries)
+       ,("log-level",                 q . dumpLogLevel . configLogLevel)
+-      ,("log-query",                 q . dumpLogQuery . configLogQuery)
++      ,("log-query",                     T.toLower . show . configLogQuery)
+       ,("openapi-mode",              q . dumpOpenApiMode . configOpenApiMode)
+       ,("openapi-security-active",       T.toLower . show . configOpenApiSecurityActive)
+       ,("openapi-server-proxy-uri",  q . fromMaybe mempty . configOpenApiServerProxyUri)
+@@ -289,7 +280,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+           (optBool "secret-is-base64"))
+     <*> (fromMaybe 1000 <$> optInt "jwt-cache-max-entries")
+     <*> parseLogLevel "log-level"
+-    <*> parseLogQuery "log-query"
++    <*> (fromMaybe False <$> optBool "log-query")
+     <*> parseOpenAPIMode "openapi-mode"
+     <*> (fromMaybe False <$> optBool "openapi-security-active")
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+@@ -365,14 +356,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+         Just "debug" -> pure LogDebug
+         Just _       -> fail "Invalid logging level. Check your configuration."
+ 
+-    parseLogQuery :: C.Key -> C.Parser C.Config LogQuery
+-    parseLogQuery k =
+-      optString k >>= \case
+-        Nothing           -> pure  LogQueryDisabled
+-        Just "disabled"   -> pure  LogQueryDisabled
+-        Just "main-query" -> pure  LogQueryMain
+-        Just _            -> fail "Invalid SQL logging value. Check your configuration."
+-
+     parseTxEnd :: C.Key -> ((Bool, Bool) -> Bool) -> C.Parser C.Config Bool
+     parseTxEnd k f =
+       optString k >>= \case

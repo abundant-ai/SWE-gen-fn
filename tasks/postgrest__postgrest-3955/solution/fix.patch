@@ -1,0 +1,104 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0a336cb..28425938 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3041, Allow spreading one-to-many and many-to-many embedded resources - @laurenceisla
+    + The selected columns in the embedded resources are aggregated into arrays
+    + Aggregates are not supported
++ - #2967, Add `Proxy-Status` header for better error response - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 045684f0..780aa4ad 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -5,6 +5,8 @@ Errors
+ 
+ PostgREST error messages follow the PostgreSQL error structure. It includes ``MESSAGE``, ``DETAIL``, ``HINT``, ``ERRCODE`` and will add an HTTP status code to the response.
+ 
++.. _postgresql_errors:
++
+ Errors from PostgreSQL
+ ======================
+ 
+@@ -348,6 +350,8 @@ Internal errors. If you encounter any of these, you may have stumbled on a Postg
+ | PGRSTX00      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+ 
++.. _custom_errors:
++
+ Custom Errors
+ =============
+ 
+@@ -444,3 +448,24 @@ For non standard HTTP status, you can optionally add ``status_text`` to describe
+   detail = '{"status":419,"status_text":"Page Expired","headers":{"X-Powered-By":"Nerd Rage"}}';
+ 
+ If PostgREST can't parse the JSON objects ``message`` and ``detail``, it will throw a ``PGRST121`` error. See :ref:`Errors from PostgREST<pgrst1**>`.
++
++.. _proxy-status_header:
++
++Proxy-Status Header
++===================
++
++For error cases, the standard `Proxy-Status <https://www.rfc-editor.org/rfc/rfc9209.html#name-the-proxy-status-http-field>`_ header is returned with the error code. The error code comes from either :ref:`PostgREST <pgrst_errors>`, :ref:`PostgreSQL <postgresql_errors>` or :ref:`Custom <custom_errors>` errors. This is useful when doing ``HEAD`` requests where the HTTP status is not descriptive enough.
++
++For example, doing a request on a table with high count (say 30_000_000), we get:
++
++.. code-block:: http
++
++  HEAD /table HTTP/1.1
++  Prefer: count=exact
++
++.. code-block:: http
++
++  HTTP/1.1 500 Internal Server Error
++  Proxy-Status: PostgREST; error=57014
++
++The PostgreSQL error code ``57014`` (`ref <https://www.postgresql.org/docs/current/errcodes-appendix.html>`_) reveals that the error is due to a short ``statement_timeout`` value.
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index 37abc8c3..2ace309b 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -236,6 +236,11 @@ You can enable tracing HTTP requests by setting :ref:`server-trace-header`. Spec
+   HTTP/1.1 200 OK
+   X-Request-Id: 123
+ 
++Proxy-Status Header
++-------------------
++
++See :ref:`proxy-status_header`.
++
+ .. _server-timing_header:
+ 
+ Server-Timing Header
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index a6f99843..e269d157 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -478,6 +478,9 @@ instance PgrstError PgError where
+        then [("WWW-Authenticate", "Bearer") :: Header]
+        else mempty
+ 
++proxyStatusHeader :: Text -> Header
++proxyStatusHeader code' = ("Proxy-Status", "PostgREST; error=" <> T.encodeUtf8 code')
++
+ instance JSON.ToJSON PgError where
+   toJSON (PgError _ usageError) = toJsonPgrstError
+     (code usageError) (message usageError) (details usageError) (hint usageError)
+@@ -625,10 +628,10 @@ instance PgrstError Error where
+   status NoSchemaCacheError    = HTTP.status503
+   status (PgErr err)           = status err
+ 
+-  headers (ApiRequestError err) = headers err
+-  headers (JwtErr err)          = headers err
+-  headers (PgErr err)           = headers err
+-  headers _                     = mempty
++  headers (ApiRequestError err)  = proxyStatusHeader (code err) : headers err
++  headers (JwtErr err)           = proxyStatusHeader (code err) : headers err
++  headers (PgErr err)            = proxyStatusHeader (code err) : headers err
++  headers err@NoSchemaCacheError = proxyStatusHeader (code err) : mempty
+ 
+ instance JSON.ToJSON Error where
+   toJSON err = toJsonPgrstError

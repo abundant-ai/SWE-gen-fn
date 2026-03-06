@@ -1,0 +1,94 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b4659f5a..2ef5c4e5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ - Fix not logging explain query when `log-query=main-query` is enabled by @steve-chavez in #4319
+ - Fix not logging transaction variables and db-pre-request function when `log-query=main-query` is enabled by @steve-chavez in #3934
+ - Fix loading utf-8 config files with `ASCII` locale set in #4386
++- Fix not logging the JSON message to stderr on a `PGRST002` error by @laurenceisla in #4129
++- Fix reloading the Schema Cache unnecessarily on a `PGRST002` error by @laurenceisla in #4367
+ 
+ ### Added
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index c62a2408..5387c692 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -109,10 +109,14 @@ postgrest logLevel appState connWorker =
+             runExceptT $ postgrestResponse appState appConf maybeSchemaCache authResult req
+ 
+         response <- either Error.errorResponseFor identity <$> eitherResponse
+-        -- Launch the connWorker when the connection is down.  The postgrest
++        -- Launch the connWorker when the connection is down. The postgrest
+         -- function can respond successfully (with a stale schema cache) before
+-        -- the connWorker is done.
+-        when (isServiceUnavailable response) connWorker
++        -- the connWorker is done. However, when there's an empty schema cache
++        -- postgrest responds with the error `PGRST002`; this means that the schema
++        -- cache is still loading, so we don't launch the connWorker here because
++        -- it would duplicate the loading process, e.g. https://github.com/PostgREST/postgrest/issues/3704
++        -- TODO: this process may be unnecessary when the Listener is enabled. Revisit once https://github.com/PostgREST/postgrest/issues/1766 is done
++        when (isServiceUnavailable response && isJust maybeSchemaCache) connWorker
+         resp <- do
+           delay <- AppState.getNextDelay appState
+           return $ addRetryHint delay response
+@@ -126,11 +130,14 @@ postgrestResponse
+   -> Wai.Request
+   -> Handler IO Wai.Response
+ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthResult{..} req = do
++  let observer = AppState.getObserver appState
++
+   sCache <-
+     case maybeSchemaCache of
+       Just sCache ->
+         return sCache
+-      Nothing ->
++      Nothing -> do
++        lift $ observer SchemaCacheEmptyObs
+         throwError Error.NoSchemaCacheError
+ 
+   body <- lift $ Wai.strictRequestBody req
+@@ -144,7 +151,6 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthRe
+ 
+   let mainQ = Query.mainQuery plan conf apiReq authResult configDbPreRequest
+       tx = MainTx.mainTx mainQ conf authResult apiReq plan sCache
+-      observer = AppState.getObserver appState
+       obsQuery s = when configLogQuery $ observer $ QueryObs mainQ s
+ 
+   (txTime, txResult) <- withTiming $ do
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index 93d44129..8f615098 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -95,6 +95,9 @@ observationLogger loggerState logLevel obs = case obs of
+   o@(QueryErrorCodeHighObs _) -> do
+     when (logLevel >= LogError) $ do
+       logWithZTime loggerState $ observationMessage o
++  o@SchemaCacheEmptyObs ->
++    when (logLevel >= LogError) $ do
++    logWithZTime loggerState $ observationMessage o
+   o@(HasqlPoolObs _) -> do
+     when (logLevel >= LogDebug) $ do
+       logWithZTime loggerState $ observationMessage o
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 34b11b5e..42a16c77 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -37,6 +37,7 @@ data Observation
+   | ExitDBNoRecoveryObs
+   | ExitDBFatalError ObsFatalError SQL.UsageError
+   | DBConnectedObs Text
++  | SchemaCacheEmptyObs
+   | SchemaCacheErrorObs (NonEmpty Text) [Text] SQL.UsageError
+   | SchemaCacheQueriedObs Double
+   | SchemaCacheSummaryObs Text
+@@ -88,6 +89,8 @@ observationMessage = \case
+     "If you are using connection poolers in transaction mode, try setting db-prepared-statements to false. " <> jsonMessage usageErr
+   ExitDBFatalError ServerError08P01 usageErr ->
+     "Connection poolers in statement mode are not supported." <> jsonMessage usageErr
++  SchemaCacheEmptyObs ->
++    T.decodeUtf8 . LBS.toStrict . Error.errorPayload $ Error.NoSchemaCacheError
+   SchemaCacheErrorObs dbSchemas extraPaths usageErr ->
+     "Failed to load the schema cache using "
+       <> "db-schemas=" <> T.intercalate "," (toList dbSchemas)

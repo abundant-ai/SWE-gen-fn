@@ -1,0 +1,92 @@
+diff --git a/CHANGELOG.d/misc_overlapping-let.md b/CHANGELOG.d/misc_overlapping-let.md
+new file mode 100644
+index 00000000..0100fe2e
+--- /dev/null
++++ b/CHANGELOG.d/misc_overlapping-let.md
+@@ -0,0 +1 @@
++* Improve `DuplicateDeclarationsInLet` error so that it mentions what variable names were duplicated, reporting several in separate errors as necessary.
+diff --git a/src/Language/PureScript/Errors.hs b/src/Language/PureScript/Errors.hs
+index eecbfc3c..872022d0 100644
+--- a/src/Language/PureScript/Errors.hs
++++ b/src/Language/PureScript/Errors.hs
+@@ -79,7 +79,7 @@ data SimpleErrorMessage
+   | OrphanKindDeclaration (ProperName 'TypeName)
+   | OrphanRoleDeclaration (ProperName 'TypeName)
+   | RedefinedIdent Ident
+-  | OverlappingNamesInLet
++  | OverlappingNamesInLet Ident
+   | UnknownName (Qualified Name)
+   | UnknownImport ModuleName Name
+   | UnknownImportDataConstructor ModuleName (ProperName 'TypeName) (ProperName 'ConstructorName)
+@@ -258,7 +258,7 @@ errorCode em = case unwrapErrorMessage em of
+   OrphanKindDeclaration{} -> "OrphanKindDeclaration"
+   OrphanRoleDeclaration{} -> "OrphanRoleDeclaration"
+   RedefinedIdent{} -> "RedefinedIdent"
+-  OverlappingNamesInLet -> "OverlappingNamesInLet"
++  OverlappingNamesInLet{} -> "OverlappingNamesInLet"
+   UnknownName{} -> "UnknownName"
+   UnknownImport{} -> "UnknownImport"
+   UnknownImportDataConstructor{} -> "UnknownImportDataConstructor"
+@@ -731,8 +731,8 @@ prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath fileCon
+       line "The last statement in a 'do' block must be an expression, but this block ends with a binder."
+     renderSimpleErrorMessage InvalidDoLet =
+       line "The last statement in a 'do' block must be an expression, but this block ends with a let binding."
+-    renderSimpleErrorMessage OverlappingNamesInLet =
+-      line "The same name was used more than once in a let binding."
++    renderSimpleErrorMessage (OverlappingNamesInLet name) =
++      line $ "The name " <> markCode (showIdent name) <> " was defined multiple times in a binding group"
+     renderSimpleErrorMessage (InfiniteType ty) =
+       paras [ line "An infinite type was inferred for an expression: "
+             , markCodeBox $ indent $ prettyType ty
+diff --git a/src/Language/PureScript/Sugar/Names.hs b/src/Language/PureScript/Sugar/Names.hs
+index 03968af3..7c09126a 100644
+--- a/src/Language/PureScript/Sugar/Names.hs
++++ b/src/Language/PureScript/Sugar/Names.hs
+@@ -10,14 +10,15 @@ module Language.PureScript.Sugar.Names
+   ) where
+ 
+ import Prelude
+-import Protolude (ordNub, sortOn, swap, foldl')
++import Protolude (sortOn, swap, foldl')
+ 
+-import Control.Arrow (first, second)
++import Control.Arrow (first, second, (&&&))
+ import Control.Monad
+ import Control.Monad.Error.Class (MonadError(..))
+ import Control.Monad.State.Lazy
+ import Control.Monad.Writer (MonadWriter(..))
+ 
++import qualified Data.List.NonEmpty as NEL
+ import Data.Maybe (fromMaybe, mapMaybe)
+ import qualified Data.Map as M
+ import qualified Data.Set as S
+@@ -253,9 +254,15 @@ renameInModule imports (Module modSS coms mn decls exps) =
+   updateValue (pos, bound) (Abs (VarBinder ss arg) val') =
+     return ((pos, M.insert arg (spanStart ss) bound), Abs (VarBinder ss arg) val')
+   updateValue (pos, bound) (Let w ds val') = do
+-    let args = mapMaybe letBoundVariable ds
+-    unless (length (ordNub args) == length args) .
+-      throwError . errorMessage' pos $ OverlappingNamesInLet
++    let
++      args = mapMaybe letBoundVariable ds
++      groupByFst = map (\ts -> (fst (NEL.head ts), snd <$> ts)) . NEL.groupAllWith fst
++      duplicateArgsErrs = foldMap mkArgError $ groupByFst args
++      mkArgError (ident, poses)
++        | NEL.length poses < 2 = mempty
++        | otherwise = errorMessage'' (NEL.reverse poses) (OverlappingNamesInLet ident)
++    when (nonEmpty duplicateArgsErrs) $
++      throwError duplicateArgsErrs
+     return ((pos, declarationsToMap ds `M.union` bound), Let w ds val')
+   updateValue (_, bound) (Var ss name'@(Qualified qualifiedBy ident)) =
+     ((ss, bound), ) <$> case (M.lookup ident bound, qualifiedBy) of
+@@ -324,8 +331,8 @@ renameInModule imports (Module modSS coms mn decls exps) =
+     . fmap (second spanStart . swap)
+     . binderNamesWithSpans
+ 
+-  letBoundVariable :: Declaration -> Maybe Ident
+-  letBoundVariable = fmap valdeclIdent . getValueDeclaration
++  letBoundVariable :: Declaration -> Maybe (Ident, SourceSpan)
++  letBoundVariable = fmap (valdeclIdent &&& (fst . valdeclSourceAnn)) . getValueDeclaration
+ 
+   declarationsToMap :: [Declaration] -> M.Map Ident SourcePos
+   declarationsToMap = foldl goDTM M.empty

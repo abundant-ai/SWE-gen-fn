@@ -1,0 +1,222 @@
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index b760ccce..e8ec0871 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -115,9 +115,7 @@ data AppConfig = AppConfig
+   , configAdminServerPort          :: Maybe Int
+   , configRoleSettings             :: RoleSettings
+   , configRoleIsoLvl               :: RoleIsolationLvl
+-  , configInternalSCQuerySleep     :: Maybe Int32
+-  , configInternalSCLoadSleep      :: Maybe Int32
+-  , configInternalSCRelLoadSleep   :: Maybe Int32
++  , configInternalSCSleep          :: Maybe Int32
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo | LogDebug
+@@ -300,9 +298,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> parseAdminServerPort "admin-server-port"
+     <*> pure roleSettings
+     <*> pure roleIsolationLvl
+-    <*> optInt "internal-schema-cache-query-sleep"
+-    <*> optInt "internal-schema-cache-load-sleep"
+-    <*> optInt "internal-schema-cache-relationship-load-sleep"
++    <*> optInt "internal-schema-cache-sleep"
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 7f5e7aa8..cc418a1f 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -25,6 +25,8 @@ module PostgREST.SchemaCache
+   , decodeFuncs
+   ) where
+ 
++import Control.Monad.Extra (whenJust)
++
+ import           Data.Aeson                 ((.=))
+ import qualified Data.Aeson                 as JSON
+ import qualified Data.HashMap.Strict        as HM
+@@ -67,7 +69,6 @@ import PostgREST.SchemaCache.Table           (Column (..), ColumnMap,
+ import qualified PostgREST.MediaType as MediaType
+ 
+ import Protolude
+-import System.IO.Unsafe (unsafePerformIO)
+ 
+ data SchemaCache = SchemaCache
+   { dbTables          :: TablesMap
+@@ -151,16 +152,14 @@ querySchemaCache conf@AppConfig{..} = do
+   tzones  <- SQL.statement mempty $ timezones prepared
+   _       <-
+     let sleepCall = SQL.Statement "select pg_sleep($1 / 1000.0)" (param HE.int4) HD.noResult prepared in
+-    for_ configInternalSCQuerySleep (`SQL.statement` sleepCall) -- only used for testing
++    whenJust configInternalSCSleep (`SQL.statement` sleepCall) -- only used for testing
+ 
+   let tabsWViewsPks = addViewPrimaryKeys tabs keyDeps
+       rels          = addInverseRels $ addM2MRels tabsWViewsPks $ addViewM2OAndO2ORels keyDeps m2oRels
+ 
+-  -- Add delay in loading schema cache when internal-schema-cache-load-sleep config is set
+-  return $ delayEval configInternalSCLoadSleep $ removeInternal schemas $ SchemaCache {
++  return $ removeInternal schemas $ SchemaCache {
+       dbTables = tabsWViewsPks
+-    -- Add delay in loading relationships when internal-schema-cache-relationship-load-sleep config is set
+-    , dbRelationships = delayEval configInternalSCRelLoadSleep $ getOverrideRelationshipsMap rels cRels
++    , dbRelationships = getOverrideRelationshipsMap rels cRels
+     , dbRoutines = funcs
+     , dbRepresentations = reps
+     , dbMediaHandlers = HM.union mHdlers initialMediaHandlers -- the custom handlers will override the initial ones
+@@ -169,7 +168,6 @@ querySchemaCache conf@AppConfig{..} = do
+   where
+     schemas = toList configDbSchemas
+     prepared = configDbPreparedStatements
+-    delayEval confDelay result = maybe result (unsafePerformIO . (($> result) . (threadDelay . (1000 *) . fromIntegral))) confDelay
+ 
+ -- | overrides detected relationships with the computed relationships and gets the RelationshipsMap
+ getOverrideRelationshipsMap :: [Relationship] -> [Relationship] -> RelationshipsMap
+diff --git a/test/io/conftest.py b/test/io/conftest.py
+index 87880724..84707aaa 100644
+--- a/test/io/conftest.py
++++ b/test/io/conftest.py
+@@ -61,7 +61,7 @@ def slow_schema_cache_env(defaultenv):
+     "Slow schema cache load environment PostgREST."
+     return {
+         **defaultenv,
+-        "PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP": "1000",  # this does a pg_sleep internally, it will cause the schema cache query to be slow
++        "PGRST_INTERNAL_SCHEMA_CACHE_SLEEP": "1000",  # this does a pg_sleep internally, it will cause the schema cache query to be slow
+         # the slow schema cache query will keep using one pool connection until it finishes
+         # to prevent requests waiting for PGRST_DB_POOL_ACQUISITION_TIMEOUT we'll increase the pool size (must be >= 2)
+         "PGRST_DB_POOL": "2",
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index deabace2..90905769 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -2,6 +2,7 @@
+ 
+ import pytest
+ 
++from util import parse_server_timings_header
+ from postgrest import run
+ 
+ 
+@@ -13,7 +14,7 @@ def test_requests_with_resource_embedding_wait_for_schema_cache_reload(defaulten
+         "PGRST_DB_SCHEMAS": "apflora",
+         "PGRST_DB_POOL": "2",
+         "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-        "PGRST_INTERNAL_SCHEMA_CACHE_RELATIONSHIP_LOAD_SLEEP": "5100",
++        "PGRST_SERVER_TIMING_ENABLED": "true",
+     }
+ 
+     with run(env=env, wait_max_seconds=30) as postgrest:
+@@ -26,7 +27,10 @@ def test_requests_with_resource_embedding_wait_for_schema_cache_reload(defaulten
+         response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+         assert response.status_code == 200
+ 
+-        assert response.elapsed.total_seconds() > 5
++        plan_dur = parse_server_timings_header(response.headers["Server-Timing"])[
++            "plan"
++        ]
++        assert plan_dur > 10000.0
+ 
+ 
+ def test_requests_without_resource_embedding_wait_for_schema_cache_reload(defaultenv):
+@@ -37,8 +41,7 @@ def test_requests_without_resource_embedding_wait_for_schema_cache_reload(defaul
+         "PGRST_DB_SCHEMAS": "apflora",
+         "PGRST_DB_POOL": "2",
+         "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-        "PGRST_INTERNAL_SCHEMA_CACHE_LOAD_SLEEP": "1100",
+-        "PGRST_INTERNAL_SCHEMA_CACHE_RELATIONSHIP_LOAD_SLEEP": "5000",
++        "PGRST_SERVER_TIMING_ENABLED": "true",
+     }
+ 
+     with run(env=env, wait_max_seconds=30) as postgrest:
+@@ -51,10 +54,10 @@ def test_requests_without_resource_embedding_wait_for_schema_cache_reload(defaul
+         response = postgrest.session.get("/tpopmassn")
+         assert response.status_code == 200
+ 
+-        assert (
+-            response.elapsed.total_seconds() > 1
+-            and response.elapsed.total_seconds() < 5
+-        )
++        plan_dur = parse_server_timings_header(response.headers["Server-Timing"])[
++            "plan"
++        ]
++        assert plan_dur < 10000.0
+ 
+ 
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122
+diff --git a/test/io/test_cli.py b/test/io/test_cli.py
+index 0f46e4c0..6d9067aa 100644
+--- a/test/io/test_cli.py
++++ b/test/io/test_cli.py
+@@ -312,13 +312,13 @@ def test_cli_ready_flag_fail_when_schema_cache_not_loaded(defaultenv, metapostgr
+         **defaultenv,
+         "PGUSER": role,
+         "PGRST_DB_ANON_ROLE": role,
+-        "PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP": "500",
++        "PGRST_INTERNAL_SCHEMA_CACHE_SLEEP": "500",
+     }
+ 
+     port = freeport()
+ 
+     with run(env=env, port=port) as postgrest:
+-        # The schema cache query takes at least 500ms, due to PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP above.
++        # The schema cache query takes at least 500ms, due to PGRST_INTERNAL_SCHEMA_CACHE_SLEEP above.
+         # Make it impossible to load the schema cache, by setting statement timeout to 400ms.
+         set_statement_timeout(metapostgrest, role, 400)
+ 
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 5f95d3c4..e1275cbd 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -825,11 +825,11 @@ def test_admin_ready_includes_schema_cache_state(defaultenv, metapostgrest):
+         **defaultenv,
+         "PGUSER": role,
+         "PGRST_DB_ANON_ROLE": role,
+-        "PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP": "500",
++        "PGRST_INTERNAL_SCHEMA_CACHE_SLEEP": "500",
+     }
+ 
+     with run(env=env) as postgrest:
+-        # The schema cache query takes at least 500ms, due to PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP above.
++        # The schema cache query takes at least 500ms, due to PGRST_INTERNAL_SCHEMA_CACHE_SLEEP above.
+         # Make it impossible to load the schema cache, by setting statement timeout to 400ms.
+         set_statement_timeout(metapostgrest, role, 400)
+ 
+@@ -855,11 +855,11 @@ def test_metrics_include_schema_cache_fails(defaultenv, metapostgrest):
+     env = {
+         **defaultenv,
+         "PGUSER": role,
+-        "PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP": "50",
++        "PGRST_INTERNAL_SCHEMA_CACHE_SLEEP": "50",
+     }
+ 
+     with run(env=env) as postgrest:
+-        # The schema cache query takes at least 20ms, due to PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP above.
++        # The schema cache query takes at least 20ms, due to PGRST_INTERNAL_SCHEMA_CACHE_SLEEP above.
+         # Make it impossible to load the schema cache, by setting statement timeout to 100ms.
+         set_statement_timeout(metapostgrest, role, 20)
+ 
+@@ -1320,7 +1320,7 @@ def test_schema_cache_concurrent_notifications(slow_schema_cache_env):
+     "schema cache should be up-to-date whenever a notification is sent while another reload is in progress, see https://github.com/PostgREST/postgrest/issues/2791"
+ 
+     internal_sleep = (
+-        int(slow_schema_cache_env["PGRST_INTERNAL_SCHEMA_CACHE_QUERY_SLEEP"]) / 1000
++        int(slow_schema_cache_env["PGRST_INTERNAL_SCHEMA_CACHE_SLEEP"]) / 1000
+     )
+ 
+     with run(env=slow_schema_cache_env, wait_for_readiness=False) as postgrest:
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 3c48a113..f2299975 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -157,9 +157,7 @@ baseCfg = let secret = encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configAdminServerPort           = Nothing
+   , configRoleSettings              = mempty
+   , configRoleIsoLvl                = mempty
+-  , configInternalSCQuerySleep      = Nothing
+-  , configInternalSCLoadSleep       = Nothing
+-  , configInternalSCRelLoadSleep    = Nothing
++  , configInternalSCSleep           = Nothing
+   , configServerTimingEnabled       = True
+   }
+ 

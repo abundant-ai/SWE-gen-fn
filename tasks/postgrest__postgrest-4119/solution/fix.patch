@@ -1,0 +1,117 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4ec64911..b138a98e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+   + The exposed schemas are now listed in the `hint` instead of the `message` field.
+ - Improve error details of `PGRST301` error by @taimoorzaeem in #4051
+ 
++### Fixed
++
++- Fix `max-affected` preference not failing with RPC when `handling=strict` by @taimoorzaeem in #4100
++
+ ## [13.0.2] - 2025-06-02
+ 
+ ### Fixed
+diff --git a/docs/references/api/preferences.rst b/docs/references/api/preferences.rst
+index 398a49aa..96dd4f48 100644
+--- a/docs/references/api/preferences.rst
++++ b/docs/references/api/preferences.rst
+@@ -292,3 +292,7 @@ With :ref:`RPC <functions>`, the preference is honored completely on the basis o
+       "details": "The query affects 14 rows",
+       "hint": null
+   }
++
++.. note::
++
++  It is important for functions to return ``SETOF`` or ``TABLE`` when called with ``max-affected`` preference. A violation of this would cause a :ref:`PGRST128 <pgrst128>` error.
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 780aa4ad..0ae8dd2b 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -267,6 +267,10 @@ Related to the HTTP request elements.
+ |               |             | implemented.                                                |
+ | PGRST127      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
++| .. _pgrst128: | 400         | ``max-affected`` preference is violated with ``RPC`` call.  |
++|               |             | See :ref:`prefer_max_affected`.                             |
++| PGRST128      |             |                                                             |
+++---------------+-------------+-------------------------------------------------------------+
+ 
+ 
+ .. _pgrst2**:
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 06f49617..39217610 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -98,6 +98,7 @@ data ApiRequestError
+   | MaxAffectedViolationError Integer
+   | InvalidResourcePath
+   | OpenAPIDisabled
++  | MaxAffectedRpcViolation
+   deriving Show
+ 
+ data QPError = QPError Text Text
+@@ -140,6 +141,7 @@ instance PgrstError ApiRequestError where
+   status MaxAffectedViolationError{} = HTTP.status400
+   status InvalidResourcePath         = HTTP.status404
+   status OpenAPIDisabled             = HTTP.status404
++  status MaxAffectedRpcViolation     = HTTP.status400
+ 
+   headers _ = mempty
+ 
+@@ -186,6 +188,7 @@ instance ErrorBody ApiRequestError where
+   code InvalidResourcePath         = "PGRST125"
+   code OpenAPIDisabled             = "PGRST126"
+   code NotImplemented{}            = "PGRST127"
++  code MaxAffectedRpcViolation     = "PGRST128"
+ 
+   -- MESSAGE: Text
+   message (QueryParamError (QPError msg _)) = msg
+@@ -211,6 +214,7 @@ instance ErrorBody ApiRequestError where
+   message InvalidResourcePath            = "Invalid path specified in request URL"
+   message OpenAPIDisabled                = "Root endpoint metadata is disabled"
+   message (NotImplemented _)             = "Feature not implemented"
++  message MaxAffectedRpcViolation        = "Function must return SETOF or TABLE when max-affected preference is used with handling=strict"
+ 
+   -- DETAILS: Maybe JSON.Value
+   details (QueryParamError (QPError _ dets)) = Just $ JSON.String dets
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index fea81c2b..a5cb2519 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -72,7 +72,8 @@ import PostgREST.SchemaCache.Routine         (MediaHandler (..),
+                                               RoutineParam (..),
+                                               funcReturnsCompositeAlias,
+                                               funcReturnsScalar,
+-                                              funcReturnsSetOfScalar)
++                                              funcReturnsSetOfScalar,
++                                              funcReturnsSingle)
+ import PostgREST.SchemaCache.Table           (Column (..), Table (..),
+                                               TablesMap,
+                                               tableColumnsList,
+@@ -172,7 +173,7 @@ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..}
+   return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation qi
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+-callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs},..} invMethod = do
++callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs, preferMaxAffected},..} invMethod = do
+   let paramKeys = case invMethod of
+         InvRead _ -> S.fromList $ fst <$> qsParams'
+         Inv       -> iColumns
+@@ -192,10 +193,15 @@ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferenc
+       cPlan = callPlan proc apiRequest paramKeys args rPlan
+   (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest relIdentifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
++  failMaxAffectedRpcReturnsSingle (preferMaxAffected, preferHandling) proc
+   return $ CallReadPlan rPlan cPlan txMode proc handler mediaType invMethod identifier
+   where
+     qsParams' = QueryParams.qsParams iQueryParams
+ 
++    failMaxAffectedRpcReturnsSingle :: (Maybe PreferMaxAffected, Maybe PreferHandling) -> Routine -> Either Error ()
++    failMaxAffectedRpcReturnsSingle (Just (PreferMaxAffected _), Just Strict) rout = if funcReturnsSingle rout then Left $ ApiRequestError MaxAffectedRpcViolation else Right ()
++    failMaxAffectedRpcReturnsSingle _ _ = Right ()
++
+ hasDefaultSelect :: ReadPlanTree -> Bool
+ hasDefaultSelect (Node ReadPlan{select=[CoercibleSelectField{csField=CoercibleField{cfName}}]} []) = cfName == "*"
+ hasDefaultSelect _ = False

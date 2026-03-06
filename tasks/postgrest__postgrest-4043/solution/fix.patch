@@ -1,0 +1,148 @@
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index eab4f7b3..5de9abdc 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -166,10 +166,27 @@ PostgREST honors the following `JWT claims <https://datatracker.ietf.org/doc/htm
+ - ``exp`` Expiration Time
+ - ``iat`` Issued At
+ - ``nbf`` Not Before
+-- ``aud`` Audience, see :ref:`jwt-aud`
++- ``aud`` :ref:`Audience <jwt_aud_validation>`
+ 
+ .. note::
+-  PostgREST allows for a 30-second clock skew when validating the ``exp`` and ``iat`` claims. In other words, it gives an extra 30 seconds before the token is rejected if there is a slight discrepancy in the timestamps.
++  PostgREST allows for a 30-second clock skew when validating the ``exp``, ``iat`` and ``nbf`` claims.
++  In other words, it gives an extra 30 seconds before the token is rejected if there is a slight discrepancy in the timestamps.
++
++.. _jwt_aud_validation:
++
++JWT ``aud`` Claim Validation
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++PostgREST has built-in validation of the `JWT audience claim <https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3>`_.
++It works this way:
++
++- If :ref:`jwt-aud` is not set (the default), PostgREST identifies with all audiences and allows the JWT for any ``aud`` claim.
++- If :ref:`jwt-aud` is set to a specific audience, PostgREST will check if this audience is present in the ``aud`` claim:
++
++  + If the ``aud`` value is a JSON string, it will match it to the :ref:`jwt-aud`.
++  + If the ``aud`` value is a JSON array of strings, it will search every element for a match.
++  + If the match fails or if the ``aud`` value is not a string or array of strings, then the token will be rejected with a :ref:`401 Unauthorized <pgrst303>` error.
++  + If the ``aud`` key **is not present** or if its value is ``null`` or ``[]``, PostgREST will interpret this token as allowed for all audiences and will complete the request.
+ 
+ .. _jwt_role_claim_key_extract:
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 5c179e82..560d4f22 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -599,11 +599,7 @@ jwt-aud
+   **In-Database** pgrst.jwt_aud
+   =============== =================================
+ 
+-  Specifies the `JWT audience claim <https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3>`_. If this claim is present in the client provided JWT then you must set this to the same value as in the JWT, otherwise verifying the JWT will fail.
+-
+-  .. warning::
+-
+-     Using this setting will only reject tokens with a different audience claim. Tokens **without** audience claim will still be accepted.
++    Specifies an audience for the JWT ``aud`` claim. See :ref:`jwt_aud_validation`.
+ 
+ .. _jwt-role-claim-key:
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index f06fe783..1fee6102 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -267,6 +267,7 @@ test-suite spec
+                     , hspec-wai         >= 0.10 && < 0.12
+                     , hspec-wai-json    >= 0.10 && < 0.12
+                     , http-types        >= 0.12.3 && < 0.13
++                    , jose-jwt          >= 0.9.6 && < 0.11
+                     , lens              >= 4.14 && < 5.3
+                     , lens-aeson        >= 1.0.1 && < 1.3
+                     , monad-control     >= 1.0.1 && < 1.1
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index cbcef6b5..8febebf4 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -10,6 +10,7 @@ Authentication should always be implemented in an external service.
+ In the test suite there is an example of simple login function that can be used for a
+ very simple authentication system inside the PostgreSQL database.
+ -}
++{-# LANGUAGE LambdaCase      #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Auth
+   ( getResult
+@@ -82,39 +83,44 @@ parseToken AppConfig{..} (Just tkn) time = do
+ 
+       verifyClaims :: JWT.JwtContent -> Either JwtError JSON.Value
+       verifyClaims (JWT.Jws (_, claims)) = case JSON.decodeStrict claims of
+-        Nothing                    -> Left $ JwtClaimsError "Parsing claims failed"
+-        Just (JSON.Object mclaims)
+-          | failedExpClaim mclaims -> Left $ JwtClaimsError "JWT expired"
+-          | failedNbfClaim mclaims -> Left $ JwtClaimsError "JWT not yet valid"
+-          | failedIatClaim mclaims -> Left $ JwtClaimsError "JWT issued at future"
+-          | failedAudClaim mclaims -> Left $ JwtClaimsError "JWT not in audience"
+-        Just jclaims               -> Right jclaims
++        Just jclaims@(JSON.Object mclaims) ->
++          verifyClaim mclaims "exp" isValidExpClaim "JWT expired" >>
++          verifyClaim mclaims "nbf" isValidNbfClaim "JWT not yet valid" >>
++          verifyClaim mclaims "iat" isValidIatClaim "JWT issued at future" >>
++          verifyClaim mclaims "aud" isValidAudClaim "JWT not in audience" >>
++          return jclaims
++        _ -> Left $ JwtClaimsError "Parsing claims failed"
+       -- TODO: We could enable JWE support here (encrypted tokens)
+-      verifyClaims _                = Left $ JwtDecodeError "Unsupported token type"
++      verifyClaims _ = Left $ JwtDecodeError "Unsupported token type"
++
++      verifyClaim mclaims claim func err = do
++        isValid <- maybe (Right True) func (KM.lookup claim mclaims)
++        unless isValid $ Left $ JwtClaimsError err
+ 
+       allowedSkewSeconds = 30 :: Int64
+       now = floor . nominalDiffTimeToSeconds $ utcTimeToPOSIXSeconds time
+       sciToInt = fromMaybe 0 . Sci.toBoundedInteger
+-
+-      failedExpClaim :: KM.KeyMap JSON.Value -> Bool
+-      failedExpClaim mclaims = case KM.lookup "exp" mclaims of
+-        Just (JSON.Number secs) -> now > (sciToInt secs + allowedSkewSeconds)
+-        _                       -> False
+-
+-      failedNbfClaim :: KM.KeyMap JSON.Value -> Bool
+-      failedNbfClaim mclaims = case KM.lookup "nbf" mclaims of
+-        Just (JSON.Number secs) -> now < (sciToInt secs - allowedSkewSeconds)
+-        _                       -> False
+-
+-      failedIatClaim :: KM.KeyMap JSON.Value -> Bool
+-      failedIatClaim mclaims = case KM.lookup "iat" mclaims of
+-        Just (JSON.Number secs) -> now < (sciToInt secs - allowedSkewSeconds)
+-        _                       -> False
+-
+-      failedAudClaim :: KM.KeyMap JSON.Value -> Bool
+-      failedAudClaim mclaims = case KM.lookup "aud" mclaims of
+-        Just (JSON.String str) -> maybe (const False) (/=) configJwtAudience str
+-        _                      -> False
++      allStrings = all (\case (JSON.String _) -> True; _ -> False)
++
++      isValidExpClaim :: JSON.Value -> Either JwtError Bool
++      isValidExpClaim (JSON.Number secs) = Right $ now <= (sciToInt secs + allowedSkewSeconds)
++      isValidExpClaim _ = Left $ JwtClaimsError "The JWT 'exp' claim must be a number"
++
++      isValidNbfClaim :: JSON.Value -> Either JwtError Bool
++      isValidNbfClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
++      isValidNbfClaim _ = Left $ JwtClaimsError "The JWT 'nbf' claim must be a number"
++
++      isValidIatClaim :: JSON.Value -> Either JwtError Bool
++      isValidIatClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
++      isValidIatClaim _ = Left $ JwtClaimsError "The JWT 'iat' claim must be a number"
++
++      isValidAudClaim :: JSON.Value -> Either JwtError Bool
++      isValidAudClaim JSON.Null = Right True -- {"aud": null} is valid for all audiences
++      isValidAudClaim (JSON.String str) = Right $ maybe (const True) (==) configJwtAudience str
++      isValidAudClaim (JSON.Array arr)
++        | null arr = Right True              -- {"aud": []} is valid for all audiences
++        | allStrings arr = Right $ maybe True (\a -> JSON.String a `elem` arr) configJwtAudience
++      isValidAudClaim _ = Left $ JwtClaimsError "The JWT 'aud' claim must be a string or an array of strings"
+ 
+ parseClaims :: Monad m =>
+   AppConfig -> JSON.Value -> ExceptT Error m AuthResult

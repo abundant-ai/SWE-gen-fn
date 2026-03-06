@@ -1,0 +1,274 @@
+diff --git a/hadolint.cabal b/hadolint.cabal
+index 659ef17..4e7a31b 100644
+--- a/hadolint.cabal
++++ b/hadolint.cabal
+@@ -146,7 +146,7 @@ library
+     , foldl
+     , gitrev >=1.3.1
+     , ilist
+-    , language-docker >=10.3.0 && <11
++    , language-docker >=10.1.2 && <11
+     , megaparsec >=9.0.0
+     , mtl
+     , network-uri
+@@ -183,7 +183,7 @@ executable hadolint
+       base >=4.8 && <5
+     , containers
+     , hadolint
+-    , language-docker >=10.3.0 && <11
++    , language-docker >=10.1.2 && <11
+     , megaparsec >=9.0.0
+     , optparse-applicative >=0.14.0
+     , text
+@@ -291,7 +291,7 @@ test-suite hadolint-unit-tests
+     , foldl
+     , hadolint
+     , hspec
+-    , language-docker >=10.3.0 && <11
++    , language-docker >=10.1.2 && <11
+     , megaparsec >=9.0.0
+     , split >=0.2
+     , text
+diff --git a/package.yaml b/package.yaml
+index c0adcc8..6ab578e 100644
+--- a/package.yaml
++++ b/package.yaml
+@@ -26,7 +26,7 @@ ghc-options:
+ dependencies:
+   - base >=4.8 && <5
+   - megaparsec >= 9.0.0
+-  - language-docker >=10.3.0 && <11
++  - language-docker >=10.1.2 && <11
+ default-extensions:
+   - DeriveAnyClass
+   - DeriveGeneric
+diff --git a/src/Hadolint/Rule/DL3009.hs b/src/Hadolint/Rule/DL3009.hs
+index 76bd06a..305e71c 100644
+--- a/src/Hadolint/Rule/DL3009.hs
++++ b/src/Hadolint/Rule/DL3009.hs
+@@ -1,23 +1,19 @@
+ module Hadolint.Rule.DL3009 (rule) where
+ 
+-import Hadolint.Rule
+-import Language.Docker.Syntax
+ import qualified Data.Map.Strict as Map
+-import qualified Data.Set as Set
+ import qualified Data.Text as Text
++import Hadolint.Rule
+ import qualified Hadolint.Shell as Shell
+-
++import Language.Docker.Syntax
+ 
+ data Acc
+   = Acc
+       { lastFrom :: BaseImage,
+-        dockerClean :: Bool,
+         stages :: Map.Map Text.Text Linenumber,
+         forgets :: Map.Map Linenumber BaseImage
+       }
+   | Empty
+-  deriving (Eq, Show)
+-
++  deriving (Show)
+ 
+ rule :: Rule Shell.ParsedShell
+ rule = veryCustomRule check (emptyState Empty) markFailures
+@@ -28,14 +24,9 @@ rule = veryCustomRule check (emptyState Empty) markFailures
+ 
+     check line st (From from) = st |> modify (rememberStage line from)
+     check line st (Run (RunArgs args flags))
+-      | not (foldArguments forgotToCleanup args) =
+-          if foldArguments disabledDockerClean args
+-          then st |> modify rememberDockerClean
+-          else st
+-      | hasCacheDirectory "/var/lib/apt/lists" flags = st
+-      | hasCacheDirectory "/var/lib/apt" flags
+-        && hasCacheDirectory "/var/cache/apt" flags = st
+-      | otherwise = st |> modify (rememberLine line)
++      | hasNoCacheMount flags && foldArguments forgotToCleanup args =
++          st |> modify (rememberLine line)
++      | otherwise = st
+     check _ st _ = st
+ 
+     -- Convert the final state into failures
+@@ -52,53 +43,29 @@ rule = veryCustomRule check (emptyState Empty) markFailures
+ {-# INLINEABLE rule #-}
+ 
+ rememberStage :: Linenumber -> BaseImage -> Acc -> Acc
+-rememberStage line from@BaseImage {image = Image _ als} (Acc _ _ stages o) = Acc from True (Map.insert als line stages) o
+-rememberStage line from@BaseImage {image = Image _ als} Empty = Acc from True (Map.singleton als line) Map.empty
++rememberStage line from@BaseImage {image = Image _ als} (Acc _ stages o) = Acc from (Map.insert als line stages) o
++rememberStage line from@BaseImage {image = Image _ als} Empty = Acc from (Map.singleton als line) Map.empty
+ 
+ rememberLine :: Linenumber -> Acc -> Acc
+-rememberLine line (Acc from clean stages o) = Acc from clean stages (Map.insert line from o)
+-rememberLine line Empty = Acc emptyImage True mempty (Map.singleton line emptyImage)
+-
+-rememberDockerClean :: Acc -> Acc
+-rememberDockerClean Empty = Acc emptyImage False mempty mempty
+-rememberDockerClean (Acc from _ stages forget) = Acc from False stages forget
++rememberLine line (Acc from stages o) = Acc from stages (Map.insert line from o)
++rememberLine line Empty = Acc emptyImage mempty (Map.singleton line emptyImage)
+ 
+ forgotToCleanup :: Shell.ParsedShell -> Bool
+ forgotToCleanup args
+-  | hasUpdate args && not hasCleanup = True
++  | hasUpdate && not hasCleanup = True
+   | otherwise = False
+   where
+     hasCleanup =
+       any (Shell.cmdHasArgs "rm" ["-rf", "/var/lib/apt/lists/*"]) (Shell.presentCommands args)
+ 
+-hasUpdate :: Shell.ParsedShell -> Bool
+-hasUpdate args =
+-  any (Shell.cmdHasArgs "apt-get" ["update"]) (Shell.presentCommands args)
+-
+-disabledDockerClean :: Shell.ParsedShell -> Bool
+-disabledDockerClean args
+-  | removesScript || keepsPackages = True
+-  | otherwise = False
+-  where
+-    removesScript =
+-      any
+-        (Shell.cmdHasArgs "rm" ["/etc/apt/apt.conf.d/docker-clean"])
+-        (Shell.presentCommands args)
+-    keepsPackages =
+-      any
+-        ( Shell.cmdHasArgs
+-            "echo"
+-            ["\'Binary::apt::APT::Keep-Downloaded-Packages \"true\";\'"]
+-        )
+-        (Shell.presentCommands args)
+-
+-hasCacheDirectory :: Text.Text -> RunFlags -> Bool
+-hasCacheDirectory dir RunFlags { mount } =
+-  not ( null $ Set.filter (isCacheMount dir) mount)
++    hasUpdate = any (Shell.cmdHasArgs "apt-get" ["update"]) (Shell.presentCommands args)
+ 
+-isCacheMount :: Text.Text -> RunMount -> Bool
+-isCacheMount dir (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = t}}) = dir `Text.isPrefixOf` t
+-isCacheMount _ _ = False
++hasNoCacheMount :: RunFlags -> Bool
++hasNoCacheMount RunFlags
++  { mount =
++      Just (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = p}})
++  } = Text.dropWhileEnd (=='/') p /= "/var/lib/apt/lists"
++hasNoCacheMount RunFlags {} = True
+ 
+ -- | Even though dockerfiles without a FROM are not valid, we still want to provide some feedback for this rule
+ -- so we pretend there is a base image at the start of the file if there is none
+diff --git a/src/Hadolint/Rule/DL3019.hs b/src/Hadolint/Rule/DL3019.hs
+index 8523596..a55a6e2 100644
+--- a/src/Hadolint/Rule/DL3019.hs
++++ b/src/Hadolint/Rule/DL3019.hs
+@@ -1,11 +1,10 @@
+ module Hadolint.Rule.DL3019 (rule) where
+ 
++import qualified Data.Text as Text
+ import Hadolint.Rule
+ import Hadolint.Shell (ParsedShell)
+-import Language.Docker.Syntax
+-import qualified Data.Set as Set
+-import qualified Data.Text as Text
+ import qualified Hadolint.Shell as Shell
++import Language.Docker.Syntax
+ 
+ rule :: Rule ParsedShell
+ rule = simpleRule code severity message check
+@@ -21,16 +20,11 @@ rule = simpleRule code severity message check
+ {-# INLINEABLE rule #-}
+ 
+ hasCacheMount :: RunFlags -> Bool
+-hasCacheMount RunFlags { mount } =
+-  not (null $ Set.filter isCacheMount mount)
+-
+-isCacheMount :: RunMount -> Bool
+-isCacheMount (CacheMount CacheOpts { cTarget = t })= isVarCacheApk t
+-isCacheMount _ = False
+-
+-isVarCacheApk :: TargetPath -> Bool
+-isVarCacheApk TargetPath { unTargetPath = p }
+-  = Text.dropWhileEnd (=='/') p == "/var/cache/apk"
++hasCacheMount RunFlags
++  { mount =
++      Just (CacheMount CacheOpts {cTarget = TargetPath {unTargetPath = p}})
++  } = Text.dropWhileEnd (=='/') p == "/var/cache/apk"
++hasCacheMount RunFlags {} = False
+ 
+ forgotCacheOption :: Shell.Command -> Bool
+ forgotCacheOption cmd = Shell.cmdHasArgs "apk" ["add"] cmd
+diff --git a/stack.yaml b/stack.yaml
+index ca53bee..2ae044c 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -6,7 +6,7 @@ resolver: lts-17.5
+ extra-deps:
+   - ShellCheck-0.7.1@sha256:94a6ee5a38e2668204bc95fdc7539a9a4ca7230984157694409444530c23b5a4,3170
+   - colourista-0.1.0.0
+-  - language-docker-10.3.0
++  - language-docker-10.1.2
+   - megaparsec-9.0.0@sha256:920d1e469056c746b532333a078c2a9a195fab5e860e0c9734ee92a28c2bfb65,3117
+   - spdx-1.0.0.2@sha256:7dfac9b454ff2da0abb7560f0ffbe00ae442dd5cb76e8be469f77e6988a70fed,2008
+ ghc-options:
+diff --git a/test/DL3009.hs b/test/DL3009.hs
+index 49cd3ff..09b7bf3 100644
+--- a/test/DL3009.hs
++++ b/test/DL3009.hs
+@@ -77,55 +77,5 @@ tests = do
+             onBuildRuleCatchesNot "DL3009" $ Text.unlines dockerFile
+ 
+     it "don't warn: BuildKit cache mount to apt lists directory" $ do
+-      ruleCatchesNot
+-        "DL3009"
+-        "RUN --mount=type=cache,target=/var/lib/apt/lists \\\
+-        \    apt-get update && apt-get install python"
+-      onBuildRuleCatchesNot
+-        "DL3009"
+-        "RUN --mount=type=cache,target=/var/lib/apt/lists \\\
+-        \    apt-get update && apt-get install python"
+-
+-    it "don't warn: BuildKit cache mount to apt directories 1" $ do
+-      ruleCatchesNot
+-        "DL3009"
+-        "RUN --mount=type=cache,target=/var/lib/apt \\\
+-        \    --mount=type=cache,target=/var/cache/apt \\\
+-        \    rm -f /etc/apt/apt.conf.d/docker-clean && \\\
+-        \    apt-get update && apt-get install python"
+-      onBuildRuleCatchesNot
+-        "DL3009"
+-        "RUN --mount=type=cache,target=/var/lib/apt \\\
+-        \    --mount=type=cache,target=/var/cache/apt \\\
+-        \    rm -f /etc/apt/apt.conf.d/docker-clean && \\\
+-        \    apt-get update && apt-get install python"
+-
+-    it "don't warn: BuildKit cache mount to apt directories 2" $ do
+-      let dockerFile =
+-            [ "RUN rm -f /etc/apt/apt.conf.d/docker-clean",
+-              "RUN --mount=type=cache,target=/var/cache/apt \\",
+-              "    --mount=type=cache,target=/var/lib/apt \\",
+-              "    apt-get update && apt-get install foo"
+-            ]
+-      ruleCatchesNot "DL3009" $ Text.unlines dockerFile
+-      onBuildRuleCatchesNot "DL3009" $ Text.unlines dockerFile
+-
+-    it "warn: BuildKit cache mount to apt cache directory only" $ do
+-      let dockerFile =
+-            [ "RUN --mount=type=cache,target=/var/cache/apt \\",
+-              "    rm -f /etc/apt/apt.conf.d/docker-clean && \\",
+-              "    apt-get update && apt-get install python"
+-            ]
+-       in do
+-            ruleCatches "DL3009" $ Text.unlines dockerFile
+-            onBuildRuleCatches "DL3009" $ Text.unlines dockerFile
+-
+-    it "warn: BuildKit cache mount to apt lists directory only" $ do
+-      let dockerFile =
+-            [ "RUN rm -f /etc/apt/apt.conf.d/docker-clean",
+-              "RUN --mount=type=cache,target=/var/lib/apt \\",
+-              "    apt-get update && apt-get install python"
+-            ]
+-       in do
+-            ruleCatches "DL3009" $ Text.unlines dockerFile
+-            onBuildRuleCatches "DL3009" $ Text.unlines dockerFile
++      ruleCatchesNot "DL3009" "RUN --mount=type=cache,target=/var/lib/apt/lists apt-get update && apt-get install python"
++      onBuildRuleCatchesNot "DL3009" "RUN --mount=type=cache,target=/var/lib/apt/lists apt-get update && apt-get install python"

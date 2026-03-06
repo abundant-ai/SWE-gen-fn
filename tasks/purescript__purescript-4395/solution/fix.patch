@@ -1,0 +1,580 @@
+diff --git a/app/Command/Compile.hs b/app/Command/Compile.hs
+index 4383e6b8..39729941 100644
+--- a/app/Command/Compile.hs
++++ b/app/Command/Compile.hs
+@@ -33,11 +33,11 @@ data PSCMakeOptions = PSCMakeOptions
+   }
+ 
+ -- | Arguments: verbose, use JSON, warnings, errors
+-printWarningsAndErrors :: Bool -> Bool -> P.MultipleErrors -> Either P.MultipleErrors a -> IO ()
+-printWarningsAndErrors verbose False warnings errors = do
++printWarningsAndErrors :: Bool -> Bool -> [(FilePath, T.Text)] -> P.MultipleErrors -> Either P.MultipleErrors a -> IO ()
++printWarningsAndErrors verbose False files warnings errors = do
+   pwd <- getCurrentDirectory
+   cc <- bool Nothing (Just P.defaultCodeColor) <$> ANSI.hSupportsANSI stdout
+-  let ppeOpts = P.defaultPPEOptions { P.ppeCodeColor = cc, P.ppeFull = verbose, P.ppeRelativeDirectory = pwd }
++  let ppeOpts = P.defaultPPEOptions { P.ppeCodeColor = cc, P.ppeFull = verbose, P.ppeRelativeDirectory = pwd, P.ppeFileContents = files }
+   when (P.nonEmpty warnings) $
+     putStrLn (P.prettyPrintMultipleWarnings ppeOpts warnings)
+   case errors of
+@@ -45,10 +45,10 @@ printWarningsAndErrors verbose False warnings errors = do
+       putStrLn (P.prettyPrintMultipleErrors ppeOpts errs)
+       exitFailure
+     Right _ -> return ()
+-printWarningsAndErrors verbose True warnings errors = do
++printWarningsAndErrors verbose True files warnings errors = do
+   putStrLn . LBU8.toString . A.encode $
+-    JSONResult (toJSONErrors verbose P.Warning warnings)
+-               (either (toJSONErrors verbose P.Error) (const []) errors)
++    JSONResult (toJSONErrors verbose P.Warning files warnings)
++               (either (toJSONErrors verbose P.Error files) (const []) errors)
+   either (const exitFailure) (const (return ())) errors
+ 
+ compile :: PSCMakeOptions -> IO ()
+@@ -66,7 +66,7 @@ compile PSCMakeOptions{..} = do
+     foreigns <- inferForeignModules filePathMap
+     let makeActions = buildMakeActions pscmOutputDir filePathMap foreigns pscmUsePrefix
+     P.make makeActions (map snd ms)
+-  printWarningsAndErrors (P.optionsVerboseErrors pscmOpts) pscmJSONErrors makeWarnings makeErrors
++  printWarningsAndErrors (P.optionsVerboseErrors pscmOpts) pscmJSONErrors moduleFiles makeWarnings makeErrors
+   exitSuccess
+ 
+ warnFileTypeNotFound :: String -> IO ()
+diff --git a/app/Command/Graph.hs b/app/Command/Graph.hs
+index ca2b5d70..7d8467a7 100644
+--- a/app/Command/Graph.hs
++++ b/app/Command/Graph.hs
+@@ -79,8 +79,8 @@ printWarningsAndErrors False warnings errors = do
+ printWarningsAndErrors True warnings errors = do
+   let verbose = True
+   hPutStrLn stderr . LBU8.toString . Json.encode $
+-    JSONResult (toJSONErrors verbose P.Warning warnings)
+-               (either (toJSONErrors verbose P.Error) (const []) errors)
++    JSONResult (toJSONErrors verbose P.Warning [] warnings)
++               (either (toJSONErrors verbose P.Error []) (const []) errors)
+   case errors of
+     Left _errs -> exitFailure
+     Right res -> pure res
+diff --git a/purescript.cabal b/purescript.cabal
+index 65fa328f..b3e1fd43 100644
+--- a/purescript.cabal
++++ b/purescript.cabal
+@@ -186,7 +186,8 @@ common defaults
+     typed-process >=0.2.10.1 && <0.3,
+     unordered-containers >=0.2.19.1 && <0.3,
+     utf8-string >=1.0.2 && <1.1,
+-    vector >=0.12.3.1 && <0.13
++    vector >=0.12.3.1 && <0.13,
++    witherable >=0.4.2 && <0.5
+ 
+ library
+   import: defaults
+diff --git a/src/Language/PureScript/AST/Declarations.hs b/src/Language/PureScript/AST/Declarations.hs
+index dfd5efcd..a4ae107c 100644
+--- a/src/Language/PureScript/AST/Declarations.hs
++++ b/src/Language/PureScript/AST/Declarations.hs
+@@ -88,7 +88,7 @@ data ErrorMessageHint
+   | ErrorSolvingConstraint SourceConstraint
+   | MissingConstructorImportForCoercible (Qualified (ProperName 'ConstructorName))
+   | PositionedError (NEL.NonEmpty SourceSpan)
+-  | ErrorUnderLabel PSString
++  | RelatedPositions (NEL.NonEmpty SourceSpan)
+   deriving (Show)
+ 
+ -- | Categories of hints
+diff --git a/src/Language/PureScript/Errors.hs b/src/Language/PureScript/Errors.hs
+index c633a5ca..87e4dbcd 100644
+--- a/src/Language/PureScript/Errors.hs
++++ b/src/Language/PureScript/Errors.hs
+@@ -7,6 +7,7 @@ import           Prelude.Compat
+ 
+ import           Control.Arrow ((&&&))
+ import           Control.Exception (displayException)
++import           Control.Lens (both, head1, over)
+ import           Control.Monad
+ import           Control.Monad.Error.Class (MonadError(..))
+ import           Control.Monad.Trans.State.Lazy
+@@ -14,18 +15,22 @@ import           Control.Monad.Writer
+ import           Data.Bifunctor (first, second)
+ import           Data.Bitraversable (bitraverse)
+ import           Data.Char (isSpace)
++import           Data.Containers.ListUtils (nubOrdOn)
+ import           Data.Either (partitionEithers)
+ import           Data.Foldable (fold)
++import           Data.Function (on)
++import           Data.Functor (($>))
+ import           Data.Functor.Identity (Identity(..))
+-import           Data.List (transpose, nubBy, partition, dropWhileEnd, sortOn)
++import           Data.List (transpose, nubBy, partition, dropWhileEnd, sortOn, uncons)
+ import qualified Data.List.NonEmpty as NEL
+ import           Data.List.NonEmpty (NonEmpty((:|)))
+-import           Data.Maybe (maybeToList, fromMaybe, mapMaybe)
++import           Data.Maybe (maybeToList, fromMaybe, isJust, mapMaybe)
+ import qualified Data.Map as M
+ import           Data.Ord (Down(..))
+ import qualified Data.Set as S
+ import qualified Data.Text as T
+ import           Data.Text (Text)
++import           Data.Traversable (for)
+ import qualified GHC.Stack
+ import           Language.PureScript.AST
+ import qualified Language.PureScript.Bundle as Bundle
+@@ -45,7 +50,9 @@ import           Language.PureScript.Traversals
+ import           Language.PureScript.Types
+ import qualified Language.PureScript.Publish.BoxesHelpers as BoxHelpers
+ import qualified System.Console.ANSI as ANSI
++import           System.FilePath (makeRelative)
+ import qualified Text.PrettyPrint.Boxes as Box
++import           Witherable (wither)
+ 
+ -- | A type of error messages
+ data SimpleErrorMessage
+@@ -188,7 +195,7 @@ data SimpleErrorMessage
+   | UnsupportedRoleDeclaration
+   | RoleDeclarationArityMismatch (ProperName 'TypeName) Int Int
+   | DuplicateRoleDeclaration (ProperName 'TypeName)
+-  | CannotDeriveInvalidConstructorArg Text SourceSpan
++  | CannotDeriveInvalidConstructorArg (Qualified (ProperName 'ClassName))
+   deriving (Show)
+ 
+ data ErrorMessage = ErrorMessage
+@@ -200,10 +207,12 @@ newtype ErrorSuggestion = ErrorSuggestion Text
+ 
+ -- | Get the source span for an error
+ errorSpan :: ErrorMessage -> Maybe (NEL.NonEmpty SourceSpan)
+-errorSpan = findHint matchSpan
++errorSpan = findHint matchPE <> findHint matchRP
+   where
+-  matchSpan (PositionedError ss) = Just ss
+-  matchSpan _ = Nothing
++  matchPE (PositionedError sss) = Just sss
++  matchPE _ = Nothing
++  matchRP (RelatedPositions sss) = Just sss
++  matchRP _ = Nothing
+ 
+ -- | Get the module name for an error
+ errorModule :: ErrorMessage -> Maybe ModuleName
+@@ -579,7 +588,6 @@ colorCodeBox codeColor b = case codeColor of
+         , Box.vcat Box.top $ replicate (Box.rows b) $ Box.text ansiColorReset
+         ]
+ 
+-
+ -- | Default color intensity and color for code
+ defaultCodeColor :: (ANSI.ColorIntensity, ANSI.Color)
+ defaultCodeColor = (ANSI.Dull, ANSI.Yellow)
+@@ -591,6 +599,7 @@ data PPEOptions = PPEOptions
+   , ppeLevel             :: Level -- ^ Should this report an error or a warning?
+   , ppeShowDocs          :: Bool -- ^ Should show a link to error message's doc page?
+   , ppeRelativeDirectory :: FilePath -- ^ FilePath to which the errors are relative
++  , ppeFileContents      :: [(FilePath, Text)] -- ^ Unparsed contents of source files
+   }
+ 
+ -- | Default options for PPEOptions
+@@ -601,11 +610,12 @@ defaultPPEOptions = PPEOptions
+   , ppeLevel             = Error
+   , ppeShowDocs          = True
+   , ppeRelativeDirectory = mempty
++  , ppeFileContents      = []
+   }
+ 
+ -- | Pretty print a single error, simplifying if necessary
+ prettyPrintSingleError :: PPEOptions -> ErrorMessage -> Box.Box
+-prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath) e = flip evalState defaultUnknownMap $ do
++prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath fileContents) e = flip evalState defaultUnknownMap $ do
+   em <- onTypesInErrorMessageM replaceUnknowns (if full then e else simplifyErrorMessage e)
+   um <- get
+   return (prettyPrintErrorMessage um em)
+@@ -1369,10 +1379,11 @@ prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath) e = fl
+     renderSimpleErrorMessage (DuplicateRoleDeclaration name) =
+       line $ "Duplicate role declaration for " <> markCode (runProperName name) <> "."
+ 
+-    renderSimpleErrorMessage (CannotDeriveInvalidConstructorArg tyVarName ss) =
++    renderSimpleErrorMessage (CannotDeriveInvalidConstructorArg className) =
+       paras
+-        [ line $ "The type variable `" <> tyVarName <> "` must only be used as the last argument in a data type:"
+-        , indent $ line $ displaySourceSpan relPath ss
++        [ line $ "One or more type variables are in positions that prevent " <> markCode (runProperName $ disqualify className) <> " from being derived."
++        , line $ "To derive this class, make sure that these variables are only used as the final arguments to type constructors, "
++          <> "and that those type constructors themselves have instances of " <> markCode (runProperName $ disqualify className) <> "."
+         ]
+ 
+     renderHint :: ErrorMessageHint -> Box.Box -> Box.Box
+@@ -1539,10 +1550,10 @@ prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath) e = fl
+       paras [ line $ "at " <> displaySourceSpan relPath (NEL.head srcSpan)
+             , detail
+             ]
+-    renderHint (ErrorUnderLabel lbl) detail =
++    renderHint (RelatedPositions srcSpans) detail =
+       paras
+         [ detail
+-        , line $ "under the label `" <> markCode (T.pack (decodeStringWithReplacement lbl)) <> "`"
++        , Box.moveRight 2 $ showSourceSpansInContext srcSpans
+         ]
+ 
+     printRow :: (Int -> Type a -> Box.Box) -> Type a -> Box.Box
+@@ -1648,7 +1659,7 @@ prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath) e = fl
+     Error -> "error"
+     Warning -> "warning"
+ 
+-  paras :: [Box.Box] -> Box.Box
++  paras :: forall f. Foldable f => f Box.Box -> Box.Box
+   paras = Box.vcat Box.left
+ 
+   -- | Simplify an error message
+@@ -1739,6 +1750,94 @@ prettyPrintSingleError (PPEOptions codeColor full level showDocs relPath) e = fl
+         Box.<> (line . displayStartEndPos . fst $ getAnnForType ty)
+     Qualified mn (Right inst) -> line . markCode . showQualified showIdent $ Qualified mn inst
+ 
++  -- | As of this writing, this function assumes that all provided SourceSpans
++  -- are non-overlapping (except for exact duplicates) and span no line breaks. A
++  -- more sophisticated implementation without this limitation would be possible
++  -- but isn't yet needed.
++  showSourceSpansInContext :: NonEmpty SourceSpan -> Box.Box
++  showSourceSpansInContext
++    = maybe Box.nullBox (paras . fmap renderFile . NEL.groupWith1 spanName . NEL.sort)
++    . NEL.nonEmpty
++    . NEL.filter ((> 0) . sourcePosLine . spanStart)
++    where
++    renderFile :: NonEmpty SourceSpan -> Box.Box
++    renderFile sss = maybe Box.nullBox (linesToBox . T.lines) $ lookup fileName fileContents
++      where
++      fileName = spanName $ NEL.head sss
++      header = lineS . (<> ":") . makeRelative relPath $ fileName
++      lineBlocks = makeLineBlocks $ NEL.groupWith1 (sourcePosLine . spanStart) sss
++
++      linesToBox fileLines = Box.moveUp 1 $ header Box.// body
++        where
++        body
++          = Box.punctuateV Box.left (lineNumberStyle "...")
++          . map (paras . fmap renderLine)
++          . flip evalState (fileLines, 1)
++          . traverse (wither (\(i, x) -> fmap (i, , x) <$> ascLookupInState i) . NEL.toList)
++          $ NEL.toList lineBlocks
++
++    makeLineBlocks :: NonEmpty (NonEmpty SourceSpan) -> NonEmpty (NonEmpty (Int, [SourceSpan]))
++    makeLineBlocks = startBlock
++      where
++      startBlock (h :| t) = over head1 (NEL.cons (pred $ headLineNumber h, [])) $ continueBlock h t
++
++      continueBlock :: NonEmpty SourceSpan -> [NonEmpty SourceSpan] -> NonEmpty (NonEmpty (Int, [SourceSpan]))
++      continueBlock lineGroup = \case
++        [] ->
++          endBlock lineGroup []
++        nextGroup : groups -> case pred $ ((-) `on` headLineNumber) nextGroup lineGroup of
++          n | n <= 3 ->
++            over head1 (appendExtraLines n lineGroup <>) $ continueBlock nextGroup groups
++          _ ->
++            endBlock lineGroup . NEL.toList . startBlock $ nextGroup :| groups
++
++      endBlock :: NonEmpty SourceSpan -> [NonEmpty (Int, [SourceSpan])] -> NonEmpty (NonEmpty (Int, [SourceSpan]))
++      endBlock h t = appendExtraLines 1 h :| t
++
++      headLineNumber = sourcePosLine . spanStart . NEL.head
++
++      appendExtraLines :: Int -> NonEmpty SourceSpan -> NonEmpty (Int, [SourceSpan])
++      appendExtraLines n lineGroup = (lineNum, NEL.toList lineGroup) :| [(lineNum + i, []) | i <- [1..n]]
++        where
++        lineNum = headLineNumber lineGroup
++
++    renderLine :: (Int, Text, [SourceSpan]) -> Box.Box
++    renderLine (lineNum, text, sss) = numBox Box.<+> lineBox
++      where
++      colSpans = nubOrdOn fst $ map (over both (pred . sourcePosColumn) . (spanStart &&& spanEnd)) sss
++      numBox = lineNumberStyle $ show lineNum
++      lineBox =
++        if isJust codeColor
++        then colorCodeBox codeColor $ line $ foldr highlightSpan text colSpans
++        else line text Box.// line (finishUnderline $ foldr underlineSpan (T.length text, "") colSpans)
++
++    highlightSpan :: (Int, Int) -> Text -> Text
++    highlightSpan (startCol, endCol) text
++       = prefix
++      <> T.pack (ANSI.setSGRCode [ANSI.SetSwapForegroundBackground True])
++      <> spanText
++      <> T.pack (ANSI.setSGRCode [ANSI.SetSwapForegroundBackground False])
++      <> suffix
++      where
++      (prefix, rest) = T.splitAt startCol text
++      (spanText, suffix) = T.splitAt (endCol - startCol) rest
++
++    underlineSpan :: (Int, Int) -> (Int, Text) -> (Int, Text)
++    underlineSpan (startCol, endCol) (len, accum) = (startCol, T.replicate (endCol - startCol) "^" <> T.replicate (len - endCol) " " <> accum)
++
++    finishUnderline :: (Int, Text) -> Text
++    finishUnderline (len, accum) = T.replicate len " " <> accum
++
++    lineNumberStyle :: String -> Box.Box
++    lineNumberStyle = colorCodeBox (codeColor $> (ANSI.Vivid, ANSI.Black)) . Box.alignHoriz Box.right 5 . lineS
++
++  -- | Lookup the nth element of a list, but without retraversing the list every
++  -- time, by instead keeping a tail of the list and the current element number
++  -- in State. Only works if the argument provided is strictly ascending over
++  -- the life of the State.
++  ascLookupInState :: forall a. Int -> State ([a], Int) (Maybe a)
++  ascLookupInState j = get >>= \(as, i) -> for (uncons $ drop (j - i) as) $ \(a, as') -> put (as', succ j) $> a
++
+ -- Pretty print and export declaration
+ prettyPrintExport :: DeclarationRef -> Text
+ prettyPrintExport (TypeRef _ pn _) = runProperName pn
+diff --git a/src/Language/PureScript/Errors/JSON.hs b/src/Language/PureScript/Errors/JSON.hs
+index 00c31707..09e565b7 100644
+--- a/src/Language/PureScript/Errors/JSON.hs
++++ b/src/Language/PureScript/Errors/JSON.hs
+@@ -43,13 +43,13 @@ $(A.deriveJSON A.defaultOptions ''ErrorSuggestion)
+ $(A.deriveJSON A.defaultOptions ''JSONError)
+ $(A.deriveJSON A.defaultOptions ''JSONResult)
+ 
+-toJSONErrors :: Bool -> P.Level -> P.MultipleErrors -> [JSONError]
+-toJSONErrors verbose level = map (toJSONError verbose level) . P.runMultipleErrors
++toJSONErrors :: Bool -> P.Level -> [(FilePath, Text)] -> P.MultipleErrors -> [JSONError]
++toJSONErrors verbose level files = map (toJSONError verbose level files) . P.runMultipleErrors
+ 
+-toJSONError :: Bool -> P.Level -> P.ErrorMessage -> JSONError
+-toJSONError verbose level e =
++toJSONError :: Bool -> P.Level -> [(FilePath, Text)] -> P.ErrorMessage -> JSONError
++toJSONError verbose level files e =
+   JSONError (toErrorPosition <$> fmap NEL.head spans)
+-            (P.renderBox (P.prettyPrintSingleError (P.PPEOptions Nothing verbose level False mempty) (P.stripModuleAndSpan e)))
++            (P.renderBox (P.prettyPrintSingleError (P.PPEOptions Nothing verbose level False mempty files) (P.stripModuleAndSpan e)))
+             (P.errorCode e)
+             (P.errorDocUri e)
+             (P.spanName <$> fmap NEL.head spans)
+diff --git a/src/Language/PureScript/Ide/Error.hs b/src/Language/PureScript/Ide/Error.hs
+index ee999486..523c3354 100644
+--- a/src/Language/PureScript/Ide/Error.hs
++++ b/src/Language/PureScript/Ide/Error.hs
+@@ -31,29 +31,29 @@ data IdeError
+     | NotFound Text
+     | ModuleNotFound ModuleIdent
+     | ModuleFileNotFound ModuleIdent
+-    | RebuildError P.MultipleErrors
++    | RebuildError [(FilePath, Text)] P.MultipleErrors
+     deriving (Show)
+ 
+ instance ToJSON IdeError where
+-  toJSON (RebuildError errs) = object
++  toJSON (RebuildError files errs) = object
+     [ "resultType" .= ("error" :: Text)
+-    , "result" .= encodeRebuildErrors errs
++    , "result" .= encodeRebuildErrors files errs
+     ]
+   toJSON err = object
+     [ "resultType" .= ("error" :: Text)
+     , "result" .= textError err
+     ]
+ 
+-encodeRebuildErrors :: P.MultipleErrors -> Value
+-encodeRebuildErrors = toJSON . map encodeRebuildError . P.runMultipleErrors
++encodeRebuildErrors :: [(FilePath, Text)] -> P.MultipleErrors -> Value
++encodeRebuildErrors files = toJSON . map encodeRebuildError . P.runMultipleErrors
+   where
+     encodeRebuildError err = case err of
+       (P.ErrorMessage _
+        ((P.HoleInferredType name _ _
+          (Just P.TSAfter{tsAfterIdentifiers=idents, tsAfterRecordFields=fields})))) ->
+-        insertTSCompletions name idents (fromMaybe [] fields) (toJSON (toJSONError False P.Error err))
++        insertTSCompletions name idents (fromMaybe [] fields) (toJSON (toJSONError False P.Error files err))
+       _ ->
+-        (toJSON . toJSONError False P.Error) err
++        (toJSON . toJSONError False P.Error files) err
+ 
+     insertTSCompletions name idents fields (Aeson.Object value) =
+       Aeson.Object
+@@ -91,7 +91,7 @@ textError (GeneralError msg)          = msg
+ textError (NotFound ident)            = "Symbol '" <> ident <> "' not found."
+ textError (ModuleNotFound ident)      = "Module '" <> ident <> "' not found."
+ textError (ModuleFileNotFound ident)  = "Extern file for module " <> ident <>" could not be found"
+-textError (RebuildError err)          = show err
++textError (RebuildError _ err)        = show err
+ 
+ prettyPrintTypeSingleLine :: P.Type a -> Text
+ prettyPrintTypeSingleLine = T.unwords . map T.strip . T.lines . T.pack . P.prettyPrintTypeWithUnicode maxBound
+diff --git a/src/Language/PureScript/Ide/Rebuild.hs b/src/Language/PureScript/Ide/Rebuild.hs
+index ac06b6e1..52a74a4d 100644
+--- a/src/Language/PureScript/Ide/Rebuild.hs
++++ b/src/Language/PureScript/Ide/Rebuild.hs
+@@ -55,7 +55,7 @@ rebuildFile file actualFile codegenTargets runOpenBuild = do
+   let fp' = fromMaybe fp actualFile
+   (pwarnings, m) <- case sequence $ CST.parseFromFile fp' input of
+     Left parseError ->
+-      throwError $ RebuildError $ CST.toMultipleErrors fp' parseError
++      throwError $ RebuildError [(fp', input)] $ CST.toMultipleErrors fp' parseError
+     Right m -> pure m
+   let moduleName = P.getModuleName m
+   -- Externs files must be sorted ahead of time, so that they get applied
+@@ -75,7 +75,7 @@ rebuildFile file actualFile codegenTargets runOpenBuild = do
+       pure newExterns
+   case result of
+     Left errors ->
+-      throwError (RebuildError errors)
++      throwError (RebuildError [(fp', input)] errors)
+     Right newExterns -> do
+       insertModule (fromMaybe file actualFile, m)
+       insertExterns newExterns
+@@ -193,7 +193,7 @@ sortExterns m ex = do
+            . M.delete (P.getModuleName m) $ ex
+   case sorted' of
+     Left err ->
+-      throwError (RebuildError err)
++      throwError (RebuildError [] err)
+     Right (sorted, graph) -> do
+       let deps = fromJust (List.lookup (P.getModuleName m) graph)
+       pure $ mapMaybe getExtern (deps `inOrderOf` map P.getModuleName sorted)
+diff --git a/src/Language/PureScript/Ide/Types.hs b/src/Language/PureScript/Ide/Types.hs
+index 8464a08c..f2748cdb 100644
+--- a/src/Language/PureScript/Ide/Types.hs
++++ b/src/Language/PureScript/Ide/Types.hs
+@@ -287,7 +287,7 @@ instance ToJSON Success where
+             ]
+         ]
+     ModuleList modules -> encodeSuccess modules
+-    RebuildSuccess warnings -> encodeSuccess (P.toJSONErrors False P.Warning warnings)
++    RebuildSuccess warnings -> encodeSuccess (P.toJSONErrors False P.Warning [] warnings)
+ 
+ encodeImport :: (P.ModuleName, P.ImportDeclarationType, Maybe P.ModuleName) -> Aeson.Value
+ encodeImport (P.runModuleName -> mn, importType, map P.runModuleName -> qualifier) = case importType of
+diff --git a/src/Language/PureScript/TypeChecker/Deriving.hs b/src/Language/PureScript/TypeChecker/Deriving.hs
+index eda0fb5d..ca458772 100644
+--- a/src/Language/PureScript/TypeChecker/Deriving.hs
++++ b/src/Language/PureScript/TypeChecker/Deriving.hs
+@@ -6,7 +6,7 @@ module Language.PureScript.TypeChecker.Deriving (deriveInstance) where
+ import Protolude hiding (Type)
+ 
+ import Control.Monad.Trans.Writer (Writer, WriterT, runWriter, runWriterT)
+-import Control.Monad.Writer.Class (MonadWriter(..), censor)
++import Control.Monad.Writer.Class (MonadWriter(..))
+ import Data.Foldable (foldl1, foldr1)
+ import Data.List (init, last, zipWith3, (!!))
+ import qualified Data.Map as M
+@@ -71,19 +71,20 @@ deriveInstance instType className strategy = do
+                   let tyArgs = map (replaceAllTypeVars (zip (map fst typeClassArguments) tys)) suTyArgs
+                   in lam UnusedIdent (DeferredDictionary superclass tyArgs)
+             let superclasses = map mkString (superClassDictionaryNames typeClassSuperclasses) `zip` superclassesDicts
+-            rethrow (addHint $ ErrorInInstance className tys) $
+-              App (Constructor nullSourceSpan ctorName) . mkLit . ObjectLiteral . (++ superclasses) <$> f mn tyCon
++            App (Constructor nullSourceSpan ctorName) . mkLit . ObjectLiteral . (++ superclasses) <$> f mn tyCon
+           _ -> throwError . errorMessage $ ExpectedTypeConstructor className tys ty
+         _ -> throwError . errorMessage $ InvalidDerivedInstance className tys 1
+ 
++      unaryClass' f = unaryClass (f className)
++
+       in case className of
+-        Foldable.Foldable -> unaryClass deriveFoldable
++        Foldable.Foldable -> unaryClass' deriveFoldable
+         Prelude.Eq -> unaryClass deriveEq
+         Prelude.Eq1 -> unaryClass $ \_ _ -> deriveEq1
+-        Prelude.Functor -> unaryClass deriveFunctor
++        Prelude.Functor -> unaryClass' deriveFunctor
+         Prelude.Ord -> unaryClass deriveOrd
+         Prelude.Ord1 -> unaryClass $ \_ _ -> deriveOrd1
+-        Traversable.Traversable -> unaryClass deriveTraversable
++        Traversable.Traversable -> unaryClass' deriveTraversable
+         -- See L.P.Sugar.TypeClasses.Deriving for the classes that can be
+         -- derived prior to type checking.
+         _ -> throwError . errorMessage $ CannotDerive className tys
+@@ -373,38 +374,29 @@ data ParamUsage
+   | MentionsParam ParamUsage
+   | IsRecord (NonEmpty (PSString, ParamUsage))
+ 
+-type ParamErrorData = [([Either (ProperName 'ConstructorName) PSString], SourceSpan)]
+-
+ validateParamsInTypeConstructors
+   :: forall m
+    . MonadError MultipleErrors m
+   => MonadState CheckState m
+-  => ModuleName
++  => Qualified (ProperName 'ClassName)
++  -> ModuleName
+   -> ProperName 'TypeName
+   -> m [(ProperName 'ConstructorName, [Maybe ParamUsage])]
+-validateParamsInTypeConstructors mn tyConNm = do
++validateParamsInTypeConstructors derivingClass mn tyConNm = do
+   (_, _, tyArgNames, ctors) <- lookupTypeDecl mn tyConNm
+   param <- note (errorMessage $ KindsDoNotUnify (kindType -:> kindType) kindType) . lastMay $ map fst tyArgNames
+   ctors' <- traverse (traverse $ traverse replaceAllTypeSynonyms) ctors
+-  let (ctorUsages, errors) = runWriter $ traverse (addCtorHint . traverse . traverse $ typeToUsageOf param) ctors'
+-  unless (null errors) $
+-    throwError . flip foldMap (sortOn snd $ ordNub errors) $ \(hints, ss) ->
+-      addHints (either ErrorInDataConstructor ErrorUnderLabel <$> hints) $
+-        errorMessage $ CannotDeriveInvalidConstructorArg param ss
++  let (ctorUsages, problemSpans) = runWriter $ traverse (traverse . traverse $ typeToUsageOf param) ctors'
++  for_ (nonEmpty $ ordNub problemSpans) $ \sss ->
++    throwError . addHint (RelatedPositions sss) . errorMessage $ CannotDeriveInvalidConstructorArg derivingClass
+   pure ctorUsages
+   where
+-  consHintData :: a -> Writer [([a], b)] c -> Writer [([a], b)] c
+-  consHintData a = censor (map $ first (a :))
+-
+-  addCtorHint :: ((ProperName 'ConstructorName, a) -> Writer ParamErrorData b) -> (ProperName 'ConstructorName, a) -> Writer ParamErrorData b
+-  addCtorHint f ctor = consHintData (Left $ fst ctor) $ f ctor
+-
+-  typeToUsageOf :: Text -> SourceType -> Writer ParamErrorData (Maybe ParamUsage)
++  typeToUsageOf :: Text -> SourceType -> Writer [SourceSpan] (Maybe ParamUsage)
+   typeToUsageOf param = go
+     where
+-    assertNoParamUsedIn :: SourceType -> Writer ParamErrorData ()
++    assertNoParamUsedIn :: SourceType -> Writer [SourceSpan] ()
+     assertNoParamUsedIn = everythingOnTypes (*>) $ \case
+-      TypeVar (ss, _) name | name == param -> tell [([], ss)]
++      TypeVar (ss, _) name | name == param -> tell [ss]
+       _ -> pure ()
+ 
+     go = \case
+@@ -416,8 +408,7 @@ validateParamsInTypeConstructors mn tyConNm = do
+ 
+       TypeApp _ (TypeConstructor _ Prim.Record) row ->
+         fmap (fmap IsRecord . nonEmpty . catMaybes) . for (decomposeRec' row) $ \(Label lbl, ty) ->
+-          consHintData (Right lbl) $
+-            fmap (lbl, ) <$> go ty
++          fmap (lbl, ) <$> go ty
+ 
+       TypeApp _ tyFn tyArg -> do
+         assertNoParamUsedIn tyFn
+@@ -495,11 +486,12 @@ deriveFunctor
+    . MonadError MultipleErrors m
+   => MonadState CheckState m
+   => MonadSupply m
+-  => ModuleName
++  => Qualified (ProperName 'ClassName)
++  -> ModuleName
+   -> ProperName 'TypeName
+   -> m [(PSString, Expr)]
+-deriveFunctor mn tyConNm = do
+-  ctors <- validateParamsInTypeConstructors mn tyConNm
++deriveFunctor nm mn tyConNm = do
++  ctors <- validateParamsInTypeConstructors nm mn tyConNm
+   mapFun <- mkTraversal mn mapVar (TraversalOps identity identity) ctors
+   pure [(Prelude.map, mapFun)]
+   where
+@@ -519,11 +511,12 @@ deriveFoldable
+    . MonadError MultipleErrors m
+   => MonadState CheckState m
+   => MonadSupply m
+-  => ModuleName
++  => Qualified (ProperName 'ClassName)
++  -> ModuleName
+   -> ProperName 'TypeName
+   -> m [(PSString, Expr)]
+-deriveFoldable mn tyConNm = do
+-  ctors <- validateParamsInTypeConstructors mn tyConNm
++deriveFoldable nm mn tyConNm = do
++  ctors <- validateParamsInTypeConstructors nm mn tyConNm
+   foldlFun <- mkAsymmetricFoldFunction False foldlVar ctors
+   foldrFun <- mkAsymmetricFoldFunction True foldrVar ctors
+   foldMapFun <- mkTraversal mn foldMapVar foldMapOps ctors
+@@ -583,11 +576,12 @@ deriveTraversable
+    . MonadError MultipleErrors m
+   => MonadState CheckState m
+   => MonadSupply m
+-  => ModuleName
++  => Qualified (ProperName 'ClassName)
++  -> ModuleName
+   -> ProperName 'TypeName
+   -> m [(PSString, Expr)]
+-deriveTraversable mn tyConNm = do
+-  ctors <- validateParamsInTypeConstructors mn tyConNm
++deriveTraversable nm mn tyConNm = do
++  ctors <- validateParamsInTypeConstructors nm mn tyConNm
+   traverseFun <- mkTraversal mn traverseVar traverseOps ctors
+   sequenceFun <- usingLamIdent $ pure . App (App traverseVar identityVar)
+   pure [(Traversable.traverse, traverseFun), (Traversable.sequence, sequenceFun)]

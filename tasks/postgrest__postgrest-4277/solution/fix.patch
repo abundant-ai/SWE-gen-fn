@@ -1,0 +1,82 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3f62b756..e4686349 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ - Fix OpenAPI broken docs link by @taimoorzaeem in #4048
+ - Fix OpenAPI specification incorrectly exposing GET methods for volatile functions by @joelonsql in #4174
++- Fix empty spread embeddings return unexpected SQL error by @taimoorzaeem in #3887
++- Fix `/metrics` endpoint not responding with `Content-Type` header by @taimoorzaeem in #4271
+ 
+ ## [13.0.4] - 2025-06-17
+ 
+diff --git a/docs/references/observability.rst b/docs/references/observability.rst
+index 871e5d1b..01d0176f 100644
+--- a/docs/references/observability.rst
++++ b/docs/references/observability.rst
+@@ -128,6 +128,11 @@ The ``metrics`` endpoint on the :ref:`admin_server` endpoint provides metrics in
+ 
+   curl "http://localhost:3001/metrics"
+ 
++.. code-block:: http
++
++  HTTP/1.1 200 OK
++  Content-Type: text/plain; charset=utf-8
++
+   # HELP pgrst_schema_cache_query_time_seconds The query time in seconds of the last schema cache load
+   # TYPE pgrst_schema_cache_query_time_seconds gauge
+   pgrst_schema_cache_query_time_seconds 1.5937927e-2
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index c9fb8c5f..d0486984 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -16,6 +16,7 @@ import Network.Socket.ByteString
+ 
+ import PostgREST.AppState    (AppState)
+ import PostgREST.Config      (AppConfig (..))
++import PostgREST.MediaType   (MediaType (..), toContentType)
+ import PostgREST.Metrics     (metricsToText)
+ import PostgREST.Network     (resolveHost)
+ import PostgREST.Observation (Observation (..))
+@@ -58,7 +59,7 @@ admin appState req respond  = do
+       respond $ Wai.responseLBS HTTP.status200 [] (maybe mempty JSON.encode sCache)
+     ["metrics"] -> do
+       mets <- metricsToText
+-      respond $ Wai.responseLBS HTTP.status200 [] mets
++      respond $ Wai.responseLBS HTTP.status200 [toContentType MTTextPlain] mets -- Content-Type is required for prometheus compliance
+     _ ->
+       respond $ Wai.responseLBS HTTP.status404 [] mempty
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 5a65f56a..2220180c 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -70,21 +70,21 @@ readPlanToQuery node@(Node ReadPlan{select,from=mainQi,fromAlias,where_=logicFor
+ 
+ getJoinSelects :: ReadPlanTree -> [SQL.Snippet]
+ getJoinSelects (Node ReadPlan{relSelect} _) =
+-  mapMaybe relSelectToSnippet relSelect
++  join $ map relSelectToSnippet relSelect
+   where
+-    relSelectToSnippet :: RelSelectField -> Maybe SQL.Snippet
++    relSelectToSnippet :: RelSelectField -> [SQL.Snippet]
+     relSelectToSnippet fld =
+       let aggAlias = pgFmtIdent $ rsAggAlias fld
+       in
+         case fld of
+           JsonEmbed{rsEmptyEmbed = True} ->
+-            Nothing
++            []
+           JsonEmbed{rsSelName, rsEmbedMode = JsonObject} ->
+-            Just $ "row_to_json(" <> aggAlias <> ".*)::jsonb AS " <> pgFmtIdent rsSelName
++            ["row_to_json(" <> aggAlias <> ".*)::jsonb AS " <> pgFmtIdent rsSelName]
+           JsonEmbed{rsSelName, rsEmbedMode = JsonArray} ->
+-            Just $ "COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> pgFmtIdent rsSelName
++            ["COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> pgFmtIdent rsSelName]
+           Spread{rsSpreadSel, rsAggAlias} ->
+-            Just $ intercalateSnippet ", " (pgFmtSpreadSelectItem rsAggAlias <$> rsSpreadSel)
++            pgFmtSpreadSelectItem rsAggAlias <$> rsSpreadSel
+ 
+ getJoins :: ReadPlanTree -> [SQL.Snippet]
+ getJoins (Node _ []) = []

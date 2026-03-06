@@ -1,0 +1,564 @@
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index 5de9abdc..eab4f7b3 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -166,27 +166,10 @@ PostgREST honors the following `JWT claims <https://datatracker.ietf.org/doc/htm
+ - ``exp`` Expiration Time
+ - ``iat`` Issued At
+ - ``nbf`` Not Before
+-- ``aud`` :ref:`Audience <jwt_aud_validation>`
++- ``aud`` Audience, see :ref:`jwt-aud`
+ 
+ .. note::
+-  PostgREST allows for a 30-second clock skew when validating the ``exp``, ``iat`` and ``nbf`` claims.
+-  In other words, it gives an extra 30 seconds before the token is rejected if there is a slight discrepancy in the timestamps.
+-
+-.. _jwt_aud_validation:
+-
+-JWT ``aud`` Claim Validation
+-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-
+-PostgREST has built-in validation of the `JWT audience claim <https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3>`_.
+-It works this way:
+-
+-- If :ref:`jwt-aud` is not set (the default), PostgREST identifies with all audiences and allows the JWT for any ``aud`` claim.
+-- If :ref:`jwt-aud` is set to a specific audience, PostgREST will check if this audience is present in the ``aud`` claim:
+-
+-  + If the ``aud`` value is a JSON string, it will match it to the :ref:`jwt-aud`.
+-  + If the ``aud`` value is a JSON array of strings, it will search every element for a match.
+-  + If the match fails or if the ``aud`` value is not a string or array of strings, then the token will be rejected with a :ref:`401 Unauthorized <pgrst303>` error.
+-  + If the ``aud`` key **is not present** or if its value is ``null`` or ``[]``, PostgREST will interpret this token as allowed for all audiences and will complete the request.
++  PostgREST allows for a 30-second clock skew when validating the ``exp`` and ``iat`` claims. In other words, it gives an extra 30 seconds before the token is rejected if there is a slight discrepancy in the timestamps.
+ 
+ .. _jwt_role_claim_key_extract:
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 560d4f22..5c179e82 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -599,7 +599,11 @@ jwt-aud
+   **In-Database** pgrst.jwt_aud
+   =============== =================================
+ 
+-    Specifies an audience for the JWT ``aud`` claim. See :ref:`jwt_aud_validation`.
++  Specifies the `JWT audience claim <https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3>`_. If this claim is present in the client provided JWT then you must set this to the same value as in the JWT, otherwise verifying the JWT will fail.
++
++  .. warning::
++
++     Using this setting will only reject tokens with a different audience claim. Tokens **without** audience claim will still be accepted.
+ 
+ .. _jwt-role-claim-key:
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 1fee6102..f06fe783 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -267,7 +267,6 @@ test-suite spec
+                     , hspec-wai         >= 0.10 && < 0.12
+                     , hspec-wai-json    >= 0.10 && < 0.12
+                     , http-types        >= 0.12.3 && < 0.13
+-                    , jose-jwt          >= 0.9.6 && < 0.11
+                     , lens              >= 4.14 && < 5.3
+                     , lens-aeson        >= 1.0.1 && < 1.3
+                     , monad-control     >= 1.0.1 && < 1.1
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 8febebf4..cbcef6b5 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -10,7 +10,6 @@ Authentication should always be implemented in an external service.
+ In the test suite there is an example of simple login function that can be used for a
+ very simple authentication system inside the PostgreSQL database.
+ -}
+-{-# LANGUAGE LambdaCase      #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Auth
+   ( getResult
+@@ -83,44 +82,39 @@ parseToken AppConfig{..} (Just tkn) time = do
+ 
+       verifyClaims :: JWT.JwtContent -> Either JwtError JSON.Value
+       verifyClaims (JWT.Jws (_, claims)) = case JSON.decodeStrict claims of
+-        Just jclaims@(JSON.Object mclaims) ->
+-          verifyClaim mclaims "exp" isValidExpClaim "JWT expired" >>
+-          verifyClaim mclaims "nbf" isValidNbfClaim "JWT not yet valid" >>
+-          verifyClaim mclaims "iat" isValidIatClaim "JWT issued at future" >>
+-          verifyClaim mclaims "aud" isValidAudClaim "JWT not in audience" >>
+-          return jclaims
+-        _ -> Left $ JwtClaimsError "Parsing claims failed"
++        Nothing                    -> Left $ JwtClaimsError "Parsing claims failed"
++        Just (JSON.Object mclaims)
++          | failedExpClaim mclaims -> Left $ JwtClaimsError "JWT expired"
++          | failedNbfClaim mclaims -> Left $ JwtClaimsError "JWT not yet valid"
++          | failedIatClaim mclaims -> Left $ JwtClaimsError "JWT issued at future"
++          | failedAudClaim mclaims -> Left $ JwtClaimsError "JWT not in audience"
++        Just jclaims               -> Right jclaims
+       -- TODO: We could enable JWE support here (encrypted tokens)
+-      verifyClaims _ = Left $ JwtDecodeError "Unsupported token type"
+-
+-      verifyClaim mclaims claim func err = do
+-        isValid <- maybe (Right True) func (KM.lookup claim mclaims)
+-        unless isValid $ Left $ JwtClaimsError err
++      verifyClaims _                = Left $ JwtDecodeError "Unsupported token type"
+ 
+       allowedSkewSeconds = 30 :: Int64
+       now = floor . nominalDiffTimeToSeconds $ utcTimeToPOSIXSeconds time
+       sciToInt = fromMaybe 0 . Sci.toBoundedInteger
+-      allStrings = all (\case (JSON.String _) -> True; _ -> False)
+-
+-      isValidExpClaim :: JSON.Value -> Either JwtError Bool
+-      isValidExpClaim (JSON.Number secs) = Right $ now <= (sciToInt secs + allowedSkewSeconds)
+-      isValidExpClaim _ = Left $ JwtClaimsError "The JWT 'exp' claim must be a number"
+-
+-      isValidNbfClaim :: JSON.Value -> Either JwtError Bool
+-      isValidNbfClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
+-      isValidNbfClaim _ = Left $ JwtClaimsError "The JWT 'nbf' claim must be a number"
+-
+-      isValidIatClaim :: JSON.Value -> Either JwtError Bool
+-      isValidIatClaim (JSON.Number secs) = Right $ now >= (sciToInt secs - allowedSkewSeconds)
+-      isValidIatClaim _ = Left $ JwtClaimsError "The JWT 'iat' claim must be a number"
+-
+-      isValidAudClaim :: JSON.Value -> Either JwtError Bool
+-      isValidAudClaim JSON.Null = Right True -- {"aud": null} is valid for all audiences
+-      isValidAudClaim (JSON.String str) = Right $ maybe (const True) (==) configJwtAudience str
+-      isValidAudClaim (JSON.Array arr)
+-        | null arr = Right True              -- {"aud": []} is valid for all audiences
+-        | allStrings arr = Right $ maybe True (\a -> JSON.String a `elem` arr) configJwtAudience
+-      isValidAudClaim _ = Left $ JwtClaimsError "The JWT 'aud' claim must be a string or an array of strings"
++
++      failedExpClaim :: KM.KeyMap JSON.Value -> Bool
++      failedExpClaim mclaims = case KM.lookup "exp" mclaims of
++        Just (JSON.Number secs) -> now > (sciToInt secs + allowedSkewSeconds)
++        _                       -> False
++
++      failedNbfClaim :: KM.KeyMap JSON.Value -> Bool
++      failedNbfClaim mclaims = case KM.lookup "nbf" mclaims of
++        Just (JSON.Number secs) -> now < (sciToInt secs - allowedSkewSeconds)
++        _                       -> False
++
++      failedIatClaim :: KM.KeyMap JSON.Value -> Bool
++      failedIatClaim mclaims = case KM.lookup "iat" mclaims of
++        Just (JSON.Number secs) -> now < (sciToInt secs - allowedSkewSeconds)
++        _                       -> False
++
++      failedAudClaim :: KM.KeyMap JSON.Value -> Bool
++      failedAudClaim mclaims = case KM.lookup "aud" mclaims of
++        Just (JSON.String str) -> maybe (const False) (/=) configJwtAudience str
++        _                      -> False
+ 
+ parseClaims :: Monad m =>
+   AppConfig -> JSON.Value -> ExceptT Error m AuthResult
+diff --git a/test/spec/Feature/Auth/AudienceJwtSecretSpec.hs b/test/spec/Feature/Auth/AudienceJwtSecretSpec.hs
+index d4ad2968..2fda8b73 100644
+--- a/test/spec/Feature/Auth/AudienceJwtSecretSpec.hs
++++ b/test/spec/Feature/Auth/AudienceJwtSecretSpec.hs
+@@ -3,238 +3,43 @@ module Feature.Auth.AudienceJwtSecretSpec where
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+-import Protolude           hiding (get)
+-import SpecHelper
+ import Test.Hspec
+ import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-spec :: SpecWith ((), Application)
+-spec = describe "test handling of aud claims in JWT when the jwt-aud config is set" $ do
+-
+-  context "when the audience claim is a string" $ do
+-    -- this test will stop working 9999999999s after the UNIX EPOCH
+-    it "succeeds when the audience claim matches" $ do
+-      let jwtPayload =
+-            [json|{
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": "youraudience"
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "fails when the audience claim does not match" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": "notyouraudience"
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith`
+-          [json|{"code":"PGRST303","details":null,"hint":null,"message":"JWT not in audience"}|]
+-          { matchStatus = 401 }
+-
+-    it "fails when the audience claim is empty" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ""
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith`
+-          [json|{"code":"PGRST303","details":null,"hint":null,"message":"JWT not in audience"}|]
+-          { matchStatus = 401 }
+-
+-  context "when the audience claim is an array of strings" $ do
+-    it "succeeds when the audience claim has 1 element and it matches" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["youraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "succeeds when the audience claim has more than 1 element and one matches" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["notyouraudience", "youraudience", "anotheraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "fails when the audience claim has 1 element and it doesn't match" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["notyouraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith`
+-          [json|{"code":"PGRST303","details":null,"hint":null,"message":"JWT not in audience"}|]
+-          { matchStatus = 401 }
+-
+-
+-    it "fails when the audience claim has more than 1 element and none matches" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["notyouraudience", "stillnotyouraudience", "anotheraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith`
+-          [json|{"code":"PGRST303","details":null,"hint":null,"message":"JWT not in audience"}|]
+-          { matchStatus = 401 }
+-
+-    it "ignores the audience claim and succeeds when it's empty" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": []
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+ 
+-    it "ignores the audience claim and succeeds when it's null" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": null
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-  context "when the audience claim is not present" $ do
+-    it "succeeds with a JWT with no audience claim" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe"
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "succeeds without a JWT" $
+-      get "/has_count_column" `shouldRespondWith` 200
+-
+-disabledSpec :: SpecWith ((), Application)
+-disabledSpec = describe "test handling of aud claims in JWT when the jwt-aud config is not set" $ do
+-
+-  context "when the audience claim is a string" $ do
+-    it "ignores the audience claim and suceeds" $ do
+-      let jwtPayload =
+-            [json|{
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": "youraudience"
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "ignores the audience claim and suceeds when it's empty" $ do
+-      let jwtPayload =
+-            [json|{
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ""
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-  context "when the audience is an array of strings" $ do
+-    it "ignores the audience claim and suceeds when it has 1 element" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["youraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "ignores the audience claim and suceeds when it has more than 1 element" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": ["notyouraudience", "youraudience", "anotheraudience"]
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "ignores the audience claim and suceeds when it's empty" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": []
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-    it "ignores the audience claim and succeeds when it's null" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe",
+-              "aud": null
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
+-
+-  context "when the audience claim is not present" $ do
+-    it "succeeds with a JWT with no audience claim" $ do
+-      let jwtPayload = [json|
+-            {
+-              "exp": 9999999999,
+-              "role": "postgrest_test_author",
+-              "id": "jdoe"
+-            }|]
+-          auth = authHeaderJWT $ generateJWT jwtPayload
+-      request methodGet "/authors_only" [auth] ""
+-        `shouldRespondWith` 200
++import Protolude  hiding (get)
++import SpecHelper
+ 
+-    it "succeeds without a JWT" $
+-      get "/has_count_column" `shouldRespondWith` 200
++spec :: SpecWith ((), Application)
++spec = describe "test handling of aud claims in JWT" $ do
++
++  -- this test will stop working 9999999999s after the UNIX EPOCH
++  it "succeeds with jwt token containing with an audience claim" $ do
++    {-  This is the decoded contents of authHeaderJWT
++
++        {
++          "exp": 9999999999,
++          "role": "postgrest_test_author",
++          "id": "jdoe",
++          "aud": "youraudience"
++        }
++
++    -}
++    let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjk5OTk5OTk5OTksInJvbGUiOiJwb3N0Z3Jlc3RfdGVzdF9hdXRob3IiLCJpZCI6Impkb2UiLCJhdWQiOiJ5b3VyYXVkaWVuY2UifQ.fJ4tLKSmolWGWehWN20qiU9dMO-WY0RI2VvacL7-ZGo"
++    request methodGet "/authors_only" [auth] ""
++      `shouldRespondWith` 200
++
++  it "succeeds with jwt token that does not contain an audience claim" $ do
++    {- This is the decoded contents of authHeaderJWT
++
++        {
++          "exp": 9999999999,
++          "role": "postgrest_test_author",
++          "id": "jdoe"
++        }
++    -}
++    let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjk5OTk5OTk5OTksInJvbGUiOiJwb3N0Z3Jlc3RfdGVzdF9hdXRob3IiLCJpZCI6Impkb2UifQ.Dpss-QoLYjec5OTsOaAc3FNVsSjA89wACoV-0ra3ClA"
++    request methodGet "/authors_only" [auth] ""
++      `shouldRespondWith` 200
++
++  it "requests without JWT token should work" $
++    get "/has_count_column" `shouldRespondWith` 200
+diff --git a/test/spec/Feature/Auth/AuthSpec.hs b/test/spec/Feature/Auth/AuthSpec.hs
+index 5538c83a..f30f7aa4 100644
+--- a/test/spec/Feature/Auth/AuthSpec.hs
++++ b/test/spec/Feature/Auth/AuthSpec.hs
+@@ -137,66 +137,6 @@ spec = describe "authorization" $ do
+     request methodGet "/authors_only" [auth] ""
+       `shouldRespondWith` 200
+ 
+-  it "fails when the exp claim is not a number" $ do
+-    let jwtPayload = [json|
+-          {
+-            "exp": "invalid",
+-            "role": "postgrest_test_author"
+-          }|]
+-        auth = authHeaderJWT $ generateJWT jwtPayload
+-    request methodGet "/authors_only" [auth] ""
+-      `shouldRespondWith`
+-        [json|{"code":"PGRST303","details":null,"hint":null,"message":"The JWT 'exp' claim must be a number"}|]
+-        { matchStatus = 401 }
+-
+-  it "fails when the nbf claim is not a number" $ do
+-    let jwtPayload = [json|
+-          {
+-            "nbf": "invalid",
+-            "role": "postgrest_test_author"
+-          }|]
+-        auth = authHeaderJWT $ generateJWT jwtPayload
+-    request methodGet "/authors_only" [auth] ""
+-      `shouldRespondWith`
+-        [json|{"code":"PGRST303","details":null,"hint":null,"message":"The JWT 'nbf' claim must be a number"}|]
+-        { matchStatus = 401 }
+-
+-  it "fails when the iat claim is not a number" $ do
+-    let jwtPayload = [json|
+-          {
+-            "iat": "invalid",
+-            "role": "postgrest_test_author"
+-          }|]
+-        auth = authHeaderJWT $ generateJWT jwtPayload
+-    request methodGet "/authors_only" [auth] ""
+-      `shouldRespondWith`
+-        [json|{"code":"PGRST303","details":null,"hint":null,"message":"The JWT 'iat' claim must be a number"}|]
+-        { matchStatus = 401 }
+-
+-  it "fails when the aud claim has a single value and it's not a string" $ do
+-    let jwtPayload = [json|
+-          {
+-            "aud": {"invalid": "value"},
+-            "role": "postgrest_test_author"
+-          }|]
+-        auth = authHeaderJWT $ generateJWT jwtPayload
+-    request methodGet "/authors_only" [auth] ""
+-      `shouldRespondWith`
+-        [json|{"code":"PGRST303","details":null,"hint":null,"message":"The JWT 'aud' claim must be a string or an array of strings"}|]
+-        { matchStatus = 401 }
+-
+-  it "fails when the aud claim is an array but it has non-string elements" $ do
+-    let jwtPayload = [json|
+-          {
+-            "aud": [{"invalid": "value"}, "test"],
+-            "role": "postgrest_test_author"
+-          }|]
+-        auth = authHeaderJWT $ generateJWT jwtPayload
+-    request methodGet "/authors_only" [auth] ""
+-      `shouldRespondWith`
+-        [json|{"code":"PGRST303","details":null,"hint":null,"message":"The JWT 'aud' claim must be a string or an array of strings"}|]
+-        { matchStatus = 401 }
+-
+   describe "custom pre-request proc acting on id claim" $ do
+ 
+     it "able to switch to postgrest_test_author role (id=1)" $
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 2fc0690b..16c5f393 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -137,8 +137,7 @@ main = do
+         analyzeTable "child_entities"
+ 
+       specs = uncurry describe <$> [
+-          ("Feature.Auth.AudienceJwtSecretSpec"          , Feature.Auth.AudienceJwtSecretSpec.disabledSpec)
+-        , ("Feature.Auth.AuthSpec"                       , Feature.Auth.AuthSpec.spec)
++          ("Feature.Auth.AuthSpec"                       , Feature.Auth.AuthSpec.spec)
+         , ("Feature.ConcurrentSpec"                      , Feature.ConcurrentSpec.spec)
+         , ("Feature.CorsSpec"                            , Feature.CorsSpec.spec)
+         , ("Feature.CustomMediaSpec"                     , Feature.Query.CustomMediaSpec.spec)
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 08c947da..6ecb7ff6 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -10,9 +10,6 @@ import qualified Data.ByteString.Lazy   as BL
+ import qualified Data.Map.Strict        as M
+ import           Data.Scientific        (toRealFloat)
+ import qualified Data.Set               as S
+-import qualified Jose.Jwa               as JWT
+-import qualified Jose.Jws               as JWT
+-import qualified Jose.Jwt               as JWT
+ 
+ import Data.Aeson           ((.=))
+ import Data.CaseInsensitive (CI (..), mk, original)
+@@ -200,17 +197,19 @@ testPlanEnabledCfg = baseCfg { configDbPlanEnabled = True }
+ 
+ testCfgBinaryJWT :: AppConfig
+ testCfgBinaryJWT =
++  let secret = B64.decodeLenient "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+   baseCfg {
+-    configJwtSecret = Just generateSecret
+-  , configJWKS = rightToMaybe $ parseSecret generateSecret
++    configJwtSecret = Just secret
++  , configJWKS = rightToMaybe $ parseSecret secret
+   }
+ 
+ testCfgAudienceJWT :: AppConfig
+ testCfgAudienceJWT =
++  let secret = B64.decodeLenient "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+   baseCfg {
+-    configJwtSecret = Just generateSecret
++    configJwtSecret = Just secret
+   , configJwtAudience = Just "youraudience"
+-  , configJWKS = rightToMaybe $ parseSecret generateSecret
++  , configJWKS = rightToMaybe $ parseSecret secret
+   }
+ 
+ testCfgAsymJWK :: AppConfig
+@@ -292,13 +291,6 @@ authHeader typ creds =
+ authHeaderJWT :: BS.ByteString -> Header
+ authHeaderJWT = authHeader "Bearer"
+ 
+-generateSecret :: ByteString
+-generateSecret = B64.decodeLenient "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU="
+-
+-generateJWT :: BL.ByteString -> ByteString
+-generateJWT claims =
+-  either mempty JWT.unJwt $ JWT.hmacEncode JWT.HS256 generateSecret (BL.toStrict claims)
+-
+ -- | Tests whether the text can be parsed as a json object containing
+ -- the key "message", and optional keys "details", "hint", "code",
+ -- and no extraneous keys
