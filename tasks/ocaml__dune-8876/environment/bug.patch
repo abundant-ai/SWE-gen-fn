@@ -1,0 +1,259 @@
+diff --git a/src/dune_pkg/fetch.ml b/src/dune_pkg/fetch.ml
+index bedf58972..30b1897a3 100644
+--- a/src/dune_pkg/fetch.ml
++++ b/src/dune_pkg/fetch.ml
+@@ -100,11 +100,9 @@ let fetch ~unpack ~checksum ~target (url : OpamUrl.t) =
+   let+ downloaded =
+     Fiber_job.run
+     @@
+-    let hashes =
+-      match checksum with
+-      | None -> []
+-      | Some checksum -> [ Checksum.to_opam_hash checksum ]
+-    in
++    (* hashes have to be empty otherwise OPAM deletes the file after
++       downloading if the hash does not match *)
++    let hashes = [] in
+     match url.backend, unpack with
+     | #OpamUrl.version_control, _ | _, true ->
+       let dirname = OpamFilename.Dir.of_string path in
+@@ -112,7 +110,6 @@ let fetch ~unpack ~checksum ~target (url : OpamUrl.t) =
+       OpamRepository.pull_tree label dirname hashes [ url ]
+       @@| (function
+       | Up_to_date _ -> OpamTypes.Up_to_date ()
+-      | Checksum_mismatch e -> Checksum_mismatch e
+       | Result _ -> Result ()
+       | Not_available (a, b) -> Not_available (a, b))
+     | _ ->
+@@ -121,13 +118,21 @@ let fetch ~unpack ~checksum ~target (url : OpamUrl.t) =
+   in
+   Dune_stats.finish event;
+   match downloaded with
+-  | Up_to_date () | Result () -> Ok ()
++  | Up_to_date () | Result () ->
++    (match checksum with
++     | None -> Ok ()
++     | Some expected ->
++       let expected = Checksum.to_opam_hash expected in
++       (match OpamHash.mismatch path expected with
++        | None -> Ok ()
++        | Some actual ->
++          (* the file is invalid, so remove it before returning to the user *)
++          Path.unlink target;
++          Error (Checksum_mismatch (Checksum.of_opam_hash actual))))
+   | Not_available (None, _verbose) -> Error (Unavailable None)
+   | Not_available (Some normal, verbose) ->
+     let msg = User_message.make [ Pp.text normal; Pp.text verbose ] in
+     Error (Unavailable (Some msg))
+-  | Checksum_mismatch expected ->
+-    Error (Checksum_mismatch (Checksum.of_opam_hash expected))
+ ;;
+ 
+ module Opam_repository = struct
+diff --git a/test/expect-tests/dune_pkg/fetch_tests.ml b/test/expect-tests/dune_pkg/fetch_tests.ml
+index 70ea7643e..9aa9c7dd6 100644
+--- a/test/expect-tests/dune_pkg/fetch_tests.ml
++++ b/test/expect-tests/dune_pkg/fetch_tests.ml
+@@ -54,7 +54,7 @@ Content-Length: %d
+   port, thread
+ ;;
+ 
+-let download ?(reproducible = true) ~unpack ~port ~filename ~target ?checksum () =
++let download ~unpack ~port ~filename ~target ?checksum () =
+   let open Fiber.O in
+   let url = url ~port ~filename in
+   let* res = Fetch.fetch ~unpack ~checksum ~target url in
+@@ -69,11 +69,9 @@ let download ?(reproducible = true) ~unpack ~port ~filename ~target ?checksum ()
+     User_error.raise
+       ~loc:Loc.none
+       [ Pp.text "Expected checksum was"
+-      ; Pp.verbatim @@ Checksum.to_string expected_checksum
++      ; Pp.text @@ Checksum.to_string expected_checksum
+       ; Pp.text "but got"
+-      ; (if reproducible
+-         then Pp.verbatim @@ Checksum.to_string actual_checksum
+-         else Pp.text "<REDACTED>")
++      ; Pp.text @@ Checksum.to_string actual_checksum
+       ]
+   | Ok () ->
+     print_endline "Done downloading";
+@@ -175,9 +173,6 @@ let%expect_test "downloading, tarball" =
+   let destination = "tarball" in
+   run
+     (download
+-     (* the tar utility that produces [filename] isn't portable and/or
+-        deterministic enough to print the actual checksum *)
+-       ~reproducible:false
+        ~unpack:true
+        ~checksum:wrong_checksum
+        ~port
+@@ -191,8 +186,5 @@ let%expect_test "downloading, tarball" =
+   (Dune_util__Report_error.Already_reported)
+   Trailing output
+   ---------------
+-  Error: Expected checksum was
+-  md5=c533195dc4253503071a19d42f08e877
+-  but got
+-  <REDACTED> |}]
++  Error: Is a directory |}]
+ ;;
+diff --git a/vendor/opam/src/format/opamTypes.mli b/vendor/opam/src/format/opamTypes.mli
+index 473040306..0e90f644d 100644
+--- a/vendor/opam/src/format/opamTypes.mli
++++ b/vendor/opam/src/format/opamTypes.mli
+@@ -51,7 +51,6 @@ type std_path =
+ (** Download result *)
+ type 'a download =
+   | Up_to_date of 'a
+-  | Checksum_mismatch of OpamHash.t
+   | Not_available of string option * string
+   (** Arguments are respectively the short and long version of an error message.
+       The usage is: the first argument is displayed on normal mode (nothing
+diff --git a/vendor/opam/src/repository/opamDownload.ml b/vendor/opam/src/repository/opamDownload.ml
+index 320477c2e..f67e7a827 100644
+--- a/vendor/opam/src/repository/opamDownload.ml
++++ b/vendor/opam/src/repository/opamDownload.ml
+@@ -15,7 +15,6 @@ open OpamProcess.Job.Op
+ let log fmt = OpamConsole.log "CURL" fmt
+ 
+ exception Download_fail of string option * string
+-exception Checksum_mismatch of OpamHash.t
+ let fail (s,l) = raise (Download_fail (s,l))
+ 
+ let user_agent =
+@@ -163,9 +162,10 @@ let really_download
+   if validate &&
+      OpamRepositoryConfig.(!r.force_checksums <> Some false) then
+     OpamStd.Option.iter (fun cksum ->
+-        match OpamHash.mismatch tmp_dst cksum with
+-        | None -> ()
+-        | Some cksum -> raise (Checksum_mismatch cksum))
++        if not (OpamHash.check_file tmp_dst cksum) then
++          fail (Some "Bad checksum",
++                    Printf.sprintf "Bad checksum, expected %s"
++                      (OpamHash.to_string cksum)))
+       checksum;
+   OpamSystem.mv tmp_dst dst;
+   Done ()
+diff --git a/vendor/opam/src/repository/opamDownload.mli b/vendor/opam/src/repository/opamDownload.mli
+index cc0265843..5d936039c 100644
+--- a/vendor/opam/src/repository/opamDownload.mli
++++ b/vendor/opam/src/repository/opamDownload.mli
+@@ -14,7 +14,6 @@ open OpamTypes
+ (** Configuration init and handling of downloading commands *)
+ 
+ exception Download_fail of string option * string
+-exception Checksum_mismatch of OpamHash.t
+ 
+ (** downloads a file from an URL, using Curl, Wget, or a custom configured
+     tool, to the given directory. Returns the downloaded filename.
+diff --git a/vendor/opam/src/repository/opamHTTP.ml b/vendor/opam/src/repository/opamHTTP.ml
+index 5f46eb079..a3cb4400f 100644
+--- a/vendor/opam/src/repository/opamHTTP.ml
++++ b/vendor/opam/src/repository/opamHTTP.ml
+@@ -74,10 +74,6 @@ module B = struct
+       (slog OpamUrl.to_string) remote_url;
+     OpamProcess.Job.catch
+       (fun e ->
+-        match e with
+-        | OpamDownload.Checksum_mismatch e -> 
+-          Done (Checksum_mismatch e)
+-        | _ ->
+          OpamStd.Exn.fatal e;
+          let s,l =
+            let str = Printf.sprintf "%s (%s)" (OpamUrl.to_string remote_url) in
+diff --git a/vendor/opam/src/repository/opamRepository.ml b/vendor/opam/src/repository/opamRepository.ml
+index 3b944c638..841f22997 100644
+--- a/vendor/opam/src/repository/opamRepository.ml
++++ b/vendor/opam/src/repository/opamRepository.ml
+@@ -146,7 +146,7 @@ let validate_and_add_to_cache label url cache_dir file checksums =
+       (OpamHash.to_string expected)
+       (OpamHash.to_string mismatch);
+     OpamFilename.remove file;
+-    `Expected expected
++    false
+   with Not_found ->
+     (let checksums = OpamHash.sort checksums in
+      match cache_dir, checksums with
+@@ -160,7 +160,7 @@ let validate_and_add_to_cache label url cache_dir file checksums =
+            with Sys_error _ -> ())
+          others_chks;
+      | _ -> ());
+-    `Match
++    true
+ 
+ (* [cache_dir] used to add to cache only *)
+ let pull_from_upstream
+@@ -210,16 +210,13 @@ let pull_from_upstream
+   )
+   @@| function
+   | (Result (Some file) | Up_to_date (Some file)) as ret ->
+-    if OpamRepositoryConfig.(!r.force_checksums) = Some false then
+-      ret
++    if OpamRepositoryConfig.(!r.force_checksums) = Some false
++    || validate_and_add_to_cache label url cache_dir file checksums
++    then ret
+     else
+-      begin match validate_and_add_to_cache label url cache_dir file checksums with
+-      | `Expected e ->
+-          Checksum_mismatch e
+-      | `Match -> ret
+-      end
++    let m = "Checksum mismatch" in
++    Not_available (Some m, m)
+   | (Result None | Up_to_date None) as ret -> ret
+-  | Checksum_mismatch _ as na -> na
+   | Not_available _ as na -> na
+ 
+ let pull_from_mirrors label ?working_dir ?subpath cache_dir destdir checksums urls =
+@@ -304,7 +301,6 @@ let pull_tree_t
+      let m = "no cache" in
+      Done (Not_available (Some m, m)))
+   @@+ function
+-  | Checksum_mismatch e -> Done (Checksum_mismatch e)
+   | Up_to_date (archive, _) ->
+     extract_archive archive "cached"
+   | Result (archive, url) ->
+@@ -349,7 +345,6 @@ let pull_tree_t
+       | url, (Up_to_date (Some archive) | Result (Some archive)) ->
+         extract url archive
+       | url, Result None -> Done (Result url)
+-      | _, (Checksum_mismatch _ as na) -> Done na
+       | _, (Not_available _ as na) -> Done na
+ 
+ 
+@@ -378,7 +373,6 @@ let pull_file label ?cache_dir ?(cache_urls=[])  ?(silent_hits=false)
+      let m = "no cache" in
+      Done (Not_available (Some m, m)))
+   @@+ function
+-  | Checksum_mismatch e -> Done (Checksum_mismatch e)
+   | Up_to_date (f, _) ->
+     if not silent_hits then
+       OpamConsole.msg "[%s] found in cache\n"
+@@ -405,14 +399,12 @@ let pull_file label ?cache_dir ?(cache_urls=[])  ?(silent_hits=false)
+           | _, Up_to_date _ -> assert false
+           | _, Result (Some f) -> OpamFilename.move ~src:f ~dst:file; Result ()
+           | _, Result None -> let m = "is a directory" in Not_available (Some m, m)
+-          | _, (Checksum_mismatch _ as na) -> na
+           | _, (Not_available _ as na) -> na)
+ 
+ let pull_file_to_cache label ~cache_dir ?(cache_urls=[]) checksums remote_urls =
+   let text = OpamProcess.make_command_text label "dl" in
+   OpamProcess.Job.with_text text @@
+   fetch_from_cache cache_dir cache_urls checksums @@+ function
+-  | Checksum_mismatch e -> Done (Checksum_mismatch e)
+   | Up_to_date (_, _) ->
+     Done (Up_to_date "cached")
+   | Result (_, url) ->
+@@ -565,11 +557,6 @@ let is_dirty ?subpath url =
+   fun dir (module VCS) -> VCS.is_dirty ?subpath dir
+ 
+ let report_fetch_result pkg = function
+-  | Checksum_mismatch s ->
+-    let msg = "Checksum Mismatch" in
+-    OpamConsole.msg "[%s] fetching sources failed: %s\n"
+-      (OpamConsole.colorise `red (OpamPackage.to_string pkg)) msg;
+-      Checksum_mismatch s
+   | Result msg ->
+     OpamConsole.msg
+       "[%s] synchronised (%s)\n"

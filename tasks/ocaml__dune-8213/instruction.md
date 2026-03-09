@@ -1,0 +1,11 @@
+The persistence version-tracking mechanism is currently too easy to misuse: a module implementing the persistent descriptor interface can change the shape/encoding of its stored values without updating the associated version, and there is no reliable way to detect that oversight. As a result, persistent values may be read/written with an incorrect version, causing silent incompatibilities.
+
+Update the persistent descriptor API so that every instance of the persistence descriptor (e.g., modules implementing `Dune_util.Persistent.Desc`) must provide a concrete `test_example` value of its stored type `t`. This example value is used to compute a stable digest (using `Dune_digest.generic` and converting it to a string) that represents the expected structure/format of the persisted data.
+
+Add an entry point `Persistent.test_examples : unit -> (Persistent.T of (module Persistent.Desc with type t = _) * _) Seq.t` (or equivalent existential packaging) that returns all registered persistent descriptors paired with their `test_example`. When iterating these, callers should be able to print `Persistent.name`, `Persistent.version`, and the computed digest for each example.
+
+Expected behavior: invoking `Persistent.test_examples ()` must enumerate all persistent descriptors that participate in persistence/versioning, each supplying a constructible `test_example`. Computing `Dune_digest.generic example |> Dune_digest.to_string` must yield a stable digest for that example. If the type/format of a persistent value changes, the corresponding `test_example` should change in the same way, which should in turn change the digest and force the developer to bump `Persistent.version` for that descriptor.
+
+Actual behavior to fix: the current system does not require a `test_example` per persistent descriptor, and therefore cannot reliably detect when persisted value formats change without a version bump.
+
+Make sure that all existing persistent descriptors are updated to provide an appropriate `test_example` and that `Persistent.test_examples ()` includes them all. The output of digest computation for each descriptor must remain stable unless the underlying persisted data format changes, in which case the developer is expected to bump that descriptor’s version to match the new format.

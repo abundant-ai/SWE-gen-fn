@@ -1,0 +1,115 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7a32938b..f2ce947f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file. From versio
+ 
+ ## Unreleased
+ 
++### Added
++
++- Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
++- Add a `HINT` when the LISTEN channel stops working due to a PostgreSQL bug by @laurenceisla in #4581
++- Add string slicing operator for `jwt-role-claim-key` by @taimoorzaeem in #4599
++- Log host, port and pg version of listener database connection by @mkleczek in #4617 #4618
++- Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
++  + Removed unnecessary double count when building the `Content-Range`.
++
++### Fixed
++
++- Don't hide async exceptions in logs by @stevechavez in #4646
++
++### Changed
++
++- Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
++  + Now fails at startup. Prior to this, it failed with `PGRST205` on requests related to these schemas.
++
+ ## [14.4] - 2026-01-29
+ 
+ ### Fixed
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 411694fd..64e31b19 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -9,18 +9,24 @@ Some of its functionality includes:
+ - Producing HTTP Headers according to RFCs.
+ - Content Negotiation
+ -}
+-{-# LANGUAGE RecordWildCards #-}
++{-# LANGUAGE RecordWildCards     #-}
++{-# LANGUAGE ScopedTypeVariables #-}
++{-# LANGUAGE ViewPatterns        #-}
+ module PostgREST.App
+   ( postgrest
+   , run
+   ) where
+ 
+ 
++import GHC.IO.Exception (IOErrorType (..))
++import System.IO.Error  (ioeGetErrorType)
++
+ import Control.Monad.Except     (liftEither)
+ import Data.Either.Combinators  (mapLeft, whenLeft)
+ import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+-import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
++import Network.Wai.Handler.Warp (defaultSettings, setHost,
++                                 setOnException, setPort,
+                                  setServerName)
+ 
+ import qualified Data.Text.Encoding       as T
+@@ -63,7 +69,6 @@ type Handler = ExceptT Error
+ 
+ run :: AppState -> IO ()
+ run appState = do
+-  let observer = AppState.getObserver appState
+   conf@AppConfig{..} <- AppState.getConfig appState
+ 
+   AppState.schemaCacheLoader appState -- Loads the initial SchemaCache
+@@ -79,7 +84,24 @@ run appState = do
+     address <- resolveSocketToAddress (AppState.getSocketREST appState)
+     observer $ AppServerAddressObs address
+ 
+-  Warp.runSettingsSocket (serverSettings conf) (AppState.getSocketREST appState) app
++  Warp.runSettingsSocket (serverSettings conf & setOnException onWarpException) (AppState.getSocketREST appState) app
++  where
++    observer = AppState.getObserver appState
++
++    onWarpException :: Maybe Wai.Request -> SomeException -> IO ()
++    onWarpException _ ex =
++      when (shouldDisplayException ex) $
++        observer $ WarpErrorObs $ show ex
++
++    -- Similar to wai defaultShouldDisplayException in
++    -- https://github.com/yesodweb/wai//blob/8c3882c60f6abe043889fc20c7efd3fa9747fa4a/warp/Network/Wai/Handler/Warp/Settings.hs#L251-L258
++    -- but without omitting AsyncException since it's important to log for ThreadKilled, StackOverflow and other cases.
++    -- We want to reuse this to avoid flooding the logs for some transient failure cases.
++    shouldDisplayException :: SomeException -> Bool
++    shouldDisplayException se
++        | Just (_ :: Warp.InvalidRequest) <- fromException se = False
++        | Just (ioeGetErrorType -> et) <- fromException se, et == ResourceVanished || et == InvalidArgument = False
++        | otherwise = True
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+ serverSettings AppConfig{..} =
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index bc4e6311..b93d67e5 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -63,6 +63,7 @@ data Observation
+   | PoolRequestFullfilled
+   | JwtCacheLookup Bool
+   | JwtCacheEviction
++  | WarpErrorObs Text
+ 
+ data ObsFatalError = ServerAuthError | ServerPgrstBug | ServerError42P05 | ServerError08P01
+ 
+@@ -157,6 +158,8 @@ observationMessage = \case
+     "Looked up a JWT in JWT cache"
+   JwtCacheEviction ->
+     "Evicted entry from JWT cache"
++  WarpErrorObs txt ->
++    "Warp server error: " <> txt
+   where
+     showMillis :: Double -> Text
+     showMillis x = toS $ showFFloat (Just 1) x ""

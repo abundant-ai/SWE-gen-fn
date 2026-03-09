@@ -1,0 +1,423 @@
+diff --git a/bin/exec.ml b/bin/exec.ml
+index 6028144a5..284fbe78e 100644
+--- a/bin/exec.ml
++++ b/bin/exec.ml
+@@ -30,46 +30,13 @@ let man =
+ 
+ let info = Cmd.info "exec" ~doc ~man
+ 
+-module Cmd_arg = struct
+-  type t =
+-    | Expandable of Dune_lang.String_with_vars.t * string
+-    | Terminal of string
+-
+-  let parse s =
+-    match Arg.conv_parser Arg.dep s with
+-    | Ok (File sw) when Dune_lang.String_with_vars.has_pforms sw -> Expandable (sw, s)
+-    | _ -> Terminal s
+-  ;;
+-
+-  let pp pps = function
+-    | Expandable (_, s) -> Format.fprintf pps "%s" s
+-    | Terminal s -> Format.fprintf pps "%s" s
+-  ;;
+-
+-  let expand t ~root ~sctx =
+-    let open Memo.O in
+-    match t with
+-    | Terminal s -> Memo.return s
+-    | Expandable (sw, _) ->
+-      let+ path, _ =
+-        Action_builder.run (Target.expand_path_from_root root sctx sw) Eager
+-      in
+-      let context = Dune_rules.Super_context.context sctx in
+-      (* TODO Why are we stringifying this path? *)
+-      Path.to_string (Path.build (Path.Build.relative context.build_dir path))
+-  ;;
+-
+-  let conv = Arg.conv ((fun s -> Ok (parse s)), pp)
+-end
+-
+ module Command_to_exec = struct
+   (* A command to execute, which knows how to (re)build the program and then
+-     run it with some arguments in an environment *)
++     run it with some arguments in an enivorment *)
+ 
+   type t =
+     { get_path_and_build_if_necessary :
+-        string -> (Path.t, [ `Already_reported ]) result Fiber.t
+-    ; prog : string
++        unit -> (Path.t, [ `Already_reported ]) result Fiber.t
+     ; args : string list
+     ; env : Env.t
+     }
+@@ -77,19 +44,17 @@ module Command_to_exec = struct
+   (* Helper function to spawn a new process running a command in an
+      environment, returning the new process' pid *)
+   let spawn_process path ~args ~env =
+-    let pid =
+-      let path = Path.to_string path in
+-      let env = Env.to_unix env |> Spawn.Env.of_list in
+-      let argv = path :: args in
+-      Spawn.spawn ~prog:path ~env ~argv ()
+-    in
++    let path = Path.to_string path in
++    let env = Env.to_unix env |> Spawn.Env.of_list in
++    let argv = path :: args in
++    let pid = Spawn.spawn ~prog:path ~env ~argv () in
+     Pid.of_int pid
+   ;;
+ 
+   (* Run the command, first (re)building the program which the command is
+      invoking *)
+-  let build_and_run_in_child_process { get_path_and_build_if_necessary; prog; args; env } =
+-    get_path_and_build_if_necessary prog
++  let build_and_run_in_child_process { get_path_and_build_if_necessary; args; env } =
++    get_path_and_build_if_necessary ()
+     |> Fiber.map ~f:(Result.map ~f:(spawn_process ~args ~env))
+   ;;
+ end
+@@ -141,7 +106,6 @@ module Watch = struct
+     let open Fiber.O in
+     let* () = Fiber.return () in
+     let* () = kill_currently_running_process state in
+-    let* command_to_exec = command_to_exec () in
+     Command_to_exec.build_and_run_in_child_process command_to_exec
+     >>| Result.map ~f:(fun pid -> state.currently_running_pid := Some pid)
+   ;;
+@@ -231,81 +195,63 @@ let get_path_and_build_if_necessary sctx ~no_rebuild ~dir ~prog =
+ 
+ module Exec_context = struct
+   type t =
+-    { prog : Cmd_arg.t
+-    ; args : Cmd_arg.t list
+-    ; env : Env.t Memo.t
+-    ; sctx : Super_context.t Memo.t
+-    ; get_path_and_build_if_necessary : prog:string -> Path.t Memo.t
++    { common : Common.t
++    ; config : Dune_config.t
++    ; args : string list
++    ; env : Env.t Fiber.t
++    ; get_path_and_build_if_necessary : (unit -> Path.t Memo.t) Fiber.t
+     }
+ 
+   let init ~common ~context ~no_rebuild ~prog ~args =
+     (* The initialization of some fields is deferred until the fiber scheduler
+        has been started. *)
+-    let open Fiber.O in
+-    let+ setup = Import.Main.setup () in
+-    let open Memo.O in
++    let config = Common.init common in
+     let sctx =
+-      let+ setup = setup in
++      let open Fiber.O in
++      let* setup = Import.Main.setup () in
++      let+ setup = Memo.run setup in
+       Import.Main.find_scontext_exn setup ~name:context
+     in
+     let dir =
+-      let+ sctx = sctx in
+-      let context = Dune_rules.Super_context.context sctx in
+-      Path.Build.relative context.build_dir (Common.prefix_target common "")
++      Fiber.map sctx ~f:(fun sctx ->
++        let context = Dune_rules.Super_context.context sctx in
++        Path.Build.relative context.build_dir (Common.prefix_target common ""))
+     in
+-    let env = Memo.map sctx ~f:Super_context.context_env in
+-    let get_path_and_build_if_necessary ~prog =
+-      let* sctx = sctx
+-      and+ dir = dir in
+-      get_path_and_build_if_necessary sctx ~no_rebuild ~dir ~prog
++    let env = Fiber.map sctx ~f:Super_context.context_env in
++    let get_path_and_build_if_necessary =
++      let open Fiber.O in
++      let* sctx = sctx in
++      let+ dir = dir in
++      fun () -> get_path_and_build_if_necessary sctx ~no_rebuild ~dir ~prog
+     in
+-    { sctx; env; prog; args; get_path_and_build_if_necessary }
++    { common; config; env; args; get_path_and_build_if_necessary }
+   ;;
+ 
+-  let run_once t common config =
++  let run_once { common; config; env; args; get_path_and_build_if_necessary; _ } =
+     Scheduler.go ~common ~config
+     @@ fun () ->
+     let open Fiber.O in
+-    let* path, args, env =
+-      let* { sctx; env; prog; args; get_path_and_build_if_necessary } = t in
+-      Build_system.run_exn (fun () ->
+-        let open Memo.O in
+-        let* env = env
+-        and* sctx = sctx in
+-        let root = Common.root common in
+-        let* path =
+-          let* prog = Cmd_arg.expand prog ~root ~sctx in
+-          get_path_and_build_if_necessary ~prog
+-        in
+-        let+ args = Memo.parallel_map ~f:(Cmd_arg.expand ~root ~sctx) args in
+-        path, args, env)
+-    in
++    let* get_path_and_build_if_necessary = get_path_and_build_if_necessary in
++    let* env = env in
++    let+ path = Build_system.run_exn get_path_and_build_if_necessary in
+     let prog = Path.to_string path in
+     let argv = prog :: args in
+     restore_cwd_and_execve common prog argv env
+   ;;
+ 
+-  let run_eager_watch t common config =
++  let run_eager_watch { common; config; env; args; get_path_and_build_if_necessary; _ } =
+     Scheduler.go_with_rpc_server_and_console_status_reporting ~common ~config
+     @@ fun () ->
+-    let command_to_exec () =
+-      let open Fiber.O in
+-      let* { sctx; env; prog; args; get_path_and_build_if_necessary } = t in
+-      Memo.run
+-      @@
+-      let open Memo.O in
+-      let* env = env
+-      and* sctx = sctx in
+-      let expand = Cmd_arg.expand ~root:(Common.root common) ~sctx in
+-      let* prog = expand prog in
+-      let+ args = Memo.parallel_map args ~f:expand in
++    let open Fiber.O in
++    let* get_path_and_build_if_necessary = get_path_and_build_if_necessary in
++    let* env = env in
++    let command_to_exec =
+       { Command_to_exec.get_path_and_build_if_necessary =
+-          (fun prog ->
++          (fun () ->
+             (* TODO we should release the dune lock. But we aren't doing it
+                because we don't unload the database files we've marshalled.
+             *)
+-            Build_system.run (fun () -> get_path_and_build_if_necessary ~prog))
+-      ; prog
++            Build_system.run get_path_and_build_if_necessary)
+       ; args
+       ; env
+       }
+@@ -317,23 +263,19 @@ end
+ let term =
+   let+ common = Common.term
+   and+ context = Common.context_arg ~doc:{|Run the command in this build context.|}
+-  and+ prog = Arg.(required & pos 0 (some Cmd_arg.conv) None (Arg.info [] ~docv:"PROG"))
++  and+ prog = Arg.(required & pos 0 (some string) None (Arg.info [] ~docv:"PROG"))
+   and+ no_rebuild =
+     Arg.(value & flag & info [ "no-build" ] ~doc:"don't rebuild target before executing")
+-  and+ args = Arg.(value & pos_right 0 Cmd_arg.conv [] (Arg.info [] ~docv:"ARGS")) in
++  and+ args = Arg.(value & pos_right 0 string [] (Arg.info [] ~docv:"ARGS")) in
+   (* TODO we should make sure to finalize the current backend before exiting dune.
+      For watch mode, we should finalize the backend and then restart it in between
+      runs. *)
+-  let config = Common.init common in
+   let exec_context = Exec_context.init ~common ~context ~no_rebuild ~prog ~args in
+-  let f =
+-    match Common.watch common with
+-    | Yes Passive ->
+-      User_error.raise [ Pp.textf "passive watch mode is unsupported by exec" ]
+-    | Yes Eager -> Exec_context.run_eager_watch
+-    | No -> Exec_context.run_once
+-  in
+-  f exec_context common config
++  match Common.watch common with
++  | Yes Passive ->
++    User_error.raise [ Pp.textf "passive watch mode is unsupported by exec" ]
++  | Yes Eager -> Exec_context.run_eager_watch exec_context
++  | No -> Exec_context.run_once exec_context
+ ;;
+ 
+ let command = Cmd.v info term
+diff --git a/bin/target.ml b/bin/target.ml
+index fefc18e86..ef095e370 100644
+--- a/bin/target.ml
++++ b/bin/target.ml
+@@ -165,8 +165,8 @@ let resolve_path path ~(setup : Dune_rules.Main.build_system)
+     | None -> can't_build path)
+ ;;
+ 
+-let expand_path_from_root (root : Workspace_root.t) sctx sv =
+-  let ctx = Super_context.context sctx in
++let expand_path (root : Workspace_root.t) ~(setup : Dune_rules.Main.build_system) ctx sv =
++  let sctx = Dune_engine.Context_name.Map.find_exn setup.scontexts (Context.name ctx) in
+   let dir =
+     Path.Build.relative
+       ctx.Context.build_dir
+@@ -175,12 +175,7 @@ let expand_path_from_root (root : Workspace_root.t) sctx sv =
+   let* expander = Action_builder.of_memo (Dune_rules.Super_context.expander sctx ~dir) in
+   let expander = Dune_rules.Dir_contents.add_sources_to_expander sctx expander in
+   let+ s = Dune_rules.Expander.expand_str expander sv in
+-  root.reach_from_root_prefix ^ s
+-;;
+-
+-let expand_path root sctx sv =
+-  let+ s = expand_path_from_root root sctx sv in
+-  Path.relative Path.root s
++  Path.relative Path.root (root.reach_from_root_prefix ^ s)
+ ;;
+ 
+ let resolve_alias root ~recursive sv ~(setup : Dune_rules.Main.build_system) =
+@@ -204,10 +199,7 @@ let resolve_target root ~setup target =
+          (resolve_alias root ~recursive:true sv ~setup))
+   | File sv as dep ->
+     let f ctx =
+-      let sctx =
+-        Dune_engine.Context_name.Map.find_exn setup.scontexts (Context.name ctx)
+-      in
+-      let* path = expand_path root sctx sv in
++      let* path = expand_path root ~setup ctx sv in
+       Action_builder.of_memo (resolve_path path ~setup)
+       >>| Result.map_error ~f:(fun hints -> dep, hints)
+     in
+diff --git a/bin/target.mli b/bin/target.mli
+index 03a1e5511..c4a57eb36 100644
+--- a/bin/target.mli
++++ b/bin/target.mli
+@@ -17,9 +17,3 @@ val interpret_targets
+   -> Dune_rules.Main.build_system
+   -> Arg.Dep.t list
+   -> unit Dune_engine.Action_builder.t
+-
+-val expand_path_from_root
+-  :  Workspace_root.t
+-  -> Dune_rules.Super_context.t
+-  -> Dune_lang.String_with_vars.t
+-  -> string Dune_engine.Action_builder.t
+diff --git a/doc/changes/8474.md b/doc/changes/8474.md
+deleted file mode 100644
+index c51cbacb3..000000000
+--- a/doc/changes/8474.md
++++ /dev/null
+@@ -1,3 +0,0 @@
+-- `dune exec`: support syntax like `%{bin:program}`. This can appear anywhere
+-  in the command line, so things like `dune exec time %{bin:program}` now work.
+-  (#6035, #8474, fixes #2691, @emillon, @Leonidas-from-XIV)
+diff --git a/src/dune_lang/string_with_vars.mli b/src/dune_lang/string_with_vars.mli
+index ec646ca42..65837e04b 100644
+--- a/src/dune_lang/string_with_vars.mli
++++ b/src/dune_lang/string_with_vars.mli
+@@ -43,10 +43,7 @@ val make_text : ?quoted:bool -> Loc.t -> string -> t
+ (** Concatenate a list of parts. *)
+ val make : ?quoted:bool -> Loc.t -> [ `Text of string | `Pform of Pform.t ] list -> t
+ 
+-(** [is_pform v p] holds when [v] is just the Pform [p] *)
+ val is_pform : t -> Pform.t -> bool
+-
+-(** If [t] contains any variables *)
+ val has_pforms : t -> bool
+ 
+ (** If [t] contains no variable, returns the contents of [t]. *)
+diff --git a/test/blackbox-tests/test-cases/exec-bin.t b/test/blackbox-tests/test-cases/exec-bin.t
+deleted file mode 100644
+index 0688a016c..000000000
+--- a/test/blackbox-tests/test-cases/exec-bin.t
++++ /dev/null
+@@ -1,108 +0,0 @@
+-  $ cat > dune-project << EOF
+-  > (lang dune 1.1)
+-  > 
+-  > (package
+-  >  (name e))
+-  > EOF
+-  $ cat > dune << EOF
+-  > (executable
+-  >  (public_name e))
+-  > EOF
+-
+-The executable just displays "Hello" and its arguments.
+-
+-  $ cat > e.ml << EOF
+-  > let () =
+-  >   print_endline "Hello";
+-  >   Array.iteri (fun i s ->
+-  >     Printf.printf "argv[%d] = %s\n" i s
+-  >     ) Sys.argv
+-  > EOF
+-
+-By default, e is executed with the program name and arguments in argv.
+-
+-  $ dune exec ./e.exe a b c
+-  Hello
+-  argv[0] = _build/default/e.exe
+-  argv[1] = a
+-  argv[2] = b
+-  argv[3] = c
+-
+-The special form %{bin:public_name} is supported.
+-
+-  $ dune exec %{bin:e} a b c
+-  Hello
+-  argv[0] = _build/install/default/bin/e
+-  argv[1] = a
+-  argv[2] = b
+-  argv[3] = c
+-
+-This wrapper parses its own arguments and executes the rest.
+-
+-  $ cat > wrap.sh << 'EOF'
+-  > #!/bin/bash
+-  > while getopts "xy" o; do
+-  >   echo "Got option: $o"
+-  > done
+-  > shift $((OPTIND-1))
+-  > echo Before
+-  > "$@"
+-  > echo After
+-  > EOF
+-  $ chmod +x wrap.sh
+-
+-It is possible to put the %{bin:...} pform in arguments rather than first.
+-
+-  $ dune exec -- ./wrap.sh -x -y %{bin:e} a b c
+-  Got option: x
+-  Got option: y
+-  Before
+-  Hello
+-  argv[0] = _build/install/default/bin/e
+-  argv[1] = a
+-  argv[2] = b
+-  argv[3] = c
+-  After
+-
+-The first item is still looked up in PATH.
+-
+-  $ dune exec ls %{bin:e}
+-  _build/install/default/bin/e
+-
+-Pforms can appear several times.
+-
+-  $ dune exec ls %{bin:e} %{bin:e}
+-  _build/install/default/bin/e
+-  _build/install/default/bin/e
+-
+-It should also be possible to call another program that is also supposed to be
+-built if referenced, for this we create a new binary that calls its first
+-argument:
+-
+-  $ cat > call_arg.ml << EOF
+-  > let () =
+-  >   let first = Sys.argv.(1) in
+-  >   Printf.printf "Calling my first arg, %S:\n" first;
+-  >   let inch, outch = Unix.open_process_args first [|first|] in
+-  >   print_endline (input_line inch);
+-  >   let status = Unix.close_process (inch, outch) in
+-  >   match status with
+-  >   | Unix.WEXITED 0 -> print_endline "All good"
+-  >   | _ -> print_endline "Something is Rotten in the State of Dune"
+-  > EOF
+-  $ cat > called.ml << EOF
+-  > let () = print_endline "I was called"
+-  > EOF
+-  $ cat > dune << EOF
+-  > (executables
+-  >  (public_names e call_arg called)
+-  >  (libraries unix))
+-  > EOF
+-
+-If we then ask it to execute, both `call_arg` and `called` should be compiled
+-and run, successfully.
+-
+-  $ dune exec %{bin:call_arg} %{bin:called}
+-  Calling my first arg, "_build/install/default/bin/called":
+-  I was called
+-  All good

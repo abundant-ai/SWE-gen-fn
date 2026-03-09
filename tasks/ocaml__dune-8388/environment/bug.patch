@@ -1,0 +1,566 @@
+diff --git a/otherlibs/dune-rpc/private/conv.ml b/otherlibs/dune-rpc/private/conv.ml
+index 48c2c7ca6..c37006281 100644
+--- a/otherlibs/dune-rpc/private/conv.ml
++++ b/otherlibs/dune-rpc/private/conv.ml
+@@ -119,11 +119,6 @@ type version =
+   }
+ 
+ type ('a, 'kind) t =
+-  | String : (string, values) t
+-  | Int : (int, values) t
+-  | Float : (float, values) t
+-  | Unit : (unit, values) t
+-  | Char : (char, values) t
+   | Iso : ('a, 'kind) t * ('a -> 'b) * ('b -> 'a) -> ('b, 'kind) t
+   | Iso_result : ('a, 'kind) t * ('a -> ('b, exn) result) * ('b -> 'a) -> ('b, 'kind) t
+   | Version : ('a, 'kind) t * version -> ('a, 'kind) t
+@@ -138,7 +133,7 @@ type ('a, 'kind) t =
+   | Sum : 'a econstr list * ('a -> case) -> ('a, values) t
+   | Pair : ('a, values) t * ('b, values) t -> ('a * 'b, values) t
+   | Triple : ('a, values) t * ('b, values) t * ('c, values) t -> ('a * 'b * 'c, values) t
+-  | Fdecl : int * ('a, 'k) t Fdecl.t -> ('a, 'k) t
++  | Fdecl : ('a, 'k) t Fdecl.t -> ('a, 'k) t
+   | Either :
+       (* Invariant: field names must be different *)
+       ('a, fields) t * ('b, fields) t
+@@ -179,10 +174,50 @@ let discard_values ((a, x) : _ * values ret) =
+   | Values -> a
+ ;;
+ 
+-let string = String
+-let int = Int
+-let float = Float
+-let unit = Unit
++let string =
++  Iso
++    ( Sexp
++    , (function
++       | Atom s -> s
++       | List _ as list ->
++         raise_of_sexp ~payload:[ "list", list ] "string: expected atom. received list")
++    , fun s -> Atom s )
++;;
++
++let int =
++  Iso
++    ( Sexp
++    , (function
++       | List _ as list ->
++         raise_of_sexp ~payload:[ "list", list ] "int: expected atom. received list"
++       | Atom s ->
++         (match Int.of_string s with
++          | None -> raise_of_sexp "unable to read int"
++          | Some i -> i))
++    , fun s -> Atom (Int.to_string s) )
++;;
++
++let float =
++  Iso
++    ( Sexp
++    , (function
++       | List _ as list ->
++         raise_of_sexp ~payload:[ "list", list ] "float: expected atom. received list"
++       | Atom s ->
++         (match Float.of_string_opt s with
++          | None -> raise_of_sexp "unable to read float"
++          | Some i -> i))
++    , fun s -> Atom (Float.to_string s) )
++;;
++
++let unit =
++  Iso
++    ( Sexp
++    , (function
++       | List [] -> ()
++       | _ -> raise_of_sexp "expected empty list")
++    , fun () -> List [] )
++;;
+ 
+ let option x =
+   let none = constr "None" unit (fun () -> None) in
+@@ -194,63 +229,16 @@ let option x =
+      | Some s -> case s some)
+ ;;
+ 
+-let char = Char
+-
+-let sexp_for_digest t =
+-  let rec iter : type a b. int list -> (a, b) t -> Sexp.t =
+-    fun ids -> function
+-    | String -> Atom "String"
+-    | Int -> Atom "Int"
+-    | Float -> Atom "Float"
+-    | Unit -> Atom "Unit"
+-    | Char -> Atom "Char"
+-    | Iso (t, _, _) -> List [ Atom "Iso"; iter ids t ]
+-    | Iso_result (t, _, _) -> List [ Atom "Iso_result"; iter ids t ]
+-    | Version (t, { since = a, b; until }) ->
+-      let items : Sexp.t list =
+-        [ Atom "Version"
+-        ; iter ids t
+-        ; List [ Atom "since"; Atom (Int.to_string a); Atom (Int.to_string b) ]
+-        ]
+-      in
+-      let items =
+-        match until with
+-        | None -> items
+-        | Some (a, b) ->
+-          items
+-          @ [ List [ Atom "until"; Atom (Int.to_string a); Atom (Int.to_string b) ] ]
+-      in
+-      List items
+-    | Both (a, b) -> List [ Atom "Both"; iter ids a; iter ids b ]
+-    | Sexp -> Atom "Sexp"
+-    | List t -> List [ Atom "List"; iter ids t ]
+-    | Field (name, field) ->
+-      let field : Sexp.t =
+-        match field with
+-        | Required t -> List [ Atom "Required"; iter ids t ]
+-        | Optional t -> List [ Atom "Optional"; iter ids t ]
+-      in
+-      List [ Atom "Field"; Atom name; field ]
+-    | Enum cases ->
+-      List (Atom "Enum" :: List.map cases ~f:(fun (name, _) : Sexp.t -> Atom name))
+-    | Sum (constrs, _) ->
+-      List
+-        (Atom "Sum"
+-         :: List.map constrs ~f:(fun (Constr { name; arg; inj = _ }) : Sexp.t ->
+-           List [ Atom name; iter ids arg ]))
+-    | Pair (a, b) -> List [ Atom "Pair"; iter ids a; iter ids b ]
+-    | Triple (a, b, c) -> List [ Atom "Triple"; iter ids a; iter ids b; iter ids c ]
+-    | Fdecl (id, fdecl) ->
+-      (* Although the id is represented as an auto-incrementing integer, we
+-         find De Bruijn indices to put in the digest so that equivalent
+-         structures produce the same digest. *)
+-      (match List.findi ids ~f:(Int.equal id) with
+-       | Some (_, index) -> List [ Atom "Recurse"; Atom (Int.to_string index) ]
+-       | None -> List [ Atom "Fixpoint"; iter (id :: ids) (Fdecl.get fdecl) ])
+-    | Either (a, b) -> List [ Atom "Either"; iter ids a; iter ids b ]
+-    | Record t -> List [ Atom "Record"; iter ids t ]
+-  in
+-  iter [] t
++let char =
++  Iso
++    ( Sexp
++    , (function
++       | Atom s ->
++         if String.length s = 1
++         then s.[0]
++         else raise_of_sexp "expected only a single character"
++       | List _ -> raise_of_sexp "expected a string of length 1")
++    , fun c -> Atom (String.make 1 c) )
+ ;;
+ 
+ let to_sexp : 'a. ('a, values) t -> 'a -> Sexp.t =
+@@ -258,14 +246,9 @@ let to_sexp : 'a. ('a, values) t -> 'a -> Sexp.t =
+   let rec loop : type a k. (a, k) t -> a -> k =
+     fun t a ->
+     match t with
+-    | String -> Atom a
+-    | Int -> Atom (Int.to_string a)
+-    | Float -> Atom (Float.to_string a)
+-    | Unit -> List []
+-    | Char -> Atom (String.make 1 a)
+     | Sexp -> a
+     | Version (t, _) -> loop t a
+-    | Fdecl (_, t) -> loop (Fdecl.get t) a
++    | Fdecl t -> loop (Fdecl.get t) a
+     | List t -> List (List.map a ~f:(loop t))
+     | Pair (x, y) ->
+       let a, b = a in
+@@ -326,43 +309,11 @@ let of_sexp : 'a. ('a, values) t -> version:int * int -> Sexp.t -> 'a =
+   let rec loop : type a k. (a, k) t -> k -> a * k ret =
+     fun (type a k) (t : (a, k) t) (ctx : k) : (a * k ret) ->
+     match t with
+-    | String ->
+-      (match ctx with
+-       | Atom s -> s, Values
+-       | List _ as list ->
+-         raise_of_sexp ~payload:[ "list", list ] "string: expected atom. received list")
+-    | Int ->
+-      (match ctx with
+-       | List _ as list ->
+-         raise_of_sexp ~payload:[ "list", list ] "int: expected atom. received list"
+-       | Atom s ->
+-         (match Int.of_string s with
+-          | None -> raise_of_sexp "unable to read int"
+-          | Some i -> i, Values))
+-    | Float ->
+-      (match ctx with
+-       | List _ as list ->
+-         raise_of_sexp ~payload:[ "list", list ] "float: expected atom. received list"
+-       | Atom s ->
+-         (match Float.of_string_opt s with
+-          | None -> raise_of_sexp "unable to read float"
+-          | Some i -> i, Values))
+-    | Unit ->
+-      (match ctx with
+-       | List [] -> (), Values
+-       | _ -> raise_of_sexp "expected empty list")
+-    | Char ->
+-      (match ctx with
+-       | Atom s ->
+-         if String.length s = 1
+-         then s.[0], Values
+-         else raise_of_sexp "expected only a single character"
+-       | List _ -> raise_of_sexp "expected a string of length 1")
+     | Sexp -> ctx, Values
+     | Version (t, { since; until }) ->
+       check_version ~version ~since ~until ctx;
+       loop t ctx
+-    | Fdecl (_, t) -> loop (Fdecl.get t) ctx
++    | Fdecl t -> loop (Fdecl.get t) ctx
+     | List t ->
+       (match ctx with
+        | List xs -> List.map xs ~f:(fun x -> discard_values (loop t x)), Values
+@@ -506,15 +457,5 @@ let eight a b c d e f g h =
+ let sexp = Sexp
+ let required x = Required x
+ let optional x = Optional x
+-let fdecl_id = ref 0
+-
+-let fixpoint f =
+-  let fdecl = Fdecl.create Dyn.opaque in
+-  let id = !fdecl_id in
+-  incr fdecl_id;
+-  let result = Fdecl (id, fdecl) in
+-  Fdecl.set fdecl (f result);
+-  result
+-;;
+-
++let fdecl x = Fdecl x
+ let error e = raise (Of_sexp e)
+diff --git a/otherlibs/dune-rpc/private/conv.mli b/otherlibs/dune-rpc/private/conv.mli
+index 14fefc489..93922251f 100644
+--- a/otherlibs/dune-rpc/private/conv.mli
++++ b/otherlibs/dune-rpc/private/conv.mli
+@@ -118,5 +118,4 @@ val error : error -> 'a
+ val dyn_of_error : error -> Dyn.t
+ val to_sexp : ('a, values) t -> 'a -> Sexp.t
+ val of_sexp : ('a, values) t -> version:int * int -> Sexp.t -> ('a, error) result
+-val fixpoint : (('a, 'k) t -> ('a, 'k) t) -> ('a, 'k) t
+-val sexp_for_digest : ('a, 'k) t -> Sexp.t
++val fdecl : ('a, 'k) t Fdecl.t -> ('a, 'k) t
+diff --git a/otherlibs/dune-rpc/private/dune_rpc_private.mli b/otherlibs/dune-rpc/private/dune_rpc_private.mli
+index e4f3a1317..0370d10b9 100644
+--- a/otherlibs/dune-rpc/private/dune_rpc_private.mli
++++ b/otherlibs/dune-rpc/private/dune_rpc_private.mli
+@@ -155,8 +155,6 @@ module Decl : sig
+       -> generations:('req, 'resp) gen list
+       -> ('req, 'resp) t
+ 
+-    val print_generations : ('req, 'resp) t -> unit
+-
+     type ('a, 'b) witness
+ 
+     val witness : ('a, 'b) t -> ('a, 'b) witness
+@@ -177,7 +175,6 @@ module Decl : sig
+     type 'a t
+ 
+     val make : method_:Method.Name.t -> generations:'payload gen list -> 'payload t
+-    val print_generations : 'payload t -> unit
+ 
+     type 'a witness
+ 
+diff --git a/otherlibs/dune-rpc/private/exported_types.ml b/otherlibs/dune-rpc/private/exported_types.ml
+index f497d494c..1dfe4e4a5 100644
+--- a/otherlibs/dune-rpc/private/exported_types.ml
++++ b/otherlibs/dune-rpc/private/exported_types.ml
+@@ -119,55 +119,57 @@ module Diagnostic = struct
+     let verbatim = constr "Verbatim" string (fun s -> Verbatim s) in
+     let char = constr "Char" char (fun c -> Char c) in
+     let newline = constr "Newline" unit (fun () -> Newline) in
+-    let t =
+-      fixpoint (fun t ->
+-        let text = constr "Text" string (fun s -> Text s) in
+-        let seq = constr "Seq" (pair t t) (fun (x, y) -> Seq (x, y)) in
+-        let concat = constr "Concat" (pair t (list t)) (fun (x, y) -> Concat (x, y)) in
+-        let box = constr "Box" (pair int t) (fun (x, y) -> Box (x, y)) in
+-        let vbox = constr "Vbox" (pair int t) (fun (x, y) -> Vbox (x, y)) in
+-        let hbox = constr "Hbox" t (fun t -> Hbox t) in
+-        let hvbox = constr "Hvbox" (pair int t) (fun (x, y) -> Hvbox (x, y)) in
+-        let hovbox = constr "Hovbox" (pair int t) (fun (x, y) -> Hovbox (x, y)) in
+-        let break =
+-          constr
+-            "Break"
+-            (pair (triple string int string) (triple string int string))
+-            (fun (x, y) -> Break (x, y))
+-        in
+-        let tag = constr "Tag" t (fun t -> Tag ((), t)) in
+-        sum
+-          [ econstr nop
+-          ; econstr verbatim
+-          ; econstr char
+-          ; econstr newline
+-          ; econstr text
+-          ; econstr seq
+-          ; econstr concat
+-          ; econstr box
+-          ; econstr vbox
+-          ; econstr hbox
+-          ; econstr hvbox
+-          ; econstr hovbox
+-          ; econstr break
+-          ; econstr tag
+-          ]
+-          (function
+-           | Nop -> case () nop
+-           | Seq (x, y) -> case (x, y) seq
+-           | Concat (x, y) -> case (x, y) concat
+-           | Box (i, t) -> case (i, t) box
+-           | Vbox (i, t) -> case (i, t) vbox
+-           | Hbox t -> case t hbox
+-           | Hvbox (i, t) -> case (i, t) hvbox
+-           | Hovbox (i, t) -> case (i, t) hovbox
+-           | Verbatim s -> case s verbatim
+-           | Char c -> case c char
+-           | Break (x, y) -> case (x, y) break
+-           | Newline -> case () newline
+-           | Text s -> case s text
+-           | Tag ((), t) -> case t tag))
++    let t_fdecl = Fdecl.create Dyn.opaque in
++    let t = fdecl t_fdecl in
++    let text = constr "Text" string (fun s -> Text s) in
++    let seq = constr "Seq" (pair t t) (fun (x, y) -> Seq (x, y)) in
++    let concat = constr "Concat" (pair t (list t)) (fun (x, y) -> Concat (x, y)) in
++    let box = constr "Box" (pair int t) (fun (x, y) -> Box (x, y)) in
++    let vbox = constr "Vbox" (pair int t) (fun (x, y) -> Vbox (x, y)) in
++    let hbox = constr "Hbox" t (fun t -> Hbox t) in
++    let hvbox = constr "Hvbox" (pair int t) (fun (x, y) -> Hvbox (x, y)) in
++    let hovbox = constr "Hovbox" (pair int t) (fun (x, y) -> Hovbox (x, y)) in
++    let break =
++      constr
++        "Break"
++        (pair (triple string int string) (triple string int string))
++        (fun (x, y) -> Break (x, y))
++    in
++    let tag = constr "Tag" t (fun t -> Tag ((), t)) in
++    let conv =
++      sum
++        [ econstr nop
++        ; econstr verbatim
++        ; econstr char
++        ; econstr newline
++        ; econstr text
++        ; econstr seq
++        ; econstr concat
++        ; econstr box
++        ; econstr vbox
++        ; econstr hbox
++        ; econstr hvbox
++        ; econstr hovbox
++        ; econstr break
++        ; econstr tag
++        ]
++        (function
++         | Nop -> case () nop
++         | Seq (x, y) -> case (x, y) seq
++         | Concat (x, y) -> case (x, y) concat
++         | Box (i, t) -> case (i, t) box
++         | Vbox (i, t) -> case (i, t) vbox
++         | Hbox t -> case t hbox
++         | Hvbox (i, t) -> case (i, t) hvbox
++         | Hovbox (i, t) -> case (i, t) hovbox
++         | Verbatim s -> case s verbatim
++         | Char c -> case c char
++         | Break (x, y) -> case (x, y) break
++         | Newline -> case () newline
++         | Text s -> case s text
++         | Tag ((), t) -> case t tag)
+     in
++    Fdecl.set t_fdecl conv;
+     let to_ast x =
+       match Pp.to_ast x with
+       | Ok s -> s
+@@ -175,7 +177,7 @@ module Diagnostic = struct
+         (* We don't use the format constructor in dune. *)
+         assert false
+     in
+-    iso t Pp.of_ast to_ast
++    iso (Fdecl.get t_fdecl) Pp.of_ast to_ast
+   ;;
+ 
+   module Id = struct
+diff --git a/otherlibs/dune-rpc/private/types.ml b/otherlibs/dune-rpc/private/types.ml
+index 9da69e2b0..16fcef023 100644
+--- a/otherlibs/dune-rpc/private/types.ml
++++ b/otherlibs/dune-rpc/private/types.ml
+@@ -453,22 +453,6 @@ module Decl = struct
+       }
+     ;;
+ 
+-    let print_generation_list ~include_response generations =
+-      List.iter generations ~f:(fun (version, Generation.T conv) ->
+-        let conv_to_digest conv =
+-          let sexp_string = Sexp.to_string (Conv.sexp_for_digest conv) in
+-          if String.length sexp_string < 32
+-          then sexp_string
+-          else Digest.to_hex (Digest.string sexp_string)
+-        in
+-        let req = conv_to_digest conv.req in
+-        let resp = conv_to_digest conv.resp in
+-        if include_response
+-        then Printf.printf "Version %d:\n  Request: %s\n  Response: %s\n" version req resp
+-        else Printf.printf "Version %d: %s\n" version req)
+-    ;;
+-
+-    let print_generations t = print_generation_list ~include_response:true t.generations
+     let witness t = t.decl
+   end
+ 
+@@ -514,10 +498,6 @@ module Decl = struct
+       }
+     ;;
+ 
+-    let print_generations t =
+-      Request.print_generation_list ~include_response:false t.generations
+-    ;;
+-
+     let witness t = t.decl
+   end
+ 
+diff --git a/otherlibs/dune-rpc/private/types.mli b/otherlibs/dune-rpc/private/types.mli
+index 89d948623..8df192a58 100644
+--- a/otherlibs/dune-rpc/private/types.mli
++++ b/otherlibs/dune-rpc/private/types.mli
+@@ -222,7 +222,6 @@ module Decl : sig
+       -> generations:('req, 'resp) gen list
+       -> ('req, 'resp) t
+ 
+-    val print_generations : ('req, 'resp) t -> unit
+     val witness : ('a, 'b) t -> ('a, 'b) witness
+   end
+ 
+@@ -249,7 +248,6 @@ module Decl : sig
+       }
+ 
+     val make : method_:Method.Name.t -> generations:'payload gen list -> 'payload t
+-    val print_generations : 'payload t -> unit
+     val witness : 'a t -> 'a witness
+   end
+ 
+diff --git a/test/expect-tests/dune_rpc/dune_rpc_tests.ml b/test/expect-tests/dune_rpc/dune_rpc_tests.ml
+index 1dcacfc16..27232f3e1 100644
+--- a/test/expect-tests/dune_rpc/dune_rpc_tests.ml
++++ b/test/expect-tests/dune_rpc/dune_rpc_tests.ml
+@@ -808,120 +808,3 @@ let%test_module "finalization" =
+     ;;
+   end)
+ ;;
+-
+-let%expect_test "sexp_for_digest" =
+-  let open Dune_rpc_private in
+-  let print_sexp_for_digest conv =
+-    Pp.to_fmt Format.std_formatter (Sexp.pp (Conv.sexp_for_digest conv))
+-  in
+-  print_sexp_for_digest
+-    (Conv.five
+-       (Conv.field "a" (Conv.required Conv.string))
+-       (Conv.field "b" (Conv.optional Conv.int))
+-       (Conv.field "c" (Conv.required Conv.float))
+-       (Conv.field "d" (Conv.required Conv.unit))
+-       (Conv.field "e" (Conv.optional Conv.char)));
+-  [%expect
+-    {|
+-      (Iso
+-       (Both
+-        (Both (Field a (Required String)) (Field b (Optional Int)))
+-        (Iso
+-         (Both
+-          (Field c (Required Float))
+-          (Both (Field d (Required Unit)) (Field e (Optional Char))))))) |}];
+-  print_sexp_for_digest (Conv.iso Conv.sexp (fun x -> x) (fun x -> x));
+-  [%expect {| (Iso Sexp) |}];
+-  let id_iso = Conv.iso Conv.sexp (fun x -> x) (fun x -> x) in
+-  print_sexp_for_digest
+-    (Conv.pair
+-       (Conv.version ~until:(1, 2) ~since:(2, 3) id_iso)
+-       (Conv.version ~since:(1, 2) id_iso));
+-  [%expect
+-    {|
+-    (Pair
+-     (Version (Iso Sexp) (since 2 3) (until 1 2))
+-     (Version (Iso Sexp) (since 1 2))) |}];
+-  let list_conv inner =
+-    Conv.fixpoint (fun conv ->
+-      let nil = Conv.constr "nil" Conv.unit (fun () -> []) in
+-      let cons = Conv.constr "cons" (Conv.pair inner conv) (fun (x, xs) -> x :: xs) in
+-      Conv.sum
+-        [ Conv.econstr nil; Conv.econstr cons ]
+-        (function
+-         | [] -> Conv.case () nil
+-         | x :: xs -> Conv.case (x, xs) cons))
+-  in
+-  print_sexp_for_digest (list_conv Conv.int);
+-  [%expect {| (Fixpoint (Sum (nil Unit) (cons (Pair Int (Recurse 0))))) |}];
+-  print_sexp_for_digest (list_conv (list_conv Conv.int));
+-  (* Recursion uses De Bruijn indices because we want equal structures to
+-     produce the same digest. *)
+-  [%expect
+-    {|
+-    (Fixpoint
+-     (Sum
+-      (nil Unit)
+-      (cons
+-       (Pair
+-        (Fixpoint (Sum (nil Unit) (cons (Pair Int (Recurse 0)))))
+-        (Recurse 0))))) |}]
+-;;
+-
+-let%expect_test "print digests for all public RPCs" =
+-  let open Dune_rpc_private in
+-  Decl.Request.print_generations Procedures.Public.ping;
+-  [%expect {|
+-    Version 1:
+-      Request: Unit
+-      Response: Unit |}];
+-  Decl.Request.print_generations Procedures.Public.diagnostics;
+-  [%expect
+-    {|
+-    Version 1:
+-      Request: Unit
+-      Response: ffd3de9652c685594aacfc51d28f2533 |}];
+-  Decl.Notification.print_generations Procedures.Public.shutdown;
+-  [%expect {| Version 1: Unit |}];
+-  Decl.Request.print_generations Procedures.Public.format_dune_file;
+-  [%expect
+-    {|
+-    Version 1:
+-      Request: 15eae4b546faf05a0fc3b6d03aed0c63
+-      Response: String |}];
+-  Decl.Request.print_generations Procedures.Public.promote;
+-  [%expect {|
+-    Version 1:
+-      Request: String
+-      Response: Unit |}];
+-  Decl.Request.print_generations Procedures.Public.build_dir;
+-  [%expect {|
+-    Version 1:
+-      Request: Unit
+-      Response: String |}];
+-  Decl.Notification.print_generations Procedures.Server_side.abort;
+-  [%expect {| Version 1: 0e9dfd1099101769896cf0bb06f891c6 |}];
+-  Decl.Notification.print_generations Procedures.Server_side.log;
+-  [%expect {| Version 1: 0e9dfd1099101769896cf0bb06f891c6 |}];
+-  Decl.Request.print_generations (Procedures.Poll.poll Procedures.Poll.progress);
+-  [%expect
+-    {|
+-    Version 1:
+-      Request: Sexp
+-      Response: 889aa68f4ad3fc68ef5dfffbb7282c18
+-    Version 2:
+-      Request: Sexp
+-      Response: 929074caab98360dc7116b6f27c2b9ad |}];
+-  Decl.Request.print_generations (Procedures.Poll.poll Procedures.Poll.diagnostic);
+-  [%expect
+-    {|
+-    Version 1:
+-      Request: Sexp
+-      Response: 443627a52ab5595206164d020ff01c56 |}];
+-  Decl.Request.print_generations (Procedures.Poll.poll Procedures.Poll.running_jobs);
+-  [%expect
+-    {|
+-    Version 1:
+-      Request: Sexp
+-      Response: 33528f248084297d123a6ebd4c3ddee0 |}]
+-;;

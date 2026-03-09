@@ -1,0 +1,380 @@
+diff --git a/doc/changes/8416.md b/doc/changes/8416.md
+new file mode 100644
+index 000000000..7f44d0991
+--- /dev/null
++++ b/doc/changes/8416.md
+@@ -0,0 +1,2 @@
++- Add `with_prefix` keyword for changing the prefix of the destination of
++  installed files matched by globs. (#8416, @gridbugs)
+diff --git a/doc/stanzas/install.rst b/doc/stanzas/install.rst
+index 0d8842593..98454a3dc 100644
+--- a/doc/stanzas/install.rst
++++ b/doc/stanzas/install.rst
+@@ -7,10 +7,10 @@ Dune supports installing packages on the system, i.e., copying freshly built
+ artifacts from the workspace to the system. The ``install`` stanza takes three
+ pieces of information:
+ 
+-- The list of files or directories to install.
++- The list of files or directories to install
+ - The package to attach these files. This field is optional if your project
+   contains a single package.
+-- The section in which the files will be installed.
++- The section in which the files will be installed
+ 
+ For instance:
+ 
+@@ -106,13 +106,13 @@ installed with mode ``0o644`` (``rw-r--r--``).
+ Note that all files in the install stanza must be specified by relative paths
+ only. It is an error to specify files by absolute paths.
+ 
+-Also note that as of dune-lang 3.11 (ie. ``(lang dune 3.11)`` in
++Also note that as of dune-lang 3.11 (i.e., ``(lang dune 3.11)`` in
+ ``dune-project``) it is deprecated to use the ``as`` keyword to specify a
+ destination beginning with ``..``. Dune intends for files associated with a
+ package to only be installed under specific directories in the file system
+-implied by the installation section (e.g. ``share``, ``bin``, ``doc``, etc.)
++implied by the installation section (e.g., ``share``, ``bin``, ``doc``, etc.)
+ and the package name. Starting destination paths with ``..`` allows packages to
+-install files to arbitrary locations on the file system. In 3.11 this behaviour
++install files to arbitrary locations on the file system. In 3.11, this behaviour
+ is still supported (as some projects may depend on it) but will generate a
+ warning and will be removed in a future version of Dune.
+ 
+@@ -162,7 +162,9 @@ For example:
+ .. code:: dune
+ 
+     (install
+-     (files (glob_files style/*.css) (glob_files_rec content/*.html))
++     (files
++      (glob_files style/*.css)
++      (glob_files_rec content/*.html))
+      (section share))
+ 
+ This example will install:
+@@ -176,7 +178,61 @@ Note that the paths to files are preserved after installation. Suppose the
+ source directory contained the files ``style/foo.css`` and
+ ``content/bar/baz.html``. The example above will place these files in
+ ``share/<package>/style/foo.css`` and ``share/<package>/content/bar/baz.html``
+-respectively.
++respectively where ``<package>`` is the name of the package (ie.
++``dune-project`` would contain ``(package (name <package>))``).
++
++The ``with_prefix`` keyword can be used to change the destination path of files
++matched by a glob, similar to the ``as`` keyword in the ``(files ...)`` field.
++``with_prefix`` changes the prefix of a path before the component matched by the
++``*`` to some new value. For example:
++
++.. code:: dune
++
++    (install
++     (files
++      (glob_files (style/*.css with_prefix web/stylesheets))
++      (glob_files_rec (content/*.html with_prefix web/documents)))
++     (section share))
++
++Continuing the example above, this would result in the source file at
++``style/foo.css`` being installed to ``share/<package>/web/stylesheets/foo.css``
++and ``content/bar/baz.html`` being installed to
++``share/<package>/web/documents/bar/baz.html``. Note in the latter case
++``with_prefix`` only replaced the ``content`` component of the path and not the
++``bar`` component since since it replaces the prefix of the glob - not the
++prefix of paths matching the glob.
++
++Installing Globs from Parent Directories
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++The default treatment of paths in globs creates a complication where referring
++to globs in a parent directory such as ``(glob_files ../*.txt)`` would attempt
++to install the matched files outside the designated install directory. For
++example writing:
++
++.. code:: dune
++
++    (install
++     (files (glob_files ../*.txt))
++     (section share))
++
++...would cause Dune to attempt to install the matching files to
++``share/<package>/../``, ie. ``share`` where ``<package>`` is the name of the
++package (i.e., ``dune-project`` would contain ``(package (name <package>))``).
++This is probably not what the user intends, and installing files to relative
++paths beginning with ``..`` is deprecated from version 3.11 of Dune and will
++become an error in a future version.
++
++The solution is to use ``with_prefix`` to replace the ``..`` with some other
++path. For example:
++
++.. code:: dune
++
++    (install
++     (files (glob_files (../*.txt with_prefix .)))
++     (section share))
++
++...would install the matched files to ``share/<package>/`` instead.
+ 
+ Handling of the .exe Extension on Windows
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/src/dune_rules/dep_conf.ml b/src/dune_rules/dep_conf.ml
+index 17733cf49..f7ad152a7 100644
+--- a/src/dune_rules/dep_conf.ml
++++ b/src/dune_rules/dep_conf.ml
+@@ -6,6 +6,10 @@ module Glob_files = struct
+     { glob : String_with_vars.t
+     ; recursive : bool
+     }
++
++  let to_dyn { glob; recursive } =
++    Dyn.record [ "glob", String_with_vars.to_dyn glob; "recursive", Dyn.bool recursive ]
++  ;;
+ end
+ 
+ type t =
+diff --git a/src/dune_rules/dep_conf.mli b/src/dune_rules/dep_conf.mli
+index 7f5e140b9..1c04d5bd5 100644
+--- a/src/dune_rules/dep_conf.mli
++++ b/src/dune_rules/dep_conf.mli
+@@ -12,6 +12,8 @@ module Glob_files : sig
+     { glob : String_with_vars.t
+     ; recursive : bool
+     }
++
++  val to_dyn : t -> Dyn.t
+ end
+ 
+ type t =
+diff --git a/src/dune_rules/dep_conf_eval.ml b/src/dune_rules/dep_conf_eval.ml
+index 7b6c5ef8b..361309c77 100644
+--- a/src/dune_rules/dep_conf_eval.ml
++++ b/src/dune_rules/dep_conf_eval.ml
+@@ -141,6 +141,7 @@ let rec dep expander = function
+          glob_files
+          ~f:(Expander.expand_str expander)
+          ~base_dir:(Expander.dir expander)
++       >>| Glob_files_expand.Expanded.matches
+        >>| List.map ~f:(fun path ->
+          if Filename.is_relative path
+          then Path.Build.relative (Expander.dir expander) path |> Path.build
+diff --git a/src/dune_rules/glob_files_expand.ml b/src/dune_rules/glob_files_expand.ml
+index 0b30f141f..ae1b10be7 100644
+--- a/src/dune_rules/glob_files_expand.ml
++++ b/src/dune_rules/glob_files_expand.ml
+@@ -64,13 +64,20 @@ module Glob_dir = struct
+         { relative_dir : string
+         ; base_dir : Path.Build.t
+         }
++
++  let to_dyn = function
++    | Absolute external_path ->
++      Dyn.variant "Absolute" [ Path.External.to_dyn external_path ]
++    | Relative { relative_dir; base_dir } ->
++      Dyn.variant "Relative" [ Dyn.string relative_dir; Path.Build.to_dyn base_dir ]
++  ;;
+ end
+ 
+ module Without_vars = struct
+   (* A glob whose [String_with_vars.t] has been expanded. A [Glob.t] is a
+-     wildcard for matching filenames only, not entire paths. The [relative_dir]
+-     field holds the directory component of the original glob. E.g. for the glob
+-     "foo/bar/*.txt", [relative_dir] would be "foo/bar". *)
++     wildcard for matching filenames only, not entire paths. The [dir] field
++     holds the directory component of the original glob. E.g., for the glob
++     "foo/bar/*.txt", [dir] would be "foo/bar". *)
+   type t =
+     { glob : Glob.t
+     ; dir : Glob_dir.t
+@@ -113,6 +120,25 @@ module Without_vars = struct
+   ;;
+ end
+ 
++module Expanded = struct
++  type t =
++    { matches : string list
++    ; dir : Glob_dir.t
++    }
++
++  let to_dyn { matches; dir } =
++    Dyn.record [ "matches", Dyn.list Dyn.string matches; "dir", Glob_dir.to_dyn dir ]
++  ;;
++
++  let matches { matches; _ } = matches
++
++  let prefix { dir; _ } =
++    match dir with
++    | Glob_dir.Absolute path -> Path.External.to_string path
++    | Relative { relative_dir; _ } -> relative_dir
++  ;;
++end
++
+ module Expand
+     (M : Memo.S)
+     (C : sig
+@@ -137,12 +163,15 @@ struct
+     let open M.O in
+     let loc = String_with_vars.loc t.glob in
+     let* without_vars = expand_vars t ~f ~base_dir in
+-    Without_vars.file_selectors_with_relative_dirs without_vars ~loc
+-    |> M.of_memo
+-    >>= M.List.concat_map ~f:(fun (file_selector, relative_dir) ->
+-      C.collect_files ~loc file_selector
+-      >>| Path.Set.to_list_map ~f:(replace_path_dir relative_dir))
+-    >>| List.sort ~compare:String.compare
++    let+ matches =
++      Without_vars.file_selectors_with_relative_dirs without_vars ~loc
++      |> M.of_memo
++      >>= M.List.concat_map ~f:(fun (file_selector, relative_dir) ->
++        C.collect_files ~loc file_selector
++        >>| Path.Set.to_list_map ~f:(replace_path_dir relative_dir))
++      >>| List.sort ~compare:String.compare
++    in
++    { Expanded.matches; dir = without_vars.dir }
+   ;;
+ end
+ 
+diff --git a/src/dune_rules/glob_files_expand.mli b/src/dune_rules/glob_files_expand.mli
+index 8abf3515b..a64ff27ad 100644
+--- a/src/dune_rules/glob_files_expand.mli
++++ b/src/dune_rules/glob_files_expand.mli
+@@ -1,5 +1,16 @@
+ open! Import
+ 
++module Expanded : sig
++  type t
++
++  val to_dyn : t -> Dyn.t
++  val matches : t -> string list
++
++  (** The component of the glob before the final "/". This is guaranteed to be
++      a common prefix of all matches patchs. *)
++  val prefix : t -> string
++end
++
+ (** There are different contexts within which globs can be expanded, and this
+     signature generalizes the [expand] function over them. These contexts affect
+     the expressive power available in [f] when expanding [String_with_vars.t]s
+@@ -12,7 +23,7 @@ val memo
+   :  Dep_conf.Glob_files.t
+   -> f:(String_with_vars.t -> string Memo.t)
+   -> base_dir:Path.Build.t
+-  -> string list Memo.t
++  -> Expanded.t Memo.t
+ 
+ (** Expand a glob inside the [Action_builder] context. The result of calling
+     [Glob_files.Action_builder.expand] is an action builder which will resolve
+@@ -22,4 +33,4 @@ val action_builder
+   :  Dep_conf.Glob_files.t
+   -> f:(String_with_vars.t -> string Action_builder.t)
+   -> base_dir:Path.Build.t
+-  -> string list Action_builder.t
++  -> Expanded.t Action_builder.t
+diff --git a/src/dune_rules/install_entry.ml b/src/dune_rules/install_entry.ml
+index 5987458a1..96d979b3b 100644
+--- a/src/dune_rules/install_entry.ml
++++ b/src/dune_rules/install_entry.ml
+@@ -13,11 +13,45 @@ let expand_str_with_check_for_local_path ~expand_str sw =
+     str)
+ ;;
+ 
++module Glob_files_with_optional_prefix = struct
++  type t =
++    { glob_files : Dep_conf.Glob_files.t
++    ; prefix : String_with_vars.t option
++    }
++
++  let decode =
++    let open Dune_lang.Decoder in
++    let install_glob_version_check = Dune_lang.Syntax.since Stanza.syntax (3, 6) in
++    let install_glob_with_prefix_version_check =
++      Dune_lang.Syntax.since Stanza.syntax (3, 11)
++    in
++    let decode_args ~recursive =
++      let decode_without_prefix =
++        let+ glob = String_with_vars.decode in
++        { glob_files = { Dep_conf.Glob_files.glob; recursive }; prefix = None }
++      in
++      let decode_with_prefix =
++        enter
++          (let* () = install_glob_with_prefix_version_check in
++           let* glob = String_with_vars.decode in
++           let* () = keyword "with_prefix" in
++           let+ prefix = String_with_vars.decode in
++           { glob_files = { Dep_conf.Glob_files.glob; recursive }; prefix = Some prefix })
++      in
++      decode_with_prefix <|> decode_without_prefix
++    in
++    sum
++      [ "glob_files", install_glob_version_check >>> decode_args ~recursive:false
++      ; "glob_files_rec", install_glob_version_check >>> decode_args ~recursive:true
++      ]
++  ;;
++end
++
+ module File = struct
+   module Without_include = struct
+     type t =
+       | File_binding of File_binding.Unexpanded.t
+-      | Glob_files of Dep_conf.Glob_files.t
++      | Glob_files of Glob_files_with_optional_prefix.t
+ 
+     let decode =
+       let open Dune_lang.Decoder in
+@@ -26,17 +60,7 @@ module File = struct
+         File_binding file_binding
+       in
+       let glob_files_decode =
+-        let version_check = Dune_lang.Syntax.since Stanza.syntax (3, 6) in
+-        let+ glob_files =
+-          sum
+-            [ ( "glob_files"
+-              , let+ glob = version_check >>> String_with_vars.decode in
+-                { Dep_conf.Glob_files.glob; recursive = false } )
+-            ; ( "glob_files_rec"
+-              , let+ glob = version_check >>> String_with_vars.decode in
+-                { Dep_conf.Glob_files.glob; recursive = true } )
+-            ]
+-        in
++        let+ glob_files = Glob_files_with_optional_prefix.decode in
+         Glob_files glob_files
+       in
+       file_binding_decode <|> glob_files_decode
+@@ -45,13 +69,37 @@ module File = struct
+     let to_file_bindings_unexpanded t ~expand_str ~dir ~dune_syntax =
+       match t with
+       | File_binding file_binding -> Memo.return [ file_binding ]
+-      | Glob_files glob_files ->
++      | Glob_files { glob_files; prefix } ->
+         let open Memo.O in
+-        let+ paths = Glob_files_expand.memo glob_files ~f:expand_str ~base_dir:dir in
++        let* glob_expanded =
++          Glob_files_expand.memo glob_files ~f:expand_str ~base_dir:dir
++        in
+         let glob_loc = String_with_vars.loc glob_files.glob in
+-        List.map paths ~f:(fun path ->
++        let glob_prefix = Glob_files_expand.Expanded.prefix glob_expanded in
++        let+ prefix_loc_opt =
++          Memo.Option.map prefix ~f:(fun prefix_sw ->
++            let+ prefix = expand_str prefix_sw in
++            prefix, String_with_vars.loc prefix_sw)
++        in
++        List.map (Glob_files_expand.Expanded.matches glob_expanded) ~f:(fun path ->
+           let src = glob_loc, path in
+-          File_binding.Unexpanded.make ~src ~dst:src ~dune_syntax)
++          let dst =
++            match prefix_loc_opt with
++            | None -> src
++            | Some (prefix, prefix_loc) ->
++              let path_without_prefix =
++                match String.drop_prefix path ~prefix:glob_prefix with
++                | Some s -> s
++                | None ->
++                  Code_error.raise
++                    ~loc:glob_loc
++                    "Glob has a prefix which is not the same as the prefix of the match"
++                    [ "glob_prefix", Dyn.string prefix; "match", Dyn.string path ]
++              in
++              let dst = Filename.concat prefix path_without_prefix in
++              prefix_loc, dst
++          in
++          File_binding.Unexpanded.make ~src ~dst ~dune_syntax)
+     ;;
+ 
+     let to_file_bindings_expanded t ~expand_str ~dir ~dune_syntax =

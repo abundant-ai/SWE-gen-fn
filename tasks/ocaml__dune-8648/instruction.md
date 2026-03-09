@@ -1,0 +1,10 @@
+When generating a lock directory via the opam solver, package “extra files” stored in an opam repository are currently not handled correctly. In an opam repository, a package version directory may contain a `files/` subdirectory (e.g. `.../packages/<pkg>/<pkg>.<ver>/files/`) with additional content such as patch files and nested subdirectories. These files must be copied into the generated lock directory so that the lock directory contains a reproducible snapshot of everything needed for the package.
+
+Update the lockdir generation so that, after solving a project that depends on a package, any files found under that package’s `files/` directory in the opam repository are copied into the lock directory under a per-package destination directory named like `<package>.files` (for example, for package `with-patch`, copy into `dune.lock/with-patch.files/`). The copy must preserve the relative paths under `files/`, including nested directories (e.g. copying `files/dir/bar.patch` to `dune.lock/with-patch.files/dir/bar.patch`) and file contents exactly.
+
+Additionally, error reporting for failures while copying these repository files is currently missing important context. If a Unix error occurs while reading the opam repository’s `files/` directory (for example, attempting to recurse into a subdirectory without read/execute permission), the solver should fail with a user-facing error whose message clearly indicates that the failure happened while reading files from the opam repository, and it must include the full path being accessed so users can identify which repository location caused the error. For example, a permission issue while trying to open a directory should produce an error in the form:
+
+`Error: Unable to read file in opam repository:`
+`opendir(<full-path-to-opam-repo>/packages/<pkg>/<pkg>.<ver>/files/<subdir>): Permission denied`
+
+The lockdir generation should not silently ignore such failures; it must surface them as an error and stop.

@@ -1,0 +1,7 @@
+Dune’s cache management CLI is missing a straightforward way to completely remove the shared cache directory. Today, users resort to invoking a trim command with a size of zero (for example, `dune cache trim --size 0B`), which is error-prone and non-obvious. Add a dedicated `dune cache clear` subcommand that clears the Dune cache.
+
+When Dune cache is enabled and `DUNE_CACHE_ROOT` points to a cache directory created by Dune, running `dune cache clear` should remove the cache root directory entirely when it contains only the standard cache contents (e.g., the usual cache subdirectories such as `files`, `meta`, `temp`, `values`). After `dune cache clear`, the directory referred to by `DUNE_CACHE_ROOT` should no longer exist.
+
+Safety behavior: if the cache root directory contains additional unexpected files or directories (for example, a user-created `extra/` directory or extra files at the root), `dune cache clear` must not delete those. In this case, the command should fail with an error indicating the directory is not empty (for example, an error like `rmdir(<cache_root>): Directory not empty`) and exit with status code 1, leaving the unexpected files/directories intact.
+
+The new subcommand must also appear in `dune cache --help` output as an available command (e.g., listed under COMMANDS as `clear` with a brief description such as “Clear the Dune cache.”), consistent with the existing `dune cache size` and `dune cache trim` commands.

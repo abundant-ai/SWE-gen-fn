@@ -1,0 +1,172 @@
+diff --git a/src/dune_lang/pform.ml b/src/dune_lang/pform.ml
+index c1c543eb2..e6e79c1cc 100644
+--- a/src/dune_lang/pform.ml
++++ b/src/dune_lang/pform.ml
+@@ -16,7 +16,6 @@ module Var = struct
+         | Doc
+         | Stublibs
+         | Man
+-        | Misc
+ 
+       let all =
+         [ Lib, "lib"
+@@ -29,7 +28,6 @@ module Var = struct
+         ; Doc, "doc"
+         ; Stublibs, "stublibs"
+         ; Man, "man"
+-        ; Misc, "misc"
+         ]
+       ;;
+ 
+diff --git a/src/dune_lang/pform.mli b/src/dune_lang/pform.mli
+index fef69d96a..e801b9d10 100644
+--- a/src/dune_lang/pform.mli
++++ b/src/dune_lang/pform.mli
+@@ -16,7 +16,6 @@ module Var : sig
+         | Doc
+         | Stublibs
+         | Man
+-        | Misc
+ 
+       val of_string : string -> t option
+     end
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index be4ec3b21..45bd4862a 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -249,7 +249,11 @@ let filter_to_blang package filter =
+     let variable_string = OpamVariable.to_string variable in
+     match packages with
+     | [] ->
+-      let pform = Package_variable.pform_of_opam_ident variable_string in
++      let pform =
++        Package_variable.pform_of_opam_ident
++          ~package_name:(OpamPackage.to_string package)
++          variable_string
++      in
+       Blang.Expr (String_with_vars.make_pform Loc.none pform)
+     | packages ->
+       let blangs =
+@@ -350,7 +354,10 @@ let opam_commands_to_actions package (commands : OpamTypes.command list) =
+              when String.is_prefix ~prefix:"%{" interp
+                   && String.is_suffix ~suffix:"}%" interp ->
+              let ident = String.sub ~pos:2 ~len:(String.length interp - 4) interp in
+-             `Pform (Package_variable.pform_of_opam_ident ident)
++             `Pform
++               (Package_variable.pform_of_opam_ident
++                  ~package_name:(OpamPackage.to_string package)
++                  ident)
+            | other ->
+              User_error.raise
+                [ Pp.textf
+@@ -372,7 +379,9 @@ let opam_commands_to_actions package (commands : OpamTypes.command list) =
+         | CIdent ident ->
+           String_with_vars.make_pform
+             Loc.none
+-            (Package_variable.pform_of_opam_ident ident))
++            (Package_variable.pform_of_opam_ident
++               ~package_name:(OpamPackage.to_string package)
++               ident))
+     in
+     match terms with
+     | program :: args ->
+diff --git a/src/dune_pkg/package_variable.ml b/src/dune_pkg/package_variable.ml
+index bab3e2cee..6b68a1672 100644
+--- a/src/dune_pkg/package_variable.ml
++++ b/src/dune_pkg/package_variable.ml
+@@ -57,26 +57,40 @@ let to_macro_invocation { name; scope } =
+   | Package package_name ->
+     { Pform.Macro_invocation.macro = Pkg
+     ; payload =
+-        Pform.Payload.of_args [ Name.to_string name; Package_name.to_string package_name ]
++        Pform.Payload.of_args [ Package_name.to_string package_name; Name.to_string name ]
+     }
+ ;;
+ 
+ let to_pform t = Pform.Macro (to_macro_invocation t)
+ 
+-let of_opam_ident ident =
+-  match String.lsplit2 ident ~on:':' with
+-  | Some ("_", variable) -> `Package_variable (self_scoped (Name.of_string variable))
+-  | Some (package, variable) ->
++let package_variable package variable =
++  match package, variable with
++  | _, ("root" | "hash" | "build-id" | "misc" | "opam-version") ->
++    `Unsupported_variable variable
++  | "_", variable -> `Package_variable (self_scoped (Name.of_string variable))
++  | package, variable ->
+     `Package_variable
+       (package_scoped (Name.of_string variable) (Package_name.of_string package))
++;;
++
++let of_opam_ident ident =
++  match String.lsplit2 ident ~on:':' with
++  | Some (package, variable) -> package_variable package variable
+   | None ->
+     (match Pform.Var.of_opam_global_variable_name ident with
+      | Some var -> `Global_variable var
+-     | None -> `Package_variable (self_scoped (Name.of_string ident)))
++     | None -> package_variable "_" ident)
+ ;;
+ 
+-let pform_of_opam_ident ident =
++let pform_of_opam_ident ~package_name ident =
+   match of_opam_ident ident with
+   | `Package_variable t -> to_pform t
+   | `Global_variable var -> Pform.Var var
++  | `Unsupported_variable name ->
++    User_error.raise
++      [ Pp.textf
++          "Variable %S occuring in opam package %S is not supported."
++          name
++          package_name
++      ]
+ ;;
+diff --git a/src/dune_pkg/package_variable.mli b/src/dune_pkg/package_variable.mli
+index 10eccb815..4a1af67b9 100644
+--- a/src/dune_pkg/package_variable.mli
++++ b/src/dune_pkg/package_variable.mli
+@@ -30,10 +30,16 @@ val of_macro_invocation
+ 
+ val to_pform : t -> Pform.t
+ 
+-(** Parse an opam variable name. Identifiers beginning with "<package>:" are
+-    treated as package-scoped variables unless <package> is "_" in which case
+-    they are treated as self-scoped. Identifiers without the "<package>:"
+-    prefix are treated as self-scoped unless they are the name of an opam
+-    global variable. Global variables are encoded as pform variables while all
+-    other variables are encoded as pform macros with the [Macro.Pkg] macro. *)
+-val pform_of_opam_ident : string -> Pform.t
++(** Parse an opam variable name.
++
++    Identifiers beginning with "<package>:" are treated as package-scoped variables unless
++    <package> is "_" in which case they are treated as self-scoped.
++
++    Identifiers without the "<package>:" prefix are treated as self-scoped unless they are
++    the name of an opam global variable.
++
++    Global variables are encoded as pform variables while all other variables are encoded
++    as pform macros with the [Macro.Pkg] macro.
++
++    Raises a user error if the variable is unsupported. *)
++val pform_of_opam_ident : package_name:string -> string -> Pform.t
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 13e97a29b..30b76c98a 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -450,7 +450,6 @@ module Action_expander = struct
+       | Doc -> Doc
+       | Stublibs -> Stublibs
+       | Man -> Man
+-      | Misc -> Misc
+     ;;
+ 
+     let section_dir_of_root
+@@ -468,7 +467,6 @@ module Action_expander = struct
+       | Man -> roots.man
+       | Toplevel -> Path.relative roots.lib_root "toplevel"
+       | Stublibs -> Path.relative roots.lib_root "stublibs"
+-      | Misc -> assert false
+     ;;
+ 
+     let sys_poll_var accessor =

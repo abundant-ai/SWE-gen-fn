@@ -1,0 +1,213 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 4e744af04..7eb3cc858 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -3,9 +3,6 @@ Unreleased
+ 
+ - Add `dune show rules` as alias of the `dune rules` command. (#8000, @Alizter)
+ 
+-- Fix `%{deps}` to expand properly in `(cat ...)` when containing 2 or more
+-  items. (#8196, @Alizter)
+-
+ - Add `dune show installed-libraries` as an alias of the `dune
+   installed-libraries` command. (#8135, @Alizter)
+ 
+diff --git a/src/dune_rules/action_unexpanded.ml b/src/dune_rules/action_unexpanded.ml
+index e2939b97d..07fc8aad6 100644
+--- a/src/dune_rules/action_unexpanded.ml
++++ b/src/dune_rules/action_unexpanded.ml
+@@ -55,8 +55,6 @@ module Action_expander : sig
+     -> expander:Expander.t
+     -> 'a Action_builder.With_targets.t Memo.t
+ 
+-  val with_expander : (Expander.t -> 'a t) -> 'a t
+-
+   (* String with vars expansion *)
+   module E : sig
+     val string : String_with_vars.t -> string t
+@@ -70,9 +68,6 @@ module Action_expander : sig
+     (* Evaluate a path in a position of dependency, such as in [(cat <dep>)] *)
+     val dep : String_with_vars.t -> Path.t t
+ 
+-    (* Evaluate paths in the position of dependencies, such as in [(cat <deps>)] *)
+-    val deps : String_with_vars.t -> Path.t list t
+-
+     (* Evaluate a path in a position of optional dependency, such as in [(diff
+        <dep_if_exists> ...)] *)
+     val dep_if_exists : String_with_vars.t -> Path.t t
+@@ -118,10 +113,6 @@ end = struct
+ 
+   let return x _env acc = Memo.return (Action_builder.return x, acc)
+ 
+-  let with_expander (type a) (f : Expander.t -> a t) env acc =
+-    let f = f env.expander in
+-    f env acc
+-
+   let map t ~f env acc =
+     let+! b, acc = t env acc in
+     (Action_builder.map b ~f, acc)
+@@ -250,13 +241,6 @@ end = struct
+         Value.to_path_in_build_or_external v
+           ~error_loc:(String_with_vars.loc sw) ~dir:t.dir
+ 
+-      let expand_paths t sw =
+-        let+ v, vs = expand t ~mode:At_least_one sw in
+-        List.map (v :: vs)
+-          ~f:
+-            (Value.to_path_in_build_or_external
+-               ~error_loc:(String_with_vars.loc sw) ~dir:t.dir)
+-
+       let expand_string env sw =
+         let+ v = expand env ~mode:Single sw in
+         Value.to_string v ~dir:(Path.build env.dir)
+@@ -301,26 +285,24 @@ end = struct
+       let path sw ~f = make ~expand:Expander.No_deps.expand_path sw ~f
+     end
+ 
+-    let register_deps x ~f env acc =
++    let register_dep x ~f env acc =
+       Memo.return
+         (if not env.infer then (x, acc)
+          else
+-           let x = Action_builder.memoize "deps" x in
++           let x = Action_builder.memoize "dep" x in
+            ( x
+            , { acc with
+                deps =
+                  (let+ x = x
+                   and+ set = acc.deps in
+-                  Path.Set.union set (Path.Set.of_list (f x)))
++                  match f x with
++                  | None -> set
++                  | Some fn -> Path.Set.add set fn)
+              } ))
+ 
+     let dep sw env acc =
+       let fn = Expander.expand_path env sw in
+-      register_deps fn ~f:List.singleton env acc
+-
+-    let deps sw env acc =
+-      let fn = Expander.expand_paths env sw in
+-      register_deps fn ~f:Fun.id env acc
++      register_dep fn ~f:Option.some env acc
+ 
+     let dep_if_exists sw env acc =
+       Memo.return
+@@ -384,17 +366,18 @@ end = struct
+         let args = Value.L.to_strings ~dir args in
+         (prog, args)
+       in
+-      register_deps b env acc ~f:(function
+-        | Ok p, _ -> [ p ]
+-        | Error _, _ -> [])
++      register_dep b env acc ~f:(function
++        | Ok p, _ -> Some p
++        | Error _, _ -> None)
+   end
+ end
+ 
+-let rec expand (t : Dune_lang.Action.t) : Action.t Action_expander.t =
++let rec expand (t : Dune_lang.Action.t) ~context : Action.t Action_expander.t =
+   let module A = Action_expander in
+   let module E = Action_expander.E in
+   let open Action_expander.O in
+   let module O (* [O] for "outcome" *) = Action in
++  let expand = expand ~context in
+   let expand_run prog args =
+     let+ args = A.all (List.map args ~f:E.strings)
+     and+ prog, more_args = E.prog_and_args prog in
+@@ -444,16 +427,8 @@ let rec expand (t : Dune_lang.Action.t) : Action.t Action_expander.t =
+     let l = List.concat l in
+     O.Echo l
+   | Cat xs ->
+-    A.with_expander (fun expander ->
+-        let version =
+-          Expander.scope expander |> Scope.project |> Dune_project.dune_version
+-        in
+-        if version >= (3, 10) then
+-          let+ xs = A.all (List.map xs ~f:E.deps) in
+-          O.Cat (List.concat xs)
+-        else
+-          let+ xs = A.all (List.map xs ~f:E.dep) in
+-          O.Cat xs)
++    let+ xs = A.all (List.map xs ~f:E.dep) in
++    O.Cat xs
+   | Copy (x, y) ->
+     let+ x = E.dep x
+     and+ y = E.target y in
+@@ -463,12 +438,9 @@ let rec expand (t : Dune_lang.Action.t) : Action.t Action_expander.t =
+     and+ y = E.target y in
+     O.Symlink (x, y)
+   | Copy_and_add_line_directive (x, y) ->
+-    A.with_expander (fun expander ->
+-        let context = Expander.context expander in
+-
+-        let+ x = E.dep x
+-        and+ y = E.target y in
+-        Copy_line_directive.action context ~src:x ~dst:y)
++    let+ x = E.dep x
++    and+ y = E.target y in
++    Copy_line_directive.action context ~src:x ~dst:y
+   | System x ->
+     let+ x = E.string x in
+     O.System x
+@@ -522,7 +494,8 @@ let expand_no_targets t ~loc ~chdir ~deps:deps_written_by_user ~expander ~what =
+     Expander.set_expanding_what expander (User_action_without_targets { what })
+   in
+   let* { Action_builder.With_targets.build; targets } =
+-    expand t
++    let context = Expander.context expander in
++    expand ~context t
+     |> Action_expander.run ~chdir ~targets_dir:None ~expander
+     |> Action_builder.of_memo
+   in
+@@ -567,7 +540,8 @@ let expand t ~loc ~chdir ~deps:deps_written_by_user ~targets_dir
+     Expander.set_expanding_what expander (User_action targets_written_by_user)
+   in
+   let+! { Action_builder.With_targets.build; targets } =
+-    expand t
++    let context = Expander.context expander in
++    expand ~context t
+     |> Action_expander.run ~chdir ~targets_dir:(Some targets_dir) ~expander
+   in
+   let targets =
+diff --git a/test/blackbox-tests/test-cases/quoting/cat.t/run.t b/test/blackbox-tests/test-cases/quoting/cat.t/run.t
+deleted file mode 100644
+index a464dd7f7..000000000
+--- a/test/blackbox-tests/test-cases/quoting/cat.t/run.t
++++ /dev/null
+@@ -1,34 +0,0 @@
+-  $ cat > a
+-  $ cat > b
+-  $ cat > dune-project << EOF
+-  > (lang dune 3.9)
+-  > EOF
+-
+-It should be possible to expand %{deps} in a cat action since it allows multiple
+-arguments.
+-
+-  $ cat > dune <<EOF
+-  > (rule
+-  >  (alias foo)
+-  >  (deps a b)
+-  >  (action
+-  >   (cat %{deps})))
+-  > EOF
+-
+-This isn't possible in 3.9.
+-
+-  $ dune build @foo
+-  File "dune", line 5, characters 7-14:
+-  5 |   (cat %{deps})))
+-             ^^^^^^^
+-  Error: Variable %{deps} expands to 2 values, however a single value is
+-  expected here. Please quote this atom.
+-  [1]
+-
+-But it is in 3.10:
+-
+-  $ cat > dune-project << EOF
+-  > (lang dune 3.10)
+-  > EOF
+-
+-  $ dune build @foo

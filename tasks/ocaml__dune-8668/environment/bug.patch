@@ -1,0 +1,155 @@
+diff --git a/src/dune_rules/expander.ml b/src/dune_rules/expander.ml
+index eda624ab7..f4bd580bb 100644
+--- a/src/dune_rules/expander.ml
++++ b/src/dune_rules/expander.ml
+@@ -398,11 +398,28 @@ let expand_lib_variable t source ~lib ~file ~lib_exec ~lib_private =
+   Action_builder.of_memo_join p
+ ;;
+ 
+-let make loc context =
+-  let path = Context.path context in
++let make =
+   let open Memo.O in
+-  let+ make = Make_prog.which loc (Context.name context) ~path in
+-  [ Value.Path make ]
++  let make context =
++    let which = Context.which context in
++    match Sys.unix with
++    | false -> which "make"
++    | true ->
++      let* res = which "gmake" in
++      (match res with
++       | Some _ as s -> Memo.return s
++       | None -> which "make")
++  in
++  let memo =
++    Memo.create
++      "make"
++      ~input:(module Context_name)
++      ~cutoff:(Option.equal Path.equal)
++      (fun name ->
++        let* context = Context.DB.get name in
++        make context)
++  in
++  fun (context : Context.t) -> Memo.exec memo (Context.name context)
+ ;;
+ 
+ let expand_pform_var (context : Context.t) ~source (var : Pform.Var.t) =
+@@ -434,7 +451,18 @@ let expand_pform_var (context : Context.t) ~source (var : Pform.Var.t) =
+   | Ocaml -> static (get_prog (Context.ocaml context).ocaml)
+   | Ocamlc -> static (path (Context.ocaml context).ocamlc)
+   | Ocamlopt -> static (get_prog (Context.ocaml context).ocamlopt)
+-  | Make -> Direct (Without (make (Dune_lang.Template.Pform.loc source) context))
++  | Make ->
++    let open Memo.O in
++    Direct
++      (Without
++         (make context
++          >>| function
++          | Some p -> path p
++          | None ->
++            Utils.program_not_found
++              ~context:(Context.name context)
++              ~loc:(Some (Dune_lang.Template.Pform.loc source))
++              "make"))
+   | Cpp ->
+     c_compiler_and_flags (Context.ocaml context).ocaml_config @ [ "-E" ]
+     |> strings
+diff --git a/src/dune_rules/make_prog.ml b/src/dune_rules/make_prog.ml
+deleted file mode 100644
+index f63bd51a8..000000000
+--- a/src/dune_rules/make_prog.ml
++++ /dev/null
+@@ -1,16 +0,0 @@
+-open Import
+-open Memo.O
+-
+-let which loc context ~path =
+-  (let which = Which.which ~path in
+-   match Sys.unix with
+-   | false -> which "make"
+-   | true ->
+-     which "gmake"
+-     >>= (function
+-     | None -> which "make"
+-     | Some _ as s -> Memo.return s))
+-  >>| function
+-  | Some p -> p
+-  | None -> Utils.program_not_found ~context ~loc:(Some loc) "make"
+-;;
+diff --git a/src/dune_rules/make_prog.mli b/src/dune_rules/make_prog.mli
+deleted file mode 100644
+index c69956d6d..000000000
+--- a/src/dune_rules/make_prog.mli
++++ /dev/null
+@@ -1,3 +0,0 @@
+-open Import
+-
+-val which : Loc.t -> Context_name.t -> path:Path.t list -> Path.t Memo.t
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 652b0dbb5..eda435941 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -515,11 +515,8 @@ module Action_expander = struct
+       | Var (Pkg var) -> expand_pkg paths var
+       | Var Context_name -> Memo.return [ Value.String (Context_name.to_string context) ]
+       | Var Make ->
+-        let+ make =
+-          let path = Env_path.path Env.initial in
+-          Make_prog.which loc context ~path
+-        in
+-        [ Value.Path make ]
++        (* TODO *)
++        assert false
+       | Macro ({ macro = Pkg | Pkg_self; _ } as macro_invocation) ->
+         let { Package_variable.name = variable_name; scope } =
+           match Package_variable.of_macro_invocation ~loc macro_invocation with
+diff --git a/test/blackbox-tests/test-cases/pkg/dune b/test/blackbox-tests/test-cases/pkg/dune
+index f576b17ea..f441bd945 100644
+--- a/test/blackbox-tests/test-cases/pkg/dune
++++ b/test/blackbox-tests/test-cases/pkg/dune
+@@ -9,7 +9,3 @@
+ (cram
+  (deps %{bin:git})
+  (applies_to git-source opam-repository-download))
+-
+-(cram
+- (deps %{bin:make})
+- (applies_to make))
+diff --git a/test/blackbox-tests/test-cases/pkg/helpers.sh b/test/blackbox-tests/test-cases/pkg/helpers.sh
+index 081b9fb35..2b7d82aee 100644
+--- a/test/blackbox-tests/test-cases/pkg/helpers.sh
++++ b/test/blackbox-tests/test-cases/pkg/helpers.sh
+@@ -36,10 +36,3 @@ solve_project() {
+   cat >dune-project
+   dune pkg lock --opam-repository-path=mock-opam-repository
+ }
+-
+-make_lockdir() {
+-mkdir dune.lock
+-cat >dune.lock/lock.dune <<EOF
+-(lang package 0.1)
+-EOF
+-}
+diff --git a/test/blackbox-tests/test-cases/pkg/make.t b/test/blackbox-tests/test-cases/pkg/make.t
+deleted file mode 100644
+index 5f94095f1..000000000
+--- a/test/blackbox-tests/test-cases/pkg/make.t
++++ /dev/null
+@@ -1,16 +0,0 @@
+-Build a package with make
+-  $ . ./helpers.sh
+-
+-  $ mkdir foo
+-  $ cat >foo/Makefile <<EOF
+-  > .DEFAULT: foo
+-  > .PHONY: foo
+-  > foo: ; @echo running makefile
+-  > EOF
+-  $ make_lockdir
+-  $ cat >dune.lock/foo.pkg <<EOF
+-  > (build (run %{make}))
+-  > (source (copy $PWD/foo))
+-  > EOF
+-  $ build_pkg foo
+-  running makefile

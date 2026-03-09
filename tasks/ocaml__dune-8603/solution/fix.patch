@@ -1,0 +1,271 @@
+diff --git a/bin/dune_init.ml b/bin/dune_init.ml
+index 945925ad4..33f7d8a0a 100644
+--- a/bin/dune_init.ml
++++ b/bin/dune_init.ml
+@@ -195,6 +195,37 @@ module Init_context = struct
+   ;;
+ end
+ 
++module Public_name = struct
++  include Lib_name
++  module Pkg = Dune_lang.Package_name.Opam_compatible
++
++  let is_opam_compatible l =
++    Lib_name.package_name l |> Dune_lang.Package_name.is_opam_compatible
++  ;;
++
++  let of_string_user_error (loc, s) =
++    let open Result.O in
++    let* l = of_string_user_error (loc, s) in
++    if is_opam_compatible l
++    then Ok l
++    else
++      let open Pp.O in
++      let descr =
++        Pp.text
++          "Public names are composed of an opam package name and optional dot-separated \
++           string suffixes."
++        ++ Pp.newline
++        ++ Pkg.description_of_valid_string
++      in
++      Error (User_error.make [ descr ])
++  ;;
++
++  let of_name_exn name =
++    let s = Dune_lang.Atom.to_string name in
++    of_string_user_error (Loc.none, s) |> User_error.ok_exn
++  ;;
++end
++
+ module Component = struct
+   module Options = struct
+     module Common = struct
+@@ -206,12 +237,12 @@ module Component = struct
+     end
+ 
+     module Executable = struct
+-      type t = { public : Dune_lang.Atom.t option }
++      type t = { public : Public_name.t option }
+     end
+ 
+     module Library = struct
+       type t =
+-        { public : Dune_lang.Atom.t option
++        { public : Public_name.t option
+         ; inline_tests : bool
+         }
+     end
+@@ -308,8 +339,7 @@ module Component = struct
+       if List.mem ~equal:Dune_lang.Atom.equal set elem then set else elem :: set
+     ;;
+ 
+-    let public_name_encoder atom = Atom atom
+-    let public_name_field = Encoder.field_o "public_name" public_name_encoder
++    let public_name_field = Encoder.field_o "public_name" Public_name.encode
+ 
+     let executable (common : Options.Common.t) (options : Options.Executable.t) =
+       make "executable" common [ public_name_field options.public ]
+@@ -438,7 +468,7 @@ module Component = struct
+         let libraries = Stanza_cst.add_to_list_set common.name common.libraries in
+         bin
+           { context = { context with dir = Path.relative dir "bin" }
+-          ; options = { public = Some common.name }
++          ; options = { public = Some (Public_name.of_name_exn common.name) }
+           ; common = { common with libraries; name = Dune_lang.Atom.of_string "main" }
+           }
+       in
+@@ -449,7 +479,10 @@ module Component = struct
+       let lib_target =
+         src
+           { context = { context with dir = Path.relative dir "lib" }
+-          ; options = { public = Some common.name; inline_tests = options.inline_tests }
++          ; options =
++              { public = Some (Public_name.of_name_exn common.name)
++              ; inline_tests = options.inline_tests
++              }
+           ; common
+           }
+       in
+diff --git a/bin/dune_init.mli b/bin/dune_init.mli
+index 1d959e513..3c4dc97ce 100644
+--- a/bin/dune_init.mli
++++ b/bin/dune_init.mli
+@@ -12,6 +12,14 @@ module Init_context : sig
+   val make : string option -> t Memo.t
+ end
+ 
++module Public_name : sig
++  type t
++
++  val to_string : t -> string
++  val of_string_user_error : Loc.t * string -> (t, User_message.t) result
++  val of_name_exn : Dune_lang.Atom.t -> t
++end
++
+ (** A [Component.t] is a set of files that can be built or included as part of a
+     build. *)
+ module Component : sig
+@@ -28,13 +36,13 @@ module Component : sig
+ 
+     (** Options for executable components *)
+     module Executable : sig
+-      type t = { public : Dune_lang.Atom.t option }
++      type t = { public : Public_name.t option }
+     end
+ 
+     (** Options for library components *)
+     module Library : sig
+       type t =
+-        { public : Dune_lang.Atom.t option
++        { public : Public_name.t option
+         ; inline_tests : bool
+         }
+     end
+diff --git a/bin/init.ml b/bin/init.ml
+index e9b1c943b..d843fe107 100644
+--- a/bin/init.ml
++++ b/bin/init.ml
+@@ -79,23 +79,27 @@ let context_cwd : Init_context.t Term.t =
+ module Public_name = struct
+   type t =
+     | Use_name
+-    | Public_name of Dune_lang.Atom.t
++    | Public_name of Public_name.t
+ 
+   let public_name_to_string = function
+     | Use_name -> "<default>"
+-    | Public_name p -> Dune_lang.Atom.to_string p
++    | Public_name p -> Public_name.to_string p
+   ;;
+ 
+   let public_name (common : Component.Options.Common.t) = function
+     | None -> None
+-    | Some Use_name -> Some common.name
++    | Some Use_name -> Some (Public_name.of_name_exn common.name)
+     | Some (Public_name n) -> Some n
+   ;;
+ 
+   let conv =
+-    let parser = function
+-      | "" -> Ok Use_name
+-      | s -> component_name_parser s |> Result.map ~f:(fun a -> Public_name a)
++    let parser s =
++      if String.is_empty s
++      then Ok Use_name
++      else (
++        match Public_name.of_string_user_error (Loc.none, s) with
++        | Ok n -> Ok (Public_name n)
++        | Error e -> Error (`Msg (User_message.to_string e)))
+     in
+     let printer ppf public_name =
+       Format.pp_print_string ppf (public_name_to_string public_name)
+diff --git a/doc/changes/init-public-names.md b/doc/changes/init-public-names.md
+new file mode 100644
+index 000000000..7e9a60ad6
+--- /dev/null
++++ b/doc/changes/init-public-names.md
+@@ -0,0 +1 @@
++- dune init: parse `--public` as a public name (#8603, fixes #7108, @emillon)
+diff --git a/src/dune_lang/package_name.ml b/src/dune_lang/package_name.ml
+index 2f5e6ae95..e8f8a410a 100644
+--- a/src/dune_lang/package_name.ml
++++ b/src/dune_lang/package_name.ml
+@@ -15,47 +15,52 @@ include (
+     Dune_util.Stringlike with type t := t)
+ 
+ module Opam_compatible = struct
+-  include Dune_util.Stringlike.Make (struct
+-      type t = string
++  let description_of_valid_string =
++    Pp.text
++      "Package names can contain letters, numbers, '-', '_' and '+', and need to contain \
++       at least a letter."
++  ;;
+ 
+-      let module_ = "Package.Name.Strict"
+-      let description = "opam package name"
+-      let to_string s = s
++  module T = struct
++    type t = string
++
++    let module_ = "Package.Name.Strict"
++    let description = "opam package name"
++    let to_string s = s
++    let description_of_valid_string = Some description_of_valid_string
+ 
+-      let description_of_valid_string =
+-        Some
+-          (Pp.textf
+-             "Package names can contain letters, numbers, '-', '_' and '+', and need to \
+-              contain at least a letter.")
+-      ;;
++    let is_letter = function
++      | 'a' .. 'z' | 'A' .. 'Z' -> true
++      | _ -> false
++    ;;
+ 
+-      let is_letter = function
+-        | 'a' .. 'z' | 'A' .. 'Z' -> true
+-        | _ -> false
+-      ;;
++    let is_other_valid_char = function
++      | '0' .. '9' | '-' | '+' | '_' -> true
++      | _ -> false
++    ;;
+ 
+-      let is_other_valid_char = function
+-        | '0' .. '9' | '-' | '+' | '_' -> true
+-        | _ -> false
+-      ;;
++    let is_valid_char c = is_letter c || is_other_valid_char c
+ 
+-      let is_valid_char c = is_letter c || is_other_valid_char c
++    let is_valid_string s =
++      let all_chars_valid = String.for_all s ~f:is_valid_char in
++      let has_one_letter = String.exists s ~f:is_letter in
++      all_chars_valid && has_one_letter
++    ;;
+ 
+-      let is_valid_string s =
+-        let all_chars_valid = String.for_all s ~f:is_valid_char in
+-        let has_one_letter = String.exists s ~f:is_letter in
+-        all_chars_valid && has_one_letter
+-      ;;
++    let of_string_opt s = Option.some_if (is_valid_string s) s
+ 
+-      let of_string_opt s = Option.some_if (is_valid_string s) s
++    let make_valid s =
++      let replaced = String.map s ~f:(fun c -> if is_valid_char c then c else '_') in
++      if is_valid_string replaced then replaced else "p" ^ replaced
++    ;;
+ 
+-      let make_valid s =
+-        let replaced = String.map s ~f:(fun c -> if is_valid_char c then c else '_') in
+-        if is_valid_string replaced then replaced else "p" ^ replaced
+-      ;;
++    let hint_valid = Some make_valid
++  end
+ 
+-      let hint_valid = Some make_valid
+-    end)
++  include Dune_util.Stringlike.Make (T)
+ 
++  let make_valid = T.make_valid
+   let to_package_name s = s
+ end
++
++let is_opam_compatible s = Option.is_some (Opam_compatible.of_string_opt (to_string s))
+diff --git a/src/dune_lang/package_name.mli b/src/dune_lang/package_name.mli
+index 6849029cd..75f2e58f5 100644
+--- a/src/dune_lang/package_name.mli
++++ b/src/dune_lang/package_name.mli
+@@ -20,5 +20,9 @@ module Opam_compatible : sig
+     type package_name
+ 
+     val to_package_name : t -> package_name
++    val description_of_valid_string : _ Pp.t
++    val make_valid : string -> string
+   end
+   with type package_name := t
++
++val is_opam_compatible : t -> bool

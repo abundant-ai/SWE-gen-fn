@@ -1,0 +1,372 @@
+diff --git a/otherlibs/stdune/src/array.ml b/otherlibs/stdune/src/array.ml
+index 408047a9a..4e9cd2b0b 100644
+--- a/otherlibs/stdune/src/array.ml
++++ b/otherlibs/stdune/src/array.ml
+@@ -24,32 +24,8 @@ end
+ 
+ include T
+ 
+-let to_list_map =
+-  let rec loop arr i f acc =
+-    if i < 0
+-    then acc
+-    else (
+-      let acc = f (get arr i) :: acc in
+-      loop arr (i - 1) f acc)
+-  in
+-  fun arr ~f -> loop arr (length arr - 1) f []
+-;;
+-
+-let of_list_map l ~f =
+-  let len = List.length l in
+-  let l = ref l in
+-  init len ~f:(fun _ ->
+-    match !l with
+-    | [] -> assert false
+-    | x :: xs ->
+-      l := xs;
+-      f x)
+-;;
+-
+ module Immutable = struct
+   include T
+ 
+   let of_array a = copy a
+-  let to_list_map t ~f = to_list_map t ~f
+-  let of_list_map t ~f = of_list_map t ~f
+ end
+diff --git a/otherlibs/stdune/src/array.mli b/otherlibs/stdune/src/array.mli
+index d4de6c04e..403ba6f15 100644
+--- a/otherlibs/stdune/src/array.mli
++++ b/otherlibs/stdune/src/array.mli
+@@ -18,6 +18,4 @@ module Immutable : sig
+   val fold_right : 'a t -> f:('a -> 'acc -> 'acc) -> init:'acc -> 'acc
+   val exists : 'a t -> f:('a -> bool) -> bool
+   val length : _ t -> int
+-  val to_list_map : 'a t -> f:('a -> 'b) -> 'b list
+-  val of_list_map : 'a list -> f:('a -> 'b) -> 'b t
+ end
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index cba2daf3c..c009b556d 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -502,93 +502,6 @@ module Substitute = struct
+   ;;
+ end
+ 
+-module Run_with_path = struct
+-  module Spec = struct
+-    type 'path chunk =
+-      | String of string
+-      | Path of 'path
+-
+-    type 'path arg = 'path chunk Array.Immutable.t
+-
+-    type ('path, 'target) t =
+-      { prog : Action.Prog.t
+-      ; args : 'path arg Array.Immutable.t
+-      }
+-
+-    let name = "run-with-path"
+-    let version = 1
+-
+-    let map_arg arg ~f =
+-      Array.Immutable.map arg ~f:(function
+-        | String _ as s -> s
+-        | Path p -> Path (f p))
+-    ;;
+-
+-    let bimap t f _g = { t with args = Array.Immutable.map t.args ~f:(map_arg ~f) }
+-    let is_useful_to ~memoize:_ = true
+-
+-    let encode { prog; args } path _ : Dune_lang.t =
+-      let prog =
+-        Dune_lang.atom_or_quoted_string
+-        @@
+-        match prog with
+-        | Ok p -> Path.reach p ~from:Path.root
+-        | Error e -> e.program
+-      in
+-      let args =
+-        Array.Immutable.to_list_map args ~f:(fun x ->
+-          Dune_lang.List
+-            (Array.Immutable.to_list_map x ~f:(function
+-              | String s -> Dune_lang.atom_or_quoted_string s
+-              | Path p -> path p)))
+-      in
+-      List ([ Dune_lang.atom_or_quoted_string name; prog ] @ args)
+-    ;;
+-
+-    let action { prog; args } ~(ectx : Action.Ext.context) ~(eenv : Action.Ext.env) =
+-      let open Fiber.O in
+-      match prog with
+-      | Error e -> Action.Prog.Not_found.raise e
+-      | Ok prog ->
+-        let args =
+-          Array.Immutable.to_list_map args ~f:(fun arg ->
+-            Array.Immutable.to_list_map arg ~f:(function
+-              | String s -> s
+-              | Path p -> Path.to_absolute_filename p)
+-            |> String.concat ~sep:"")
+-        in
+-        let metadata = Process.create_metadata ~purpose:ectx.purpose () in
+-        Process.run
+-          (Accept eenv.exit_codes)
+-          prog
+-          args
+-          ~display:!Clflags.display
+-          ~metadata
+-          ~stdout_to:eenv.stdout_to
+-          ~stderr_to:eenv.stderr_to
+-          ~stdin_from:eenv.stdin_from
+-          ~dir:eenv.working_dir
+-          ~env:eenv.env
+-        >>= (function
+-         | Error _ -> Fiber.return ()
+-         | Ok () -> Fiber.return ())
+-    ;;
+-  end
+-
+-  let action prog args =
+-    let module M = struct
+-      type path = Path.t
+-      type target = Path.Build.t
+-
+-      module Spec = Spec
+-
+-      let v = { Spec.prog; args }
+-    end
+-    in
+-    Action.Extension (module M)
+-  ;;
+-end
+-
+ module Action_expander = struct
+   module Expander = struct
+     include Expander0
+@@ -825,25 +738,10 @@ module Action_expander = struct
+          User_error.raise
+            ?loc
+            [ Pp.text "\"run\" action must have at least one argument" ]
+-       | (prog_loc, `Concat prog) :: args ->
+-         let+ exe =
+-           let prog =
+-             match prog with
+-             | [ Path prog ] -> Value.Path prog
+-             | [ Dir prog ] -> Value.Dir prog
+-             | prog ->
+-               String (List.map prog ~f:(Value.to_string ~dir) |> String.concat ~sep:"")
+-           in
+-           Expander.expand_exe_value expander prog ~loc:prog_loc
+-         in
+-         let args =
+-           Array.Immutable.of_list_map args ~f:(fun (_, `Concat arg) ->
+-             Array.Immutable.of_list_map arg ~f:(fun (arg : Value.t) ->
+-               match arg with
+-               | String s -> Run_with_path.Spec.String s
+-               | Path p | Dir p -> Path p))
+-         in
+-         Run_with_path.action exe args)
++       | (prog_loc, prog) :: args ->
++         let+ exe = Expander.expand_exe_value expander prog ~loc:prog_loc in
++         let args = Value.L.to_strings (List.map ~f:snd args) ~dir in
++         Action.Run (exe, Array.Immutable.of_list args))
+     | Progn t ->
+       let+ args = Memo.parallel_map t ~f:(expand ~expander) in
+       Action.Progn args
+diff --git a/src/dune_rules/slang_expand.ml b/src/dune_rules/slang_expand.ml
+index 3e493c496..7b54f81a0 100644
+--- a/src/dune_rules/slang_expand.ml
++++ b/src/dune_rules/slang_expand.ml
+@@ -1,6 +1,5 @@
+ open! Stdune
+ open Import
+-open Memo.O
+ 
+ type expander =
+   String_with_vars.t
+@@ -13,20 +12,25 @@ type error =
+       ; variable_name : Dune_pkg.Variable_name.t
+       }
+ 
+-let rec eval_rec (t : Slang.t) ~dir ~f : (Value.t list list, _) result Memo.t =
++let rec eval_rec (t : Slang.t) ~dir ~f =
++  let open Memo.O in
+   match t with
+   | Nil -> Memo.return (Ok [])
+   | Literal sw ->
+     f sw ~dir
+     >>| Result.map_error ~f:(function `Undefined_pkg_var variable_name ->
+       Undefined_pkg_var { literal = sw; variable_name })
+-    >>| Result.map ~f:List.singleton
+   | Form (_loc, form) ->
+     (match form with
+      | Concat xs ->
+-       Memo.List.map xs ~f:(eval_rec ~dir ~f)
+-       >>| Result.List.all
+-       >>| Result.map ~f:(fun x -> List.concat x |> List.concat |> List.singleton)
++       let+ evaluated = Memo.List.map xs ~f:(eval_rec ~dir ~f) >>| Result.List.all in
++       Result.map evaluated ~f:(fun evaluated ->
++         let without_nils = List.concat evaluated in
++         (* XXX if any of the arguments were [Value.Path]s this will convert them
++            into [Value.String]s *)
++         [ Value.String
++             (List.map ~f:(Value.to_string ~dir) without_nils |> String.concat ~sep:"")
++         ])
+      | When (condition, t) ->
+        let* condition = eval_blang_rec condition ~dir ~f in
+        (match condition with
+@@ -43,8 +47,8 @@ let rec eval_rec (t : Slang.t) ~dir ~f : (Value.t list list, _) result Memo.t =
+        let+ result = eval_rec t ~dir ~f in
+        Ok
+          (match result with
+-          | Ok _ -> [ [ Value.false_ ] ]
+-          | Error (Undefined_pkg_var _) -> [ [ Value.true_ ] ])
++          | Ok _ -> [ Value.false_ ]
++          | Error (Undefined_pkg_var _) -> [ Value.true_ ])
+      | Catch_undefined_var { value; fallback } ->
+        let* value = eval_rec value ~dir ~f in
+        (match value with
+@@ -60,9 +64,9 @@ let rec eval_rec (t : Slang.t) ~dir ~f : (Value.t list list, _) result Memo.t =
+               (* Propagate the first error rather than the last *)
+               if Result.is_ok acc then loop e xs else loop acc xs
+             | Ok true -> loop acc xs
+-            | Ok false -> Memo.return (Ok [ [ Value.false_ ] ]))
++            | Ok false -> Memo.return (Ok [ Value.false_ ]))
+        in
+-       loop (Ok [ [ Value.true_ ] ]) blangs
++       loop (Ok [ Value.true_ ]) blangs
+      | Or_absorb_undefined_var blangs ->
+        let rec loop acc = function
+          | [] -> Memo.return acc
+@@ -73,23 +77,19 @@ let rec eval_rec (t : Slang.t) ~dir ~f : (Value.t list list, _) result Memo.t =
+               (* Propagate the first error rather than the last *)
+               if Result.is_ok acc then loop e xs else loop acc xs
+             | Ok false -> loop acc xs
+-            | Ok true -> Memo.return (Ok [ [ Value.true_ ] ]))
++            | Ok true -> Memo.return (Ok [ Value.true_ ]))
+        in
+-       loop (Ok [ [ Value.false_ ] ]) blangs
++       loop (Ok [ Value.false_ ]) blangs
+      | Blang b ->
+        let+ result = eval_blang_rec b ~dir ~f in
+        Result.map result ~f:(function
+-         | true -> [ [ Value.true_ ] ]
+-         | false -> [ [ Value.false_ ] ]))
++         | true -> [ Value.true_ ]
++         | false -> [ Value.false_ ]))
+ 
+ and eval_to_bool (t : Slang.t) ~dir ~f =
++  let open Memo.O in
+   let+ result = eval_rec t ~dir ~f in
+-  Result.map result ~f:(fun result ->
+-    let result =
+-      List.map result ~f:(fun r ->
+-        Value.String (List.map r ~f:(Value.to_string ~dir) |> String.concat ~sep:""))
+-    in
+-    match result with
++  Result.map result ~f:(function
+     | [ x ] when Value.(equal true_ x) -> true
+     | [ x ] when Value.(equal false_ x) -> false
+     | [ Value.String other ] ->
+@@ -128,6 +128,7 @@ and eval_to_bool (t : Slang.t) ~dir ~f =
+         ])
+ 
+ and eval_blang_rec (t : Slang.blang) ~dir ~f =
++  let open Memo.O in
+   match t with
+   | Const x -> Memo.return (Ok x)
+   | Expr s -> eval_to_bool s ~dir ~f
+@@ -164,13 +165,13 @@ and eval_blang_rec (t : Slang.blang) ~dir ~f =
+     let+ x = eval_rec x ~dir ~f
+     and+ y = eval_rec y ~dir ~f in
+     Result.bind x ~f:(fun x ->
+-      Result.map y ~f:(fun y ->
+-        Relop.eval op (List.compare ~compare:(Value.L.compare_vals ~dir) x y)))
++      Result.map y ~f:(fun y -> Relop.eval op (Value.L.compare_vals ~dir x y)))
+ ;;
+ 
+-let eval t ~dir ~f : Value.t list list Memo.t =
+-  eval_rec t ~dir ~f
+-  >>| function
++let eval t ~dir ~f =
++  let open Memo.O in
++  let+ result = eval_rec t ~dir ~f in
++  match result with
+   | Ok value -> value
+   | Error (Undefined_pkg_var { literal; variable_name }) ->
+     User_error.raise
+@@ -182,11 +183,14 @@ let eval t ~dir ~f : Value.t list list Memo.t =
+ ;;
+ 
+ let eval_multi_located ts ~dir ~f =
++  let open Memo.O in
+   Memo.List.concat_map ts ~f:(fun t ->
+-    eval t ~dir ~f >>| List.map ~f:(fun value -> Slang.loc t, `Concat value))
++    let+ values = eval t ~dir ~f in
++    List.map values ~f:(fun value -> Slang.loc t, value))
+ ;;
+ 
+ let eval_blang blang ~dir ~f =
++  let open Memo.O in
+   let+ result = eval_blang_rec blang ~dir ~f in
+   match result with
+   | Ok value -> value
+diff --git a/src/dune_rules/slang_expand.mli b/src/dune_rules/slang_expand.mli
+index 9bea1dfd4..5b1735df8 100644
+--- a/src/dune_rules/slang_expand.mli
++++ b/src/dune_rules/slang_expand.mli
+@@ -6,10 +6,17 @@ type expander =
+   -> dir:Path.t
+   -> (Value.t list, [ `Undefined_pkg_var of Dune_pkg.Variable_name.t ]) result Memo.t
+ 
++(** Evaluate a [Slang.t] expression. Expressions in the unfollowed branches of
++    if-statements are not followed and boolean expressions are evaluated
++    lazily. Undefined package variables or invalid strings in the conditions of
++    if and when statements do not result in errors if they occur in unevaluated
++    portions of an expression. *)
++val eval : Slang.t -> dir:Path.t -> f:expander -> Value.t list Memo.t
++
+ val eval_multi_located
+   :  Slang.t list
+   -> dir:Path.t
+   -> f:expander
+-  -> (Loc.t * [ `Concat of Value.t list ]) list Memo.t
++  -> (Loc.t * Value.t) list Memo.t
+ 
+ val eval_blang : Slang.blang -> dir:Path.t -> f:expander -> bool Memo.t
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t
+index 79c7e46a2..368cbe621 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t
+@@ -47,17 +47,17 @@ opam-var-unsupported.t
+     (run echo %{toplevel})
+     (run echo %{stublibs})))
+ 
+-  $ build_pkg testpkg 2>&1 | sed -E 's#.*.sandbox/[^/]+#.sandbox/$SANDBOX#g'
++  $ build_pkg testpkg
+   dune
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/source
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/lib
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/lib
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/bin
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/sbin
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/share
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/doc
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/etc
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/man
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/lib/toplevel
+-  .sandbox/$SANDBOX/_private/default/.pkg/testpkg/target/lib/stublibs
++  .
++  ../target
++  ../target/lib
++  ../target/lib
++  ../target/bin
++  ../target/sbin
++  ../target/share
++  ../target/doc
++  ../target/etc
++  ../target/man
++  ../target/lib/toplevel
++  ../target/lib/stublibs

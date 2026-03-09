@@ -1,0 +1,826 @@
+diff --git a/doc/changes/8350.md b/doc/changes/8350.md
+deleted file mode 100644
+index afed7fb49..000000000
+--- a/doc/changes/8350.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-- Deprecate install destination paths beginning with ".." to prevent packages
+-  escaping their designated installation directories. (#8350, @gridbugs)
+diff --git a/doc/stanzas/install.rst b/doc/stanzas/install.rst
+index 0d8842593..9e82381bc 100644
+--- a/doc/stanzas/install.rst
++++ b/doc/stanzas/install.rst
+@@ -106,16 +106,6 @@ installed with mode ``0o644`` (``rw-r--r--``).
+ Note that all files in the install stanza must be specified by relative paths
+ only. It is an error to specify files by absolute paths.
+ 
+-Also note that as of dune-lang 3.11 (ie. ``(lang dune 3.11)`` in
+-``dune-project``) it is deprecated to use the ``as`` keyword to specify a
+-destination beginning with ``..``. Dune intends for files associated with a
+-package to only be installed under specific directories in the file system
+-implied by the installation section (e.g. ``share``, ``bin``, ``doc``, etc.)
+-and the package name. Starting destination paths with ``..`` allows packages to
+-install files to arbitrary locations on the file system. In 3.11 this behaviour
+-is still supported (as some projects may depend on it) but will generate a
+-warning and will be removed in a future version of Dune.
+-
+ Including Files in the Install Stanza
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/src/dune_rules/dune_file.ml b/src/dune_rules/dune_file.ml
+index b58946b3c..4b6b9b82c 100644
+--- a/src/dune_rules/dune_file.ml
++++ b/src/dune_rules/dune_file.ml
+@@ -1179,7 +1179,6 @@ module Executables = struct
+     type t =
+       { names : (Loc.t * string) list
+       ; public : public option
+-      ; dune_syntax : Syntax.Version.t
+       }
+ 
+     let names t = t.names
+@@ -1320,7 +1319,7 @@ module Executables = struct
+                 (pluralize "public_name" ~multi)
+             ]
+       in
+-      { names; public; dune_syntax }
++      { names; public }
+     ;;
+ 
+     let install_conf t ~ext ~enabled_if =
+@@ -1329,10 +1328,7 @@ module Executables = struct
+           List.map2 t.names public_names ~f:(fun (locn, name) (locp, pub) ->
+             Option.map pub ~f:(fun pub ->
+               Install_entry.File.of_file_binding
+-                (File_binding.Unexpanded.make
+-                   ~src:(locn, name ^ ext)
+-                   ~dst:(locp, pub)
+-                   ~dune_syntax:t.dune_syntax)))
++                (File_binding.Unexpanded.make ~src:(locn, name ^ ext) ~dst:(locp, pub))))
+           |> List.filter_opt
+         in
+         { Install_conf.section = Section Bin
+diff --git a/src/dune_rules/file_binding.ml b/src/dune_rules/file_binding.ml
+index 8e193d1c9..e690f5464 100644
+--- a/src/dune_rules/file_binding.ml
++++ b/src/dune_rules/file_binding.ml
+@@ -4,69 +4,18 @@ open Memo.O
+ type ('src, 'dst) t =
+   { src : 'src
+   ; dst : 'dst option
+-      (* The [dune_syntax] field is used for validation which has different
+-         behaviour depending on the version of dune syntax in use. *)
+-  ; dune_syntax : Syntax.Version.t
+   }
+ 
+-let equal f g { src; dst; dune_syntax } t =
+-  f src t.src
+-  && Option.equal g dst t.dst
+-  && Syntax.Version.equal dune_syntax t.dune_syntax
+-;;
+-
+-let relative_path_starts_with_parent relative_path =
+-  match String.lsplit2 relative_path ~on:'/' with
+-  | None -> Filename.(equal relative_path parent_dir_name)
+-  | Some (first, _) -> String.equal first Filename.parent_dir_name
+-;;
+-
+-let validate_dst_for_install_stanza
+-  ~relative_dst_path_starts_with_parent_error_when
+-  ~loc
+-  dst
+-  dune_syntax
+-  =
+-  if relative_path_starts_with_parent dst
+-  then (
+-    match relative_dst_path_starts_with_parent_error_when with
+-    | `Deprecation_warning_from_3_11 ->
+-      let open Syntax.Version.Infix in
+-      if dune_syntax >= (3, 11)
+-      then
+-        User_warning.emit
+-          ~loc
+-          [ Pp.textf
+-              "The destination path %s begins with %s which will become an error in a \
+-               future version of Dune. Destinations of files in install stanzas \
+-               beginning with %s will be disallowed to prevent a package's installed \
+-               files from escaping that package's install directories."
+-              (String.maybe_quoted dst)
+-              (String.maybe_quoted Filename.parent_dir_name)
+-              (String.maybe_quoted Filename.parent_dir_name)
+-          ]
+-    | `Always_error ->
+-      User_error.raise
+-        ~loc
+-        [ Pp.textf
+-            "The destination path %s begins with %s which is not allowed. Destinations \
+-             in install stanzas may not begin with %s to prevent a package's installed \
+-             files from escaping that package's install directories."
+-            (String.maybe_quoted dst)
+-            (String.maybe_quoted Filename.parent_dir_name)
+-            (String.maybe_quoted Filename.parent_dir_name)
+-        ])
+-;;
++let equal f g { src; dst } t = f src t.src && Option.equal g dst t.dst
+ 
+ module Expanded = struct
+   type nonrec t = (Loc.t * Path.Build.t, Loc.t * string) t
+ 
+-  let to_dyn { src; dst; dune_syntax } =
++  let to_dyn { src; dst } =
+     let open Dyn in
+     record
+       [ "src", pair Loc.to_dyn Path.Build.to_dyn src
+       ; "dst", option (pair Loc.to_dyn string) dst
+-      ; "dune_syntax", Syntax.Version.to_dyn dune_syntax
+       ]
+   ;;
+ 
+@@ -74,7 +23,7 @@ module Expanded = struct
+   let dst t = Option.map ~f:snd t.dst
+   let src_loc t = fst t.src
+ 
+-  let dst_basename { src = _, src; dst; dune_syntax = _ } =
++  let dst_basename { src = _, src; dst } =
+     match dst with
+     | Some (_, dst) -> dst
+     | None ->
+@@ -83,35 +32,22 @@ module Expanded = struct
+   ;;
+ 
+   let dst_path t ~dir = Path.Build.relative dir (dst_basename t)
+-
+-  let validate_for_install_stanza ~relative_dst_path_starts_with_parent_error_when t =
+-    Option.iter t.dst ~f:(fun (loc, dst) ->
+-      validate_dst_for_install_stanza
+-        ~relative_dst_path_starts_with_parent_error_when
+-        ~loc
+-        dst
+-        t.dune_syntax)
+-  ;;
+ end
+ 
+ module Unexpanded = struct
+   type nonrec t = (String_with_vars.t, String_with_vars.t) t
+ 
+-  let to_dyn { src; dst; dune_syntax } =
++  let to_dyn { src; dst } =
+     let open Dyn in
+     record
+-      [ "src", String_with_vars.to_dyn src
+-      ; "dst", option String_with_vars.to_dyn dst
+-      ; "dune_syntax", Syntax.Version.to_dyn dune_syntax
+-      ]
++      [ "src", String_with_vars.to_dyn src; "dst", option String_with_vars.to_dyn dst ]
+   ;;
+ 
+   let equal = equal String_with_vars.equal_no_loc String_with_vars.equal_no_loc
+ 
+-  let make ~src:(locs, src) ~dst:(locd, dst) ~dune_syntax =
++  let make ~src:(locs, src) ~dst:(locd, dst) =
+     { src = String_with_vars.make_text locs src
+     ; dst = Some (String_with_vars.make_text locd dst)
+-    ; dune_syntax
+     }
+   ;;
+ 
+@@ -119,19 +55,8 @@ module Unexpanded = struct
+ 
+   let destination_relative_to_install_path t ~section ~expand ~expand_partial =
+     let+ src = expand_partial t.src
+-    and+ dst_loc_opt =
+-      Memo.Option.map t.dst ~f:(fun dst ->
+-        let loc = String_with_vars.loc dst in
+-        let+ dst = expand dst in
+-        dst, loc)
+-    in
+-    Option.iter dst_loc_opt ~f:(fun (dst, loc) ->
+-      validate_dst_for_install_stanza
+-        ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
+-        ~loc
+-        dst
+-        t.dune_syntax);
+-    Install.Entry.adjust_dst ~section ~src ~dst:(Option.map dst_loc_opt ~f:fst)
++    and+ dst = Memo.Option.map ~f:expand t.dst in
++    Install.Entry.adjust_dst ~section ~src ~dst
+   ;;
+ 
+   let expand t ~dir ~f =
+@@ -150,7 +75,7 @@ module Unexpanded = struct
+         let+ loc, p = f dst in
+         Some (loc, p)
+     in
+-    { src; dst; dune_syntax = t.dune_syntax }
++    { src; dst }
+   ;;
+ 
+   let decode =
+@@ -162,37 +87,34 @@ module Unexpanded = struct
+         | Atom _ -> true
+         | _ -> false
+       and+ s = String_with_vars.decode
+-      and+ dune_syntax = Dune_lang.Syntax.get_exn Stanza.syntax in
+-      if (not is_atom) && dune_syntax < (1, 6)
++      and+ version = Dune_lang.Syntax.get_exn Stanza.syntax in
++      if (not is_atom) && version < (1, 6)
+       then (
+         let what =
+           (if String_with_vars.has_pforms s then "variables" else "quoted strings")
+           |> sprintf "Using %s here"
+         in
+         Dune_lang.Syntax.Error.since (String_with_vars.loc s) Stanza.syntax (1, 6) ~what)
+-      else s, dune_syntax
++      else s
+     in
+     peek_exn
+     >>= function
+-    | Atom _ | Quoted_string _ | Template _ ->
+-      decode >>| fun (src, dune_syntax) -> { src; dst = None; dune_syntax }
++    | Atom _ | Quoted_string _ | Template _ -> decode >>| fun src -> { src; dst = None }
+     | List (_, [ _; Atom (_, A "as"); _ ]) ->
+       enter
+-        (let* src, dune_syntax = decode in
++        (let* src = decode in
+          keyword "as"
+-         >>> let* dst, _ = decode in
+-             return { src; dst = Some dst; dune_syntax })
++         >>> let* dst = decode in
++             return { src; dst = Some dst })
+     | sexp ->
+       User_error.raise
+         ~loc:(Dune_lang.Ast.loc sexp)
+         [ Pp.text "Invalid format, <name> or (<name> as <install-as>) expected" ]
+   ;;
+ 
+-  let dune_syntax t = t.dune_syntax
+-
+   module L = struct
+     let decode = Dune_lang.Decoder.repeat decode
+-    let strings_with_vars { src; dst; dune_syntax = _ } = src :: Option.to_list dst
++    let strings_with_vars { src; dst } = src :: Option.to_list dst
+ 
+     let find_pform fbs =
+       List.find_map fbs ~f:(fun fb ->
+diff --git a/src/dune_rules/file_binding.mli b/src/dune_rules/file_binding.mli
+index c1bfd2c29..6fb5ae825 100644
+--- a/src/dune_rules/file_binding.mli
++++ b/src/dune_rules/file_binding.mli
+@@ -8,12 +8,6 @@ module Expanded : sig
+   val dst : t -> string option
+   val src_loc : t -> Loc.t
+   val dst_path : t -> dir:Path.Build.t -> Path.Build.t
+-
+-  val validate_for_install_stanza
+-    :  relative_dst_path_starts_with_parent_error_when:
+-         [ `Deprecation_warning_from_3_11 | `Always_error ]
+-    -> t
+-    -> unit
+ end
+ 
+ module Unexpanded : sig
+@@ -21,9 +15,8 @@ module Unexpanded : sig
+ 
+   val to_dyn : t -> Dyn.t
+   val equal : t -> t -> bool
+-  val make : src:Loc.t * string -> dst:Loc.t * string -> dune_syntax:Syntax.Version.t -> t
++  val make : src:Loc.t * string -> dst:Loc.t * string -> t
+   val decode : t Dune_lang.Decoder.t
+-  val dune_syntax : t -> Syntax.Version.t
+ 
+   val expand
+     :  t
+diff --git a/src/dune_rules/gen_rules.ml b/src/dune_rules/gen_rules.ml
+index 6b51ddd51..0f349bb88 100644
+--- a/src/dune_rules/gen_rules.ml
++++ b/src/dune_rules/gen_rules.ml
+@@ -236,7 +236,6 @@ let gen_rules
+           install_conf.dirs
+           ~expand_str
+           ~dir:ctx_dir
+-          ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
+       in
+       List.map (files_expanded @ dirs_expanded) ~f:(fun fb ->
+         File_binding.Expanded.src fb |> Path.build)
+diff --git a/src/dune_rules/install_entry.ml b/src/dune_rules/install_entry.ml
+index 5987458a1..f894700da 100644
+--- a/src/dune_rules/install_entry.ml
++++ b/src/dune_rules/install_entry.ml
+@@ -42,7 +42,7 @@ module File = struct
+       file_binding_decode <|> glob_files_decode
+     ;;
+ 
+-    let to_file_bindings_unexpanded t ~expand_str ~dir ~dune_syntax =
++    let to_file_bindings_unexpanded t ~expand_str ~dir =
+       match t with
+       | File_binding file_binding -> Memo.return [ file_binding ]
+       | Glob_files glob_files ->
+@@ -51,11 +51,11 @@ module File = struct
+         let glob_loc = String_with_vars.loc glob_files.glob in
+         List.map paths ~f:(fun path ->
+           let src = glob_loc, path in
+-          File_binding.Unexpanded.make ~src ~dst:src ~dune_syntax)
++          File_binding.Unexpanded.make ~src ~dst:src)
+     ;;
+ 
+-    let to_file_bindings_expanded t ~expand_str ~dir ~dune_syntax =
+-      to_file_bindings_unexpanded t ~expand_str ~dir ~dune_syntax
++    let to_file_bindings_expanded t ~expand_str ~dir =
++      to_file_bindings_unexpanded t ~expand_str ~dir
+       |> Memo.bind
+            ~f:
+              (Memo.List.map
+@@ -66,72 +66,40 @@ module File = struct
+     ;;
+   end
+ 
+-  type t =
+-    { entry : Without_include.t Recursive_include.t
+-    ; dune_syntax : Syntax.Version.t
+-    }
++  type t = Without_include.t Recursive_include.t
+ 
+   let decode =
+-    let open Dune_lang.Decoder in
+-    let+ entry =
+-      Recursive_include.decode
+-        ~base_term:Without_include.decode
+-        ~include_keyword:"include"
+-        ~non_sexp_behaviour:`User_error
+-        ~include_allowed_in_versions:(`Since (3, 5))
+-    and+ dune_syntax = Dune_lang.Syntax.get_exn Stanza.syntax in
+-    { entry; dune_syntax }
++    Recursive_include.decode
++      ~base_term:Without_include.decode
++      ~include_keyword:"include"
++      ~non_sexp_behaviour:`User_error
++      ~include_allowed_in_versions:(`Since (3, 5))
++  ;;
++
++  let expand_include = Recursive_include.expand_include
++
++  let expand_include_multi ts ~expand_str ~dir =
++    Memo.List.concat_map ts ~f:(expand_include ~expand_str ~dir)
+   ;;
+ 
+   let of_file_binding file_binding =
+-    let entry = Recursive_include.of_base (Without_include.File_binding file_binding) in
+-    let dune_syntax = File_binding.Unexpanded.dune_syntax file_binding in
+-    { entry; dune_syntax }
++    Recursive_include.of_base (Without_include.File_binding file_binding)
+   ;;
+ 
+   let to_file_bindings_unexpanded ts ~expand_str ~dir =
+-    let open Memo.O in
+-    Memo.List.concat_map ts ~f:(fun { entry; dune_syntax } ->
+-      let+ with_include_expanded =
+-        Recursive_include.expand_include entry ~expand_str ~dir
+-      in
+-      List.map with_include_expanded ~f:(fun entry -> entry, dune_syntax))
++    expand_include_multi ts ~expand_str ~dir
+     |> Memo.bind
+          ~f:
+-           (Memo.List.concat_map ~f:(fun (entry, dune_syntax) ->
+-              Without_include.to_file_bindings_unexpanded
+-                ~expand_str
+-                ~dir
+-                ~dune_syntax
+-                entry))
++           (Memo.List.concat_map
++              ~f:(Without_include.to_file_bindings_unexpanded ~expand_str ~dir))
+   ;;
+ 
+   let to_file_bindings_expanded ts ~expand_str ~dir =
+-    let open Memo.O in
+-    let+ file_bindings_expanded =
+-      Memo.List.concat_map ts ~f:(fun { entry; dune_syntax } ->
+-        let+ with_include_expanded =
+-          Recursive_include.expand_include entry ~expand_str ~dir
+-        in
+-        List.map with_include_expanded ~f:(fun entry -> entry, dune_syntax))
+-      |> Memo.bind
+-           ~f:
+-             (Memo.List.concat_map ~f:(fun (entry, dune_syntax) ->
+-                Without_include.to_file_bindings_expanded
+-                  ~expand_str
+-                  ~dir
+-                  ~dune_syntax
+-                  entry))
+-    in
+-    (* Note that validation is deferred until after file bindings have been
+-       expanded as a path may be invalid due to the contents of a variable
+-       whose value is unknown until prior to this point. *)
+-    List.iter
+-      file_bindings_expanded
+-      ~f:
+-        (File_binding.Expanded.validate_for_install_stanza
+-           ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11);
+-    file_bindings_expanded
++    expand_include_multi ts ~expand_str ~dir
++    |> Memo.bind
++         ~f:
++           (Memo.List.concat_map
++              ~f:(Without_include.to_file_bindings_expanded ~expand_str ~dir))
+   ;;
+ end
+ 
+@@ -146,29 +114,14 @@ module Dir = struct
+ 
+   type t = File_binding.Unexpanded.t Recursive_include.t
+ 
+-  let to_file_bindings_expanded
+-    ts
+-    ~expand_str
+-    ~dir
+-    ~relative_dst_path_starts_with_parent_error_when
+-    =
+-    let open Memo.O in
+-    let+ file_bindings_expanded =
+-      Memo.List.concat_map ts ~f:(Recursive_include.expand_include ~expand_str ~dir)
+-      >>= Memo.List.map
+-            ~f:
+-              (File_binding.Unexpanded.expand
+-                 ~dir
+-                 ~f:(expand_str_with_check_for_local_path ~expand_str))
+-    in
+-    (* Note that validation is deferred until after file bindings have been
+-       expanded as a path may be invalid due to the contents of a variable
+-       whose value is unknown until prior to this point. *)
+-    List.iter
+-      file_bindings_expanded
+-      ~f:
+-        (File_binding.Expanded.validate_for_install_stanza
+-           ~relative_dst_path_starts_with_parent_error_when);
+-    file_bindings_expanded
++  let to_file_bindings_expanded ts ~expand_str ~dir =
++    Memo.List.concat_map ts ~f:(Recursive_include.expand_include ~expand_str ~dir)
++    |> Memo.bind
++         ~f:
++           (Memo.List.map
++              ~f:
++                (File_binding.Unexpanded.expand
++                   ~dir
++                   ~f:(expand_str_with_check_for_local_path ~expand_str)))
+   ;;
+ end
+diff --git a/src/dune_rules/install_entry.mli b/src/dune_rules/install_entry.mli
+index e395885a1..d046e190c 100644
+--- a/src/dune_rules/install_entry.mli
++++ b/src/dune_rules/install_entry.mli
+@@ -36,7 +36,5 @@ module Dir : sig
+     :  t list
+     -> expand_str:(String_with_vars.t -> string Memo.t)
+     -> dir:Path.Build.t
+-    -> relative_dst_path_starts_with_parent_error_when:
+-         [ `Deprecation_warning_from_3_11 | `Always_error ]
+     -> File_binding.Expanded.t list Memo.t
+ end
+diff --git a/src/dune_rules/install_rules.ml b/src/dune_rules/install_rules.ml
+index 48627bb74..4d5d06283 100644
+--- a/src/dune_rules/install_rules.ml
++++ b/src/dune_rules/install_rules.ml
+@@ -391,26 +391,14 @@ end = struct
+         Install.Entry.Sourced.create ~loc entry)
+     and+ files_from_dirs =
+       let* dirs_expanded =
+-        Install_entry.Dir.to_file_bindings_expanded
+-          i.dirs
+-          ~expand_str
+-          ~dir
+-          ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
++        Install_entry.Dir.to_file_bindings_expanded i.dirs ~expand_str ~dir
+       in
+       Memo.List.map dirs_expanded ~f:(fun fb ->
+         let loc = File_binding.Expanded.src_loc fb in
+         let+ entry = make_entry ~kind:`Directory fb in
+         Install.Entry.Sourced.create ~loc entry)
+     and+ source_trees =
+-      (* There's no deprecation warning when a relative destination path
+-         starts with a parent in this feature. It's safe to raise an error in
+-         this case as installing source trees was added in the same dune version
+-         that we deprecated starting a destination install path with "..". *)
+-      Install_entry.Dir.to_file_bindings_expanded
+-        i.source_trees
+-        ~expand_str
+-        ~dir
+-        ~relative_dst_path_starts_with_parent_error_when:`Always_error
++      Install_entry.Dir.to_file_bindings_expanded i.source_trees ~expand_str ~dir
+       >>= Memo.List.map ~f:(fun fb ->
+         let loc = File_binding.Expanded.src_loc fb in
+         let* entry = make_entry ~kind:`Source_tree fb in
+diff --git a/test/blackbox-tests/test-cases/install/install-glob/install-glob-relative.t b/test/blackbox-tests/test-cases/install/install-glob/install-glob-relative.t
+index 607d964a0..f01522f0f 100644
+--- a/test/blackbox-tests/test-cases/install/install-glob/install-glob-relative.t
++++ b/test/blackbox-tests/test-cases/install/install-glob/install-glob-relative.t
+@@ -1,11 +1,10 @@
+ Install a glob pattern that uses a relative path.
+ 
+-Test that dune detects an error when we use a pattern such as ../foo/* in the
+-install stanza. The problem with this pattern is its destination refers to a
+-path outside the package's install directory.
++When we use a pattern such as ../foo/*, the relative path leaks into the
++installation destination and can escape the root of the installed package.
+ 
+   $ cat >dune-project <<EOF
+-  > (lang dune 3.11)
++  > (lang dune 3.6)
+   > (package (name foo))
+   > EOF
+ 
+@@ -20,7 +19,8 @@ normal install stanza in the share directory of the package:
+   >  (files stuff/foo.txt))
+   > EOF
+ 
+-Incorrect install stanza that would place files outside the package's install directory
++faulty stanza that install things outside the package:
++
+   $ cat >stanza/dune <<EOF
+   > (install
+   >  (files (glob_files_rec ../stuff/*.txt))
+@@ -28,18 +28,17 @@ Incorrect install stanza that would place files outside the package's install di
+   > EOF
+ 
+   $ dune build foo.install
+-  File "stanza/dune", line 2, characters 24-38:
+-  2 |  (files (glob_files_rec ../stuff/*.txt))
+-                              ^^^^^^^^^^^^^^
+-  Warning: The destination path ../stuff/foo.txt begins with .. which will
+-  become an error in a future version of Dune. Destinations of files in install
+-  stanzas beginning with .. will be disallowed to prevent a package's installed
+-  files from escaping that package's install directories.
+-  File "stanza/dune", line 2, characters 24-38:
+-  2 |  (files (glob_files_rec ../stuff/*.txt))
+-                              ^^^^^^^^^^^^^^
+-  Warning: The destination path ../stuff/xy/bar.txt begins with .. which will
+-  become an error in a future version of Dune. Destinations of files in install
+-  stanzas beginning with .. will be disallowed to prevent a package's installed
+-  files from escaping that package's install directories.
+ 
++Note that the "stuff" paths from  are now going to be installed outside the
++package.
++
++  $ grep txt _build/default/foo.install
++    "_build/install/default/share/stuff/foo.txt" {"../stuff/foo.txt"}
++    "_build/install/default/share/stuff/xy/bar.txt" {"../stuff/xy/bar.txt"}
++    "_build/install/default/share/foo/foo.txt"
++
++  $ dune install foo --prefix _foo
++  $ find _foo | sort | grep txt
++  _foo/share/foo/foo.txt
++  _foo/share/stuff/foo.txt
++  _foo/share/stuff/xy/bar.txt
+diff --git a/test/blackbox-tests/test-cases/install/install-source-tree.t b/test/blackbox-tests/test-cases/install/install-source-tree.t
+index 3b05a13ab..c791506c9 100644
+--- a/test/blackbox-tests/test-cases/install/install-source-tree.t
++++ b/test/blackbox-tests/test-cases/install/install-source-tree.t
+@@ -96,13 +96,3 @@ Install zero source trees:
+     "_build/install/default/lib/mypkg/META"
+     "_build/install/default/lib/mypkg/dune-package"
+   ]
+-
+-It is an error for the destination path to start with "..".
+-  $ test "(mydocs as ../)"
+-  File "dune", line 3, characters 26-29:
+-  3 |  (source_trees (mydocs as ../)))
+-                                ^^^
+-  Error: The destination path ../ begins with .. which is not allowed.
+-  Destinations in install stanzas may not begin with .. to prevent a package's
+-  installed files from escaping that package's install directories.
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/start-install-dst-with-parent-error.t b/test/blackbox-tests/test-cases/start-install-dst-with-parent-error.t
+deleted file mode 100644
+index 25b113578..000000000
+--- a/test/blackbox-tests/test-cases/start-install-dst-with-parent-error.t
++++ /dev/null
+@@ -1,232 +0,0 @@
+-Test for the case where the destination of an install stanza entry would place a
+-file outside of the directories associated with the package. This behaviour was
+-deprecated in 3.11.
+-
+-  $ cat >dune-project <<EOF
+-  > (lang dune 3.11)
+-  > (package
+-  >  (name foo))
+-  > (using directory-targets 0.1)
+-  > EOF
+-
+-Create a file to install
+-  $ mkdir a
+-  $ touch a/b.txt
+-
+-Test that we get a warning if `(files ...)` has a dst starting with "..":
+-  $ cat >dune <<EOF
+-  > (install
+-  >  (section etc)
+-  >  (files (a/b.txt as ../b)))
+-  > EOF
+-  $ dune build foo.install && cat _build/default/foo.install
+-  File "dune", line 3, characters 20-24:
+-  3 |  (files (a/b.txt as ../b)))
+-                          ^^^^
+-  Warning: The destination path ../b begins with .. which will become an error
+-  in a future version of Dune. Destinations of files in install stanzas
+-  beginning with .. will be disallowed to prevent a package's installed files
+-  from escaping that package's install directories.
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  etc: [
+-    "_build/install/default/etc/b" {"../b"}
+-  ]
+-
+-Test that we get a warning if `(dirs ...)` has a dst starting with "..":
+-  $ cat >dune <<EOF
+-  > (rule
+-  >  (target (dir bar))
+-  >  (action (progn (run mkdir bar) (run touch bar/baz.txt))))
+-  > 
+-  > (install
+-  >  (section etc)
+-  >  (dirs (bar as ../baz)))
+-  > EOF
+-  $ dune build foo.install && cat _build/default/foo.install
+-  File "dune", line 7, characters 15-21:
+-  7 |  (dirs (bar as ../baz)))
+-                     ^^^^^^
+-  Warning: The destination path ../baz begins with .. which will become an
+-  error in a future version of Dune. Destinations of files in install stanzas
+-  beginning with .. will be disallowed to prevent a package's installed files
+-  from escaping that package's install directories.
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  etc: [
+-    "_build/install/default/etc/baz/baz.txt" {"../baz/baz.txt"}
+-  ]
+-
+-Test that we get a warning if `(dirs ...)` has a dst that is exactly "..":
+-  $ cat >dune <<EOF
+-  > (rule
+-  >  (target (dir bar))
+-  >  (action (progn (run mkdir bar) (run touch bar/baz.txt))))
+-  > 
+-  > (install
+-  >  (section etc)
+-  >  (dirs (bar as ..)))
+-  > EOF
+-  $ dune build foo.install && cat _build/default/foo.install
+-  File "dune", line 7, characters 15-17:
+-  7 |  (dirs (bar as ..)))
+-                     ^^
+-  Warning: The destination path .. begins with .. which will become an error in
+-  a future version of Dune. Destinations of files in install stanzas beginning
+-  with .. will be disallowed to prevent a package's installed files from
+-  escaping that package's install directories.
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  etc: [
+-    "_build/install/default/etc/baz.txt" {"../baz.txt"}
+-  ]
+-
+-Test that we get get a warning if the ".." is the result of variable expansion:
+-  $ printf ".." > prefix.txt
+-  $ cat >dune <<EOF
+-  > (install
+-  >  (section etc)
+-  >  (files (a/b.txt as %{read:prefix.txt}/b)))
+-  > EOF
+-  $ dune build foo.install && cat _build/default/foo.install
+-  File "dune", line 3, characters 20-40:
+-  3 |  (files (a/b.txt as %{read:prefix.txt}/b)))
+-                          ^^^^^^^^^^^^^^^^^^^^
+-  Warning: The destination path ../b begins with .. which will become an error
+-  in a future version of Dune. Destinations of files in install stanzas
+-  beginning with .. will be disallowed to prevent a package's installed files
+-  from escaping that package's install directories.
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  etc: [
+-    "_build/install/default/etc/b" {"../b"}
+-  ]
+-
+-Test that we get an error if `(source_tree ...)` has a dst starting with "..".
+-This is an error rather than a warning as installing source trees is added in
+-the same version of dune as starting a dest with ".." was deprecated.
+-  $ cat >dune <<EOF
+-  > (install
+-  >  (section etc)
+-  >  (source_trees (a as ../b)))
+-  > EOF
+-  $ dune build foo.install
+-  File "dune", line 3, characters 21-25:
+-  3 |  (source_trees (a as ../b)))
+-                           ^^^^
+-  Error: The destination path ../b begins with .. which is not allowed.
+-  Destinations in install stanzas may not begin with .. to prevent a package's
+-  installed files from escaping that package's install directories.
+-  [1]
+-
+-Test that we get an error if `(source_tree ...)` has a dst that is exactly "..":
+-  $ cat >dune <<EOF
+-  > (install
+-  >  (section etc)
+-  >  (source_trees (a as ..)))
+-  > EOF
+-  $ dune build foo.install
+-  File "dune", line 3, characters 21-23:
+-  3 |  (source_trees (a as ..)))
+-                           ^^
+-  Error: The destination path .. begins with .. which is not allowed.
+-  Destinations in install stanzas may not begin with .. to prevent a package's
+-  installed files from escaping that package's install directories.
+-  [1]
+-
+-Test that on older versions of dune we don't get warnings in this case:
+-  $ cat >dune-project <<EOF
+-  > (lang dune 3.10)
+-  > (package
+-  >  (name foo))
+-  > (using directory-targets 0.1)
+-  > EOF
+-
+-  $ cat >dune <<EOF
+-  > (install
+-  >  (section etc)
+-  >  (files (a/b.txt as ../b)))
+-  > 
+-  > (rule
+-  >  (target (dir bar))
+-  >  (action (progn (run mkdir bar) (run touch bar/baz.txt))))
+-  > 
+-  > (install
+-  >  (section etc)
+-  >  (dirs (bar as ../baz)))
+-  > 
+-  > (install
+-  >  (section share)
+-  >  (dirs (bar as ..)))
+-  > EOF
+-  $ dune build foo.install && cat _build/default/foo.install
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  share: [
+-    "_build/install/default/share/baz.txt" {"../baz.txt"}
+-  ]
+-  etc: [
+-    "_build/install/default/etc/b" {"../b"}
+-    "_build/install/default/etc/baz/baz.txt" {"../baz/baz.txt"}
+-  ]
+-
+-Test that we don't get the warning if a vendored project starts an install dst
+-with "..". This is so that if a project vendors another project which would
+-produce warnings, the first project doesn't get spammed with those warnings.
+-
+-  $ mkdir -p vendor/bar
+-
+-  $ cat >vendor/dune <<EOF
+-  > (vendored_dirs *)
+-  > EOF
+-
+-  $ cat >vendor/bar/dune-project <<EOF
+-  > (lang dune 3.10)
+-  > (package
+-  >  (name bar))
+-  > EOF
+-
+-  $ touch vendor/bar/a.txt
+-
+-  $ cat >vendor/bar/bar.ml <<EOF
+-  > let bar = "bar"
+-  > EOF
+-
+-  $ cat >vendor/bar/dune <<EOF
+-  > (library
+-  >  (public_name bar))
+-  > 
+-  > (install
+-  >  (section etc)
+-  >  (files (a.txt as ../a.txt)))
+-  > EOF
+-
+-  $ cat >dune <<EOF
+-  > (executable
+-  >  (public_name foo)
+-  >  (libraries bar))
+-  > EOF
+-
+-  $ cat >foo.ml <<EOF
+-  > let () = print_endline "hi"
+-  > EOF
+-
+-  $ dune build foo.install && cat _build/default/foo.install
+-  lib: [
+-    "_build/install/default/lib/foo/META"
+-    "_build/install/default/lib/foo/dune-package"
+-  ]
+-  bin: [
+-    "_build/install/default/bin/foo"
+-  ]
+-

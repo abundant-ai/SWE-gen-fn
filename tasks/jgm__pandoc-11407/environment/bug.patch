@@ -1,0 +1,895 @@
+diff --git a/MANUAL.txt b/MANUAL.txt
+index 4df295a35..28c6341d0 100644
+--- a/MANUAL.txt
++++ b/MANUAL.txt
+@@ -3276,17 +3276,6 @@ These variables function when using BibLaTeX for [citation rendering].
+ 
+     See the section on [reproducible builds].
+ 
+-`pdfstandard`
+-:   PDF standard(s) for the document, e.g. `ua-2`, `a-4f`.
+-    Supports PDF/A, PDF/X, and PDF/UA variants.
+-    Requires LuaLaTeX and LaTeX 2023+. Repeat for multiple standards:
+-
+-        ---
+-        pdfstandard:
+-        - ua-2
+-        - a-4f
+-        ...
+-
+ [KOMA-Script]: https://ctan.org/pkg/koma-script
+ [LaTeX Font Catalogue]: https://tug.org/FontCatalogue/
+ [LaTeX font encodings guide]: https://ctan.org/pkg/encguide
+@@ -7791,10 +7780,10 @@ page but do not contain semantic information on the content.
+ However, it is possible to generate accessible PDFs, which use
+ tagging to add semantic information to the document.
+ 
+-Pandoc defaults to LaTeX to generate PDF. LaTeX's `\DocumentMetadata`
+-interface supports PDF standards and tagging when using LuaLaTeX;
+-set the `pdfstandard` variable to enable this (see below). For older
+-LaTeX installations, alternative engines must be used.
++Pandoc defaults to LaTeX to generate PDF. Tagging support in LaTeX
++is in development and not readily available, so PDFs generated in
++this way will always be untagged and not accessible. This means
++that alternative engines must be used to generate accessible PDFs.
+ 
+ The PDF standards PDF/A and PDF/UA define further restrictions
+ intended to optimize PDFs for archiving and accessibility. Tagging
+@@ -7806,24 +7795,6 @@ including the colorspace of embedded images. Pandoc cannot check
+ this, and external programs must be used to ensure that generated
+ PDFs are in compliance.
+ 
+-## LaTeX
+-
+-Set the `pdfstandard` variable to produce tagged PDFs conforming
+-to PDF/A, PDF/X, or PDF/UA standards. For example:
+-
+-    pandoc -V pdfstandard=ua-2 --pdf-engine=lualatex doc.md -o doc.pdf
+-
+-Multiple standards can be combined:
+-
+-    ---
+-    pdfstandard:
+-      - ua-2
+-      - a-4f
+-    ---
+-
+-The required PDF version is inferred automatically. This feature
+-requires LuaLaTeX and a recent LaTeX installation.
+-
+ ## ConTeXt
+ 
+ ConTeXt always produces tagged PDFs, but the quality depends on
+diff --git a/data/templates/default.latex b/data/templates/default.latex
+index e993af1d7..6c7045955 100644
+--- a/data/templates/default.latex
++++ b/data/templates/default.latex
+@@ -1,4 +1,3 @@
+-$document-metadata.latex()$
+ $passoptions.latex()$
+ \documentclass[
+ $for(babel-otherlangs)$
+diff --git a/data/templates/document-metadata.latex b/data/templates/document-metadata.latex
+deleted file mode 100644
+index 33bab5f93..000000000
+--- a/data/templates/document-metadata.latex
++++ /dev/null
+@@ -1,20 +0,0 @@
+-$--
+-$-- PDF standard support (PDF/A, PDF/UA, PDF/X)
+-$-- Requires LuaLaTeX and recent LaTeX (2023+)
+-$--
+-$if(pdfstandard)$
+-\DocumentMetadata{
+-$if(pdfstandard.version)$
+-  pdfversion=$pdfstandard.version$,
+-$endif$
+-$if(pdfstandard.standards)$
+-  pdfstandard={$for(pdfstandard.standards)$$it$$sep$,$endfor$},
+-$endif$
+-$if(pdfstandard.tagging)$
+-  tagging=on,
+-$endif$
+-$if(lang)$
+-  lang=$lang$,
+-$endif$
+-  xmp=true}
+-$endif$
+diff --git a/src/Text/Pandoc/Logging.hs b/src/Text/Pandoc/Logging.hs
+index 6be6a6c80..e28a40bba 100644
+--- a/src/Text/Pandoc/Logging.hs
++++ b/src/Text/Pandoc/Logging.hs
+@@ -105,7 +105,6 @@ data LogMessage =
+   | UnclosedDiv SourcePos SourcePos
+   | UnsupportedCodePage Int
+   | YamlWarning SourcePos Text
+-  | UnsupportedPdfStandard Text
+   deriving (Show, Eq, Data, Ord, Typeable, Generic)
+ 
+ instance ToJSON LogMessage where
+@@ -292,8 +291,6 @@ instance ToJSON LogMessage where
+            , "column" .= toJSON (sourceColumn pos)
+            , "message" .= msg
+            ]
+-      UnsupportedPdfStandard s ->
+-           ["contents" .= s]
+ 
+ showPos :: SourcePos -> Text
+ showPos pos = Text.pack $ sn ++ "line " ++
+@@ -441,8 +438,6 @@ showLogMessage msg =
+        UnsupportedCodePage cpg -> "Unsupported code page " <> tshow cpg <>
+           ". Text will likely be garbled."
+        YamlWarning pos m -> "YAML warning (" <> showPos pos <> "): " <> m
+-       UnsupportedPdfStandard s ->
+-         "PDF standard '" <> s <> "' is not supported by LaTeX and will be ignored."
+ 
+ messageVerbosity :: LogMessage -> Verbosity
+ messageVerbosity msg =
+@@ -502,4 +497,3 @@ messageVerbosity msg =
+        UnclosedDiv{}                 -> WARNING
+        UnsupportedCodePage{}         -> WARNING
+        YamlWarning{}                 -> WARNING
+-       UnsupportedPdfStandard{}      -> WARNING
+diff --git a/src/Text/Pandoc/Writers/LaTeX.hs b/src/Text/Pandoc/Writers/LaTeX.hs
+index 57f700241..0dbcdac1d 100644
+--- a/src/Text/Pandoc/Writers/LaTeX.hs
++++ b/src/Text/Pandoc/Writers/LaTeX.hs
+@@ -33,15 +33,13 @@ import Control.Monad
+ import Crypto.Hash (hashWith, MD5(MD5))
+ import Data.Containers.ListUtils (nubOrd)
+ import Data.Char (isDigit, isAscii, isLetter)
+-import Data.List (intersperse, partition, (\\))
+-import qualified Data.Set as Set
+-import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe, mapMaybe, isNothing)
++import Data.List (intersperse, (\\))
++import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, isNothing)
+ import Data.Monoid (Any (..))
+ import Data.Text (Text)
+ import qualified Data.Text as T
+ import Network.URI (unEscapeString)
+-import Text.DocTemplates (Context(..), FromContext(lookupContext), Val(..), renderTemplate)
+-import qualified Data.Map as M
++import Text.DocTemplates (FromContext(lookupContext), Val(..), renderTemplate)
+ import Text.Collate.Lang (renderLang)
+ import Text.Pandoc.Class.PandocMonad (PandocMonad, getPOSIXTime, lookupEnv,
+                                       report, toLang)
+@@ -60,8 +58,7 @@ import Text.Pandoc.Writers.LaTeX.Caption (getCaption)
+ import Text.Pandoc.Writers.LaTeX.Table (tableToLaTeX)
+ import Text.Pandoc.Writers.LaTeX.Citation (citationsToNatbib,
+                                            citationsToBiblatex)
+-import Text.Pandoc.Writers.LaTeX.Types (LW, WriterState (..), startingState,
+-                                        PdfStandard (..))
++import Text.Pandoc.Writers.LaTeX.Types (LW, WriterState (..), startingState)
+ import Text.Pandoc.Writers.LaTeX.Lang (toBabel)
+ import Text.Pandoc.Writers.LaTeX.Util (stringToLaTeX, StringContext(..),
+                                        toLabel, inCmd,
+@@ -224,9 +221,6 @@ pandocToLaTeX options (Pandoc meta blocks) = do
+   let bibliography' = map unescapeUnderscore <$>
+                         getField "bibliography" metadata
+ 
+-  -- Process PDF standard metadata for DocumentMetadata
+-  pdfStd <- processPdfStandard metadata
+-
+   let context  =  (case bibliography' of
+                      Nothing -> id
+                      Just xs -> resetField "bibliography" xs) $
+@@ -299,13 +293,6 @@ pandocToLaTeX options (Pandoc meta blocks) = do
+                   (if reproduciblePDF
+                     then defField "pdf-trailer-id" trailerID
+                     else id) $
+-                  (if not (null (pdfStandards pdfStd)) || isJust (pdfVersion pdfStd)
+-                    then resetField "pdfstandard" $ MapVal $ Context $ M.fromList
+-                           [ ("standards", ListVal $ map (SimpleVal . literal) (pdfStandards pdfStd))
+-                           , ("version", maybe NullVal (SimpleVal . literal) (pdfVersion pdfStd))
+-                           , ("tagging", BoolVal (pdfTagging pdfStd))
+-                           ]
+-                    else id) $
+                   metadata
+   let babelLang = mblang >>= toBabel
+   let context' =
+@@ -1427,85 +1414,3 @@ needsCancel t =
+            then return True
+            else pCancel
+       _ -> pCancel
+-
+--- PDF standard support for DocumentMetadata
+-
+--- | PDF standards supported by LaTeX's DocumentMetadata
+--- See: https://github.com/latex3/latex2e documentmetadata-support.dtx
+-latexSupportedStandards :: Set.Set Text
+-latexSupportedStandards = Set.fromList
+-  [ -- PDF/A standards (note: a-1a is NOT supported by LaTeX, only a-1b)
+-    "a-1b", "a-2a", "a-2b", "a-2u", "a-3a", "a-3b", "a-3u"
+-  , "a-4", "a-4e", "a-4f"
+-    -- PDF/X standards
+-  , "x-4", "x-4p", "x-5g", "x-5n", "x-5pg", "x-6", "x-6n", "x-6p"
+-    -- PDF/UA standards
+-  , "ua-1", "ua-2"
+-  ]
+-
+--- | Standards that require PDF tagging (document structure)
+--- PDF/A level "a" variants and PDF/UA require tagged structure
+-taggingRequiredStandards :: Set.Set Text
+-taggingRequiredStandards = Set.fromList
+-  ["a-2a", "a-3a", "ua-1", "ua-2"]
+-
+--- | Valid PDF versions for DocumentMetadata
+-validPdfVersions :: Set.Set Text
+-validPdfVersions = Set.fromList
+-  ["1.4", "1.5", "1.6", "1.7", "2.0"]
+-
+--- | PDF version required by each standard
+--- LaTeX defaults to PDF 2.0 with \DocumentMetadata, but some standards
+--- have maximum version requirements that are incompatible with 2.0
+-standardRequiredVersion :: M.Map Text Text
+-standardRequiredVersion = M.fromList
+-  [ ("a-1b", "1.4")  -- PDF/A-1 requires exactly PDF 1.4
+-    -- PDF/A-2 and PDF/A-3 require 1.7; must set explicitly since LaTeX defaults to 2.0
+-  , ("a-2a", "1.7"), ("a-2b", "1.7"), ("a-2u", "1.7")
+-  , ("a-3a", "1.7"), ("a-3b", "1.7"), ("a-3u", "1.7")
+-    -- PDF/A-4, PDF/UA-1, PDF/UA-2 work with PDF 2.0 (the default)
+-  ]
+-
+--- | Normalize a PDF standard string: lowercase, strip "pdf" prefix
+-normalizePdfStandard :: Text -> Text
+-normalizePdfStandard t =
+-  let lower = T.toLower t
+-  in case T.stripPrefix "pdf" lower of
+-       Just rest -> T.dropWhile (`elem` ['-', '/']) rest
+-       Nothing   -> lower
+-
+--- | Normalize a PDF version string
+--- Handles YAML parsing quirk where 2.0 becomes integer 2, then string "2"
+-normalizeVersion :: Text -> Text
+-normalizeVersion t
+-  | t == "2" = "2.0"
+-  | otherwise = t
+-
+--- | Check if text is a valid PDF version (after normalization)
+-isPdfVersion :: Text -> Bool
+-isPdfVersion t = Set.member (normalizeVersion t) validPdfVersions
+-
+--- | Process pdfstandard metadata, returning PDF standard settings
+-processPdfStandard :: PandocMonad m
+-                   => Context Text
+-                   -> m PdfStandard
+-processPdfStandard ctx = do
+-  let standards = fromMaybe [] $ getField "pdfstandard" ctx
+-      normalized = map normalizePdfStandard standards
+-      (versions, pdfStds) = partition isPdfVersion normalized
+-      validStandards = filter (`Set.member` latexSupportedStandards) pdfStds
+-      invalidStandards = filter (\s -> not (Set.member s latexSupportedStandards)
+-                                    && not (isPdfVersion s)) pdfStds
+-      needsTagging = any (`Set.member` taggingRequiredStandards) validStandards
+-      -- Use explicit version if provided, otherwise infer from standards
+-      -- Apply normalizeVersion to handle YAML parsing "2" -> "2.0"
+-      explicitVersion = normalizeVersion <$> listToMaybe versions
+-      inferredVersion = listToMaybe $ mapMaybe (`M.lookup` standardRequiredVersion) validStandards
+-      version = explicitVersion <|> inferredVersion
+-  -- Warn about unsupported standards
+-  mapM_ (report . UnsupportedPdfStandard) invalidStandards
+-  return PdfStandard
+-    { pdfStandards = validStandards
+-    , pdfVersion = version
+-    , pdfTagging = needsTagging
+-    }
+diff --git a/src/Text/Pandoc/Writers/LaTeX/Types.hs b/src/Text/Pandoc/Writers/LaTeX/Types.hs
+index bb42d39c0..4906026ed 100644
+--- a/src/Text/Pandoc/Writers/LaTeX/Types.hs
++++ b/src/Text/Pandoc/Writers/LaTeX/Types.hs
+@@ -2,7 +2,6 @@ module Text.Pandoc.Writers.LaTeX.Types
+   ( LW
+   , WriterState (..)
+   , startingState
+-  , PdfStandard (..)
+   ) where
+ 
+ import Control.Monad.State.Strict (StateT)
+@@ -58,13 +57,6 @@ data WriterState =
+   , stInCaption     :: Bool          -- ^ true if in a caption
+   }
+ 
+--- | PDF standard settings for DocumentMetadata
+-data PdfStandard = PdfStandard
+-  { pdfStandards :: [Text]     -- ^ list of standards (e.g., ["a-2b", "ua-1"])
+-  , pdfVersion   :: Maybe Text -- ^ PDF version (e.g., "1.7", "2.0")
+-  , pdfTagging   :: Bool       -- ^ whether tagging is required
+-  }
+-
+ startingState :: WriterOptions -> WriterState
+ startingState options =
+   WriterState
+diff --git a/test/command/pdfstandard.md b/test/command/pdfstandard.md
+deleted file mode 100644
+index 41547fc34..000000000
+--- a/test/command/pdfstandard.md
++++ /dev/null
+@@ -1,588 +0,0 @@
+-PDF standard support: basic PDF/A-2b test (infers version 1.7)
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard: a-2b
+-lang: en-US
+----
+-
+-Test document.
+-^D
+-\DocumentMetadata{
+-  pdfversion=1.7,
+-  pdfstandard={a-2b},
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-Test document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: PDF/UA-1 with tagging
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard: ua-1
+-lang: en-US
+----
+-
+-Accessible document.
+-^D
+-\DocumentMetadata{
+-  pdfstandard={ua-1},
+-  tagging=on,
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-Accessible document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: multiple standards with version
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard:
+-  - a-2b
+-  - ua-1
+-  - "1.7"
+-lang: de-DE
+----
+-
+-Multi-standard document.
+-^D
+-\DocumentMetadata{
+-  pdfversion=1.7,
+-  pdfstandard={a-2b,ua-1},
+-  tagging=on,
+-  lang=de-DE,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  ngerman,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={de-DE},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-Multi-standard document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: PDF/A-1b infers version 1.4
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard: a-1b
+-lang: en-US
+----
+-
+-PDF/A-1 document.
+-^D
+-\DocumentMetadata{
+-  pdfversion=1.4,
+-  pdfstandard={a-1b},
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-PDF/A-1 document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: PDF/A-4 with no version inference (uses default 2.0)
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard: a-4
+-lang: en-US
+----
+-
+-PDF/A-4 document.
+-^D
+-\DocumentMetadata{
+-  pdfstandard={a-4},
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-PDF/A-4 document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: numeric YAML version (2 becomes 2.0)
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard:
+-  - ua-1
+-  - 2
+-lang: en-US
+----
+-
+-PDF 2.0 document.
+-^D
+-\DocumentMetadata{
+-  pdfversion=2.0,
+-  pdfstandard={ua-1},
+-  tagging=on,
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-PDF 2.0 document.
+-
+-\end{document}
+-```
+-
+-PDF standard support: explicit version overrides inferred version
+-```
+-% pandoc -t latex -s
+----
+-pdfstandard:
+-  - a-2b
+-  - "1.5"
+-lang: en-US
+----
+-
+-Explicit version document.
+-^D
+-\DocumentMetadata{
+-  pdfversion=1.5,
+-  pdfstandard={a-2b},
+-  lang=en-US,
+-  xmp=true}
+-% Options for packages loaded elsewhere
+-\PassOptionsToPackage{unicode}{hyperref}
+-\PassOptionsToPackage{hyphens}{url}
+-\documentclass[
+-  american,
+-]{article}
+-\usepackage{xcolor}
+-\usepackage{amsmath,amssymb}
+-\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+-\usepackage{iftex}
+-\ifPDFTeX
+-  \usepackage[T1]{fontenc}
+-  \usepackage[utf8]{inputenc}
+-  \usepackage{textcomp} % provide euro and other symbols
+-\else % if luatex or xetex
+-  \usepackage{unicode-math} % this also loads fontspec
+-  \defaultfontfeatures{Scale=MatchLowercase}
+-  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+-\fi
+-\usepackage{lmodern}
+-\ifPDFTeX\else
+-  % xetex/luatex font selection
+-\fi
+-% Use upquote if available, for straight quotes in verbatim environments
+-\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+-\IfFileExists{microtype.sty}{% use microtype if available
+-  \usepackage[]{microtype}
+-  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+-}{}
+-\makeatletter
+-\@ifundefined{KOMAClassName}{% if non-KOMA class
+-  \IfFileExists{parskip.sty}{%
+-    \usepackage{parskip}
+-  }{% else
+-    \setlength{\parindent}{0pt}
+-    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+-}{% if KOMA class
+-  \KOMAoptions{parskip=half}}
+-\makeatother
+-\ifLuaTeX
+-\usepackage[bidi=basic,shorthands=off]{babel}
+-\else
+-\usepackage[bidi=default,shorthands=off]{babel}
+-\fi
+-\ifLuaTeX
+-  \usepackage{selnolig} % disable illegal ligatures
+-\fi
+-\setlength{\emergencystretch}{3em} % prevent overfull lines
+-\providecommand{\tightlist}{%
+-  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+-\usepackage{bookmark}
+-\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+-\urlstyle{same}
+-\hypersetup{
+-  pdflang={en-US},
+-  hidelinks,
+-  pdfcreator={LaTeX via pandoc}}
+-
+-\author{}
+-\date{}
+-
+-\begin{document}
+-
+-Explicit version document.
+-
+-\end{document}
+-```

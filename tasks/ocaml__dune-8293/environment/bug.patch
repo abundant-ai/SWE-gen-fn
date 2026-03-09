@@ -1,0 +1,430 @@
+diff --git a/doc/changes/remove-ctypes-versions.md b/doc/changes/remove-ctypes-versions.md
+deleted file mode 100644
+index 953a81088..000000000
+--- a/doc/changes/remove-ctypes-versions.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-- Remove versions 0.1 and 0.2 of the experimental ctypes extension. (#8293,
+-  @emillon)
+diff --git a/src/dune_rules/ctypes/ctypes_field.ml b/src/dune_rules/ctypes/ctypes_field.ml
+index 4433aa50b..6780aafc5 100644
+--- a/src/dune_rules/ctypes/ctypes_field.ml
++++ b/src/dune_rules/ctypes/ctypes_field.ml
+@@ -7,7 +7,7 @@ let syntax =
+   Dune_lang.Syntax.create
+     ~name
+     ~desc:"the ctypes extension"
+-    [ (0, 1), `Deleted_in (3, 11); (0, 2), `Deleted_in (3, 11); (0, 3), `Since (3, 7) ]
++    [ (0, 1), `Since (3, 0); (0, 2), `Since (3, 4); (0, 3), `Since (3, 7) ]
+ ;;
+ 
+ module Build_flags_resolver = struct
+@@ -115,7 +115,10 @@ module Function_description = struct
+     let open Dune_lang.Decoder in
+     fields
+       (let+ concurrency = field_o "concurrency" Concurrency_policy.decode
+-       and+ errno_policy = field_o "errno_policy" Errno_policy.decode
++       and+ errno_policy =
++         field_o
++           "errno_policy"
++           (Dune_lang.Syntax.since syntax (0, 2) >>> Errno_policy.decode)
+        and+ functor_ = field "functor" Module_name.decode
+        and+ instance = field "instance" Module_name.decode in
+        { concurrency = Option.value concurrency ~default:Concurrency_policy.default
+diff --git a/src/dune_rules/ctypes/ctypes_rules.ml b/src/dune_rules/ctypes/ctypes_rules.ml
+index c562313db..1f020026c 100644
+--- a/src/dune_rules/ctypes/ctypes_rules.ml
++++ b/src/dune_rules/ctypes/ctypes_rules.ml
+@@ -177,6 +177,7 @@ let build_c_program
+   ~cflags
+   ~output
+   ~deps
++  ~version
+   =
+   let ctx = Super_context.context sctx in
+   let open Memo.O in
+@@ -248,15 +249,43 @@ let build_c_program
+       ]
+   in
+   let action =
+-    let args =
+-      [ Command.Args.as_any all_flags
+-      ; Deps (List.map ~f:(fun s -> Path.relative (Path.build dir) s) source_files)
+-      ; A "-o"
+-      ; Target (Path.Build.relative dir output)
+-      ]
+-    in
+-    let open Action_builder.With_targets.O in
+-    Action_builder.with_no_targets deps >>> Command.run ~dir:(Path.build dir) exe args
++    if version >= (0, 3)
++    then (
++      let args =
++        [ Command.Args.as_any all_flags
++        ; Deps (List.map ~f:(fun s -> Path.relative (Path.build dir) s) source_files)
++        ; A "-o"
++        ; Target (Path.Build.relative dir output)
++        ]
++      in
++      let open Action_builder.With_targets.O in
++      Action_builder.with_no_targets deps >>> Command.run ~dir:(Path.build dir) exe args)
++    else (
++      let build =
++        let absolute_path_hack p =
++          (* These normal path builder things construct relative paths like
++             _build/default/your/project/file.c but before dune runs gcc it actually
++             cds into _build/default, which fails, so we turn them into absolutes to
++             hack around it. *)
++          Path.relative (Path.build dir) p |> Path.to_absolute_filename
++        in
++        let action =
++          let open Action_builder.O in
++          let* flag_args = Command.expand_no_targets ~dir:(Path.build dir) all_flags in
++          let+ () = deps in
++          let source_files = List.map source_files ~f:absolute_path_hack in
++          let output = absolute_path_hack output in
++          let args = flag_args @ source_files @ [ "-o"; output ] in
++          (* TODO: it might be possible to convert this to Command.run and
++             consolidate both branches but it is also possible that we drop
++             support for < 0.3 instead *)
++          Action.run exe args
++        in
++        Action_builder.with_file_targets
++          action
++          ~file_targets:[ Path.Build.relative dir output ]
++      in
++      Action_builder.With_targets.map ~f:Action.Full.make build)
+   in
+   Super_context.add_rule sctx ~dir action
+ ;;
+@@ -285,7 +314,7 @@ let exe_link_only ~dir ~shared_cctx ~sandbox program ~deps =
+     ~sandbox
+ ;;
+ 
+-let gen_rules ~cctx ~(buildable : Buildable.t) ~loc ~scope ~dir ~sctx =
++let gen_rules ~cctx ~(buildable : Buildable.t) ~loc ~scope ~dir ~sctx ~version =
+   let ctypes = Option.value_exn buildable.ctypes in
+   let external_library_name = ctypes.external_library_name in
+   let type_description_functor = ctypes.type_description.functor_ in
+@@ -393,6 +422,7 @@ let gen_rules ~cctx ~(buildable : Buildable.t) ~loc ~scope ~dir ~sctx =
+         ~output:c_generated_types_cout_exe
+         ~deps
+         ~cflags
++        ~version
+     in
+     Super_context.add_rule
+       sctx
+diff --git a/src/dune_rules/ctypes/ctypes_rules.mli b/src/dune_rules/ctypes/ctypes_rules.mli
+index 27c1241e1..d2d0f558b 100644
+--- a/src/dune_rules/ctypes/ctypes_rules.mli
++++ b/src/dune_rules/ctypes/ctypes_rules.mli
+@@ -7,6 +7,7 @@ val gen_rules
+   -> scope:Scope.t
+   -> dir:Path.Build.t
+   -> sctx:Super_context.t
++  -> version:Syntax.Version.t
+   -> unit Memo.t
+ 
+ val ctypes_cclib_flags
+diff --git a/src/dune_rules/exe_rules.ml b/src/dune_rules/exe_rules.ml
+index aaa1d90f0..603f1be58 100644
+--- a/src/dune_rules/exe_rules.ml
++++ b/src/dune_rules/exe_rules.ml
+@@ -220,7 +220,7 @@ let executables_rules
+         ~promote:exes.promote
+         ~embed_in_plugin_libraries
+         ~sandbox
+-    | Some _ ->
++    | Some { version; _ } ->
+       (* Ctypes stubgen builds utility .exe files that need to share modules
+          with this compilation context. To support that, we extract the one-time
+          run bits from [Exe.build_and_link_many] and run them here, then pass
+@@ -228,7 +228,7 @@ let executables_rules
+          dance is done to avoid triggering duplicate rule exceptions. *)
+       let* () =
+         let loc = fst (List.hd exes.Executables.names) in
+-        Ctypes_rules.gen_rules ~cctx ~buildable ~loc ~sctx ~scope ~dir
++        Ctypes_rules.gen_rules ~cctx ~buildable ~loc ~sctx ~scope ~dir ~version
+       in
+       let* () = Module_compilation.build_all cctx in
+       Exe.link_many
+diff --git a/src/dune_rules/lib_rules.ml b/src/dune_rules/lib_rules.ml
+index 9f6bfa7c6..96f2ebc89 100644
+--- a/src/dune_rules/lib_rules.ml
++++ b/src/dune_rules/lib_rules.ml
+@@ -646,8 +646,15 @@ let rules (lib : Library.t) ~sctx ~dir_contents ~dir ~expander ~scope =
+     let* () =
+       match buildable.ctypes with
+       | None -> Memo.return ()
+-      | Some _ ->
+-        Ctypes_rules.gen_rules ~loc:(fst lib.name) ~cctx ~buildable ~sctx ~scope ~dir
++      | Some { version; _ } ->
++        Ctypes_rules.gen_rules
++          ~loc:(fst lib.name)
++          ~cctx
++          ~buildable
++          ~sctx
++          ~scope
++          ~dir
++          ~version
+     in
+     library_rules lib ~local_lib ~cctx ~source_modules ~dir_contents ~compile_info
+   in
+diff --git a/test/blackbox-tests/test-cases/ctypes/delete-0.1.t b/test/blackbox-tests/test-cases/ctypes/delete-0.1.t
+deleted file mode 100644
+index e361ea526..000000000
+--- a/test/blackbox-tests/test-cases/ctypes/delete-0.1.t
++++ /dev/null
+@@ -1,15 +0,0 @@
+-Version 0.1 is deleted.
+-
+-  $ cat > dune-project << EOF
+-  > (lang dune 3.4)
+-  > (using ctypes 0.1)
+-  > EOF
+-
+-  $ dune build
+-  File "dune-project", line 2, characters 14-17:
+-  2 | (using ctypes 0.1)
+-                    ^^^
+-  Error: Version 0.1 of the ctypes extension has been deleted in Dune 3.11.
+-  Please port this project to a newer version of the extension, such as 0.3.
+-  Hint: You will also need to upgrade to (lang dune 3.7).
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/ctypes/delete-0.2.t b/test/blackbox-tests/test-cases/ctypes/delete-0.2.t
+deleted file mode 100644
+index acc642229..000000000
+--- a/test/blackbox-tests/test-cases/ctypes/delete-0.2.t
++++ /dev/null
+@@ -1,15 +0,0 @@
+-Version 0.2 is deleted.
+-
+-  $ cat > dune-project << EOF
+-  > (lang dune 3.4)
+-  > (using ctypes 0.2)
+-  > EOF
+-
+-  $ dune build
+-  File "dune-project", line 2, characters 14-17:
+-  2 | (using ctypes 0.2)
+-                    ^^^
+-  Error: Version 0.2 of the ctypes extension has been deleted in Dune 3.11.
+-  Please port this project to a newer version of the extension, such as 0.3.
+-  Hint: You will also need to upgrade to (lang dune 3.7).
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/ctypes/directories.t b/test/blackbox-tests/test-cases/ctypes/directories.t
+index 9639fa474..beafdf7f0 100644
+--- a/test/blackbox-tests/test-cases/ctypes/directories.t
++++ b/test/blackbox-tests/test-cases/ctypes/directories.t
+@@ -1,8 +1,10 @@
+ This test characterizes how the ctypes support deals with directories, in
+ particular when relative paths are passed as `-I`.
+ 
+-This test checks that relative paths are relative to the directory where rules
+-are defined, to make sure that vendoring works.
++With `(using ctypes 0.2)`, some commands are executed in workspace root and
++others are executed in the directory where `(ctypes)` is found, so it is
++necessary to pass relative dirs twice. (this prevents vendorability, since this
++requires knowing the path from the workspace root to the current directory).
+ 
+ To test that, we create a binding to `BUFSIZ` and `fopen`, both in the C
+ library. These are provided by `stdio.h`, but instead of using this header,
+@@ -10,8 +12,8 @@ we're proxying it through a `lib.h` which should be in the include path for
+ compilation to work.
+ 
+   $ cat > dune-project << EOF
+-  > (lang dune 3.7)
+-  > (using ctypes 0.3)
++  > (lang dune 3.4)
++  > (using ctypes 0.2)
+   > EOF
+ 
+   $ mkdir lib
+@@ -22,7 +24,7 @@ compilation to work.
+   >  (flags :standard -w -27)
+   >  (ctypes
+   >   (build_flags_resolver
+-  >    (vendored (c_flags :standard -I .)))
++  >    (vendored (c_flags :standard (:include extra_flags.sexp))))
+   >   (external_library_name l)
+   >   (headers (include lib.h))
+   >   (deps lib.h)
+@@ -35,6 +37,8 @@ compilation to work.
+   >   (generated_entry_point entry)))
+   > EOF
+ 
++  $ echo "(-I lib -I .)" > lib/extra_flags.sexp
++
+   $ cat > lib/lib.h << EOF
+   > #include <stdio.h>
+   > EOF
+@@ -60,3 +64,23 @@ compilation to work.
+   > EOF
+ 
+   $ dune build
++
++We ensure that just `-I lib` or `-I .` are not enough on their own.
++
++  $ echo "(-I lib)" > lib/extra_flags.sexp
++  $ dune build > /dev/null 2>&1
++  [1]
++
++  $ echo "(-I .)" > lib/extra_flags.sexp
++  $ dune build > /dev/null 2>&1
++  [1]
++
++With 0.3, everything is relative to the directory.
++
++  $ cat > dune-project << EOF
++  > (lang dune 3.7)
++  > (using ctypes 0.3)
++  > EOF
++
++  $ echo "(-I .)" > lib/extra_flags.sexp
++  $ dune build
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-pkg_config-multiple-fd.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-pkg_config-multiple-fd.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-pkg_config-multiple-fd.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-pkg_config-multiple-fd.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-pkg_config.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-pkg_config.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-pkg_config.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-pkg_config.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-vendored-multiple-fd.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-vendored-multiple-fd.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-vendored-multiple-fd.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-vendored-multiple-fd.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-vendored-override-types-generated.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-vendored-override-types-generated.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-vendored-override-types-generated.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-vendored-override-types-generated.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-vendored-preamble.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-vendored-preamble.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-vendored-preamble.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-vendored-preamble.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/exe-vendored.t/dune-project b/test/blackbox-tests/test-cases/ctypes/exe-vendored.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/exe-vendored.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/exe-vendored.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/function-description-collision.t b/test/blackbox-tests/test-cases/ctypes/function-description-collision.t
+index 101fdfed6..fe7b84e75 100644
+--- a/test/blackbox-tests/test-cases/ctypes/function-description-collision.t
++++ b/test/blackbox-tests/test-cases/ctypes/function-description-collision.t
+@@ -3,8 +3,8 @@ We create a buildable with a ctypes field that declares a duplicate
+ crash.
+ 
+   $ cat > dune-project << EOF
+-  > (lang dune 3.7)
+-  > (using ctypes 0.3)
++  > (lang dune 3.0)
++  > (using ctypes 0.1)
+   > EOF
+ 
+   $ cat > dune << EOF
+diff --git a/test/blackbox-tests/test-cases/ctypes/github-5561-name-mangle.t b/test/blackbox-tests/test-cases/ctypes/github-5561-name-mangle.t
+index 7ed0cf81e..c228c74be 100644
+--- a/test/blackbox-tests/test-cases/ctypes/github-5561-name-mangle.t
++++ b/test/blackbox-tests/test-cases/ctypes/github-5561-name-mangle.t
+@@ -1,6 +1,6 @@
+   $ cat >dune-project <<EOF
+-  > (lang dune 3.7)
+-  > (using ctypes 0.3)
++  > (lang dune 3.5)
++  > (using ctypes 0.1)
+   > EOF
+ 
+   $ cat >dune <<EOF
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-external-name-need-mangling.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-external-name-need-mangling.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-external-name-need-mangling.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-external-name-need-mangling.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-pkg_config-multiple-fd.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-pkg_config-multiple-fd.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-pkg_config-multiple-fd.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-pkg_config-multiple-fd.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-pkg_config.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-pkg_config.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-pkg_config.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-pkg_config.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-return-errno.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-return-errno.t/dune-project
+index cfaf6871a..e87896377 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-return-errno.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-return-errno.t/dune-project
+@@ -1,2 +1,2 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.4)
++(using ctypes 0.2)
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-vendored-multiple-fd.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-vendored-multiple-fd.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-vendored-multiple-fd.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-vendored-multiple-fd.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)
+diff --git a/test/blackbox-tests/test-cases/ctypes/lib-vendored.t/dune-project b/test/blackbox-tests/test-cases/ctypes/lib-vendored.t/dune-project
+index b7c96aeb0..4cac8e20f 100644
+--- a/test/blackbox-tests/test-cases/ctypes/lib-vendored.t/dune-project
++++ b/test/blackbox-tests/test-cases/ctypes/lib-vendored.t/dune-project
+@@ -1,3 +1,3 @@
+-(lang dune 3.7)
+-(using ctypes 0.3)
++(lang dune 3.0)
++(using ctypes 0.1)
+ (use_standard_c_and_cxx_flags false)

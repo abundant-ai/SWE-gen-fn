@@ -1,0 +1,575 @@
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index 722d4cf47..db546caa9 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -39,8 +39,7 @@ module Per_context = struct
+   type t =
+     { lock_dir_path : Path.Source.t
+     ; version_preference : Version_preference.t
+-    ; solver_sys_vars : Dune_pkg.Solver_env.Variable.Sys.Bindings.t option
+-    ; repositories : Dune_pkg.Pkg_workspace.Repository.Name.t list
++    ; solver_env : Dune_pkg.Solver_env.t
+     ; context_common : Dune_rules.Workspace.Context.Common.t
+     ; repos :
+         Dune_pkg.Pkg_workspace.Repository.t Dune_pkg.Pkg_workspace.Repository.Name.Map.t
+@@ -78,8 +77,7 @@ module Per_context = struct
+            (Default
+              { lock
+              ; version_preference = version_preference_context
+-             ; solver_sys_vars
+-             ; repositories
++             ; solver_env
+              ; base = context_common
+              ; _
+              }) ->
+@@ -88,8 +86,7 @@ module Per_context = struct
+                Version_preference.choose
+                  ~from_arg:version_preference_arg
+                  ~from_context:version_preference_context
+-           ; solver_sys_vars
+-           ; repositories
++           ; solver_env = Option.value solver_env ~default:Dune_pkg.Solver_env.default
+            ; context_common
+            ; repos = repositories_of_workspace workspace
+            }
+@@ -107,8 +104,7 @@ module Per_context = struct
+             { lock
+             ; version_preference = version_preference_context
+             ; base = context_common
+-            ; solver_sys_vars
+-            ; repositories
++            ; solver_env
+             } ->
+           let lock_dir_path = Option.value lock ~default:Dune_pkg.Lock_dir.default_path in
+           Some
+@@ -118,8 +114,7 @@ module Per_context = struct
+                   ~from_arg:version_preference_arg
+                   ~from_context:version_preference_context
+             ; context_common
+-            ; solver_sys_vars
+-            ; repositories
++            ; solver_env = Option.value solver_env ~default:Dune_pkg.Solver_env.default
+             ; repos = repositories_of_workspace workspace
+             }
+         | Opam _ -> None)
+@@ -154,31 +149,31 @@ module Per_context = struct
+   ;;
+ end
+ 
+-(* The system environment variables used by the solver are taken from the
+-   current system by default but can be overridden by the build context. *)
+-let solver_env_variables ~solver_sys_vars_from_context ~sys_bindings_from_current_system =
+-  match solver_sys_vars_from_context with
+-  | None -> sys_bindings_from_current_system
+-  | Some solver_env_variables ->
+-    Dune_pkg.Solver_env.Variable.Sys.Bindings.extend
+-      sys_bindings_from_current_system
+-      solver_env_variables
+-;;
+-
+ module Print_solver_env = struct
++  (* The system environment variables used by the solver are taken from the
++     current system by default but can be overridden by the build context. *)
++  let override_solver_env_variables
++    ~solver_env_from_context
++    ~sys_bindings_from_current_system
++    =
++    Dune_pkg.Solver_env.(
++      Variable.Sys.Bindings.extend
++        sys_bindings_from_current_system
++        (sys solver_env_from_context)
++      |> set_sys solver_env_from_context)
++  ;;
++
+   let print_solver_env_for_one_context
+     ~sys_bindings_from_current_system
+-    { Per_context.solver_sys_vars = solver_sys_vars_from_context
++    { Per_context.solver_env = solver_env_from_context
+     ; context_common = { name = context_name; _ }
+     ; _
+     }
+     =
+     let solver_env =
+-      Dune_pkg.Solver_env.create
+-        ~sys:
+-          (solver_env_variables
+-             ~solver_sys_vars_from_context
+-             ~sys_bindings_from_current_system)
++      override_solver_env_variables
++        ~solver_env_from_context
++        ~sys_bindings_from_current_system
+     in
+     Console.print
+       [ Pp.textf
+@@ -307,7 +302,7 @@ module Lock = struct
+     ;;
+   end
+ 
+-  let get_repos repos ~opam_repository_path ~opam_repository_url ~repositories =
++  let get_repos repos solver_env ~opam_repository_path ~opam_repository_url =
+     let open Fiber.O in
+     match opam_repository_path, opam_repository_url with
+     | Some _, Some _ ->
+@@ -330,7 +325,8 @@ module Lock = struct
+          User_error.raise
+            [ Pp.text "Can't determine the location of the opam-repository" ])
+     | None, None ->
+-      repositories
++      (* read from workspace *)
++      Dune_pkg.Solver_env.repos solver_env
+       |> Fiber.parallel_map ~f:(fun name ->
+         match Dune_pkg.Pkg_workspace.Repository.Name.Map.find repos name with
+         | None ->
+@@ -403,20 +399,17 @@ module Lock = struct
+              { Per_context.lock_dir_path
+              ; version_preference
+              ; repos
+-             ; solver_sys_vars = solver_sys_vars_from_context
++             ; solver_env = solver_env_from_context
+              ; context_common = { name = context_name; _ }
+-             ; repositories
+              }
+            ->
+            let solver_env =
+-             Dune_pkg.Solver_env.create
+-               ~sys:
+-                 (solver_env_variables
+-                    ~solver_sys_vars_from_context
+-                    ~sys_bindings_from_current_system)
++             Print_solver_env.override_solver_env_variables
++               ~solver_env_from_context
++               ~sys_bindings_from_current_system
+            in
+            let* repos =
+-             get_repos repos ~opam_repository_path ~opam_repository_url ~repositories
++             get_repos repos solver_env ~opam_repository_path ~opam_repository_url
+            in
+            let overlay =
+              Console.Status_line.add_overlay (Constant (Pp.text "Solving for Build Plan"))
+@@ -576,17 +569,18 @@ module Outdated = struct
+                 { Per_context.lock_dir_path
+                 ; version_preference = _
+                 ; repos
+-                ; solver_sys_vars = _
++                ; solver_env = solver_env_from_context
+                 ; context_common = _
+-                ; repositories
+                 }
+               ->
++              let solver_env =
++                Print_solver_env.override_solver_env_variables
++                  ~solver_env_from_context
++                  ~sys_bindings_from_current_system:
++                    Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
++              in
+               let+ repos =
+-                Lock.get_repos
+-                  repos
+-                  ~opam_repository_path
+-                  ~opam_repository_url
+-                  ~repositories
++                Lock.get_repos repos solver_env ~opam_repository_path ~opam_repository_url
+               and+ local_packages = Lock.find_local_packages in
+               let lock_dir = Lock_dir.read_disk lock_dir_path in
+               let results =
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index d39adbb2e..92de377da 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -127,38 +127,58 @@ end
+ type t =
+   { sys : Variable.Sys.Bindings.t
+   ; const : Variable.Const.Bindings.t
++  ; repos : Workspace.Repository.Name.t list
+   }
+ 
+ module Fields = struct
+   let sys = "sys"
+   let const = "const"
++  let repos = "repositories"
+ end
+ 
+-let create ~sys = { sys; const = Variable.Const.bindings }
+-let default = create ~sys:Variable.Sys.Bindings.empty
++let default =
++  { sys = Variable.Sys.Bindings.empty
++  ; const = Variable.Const.bindings
++  ; repos = [ Workspace.Repository.Name.of_string "default" ]
++  }
++;;
++
++let repos_of_ordered_set ordered_set =
++  Dune_lang.Ordered_set_lang.eval
++    ordered_set
++    ~parse:(fun ~loc string -> Workspace.Repository.Name.parse_string_exn (loc, string))
++    ~eq:Workspace.Repository.Name.equal
++    ~standard:default.repos
++;;
+ 
+ let decode =
+   let open Decoder in
+   fields
+   @@
+-  let+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode in
++  let+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode
++  and+ repos = Dune_lang.Ordered_set_lang.field Fields.repos in
+   let const = default.const in
+-  { sys; const }
++  let repos = repos_of_ordered_set repos in
++  { sys; const; repos }
+ ;;
+ 
+-let to_dyn { sys; const } =
++let to_dyn { sys; const; repos } =
+   Dyn.record
+     [ Fields.sys, Variable.Sys.Bindings.to_dyn sys
+     ; Fields.const, Variable.Const.Bindings.to_dyn const
++    ; Fields.repos, Dyn.list Workspace.Repository.Name.to_dyn repos
+     ]
+ ;;
+ 
+-let equal { sys; const } t =
+-  Variable.Sys.Bindings.equal sys t.sys && Variable.Const.Bindings.equal const t.const
++let equal { sys; const; repos } t =
++  Variable.Sys.Bindings.equal sys t.sys
++  && Variable.Const.Bindings.equal const t.const
++  && List.equal Workspace.Repository.Name.equal repos t.repos
+ ;;
+ 
+ let sys { sys; _ } = sys
+ let set_sys t sys = { t with sys }
++let repos { repos; _ } = repos
+ 
+ let pp =
+   let pp_section heading pp_section =
+@@ -166,11 +186,14 @@ let pp =
+     let pp_heading = Pp.hbox (Pp.text heading) in
+     Pp.concat ~sep:Pp.space [ pp_heading; pp_section ] |> Pp.vbox
+   in
+-  fun { sys; const } ->
++  fun { sys; const; repos } ->
+     Pp.enumerate
+       ~f:Fun.id
+       [ pp_section "System Environment Variables" (Variable.Sys.Bindings.pp sys)
+       ; pp_section "Constants" (Variable.Const.Bindings.pp const)
++      ; pp_section
++          "Repositories"
++          (Pp.chain repos ~f:(fun r -> Workspace.Repository.Name.pp r))
+       ]
+ ;;
+ 
+diff --git a/src/dune_pkg/solver_env.mli b/src/dune_pkg/solver_env.mli
+index 36393f13c..fc5b40a85 100644
+--- a/src/dune_pkg/solver_env.mli
++++ b/src/dune_pkg/solver_env.mli
+@@ -25,9 +25,6 @@ module Variable : sig
+       (** A mapping from system environment variables to their values *)
+       type t
+ 
+-      val to_dyn : t -> Dyn.t
+-      val decode : t Dune_sexp.Decoder.t
+-      val equal : t -> t -> bool
+       val empty : t
+       val set : t -> sys_var -> string -> t
+       val get : t -> sys_var -> string option
+@@ -60,7 +57,6 @@ end
+     environment as dune does not give users access to those variables.. *)
+ type t
+ 
+-val create : sys:Variable.Sys.Bindings.t -> t
+ val default : t
+ val decode : t Dune_sexp.Decoder.t
+ val to_dyn : t -> Dyn.t
+@@ -68,6 +64,9 @@ val equal : t -> t -> bool
+ val sys : t -> Variable.Sys.Bindings.t
+ val set_sys : t -> Variable.Sys.Bindings.t -> t
+ 
++(** [repos t] returns the selected repository names in priority order *)
++val repos : t -> Workspace.Repository.Name.t list
++
+ (** A human-readible summary of the variable environment *)
+ val pp : t -> 'a Pp.t
+ 
+diff --git a/src/dune_rules/context.ml b/src/dune_rules/context.ml
+index 73ec7e379..d811c1cde 100644
+--- a/src/dune_rules/context.ml
++++ b/src/dune_rules/context.ml
+@@ -584,8 +584,7 @@ module Group = struct
+       match context with
+       | Opam { base; switch } ->
+         create_for_opam builder ~switch ~loc:base.loc ~targets:base.targets
+-      | Default
+-          { lock; version_preference = _; solver_sys_vars = _; repositories = _; base } ->
++      | Default { lock; version_preference = _; solver_env = _; base } ->
+         let builder =
+           match builder.findlib_toolchain with
+           | Some _ -> builder
+diff --git a/src/dune_rules/workspace.ml b/src/dune_rules/workspace.ml
+index d60f5afb8..ec0fa4965 100644
+--- a/src/dune_rules/workspace.ml
++++ b/src/dune_rules/workspace.ml
+@@ -279,32 +279,20 @@ module Context = struct
+       { base : Common.t
+       ; lock : Path.Source.t option
+       ; version_preference : Dune_pkg.Version_preference.t option
+-      ; solver_sys_vars : Dune_pkg.Solver_env.Variable.Sys.Bindings.t option
+-      ; repositories : Dune_pkg.Pkg_workspace.Repository.Name.t list
++      ; solver_env : Dune_pkg.Solver_env.t option
+       }
+ 
+-    let to_dyn { base; lock; version_preference; solver_sys_vars; repositories } =
++    let to_dyn { base; lock; version_preference; solver_env } =
+       Dyn.record
+         [ "base", Common.to_dyn base
+         ; "lock", Dyn.(option Path.Source.to_dyn) lock
+         ; ( "version_preference"
+           , Dyn.option Dune_pkg.Version_preference.to_dyn version_preference )
+-        ; ( "solver_sys_vars"
+-          , Dyn.option Dune_pkg.Solver_env.Variable.Sys.Bindings.to_dyn solver_sys_vars )
+-        ; ( "repositories"
+-          , Dyn.list Dune_pkg.Pkg_workspace.Repository.Name.to_dyn repositories )
++        ; "solver_env", Dyn.option Dune_pkg.Solver_env.to_dyn solver_env
+         ]
+     ;;
+ 
+     let decode =
+-      let repositories_of_ordered_set ordered_set =
+-        Dune_lang.Ordered_set_lang.eval
+-          ordered_set
+-          ~parse:(fun ~loc string ->
+-            Dune_pkg.Pkg_workspace.Repository.Name.parse_string_exn (loc, string))
+-          ~eq:Dune_pkg.Pkg_workspace.Repository.Name.equal
+-          ~standard:[ Dune_pkg.Pkg_workspace.Repository.Name.of_string "default" ]
+-      in
+       let+ common = Common.decode
+       and+ name =
+         field_o "name" (Dune_lang.Syntax.since syntax (1, 10) >>> Context_name.decode)
+@@ -316,10 +304,7 @@ module Context = struct
+         field_o "lock" (Dune_lang.Path.Local.decode ~dir:(Path.source Path.Source.root))
+       and+ version_preference =
+         field_o "version_preference" Dune_pkg.Version_preference.decode
+-      and+ solver_sys_vars =
+-        field_o "solver_sys_vars" Dune_pkg.Solver_env.Variable.Sys.Bindings.decode
+-      and+ repositories_osl = Dune_lang.Ordered_set_lang.field "repositories" in
+-      let repositories = repositories_of_ordered_set repositories_osl in
++      and+ solver_env = field_o "solver_env" Dune_pkg.Solver_env.decode in
+       let lock = Option.map lock ~f:Path.as_in_source_tree_exn in
+       fun ~profile_default ~instrument_with_default ~x ->
+         let common = common ~profile_default ~instrument_with_default in
+@@ -330,24 +315,17 @@ module Context = struct
+         in
+         let name = Option.value ~default name in
+         let base = { common with targets = Target.add common.targets x; name } in
+-        { base; lock; version_preference; solver_sys_vars; repositories }
++        { base; lock; version_preference; solver_env }
+     ;;
+ 
+-    let equal { base; lock; version_preference; solver_sys_vars; repositories } t =
++    let equal { base; lock; version_preference; solver_env } t =
+       Common.equal base t.base
+       && Option.equal Path.Source.equal lock t.lock
+       && Option.equal
+            Dune_pkg.Version_preference.equal
+            version_preference
+            t.version_preference
+-      && Option.equal
+-           Dune_pkg.Solver_env.Variable.Sys.Bindings.equal
+-           solver_sys_vars
+-           t.solver_sys_vars
+-      && List.equal
+-           Dune_pkg.Pkg_workspace.Repository.Name.equal
+-           repositories
+-           t.repositories
++      && Option.equal Dune_pkg.Solver_env.equal solver_env t.solver_env
+     ;;
+   end
+ 
+@@ -412,8 +390,7 @@ module Context = struct
+     Default
+       { lock = None
+       ; version_preference = None
+-      ; solver_sys_vars = None
+-      ; repositories = [ Dune_pkg.Pkg_workspace.Repository.Name.of_string "default" ]
++      ; solver_env = None
+       ; base =
+           { loc = Loc.of_pos __POS__
+           ; targets = [ Option.value x ~default:Target.Native ]
+diff --git a/src/dune_rules/workspace.mli b/src/dune_rules/workspace.mli
+index 8ce4933bb..244bbd363 100644
+--- a/src/dune_rules/workspace.mli
++++ b/src/dune_rules/workspace.mli
+@@ -48,8 +48,7 @@ module Context : sig
+       { base : Common.t
+       ; lock : Path.Source.t option
+       ; version_preference : Dune_pkg.Version_preference.t option
+-      ; solver_sys_vars : Dune_pkg.Solver_env.Variable.Sys.Bindings.t option
+-      ; repositories : Dune_pkg.Pkg_workspace.Repository.Name.t list
++      ; solver_env : Dune_pkg.Solver_env.t option
+       }
+   end
+ 
+diff --git a/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t b/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
+index 397fd7d20..1f9b00d7d 100644
+--- a/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
++++ b/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
+@@ -33,14 +33,16 @@ Create a workspace config that defines separate build contexts for macos and lin
+   >  (default
+   >   (name linux)
+   >   (lock dune.linux.lock)
+-  >   (solver_sys_vars
+-  >    (os linux))))
++  >   (solver_env
++  >    (sys
++  >     (os linux)))))
+   > (context
+   >  (default
+   >   (name macos)
+   >   (lock dune.macos.lock)
+-  >   (solver_sys_vars
+-  >    (os macos))))
++  >   (solver_env
++  >    (sys
++  >     (os macos)))))
+   > EOF
+ 
+ Now the os-specific dependencies are included on their respective systems.
+diff --git a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+index 7f83722db..b649a7158 100644
+--- a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
++++ b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+@@ -9,6 +9,8 @@ Print the solver env when no dune-workspace is present
+     - os-family (unset)
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
++  - Repositories
++       default
+ 
+ Add some build contexts with different environments
+   $ cat >dune-workspace <<EOF
+@@ -17,18 +19,20 @@ Add some build contexts with different environments
+   >  (default
+   >   (name linux)
+   >   (lock dune.linux.lock)
+-  >   (solver_sys_vars
+-  >    (os linux))))
++  >   (solver_env
++  >    (sys
++  >     (os linux)))))
+   > (context
+   >  (default
+   >   (name no-doc)
+   >   (lock dune.linux.lock)
+-  >   (solver_sys_vars
+-  >    (arch x86_64)
+-  >    (os linux)
+-  >    (os-family ubuntu)
+-  >    (os-distribution ubuntu)
+-  >    (os-version 22.04))))
++  >   (solver_env
++  >    (sys
++  >     (arch x86_64)
++  >     (os linux)
++  >     (os-family ubuntu)
++  >     (os-distribution ubuntu)
++  >     (os-version 22.04)))))
+   > EOF
+ 
+   $ dune pkg print-solver-env --all-contexts --dont-poll-system-solver-variables
+@@ -41,6 +45,8 @@ Add some build contexts with different environments
+     - os-family = ubuntu
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
++  - Repositories
++       default
+   Solver environment for context linux:
+   - System Environment Variables
+     - arch (unset)
+@@ -50,3 +56,5 @@ Add some build contexts with different environments
+     - os-family (unset)
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
++  - Repositories
++       default
+diff --git a/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t b/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t
+index d0aad44a9..c1690ec6c 100644
+--- a/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t
++++ b/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t
+@@ -38,7 +38,8 @@ We have to define both repositories in the workspace, but will only use `new`.
+   > (context
+   >  (default
+   >   (name default)
+-  >   (repositories new)))
++  >   (solver_env
++  >    (repositories new))))
+   > EOF
+ 
+   $ cat > dune-project <<EOF
+@@ -72,7 +73,8 @@ solution:
+   > (context
+   >  (default
+   >   (name default)
+-  >   (repositories old)))
++  >   (solver_env
++  >    (repositories old))))
+   > EOF
+  
+   $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+@@ -94,7 +96,8 @@ package:
+   > (context
+   >  (default
+   >   (name default)
+-  >   (repositories new old)))
++  >   (solver_env
++  >    (repositories new old))))
+   > EOF
+ 
+   $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+@@ -117,7 +120,8 @@ older version of foo:
+   > (context
+   >  (default
+   >   (name default)
+-  >   (repositories new old \ new)))
++  >   (solver_env
++  >    (repositories new old \ new))))
+   > EOF
+ 
+   $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-repository-download.t b/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
+index 128676eb8..201e5e2f4 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
+@@ -137,7 +137,8 @@ The repository can also be injected via the dune-workspace file
+   > (context
+   >  (default
+   >   (name default)
+-  >   (repositories foo)))
++  >   (solver_env
++  >    (repositories foo))))
+   > EOF
+   $ mkdir dune-workspace-cache
+   $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock
+diff --git a/test/blackbox-tests/test-cases/pkg/unavailable-packages.t b/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
+index fb86670c4..0de7894bb 100644
+--- a/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
++++ b/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
+@@ -5,14 +5,16 @@ Set up two build contexts: a default one for linux and another for macos.
+   $ cat >dune-workspace <<EOF
+   > (lang dune 3.8)
+   > (context (default
+-  >  (solver_sys_vars
+-  >   (os linux))))
++  >   (solver_env
++  >    (sys
++  >     (os linux)))))
+   > (context
+   >  (default
+   >   (name macos)
+   >   (lock dune.macos.lock)
+-  >   (solver_sys_vars
+-  >    (os macos))))
++  >   (solver_env
++  >    (sys
++  >     (os macos)))))
+   > EOF
+ 
+ !! Do not delete this one for the one in helpers.sh as it passes --context !!

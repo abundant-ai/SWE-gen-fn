@@ -1,0 +1,480 @@
+diff --git a/src/dune_engine/scheduler.ml b/src/dune_engine/scheduler.ml
+index 7449f71d3..3dc229e1c 100644
+--- a/src/dune_engine/scheduler.ml
++++ b/src/dune_engine/scheduler.ml
+@@ -1207,7 +1207,7 @@ module Run = struct
+     let cancel = Fiber.Cancel.create () in
+     t.status := Building cancel;
+     if Memo.Invalidation.is_empty invalidation
+-    then Memo.Perf_counters.reset ()
++    then Memo.Metrics.reset ()
+     else (
+       let details_hum = Memo.Invalidation.details_hum invalidation in
+       t.handler t.config (Source_files_changed { details_hum });
+diff --git a/src/memo/counters.ml b/src/memo/counters.ml
+deleted file mode 100644
+index 64b1c0243..000000000
+--- a/src/memo/counters.ml
++++ /dev/null
+@@ -1,17 +0,0 @@
+-(* CR-soon amokhov: Move conditionals checking [enabled] from [memo.ml] to this module. *)
+-let enabled = ref false
+-let nodes_restored = ref 0
+-let nodes_computed = ref 0
+-let edges_traversed = ref 0
+-let nodes_in_cycle_detection_graph = ref 0
+-let edges_in_cycle_detection_graph = ref 0
+-let paths_in_cycle_detection_graph = ref 0
+-
+-let reset () =
+-  nodes_restored := 0;
+-  nodes_computed := 0;
+-  edges_traversed := 0;
+-  nodes_in_cycle_detection_graph := 0;
+-  edges_in_cycle_detection_graph := 0;
+-  paths_in_cycle_detection_graph := 0
+-;;
+diff --git a/src/memo/counters.mli b/src/memo/counters.mli
+deleted file mode 100644
+index 46c7ec349..000000000
+--- a/src/memo/counters.mli
++++ /dev/null
+@@ -1,12 +0,0 @@
+-(** Various performance counters. *)
+-
+-val enabled : bool ref
+-val nodes_restored : int ref
+-val nodes_computed : int ref
+-val edges_traversed : int ref
+-val nodes_in_cycle_detection_graph : int ref
+-val edges_in_cycle_detection_graph : int ref
+-val paths_in_cycle_detection_graph : int ref
+-
+-(** Reset all counters to zero. *)
+-val reset : unit -> unit
+diff --git a/src/memo/deps.ml b/src/memo/deps.ml
+index 3ba8ecc07..93cfe6b0d 100644
+--- a/src/memo/deps.ml
++++ b/src/memo/deps.ml
+@@ -1,5 +1,6 @@
+ open! Stdune
+ open Fiber.O
++module Counter = Metrics.Counter
+ 
+ (* The array is stored reversed to avoid reversing the list in [create]. We need to be
+    careful about traversing the array in the right order in the functions [to_list] and
+@@ -22,17 +23,14 @@ let changed_or_not t ~f =
+   let rec go index =
+     if index < 0
+     then (
+-      if !Counters.enabled
+-      then Counters.edges_traversed := !Counters.edges_traversed + Array.length t;
++      Counter.add Metrics.Restore.edges (Array.length t);
+       Fiber.return Changed_or_not.Unchanged)
+     else
+       f t.(index)
+       >>= function
+       | Changed_or_not.Unchanged -> go (index - 1)
+       | (Changed | Cancelled _) as res ->
+-        if !Counters.enabled
+-        then
+-          Counters.edges_traversed := !Counters.edges_traversed + (Array.length t - index);
++        Counter.add Metrics.Restore.edges (Array.length t - index);
+         Fiber.return res
+   in
+   go (Array.length t - 1)
+diff --git a/src/memo/memo.ml b/src/memo/memo.ml
+index 8c4830c2f..b3b9762db 100644
+--- a/src/memo/memo.ml
++++ b/src/memo/memo.ml
+@@ -2,6 +2,7 @@ open! Stdune
+ open Fiber.O
+ module Graph = Dune_graph.Graph
+ module Console = Dune_console
++module Counter = Metrics.Counter
+ 
+ module Debug = struct
+   let track_locations_of_lazy_values = ref false
+@@ -478,7 +479,7 @@ module Lazy_dag_node = struct
+         dag_node)
+       ~none:(fun () ->
+         let (dag_node : Dag.node) =
+-          if !Counters.enabled then incr Counters.nodes_in_cycle_detection_graph;
++          Counter.incr Metrics.Cycle_detection.nodes;
+           Dag.create_node dep_node
+         in
+         t := Option.Unboxed.some dag_node;
+@@ -614,13 +615,13 @@ module Call_stack = struct
+     Fiber.Var.set call_stack_var stack (fun () -> Implicit_output.forbid f)
+   ;;
+ 
+-  (* Add all edges leading from the root of the call stack to [dag_node] to the
+-     cycle detection DAG. *)
++  (* Add all edges leading from the root of the call stack to [dag_node] to the cycle
++     detection DAG. *)
+   let add_path_to ~dag_node : (unit, Cycle_error.t) result Fiber.t =
+     let+ stack = get_call_stack () in
+-    let rec add_path_impl stack dag_node =
++    let rec add_path_impl stack dag_node edges_added =
+       match stack with
+-      | [] -> Ok ()
++      | [] -> Ok (), edges_added
+       | frame :: stack ->
+         let dag_node_id = Dag.node_id dag_node in
+         let children_added_to_dag = Stack_frame_with_state.children_added_to_dag frame in
+@@ -630,23 +631,25 @@ module Call_stack = struct
+               a previous [add_path_to] call. Therefore, the DAG already contains
+               all the edges that we will discover by continuing the recursive
+               traversal. We might as well stop here and save time. *)
+-           Ok ()
++           Ok (), edges_added
+          | false ->
+            let caller_dag_node = Stack_frame_with_state.dag_node frame in
+            (match Dag.add_assuming_missing caller_dag_node dag_node with
+-            | exception Dag.Cycle cycle -> Error (List.map cycle ~f:Dag.value)
++            | exception Dag.Cycle cycle ->
++              Error (List.map cycle ~f:Dag.value), edges_added
+             | () ->
+-              if !Counters.enabled then incr Counters.edges_in_cycle_detection_graph;
++              let edges_added = edges_added + 1 in
+               let not_traversed_before = Dag.Id.Set.is_empty children_added_to_dag in
+               Stack_frame_with_state.record_child_added_to_dag frame ~dag_node_id;
+               (match not_traversed_before with
+-               | true -> add_path_impl stack caller_dag_node
++               | true -> add_path_impl stack caller_dag_node edges_added
+                | false ->
+                  (* Same optimisation as above: no need to traverse again. *)
+-                 Ok ())))
++                 Ok (), edges_added)))
+     in
+-    if !Counters.enabled then incr Counters.paths_in_cycle_detection_graph;
+-    add_path_impl stack dag_node
++    let result, edges_added = add_path_impl stack dag_node 0 in
++    Counter.add Metrics.Cycle_detection.edges edges_added;
++    result
+   ;;
+ 
+   (* Add a dependency on the [dep_node] from the caller, if there is one. *)
+@@ -742,11 +745,14 @@ module Computation = struct
+     result
+   ;;
+ 
+-  let read_but_first_check_for_cycles { ivar; dag_node } ~dep_node =
++  let read_but_first_check_for_cycles { ivar; dag_node } ~phase ~dep_node =
+     Fiber.Ivar.peek ivar
+     >>= function
+     | Some res -> Fiber.return (Ok res)
+     | None ->
++      (match (phase : Stack_frame_with_state.phase) with
++       | Restore_from_cache -> Counter.incr Metrics.Restore.blocked
++       | Compute -> Counter.incr Metrics.Compute.blocked);
+       let dag_node = Lazy_dag_node.force dag_node ~dep_node:(Dep_node.T dep_node) in
+       Call_stack.add_path_to ~dag_node
+       >>= (function
+@@ -1176,7 +1182,7 @@ end = struct
+     dep_node.state <- Restoring { restore_from_cache = computation };
+     Computation.force computation ~phase:Restore_from_cache ~dep_node (fun _stack_frame ->
+       let+ restore_result = restore_from_cache ~cached_value in
+-      if !Counters.enabled then incr Counters.nodes_restored;
++      Counter.incr Metrics.Restore.nodes;
+       (match restore_result with
+        | Ok cached_value -> dep_node.state <- Cached_value cached_value
+        | Cancelled { dependency_cycle } ->
+@@ -1195,11 +1201,8 @@ end = struct
+     dep_node.state <- Computing { old_value; compute = computation };
+     Computation.force computation ~phase:Compute ~dep_node (fun stack_frame ->
+       let+ cached_value = compute ~dep_node ~old_value ~stack_frame in
+-      if !Counters.enabled
+-      then (
+-        incr Counters.nodes_computed;
+-        Counters.edges_traversed
+-        := !Counters.edges_traversed + Deps.length cached_value.deps);
++      Counter.incr Metrics.Compute.nodes;
++      Counter.add Metrics.Compute.edges (Deps.length cached_value.deps);
+       dep_node.state <- Cached_value cached_value;
+       cached_value)
+ 
+@@ -1217,7 +1220,10 @@ end = struct
+       then Fiber.return (Cache_lookup.Ok cached_value)
+       else start_restoring ~dep_node ~cached_value
+     | Restoring { restore_from_cache } ->
+-      Computation.read_but_first_check_for_cycles restore_from_cache ~dep_node
++      Computation.read_but_first_check_for_cycles
++        ~phase:Restore_from_cache
++        restore_from_cache
++        ~dep_node
+       >>| (function
+        | Ok res -> res
+        | Error dependency_cycle -> Cancelled { dependency_cycle })
+@@ -1249,7 +1255,7 @@ end = struct
+     | Restoring _ -> assert false
+     | Out_of_date { old_value } -> start_computing ~dep_node ~old_value >>| Result.ok
+     | Computing { compute; _ } ->
+-      Computation.read_but_first_check_for_cycles compute ~dep_node
++      Computation.read_but_first_check_for_cycles ~phase:Compute compute ~dep_node
+       >>| (function
+        | Ok _ as result -> result
+        | Error dependency_cycle as result ->
+@@ -1620,56 +1626,10 @@ let reset invalidation =
+      justifies the [~reason:Unknown] below. *)
+   let invalidate_current_run = Current_run.invalidate ~reason:Unknown in
+   Invalidation.execute (Invalidation.combine invalidation invalidate_current_run);
+-  Run.restart ();
+-  Counters.reset ()
++  Run.restart ()
+ ;;
+ 
+-module Perf_counters = struct
+-  let enable () = Counters.enabled := true
+-  let nodes_restored_in_current_run () = !Counters.nodes_restored
+-  let nodes_computed_in_current_run () = !Counters.nodes_computed
+-  let edges_traversed_in_current_run () = !Counters.edges_traversed
+-
+-  let nodes_for_cycle_detection_in_current_run () =
+-    !Counters.nodes_in_cycle_detection_graph
+-  ;;
+-
+-  let edges_for_cycle_detection_in_current_run () =
+-    !Counters.edges_in_cycle_detection_graph
+-  ;;
+-
+-  let paths_for_cycle_detection_in_current_run () =
+-    !Counters.paths_in_cycle_detection_graph
+-  ;;
+-
+-  let report_for_current_run () =
+-    let memo =
+-      sprintf
+-        "Memo graph: %d/%d restored/computed nodes, %d traversed edges"
+-        (nodes_restored_in_current_run ())
+-        (nodes_computed_in_current_run ())
+-        (edges_traversed_in_current_run ())
+-    in
+-    let cycle_detection =
+-      sprintf
+-        "Memo cycle detection graph: %d/%d/%d nodes/edges/paths"
+-        (nodes_for_cycle_detection_in_current_run ())
+-        (edges_for_cycle_detection_in_current_run ())
+-        (paths_for_cycle_detection_in_current_run ())
+-    in
+-    String.concat ~sep:"\n" [ memo; cycle_detection ]
+-  ;;
+-
+-  let assert_invariants () =
+-    assert (
+-      nodes_for_cycle_detection_in_current_run ()
+-      <= nodes_computed_in_current_run () + nodes_restored_in_current_run ());
+-    assert (
+-      edges_for_cycle_detection_in_current_run () <= edges_traversed_in_current_run ())
+-  ;;
+-
+-  let reset () = Counters.reset ()
+-end
++module Metrics = Metrics
+ 
+ module For_tests = struct
+   let get_deps (type i o) (t : (i, o) Table.t) inp =
+diff --git a/src/memo/memo.mli b/src/memo/memo.mli
+index cd717d76e..1bbd7d359 100644
+--- a/src/memo/memo.mli
++++ b/src/memo/memo.mli
+@@ -436,43 +436,7 @@ module Debug : sig
+   val verbose_diagnostics : bool ref
+ end
+ 
+-(** Various performance counters. Reset to zero at the start of every run. *)
+-module Perf_counters : sig
+-  (** This function must be called to enable performance counters. *)
+-  val enable : unit -> unit
+-
+-  (** Number of nodes restored in the current run. *)
+-  val nodes_restored_in_current_run : unit -> int
+-
+-  (** Number of nodes (re)computed in the current run. *)
+-  val nodes_computed_in_current_run : unit -> int
+-
+-  (** Number of edges traversed in the current run. Some edges may be traversed
+-      twice: first when restoring and then when (re)computing a value. *)
+-  val edges_traversed_in_current_run : unit -> int
+-
+-  (** Number of nodes added to the cycle detection DAG in the current run; can't
+-      exceed [nodes_restored_in_current_run + nodes_computed_in_current_run]. *)
+-  val nodes_for_cycle_detection_in_current_run : unit -> int
+-
+-  (** Number of edges added to the cycle detection DAG in the current run; can't
+-      exceed [edges_traversed_in_current_run]. *)
+-  val edges_for_cycle_detection_in_current_run : unit -> int
+-
+-  (** Number of paths added to the cycle detection DAG in the current run. Each
+-      path is a sequence of "forcing" edges followed by a "blocking" edge. *)
+-  val paths_for_cycle_detection_in_current_run : unit -> int
+-
+-  (** A concise summary of performance counters. *)
+-  val report_for_current_run : unit -> string
+-
+-  (** Raise if any internal invariants are violated. *)
+-  val assert_invariants : unit -> unit
+-
+-  (** Reset the counters to zero. You typically don't need to call this function
+-      directly (as counters are reset on every run) but it's useful for tests. *)
+-  val reset : unit -> unit
+-end
++module Metrics = Metrics
+ 
+ module For_tests : sig
+   (** After executing a memoized function with a given name and input, it is
+diff --git a/src/memo/metrics.ml b/src/memo/metrics.ml
+new file mode 100644
+index 000000000..1b1cbc18c
+--- /dev/null
++++ b/src/memo/metrics.ml
+@@ -0,0 +1,84 @@
++open! Stdune
++
++module Counter = struct
++  type t = int ref
++
++  let create () = ref 0
++  let read t = !t
++  let incr t = incr t
++  let add t count = t := !t + count
++end
++
++module Restore = struct
++  let nodes = Counter.create ()
++  let edges = Counter.create ()
++  let blocked = Counter.create ()
++
++  let reset () =
++    nodes := 0;
++    edges := 0;
++    blocked := 0
++  ;;
++end
++
++module Compute = struct
++  let nodes = Counter.create ()
++  let edges = Counter.create ()
++  let blocked = Counter.create ()
++
++  let reset () =
++    nodes := 0;
++    edges := 0;
++    blocked := 0
++  ;;
++end
++
++module Cycle_detection = struct
++  let nodes = Counter.create ()
++  let edges = Counter.create ()
++
++  let reset () =
++    nodes := 0;
++    edges := 0
++  ;;
++end
++
++let reset () =
++  Restore.reset ();
++  Compute.reset ();
++  Cycle_detection.reset ()
++;;
++
++let report ~reset_after_reporting =
++  let memo =
++    sprintf
++      "Memo graph: %d/%d/%d nodes/edges/blocked (restore), %d/%d/%d nodes/edges/blocked \
++       (compute)"
++      (Counter.read Restore.nodes)
++      (Counter.read Restore.edges)
++      (Counter.read Restore.blocked)
++      (Counter.read Compute.nodes)
++      (Counter.read Compute.edges)
++      (Counter.read Compute.blocked)
++  in
++  let cycle_detection =
++    sprintf
++      "Memo cycle detection graph: %d/%d/%d nodes/edges/paths"
++      (Counter.read Cycle_detection.nodes)
++      (Counter.read Cycle_detection.edges)
++      (Counter.read Restore.blocked + Counter.read Compute.blocked)
++  in
++  if reset_after_reporting then reset ();
++  String.concat ~sep:"\n" [ memo; cycle_detection ]
++;;
++
++let assert_invariants () =
++  let nodes_in_cycle_detection_graph = Counter.read Cycle_detection.nodes in
++  let nodes_restore = Counter.read Restore.nodes in
++  let nodes_compute = Counter.read Compute.nodes in
++  assert (nodes_in_cycle_detection_graph <= nodes_compute + nodes_restore);
++  let edges_in_cycle_detection_graph = Counter.read Cycle_detection.edges in
++  let edges_restore = Counter.read Restore.edges in
++  let edges_compute = Counter.read Compute.edges in
++  assert (edges_in_cycle_detection_graph <= edges_restore + edges_compute)
++;;
+diff --git a/src/memo/metrics.mli b/src/memo/metrics.mli
+new file mode 100644
+index 000000000..f91527a64
+--- /dev/null
++++ b/src/memo/metrics.mli
+@@ -0,0 +1,59 @@
++(** Various performance metrics. *)
++
++open! Stdune
++
++module Counter : sig
++  type t
++
++  val read : t -> int
++  val incr : t -> unit
++  val add : t -> int -> unit
++end
++
++(** Counters related to Memo attempting (and possibly succeeding) to restore node values
++    from cache (i.e. from Memo tables). *)
++module Restore : sig
++  (** How many nodes did Memo attempt to restore from cache? *)
++  val nodes : Counter.t
++
++  (** How many node dependencies were confirmed as up-to-date? *)
++  val edges : Counter.t
++
++  (** How many times was restoring a node blocked on other nodes? *)
++  val blocked : Counter.t
++end
++
++(** Counters related to Memo (re)computing node values. *)
++module Compute : sig
++  (** How many nodes were (re)computed? *)
++  val nodes : Counter.t
++
++  (** How many dependencies did (re)computed nodes have? *)
++  val edges : Counter.t
++
++  (** How many times was computing a node blocked on other nodes? *)
++  val blocked : Counter.t
++end
++
++(** Counters related to Memo checking for dependency cycles between nodes. *)
++module Cycle_detection : sig
++  (** Number of nodes added to the cycle detection DAG.
++
++      This number can't exceed [Restore.nodes + Compute.nodes]. *)
++  val nodes : Counter.t
++
++  (** Number of edges added to the cycle detection DAG.
++
++      This number can't exceed [Restore.edges + Compute.edges]. *)
++  val edges : Counter.t
++end
++
++(** Reset all counters to zero. *)
++val reset : unit -> unit
++
++(** A concise summary of performance counters. Resets all counters to zero after reporting
++    if [reset_after_reporting=true]. *)
++val report : reset_after_reporting:bool -> string
++
++(** Raise if any internal invariants are violated. *)
++val assert_invariants : unit -> unit

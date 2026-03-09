@@ -1,0 +1,194 @@
+diff --git a/src/dune_rules/context.ml b/src/dune_rules/context.ml
+index e30e23752..eb73689f4 100644
+--- a/src/dune_rules/context.ml
++++ b/src/dune_rules/context.ml
+@@ -52,6 +52,7 @@ type t =
+   ; supports_shared_libraries : Dynlink_supported.By_the_os.t
+   ; lib_config : Lib_config.t
+   ; build_context : Build_context.t
++  ; instrument_with : Lib_name.t list
+   }
+ 
+ let equal x y = Context_name.equal x.name y.name
+@@ -82,6 +83,7 @@ let to_dyn t : Dyn.t =
+     ; ( "supports_shared_libraries"
+       , Bool (Dynlink_supported.By_the_os.get t.supports_shared_libraries) )
+     ; "ocaml_config", Ocaml_config.to_dyn t.ocaml.ocaml_config
++    ; "instrument_with", (list Lib_name.to_dyn) t.instrument_with
+     ]
+ ;;
+ 
+@@ -423,7 +425,6 @@ let create
+       ; ccomp_type = Ocaml_config.ccomp_type ocaml.ocaml_config
+       ; ocaml_version_string = Ocaml_config.version_string ocaml.ocaml_config
+       ; ocaml_version = Ocaml.Version.of_ocaml_config ocaml.ocaml_config
+-      ; instrument_with
+       }
+     in
+     if Option.is_some fdo_target_exe
+@@ -458,6 +459,7 @@ let create
+           Dynlink_supported.By_the_os.of_bool supports_shared_libraries
+       ; lib_config
+       ; build_context
++      ; instrument_with
+       }
+     in
+     if Ocaml.Version.supports_response_file ocaml.version
+diff --git a/src/dune_rules/context.mli b/src/dune_rules/context.mli
+index 4a7ef9502..5324ef91f 100644
+--- a/src/dune_rules/context.mli
++++ b/src/dune_rules/context.mli
+@@ -74,6 +74,7 @@ type t = private
+   ; supports_shared_libraries : Dynlink_supported.By_the_os.t
+   ; lib_config : Lib_config.t
+   ; build_context : Build_context.t
++  ; instrument_with : Lib_name.t list
+   }
+ 
+ val which : t -> string -> Path.t option Memo.t
+diff --git a/src/dune_rules/lib.ml b/src/dune_rules/lib.ml
+index 7cf0d201f..e5e7527e3 100644
+--- a/src/dune_rules/lib.ml
++++ b/src/dune_rules/lib.ml
+@@ -397,6 +397,7 @@ type db =
+   ; resolve : Lib_name.t -> resolve_result Memo.t
+   ; all : Lib_name.t list Memo.Lazy.t
+   ; lib_config : Lib_config.t
++  ; instrument_with : Lib_name.t list
+   }
+ 
+ and resolve_result =
+@@ -877,7 +878,7 @@ end = struct
+       let open Resolve.Memo.O in
+       let* pps =
+         let instrumentation_backend =
+-          instrumentation_backend db.lib_config.instrument_with resolve
++          instrumentation_backend db.instrument_with resolve
+         in
+         Lib_info.preprocess info
+         |> Preprocess.Per_module.with_instrumentation ~instrumentation_backend
+@@ -1767,8 +1768,8 @@ module DB = struct
+ 
+   type t = db
+ 
+-  let create ~parent ~resolve ~all ~lib_config () =
+-    { parent; resolve; all = Memo.lazy_ all; lib_config }
++  let create ~parent ~resolve ~all ~lib_config ~instrument_with () =
++    { parent; resolve; all = Memo.lazy_ all; lib_config; instrument_with }
+   ;;
+ 
+   let create_from_findlib findlib =
+@@ -1798,7 +1799,7 @@ module DB = struct
+     let+ findlib =
+       Findlib.create ~paths:context.findlib_paths ~lib_config:context.lib_config
+     in
+-    create_from_findlib findlib
++    create_from_findlib findlib ~instrument_with:context.instrument_with
+   ;;
+ 
+   let find t name =
+@@ -1953,7 +1954,7 @@ module DB = struct
+   ;;
+ 
+   let instrumentation_backend t libname =
+-    instrumentation_backend t.lib_config.instrument_with (resolve t) libname
++    instrumentation_backend t.instrument_with (resolve t) libname
+   ;;
+ end
+ 
+diff --git a/src/dune_rules/lib.mli b/src/dune_rules/lib.mli
+index b9a0dc54c..14e2ce2bb 100644
+--- a/src/dune_rules/lib.mli
++++ b/src/dune_rules/lib.mli
+@@ -115,6 +115,7 @@ module DB : sig
+     -> resolve:(Lib_name.t -> Resolve_result.t Memo.t)
+     -> all:(unit -> Lib_name.t list Memo.t)
+     -> lib_config:Lib_config.t
++    -> instrument_with:Lib_name.t list
+     -> unit
+     -> t
+ 
+diff --git a/src/dune_rules/lib_config.ml b/src/dune_rules/lib_config.ml
+index 77476e12d..c7209e9a5 100644
+--- a/src/dune_rules/lib_config.ml
++++ b/src/dune_rules/lib_config.ml
+@@ -14,7 +14,6 @@ type t =
+   ; ccomp_type : Ocaml_config.Ccomp_type.t
+   ; ocaml_version_string : string
+   ; ocaml_version : Ocaml.Version.t
+-  ; instrument_with : Lib_name.t list
+   }
+ 
+ let allowed_in_enabled_if =
+diff --git a/src/dune_rules/lib_config.mli b/src/dune_rules/lib_config.mli
+index 4e13e67fa..cd329829b 100644
+--- a/src/dune_rules/lib_config.mli
++++ b/src/dune_rules/lib_config.mli
+@@ -14,7 +14,6 @@ type t =
+   ; ccomp_type : Ocaml_config.Ccomp_type.t
+   ; ocaml_version_string : string
+   ; ocaml_version : Ocaml.Version.t
+-  ; instrument_with : Lib_name.t list
+   }
+ 
+ val allowed_in_enabled_if : (string * Dune_lang.Syntax.Version.t) list
+diff --git a/src/dune_rules/scope.ml b/src/dune_rules/scope.ml
+index 4c7dacec9..b124e2131 100644
+--- a/src/dune_rules/scope.ml
++++ b/src/dune_rules/scope.ml
+@@ -77,7 +77,7 @@ module DB = struct
+       | Deprecated_library_name of Dune_file.Deprecated_library_name.t
+   end
+ 
+-  let create_db_from_stanzas ~parent ~lib_config stanzas =
++  let create_db_from_stanzas ~instrument_with ~parent ~lib_config stanzas =
+     let open Memo.O in
+     let+ (map : Found_or_redirect.t Lib_name.Map.t) =
+       Memo.List.map stanzas ~f:(fun stanza ->
+@@ -135,6 +135,7 @@ module DB = struct
+            | Some (Found lib) -> Lib.DB.Resolve_result.found lib))
+       ~all:(fun () -> Lib_name.Map.keys map |> Memo.return)
+       ~lib_config
++      ~instrument_with
+   ;;
+ 
+   type redirect_to =
+@@ -248,6 +249,7 @@ module DB = struct
+     ~projects
+     ~public_libs
+     ~public_theories
++    ~instrument_with
+     stanzas
+     coq_stanzas
+     =
+@@ -276,7 +278,9 @@ module DB = struct
+           let stanzas = Option.value stanzas ~default:[] in
+           Some (project, stanzas))
+       |> Path_source_map_traversals.parallel_map ~f:(fun _dir (project, stanzas) ->
+-        let+ db = create_db_from_stanzas stanzas ~parent:public_libs ~lib_config in
++        let+ db =
++          create_db_from_stanzas stanzas ~instrument_with ~parent:public_libs ~lib_config
++        in
+         project, db)
+     in
+     let coq_scopes_by_dir =
+@@ -297,9 +301,10 @@ module DB = struct
+     let t = Fdecl.create Dyn.opaque in
+     let build_dir = context.build_dir in
+     let lib_config = Context.lib_config context in
++    let instrument_with = context.instrument_with in
+     let* public_libs =
+       let+ installed_libs = Lib.DB.installed context in
+-      public_libs t ~lib_config ~installed_libs stanzas
++      public_libs t ~instrument_with ~lib_config ~installed_libs stanzas
+     in
+     let public_theories =
+       let installed_theories =
+@@ -314,6 +319,7 @@ module DB = struct
+     in
+     let+ by_dir =
+       scopes_by_dir
++        ~instrument_with
+         ~build_dir
+         ~lib_config
+         ~projects

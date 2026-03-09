@@ -1,0 +1,306 @@
+diff --git a/doc/changes/fixed/13712.md b/doc/changes/fixed/13712.md
+deleted file mode 100644
+index 93d3eac16..000000000
+--- a/doc/changes/fixed/13712.md
++++ /dev/null
+@@ -1,3 +0,0 @@
+-- Fixed interpreting relative paths in `%{bin:..}` and `%{bin-available:..}`.
+-  These are now interpreted correctly, relative to the dune file they're in.
+-  (#13712, fixes #9564, @anmonteiro)
+diff --git a/src/dune_rules/action_unexpanded.ml b/src/dune_rules/action_unexpanded.ml
+index c87e1e999..090f5d302 100644
+--- a/src/dune_rules/action_unexpanded.ml
++++ b/src/dune_rules/action_unexpanded.ml
+@@ -403,9 +403,8 @@ end = struct
+                Action_builder.of_memo
+                @@
+                let open Memo.O in
+-               let dir = env.dir in
+                let* where =
+-                 let+ project = Dune_load.find_project ~dir in
++                 let+ project = Dune_load.find_project ~dir:env.dir in
+                  if Dune_project.dune_version project >= (3, 14)
+                  then Artifacts.Original_path
+                  else Install_dir
+@@ -416,7 +415,7 @@ end = struct
+                  | "rescript_syntax" -> Some "opam install rescript-syntax"
+                  | _ -> None
+                in
+-               Artifacts.binary ?hint ~loc:(Some loc) ~where ~dir artifacts s)
++               Artifacts.binary ?hint ~loc:(Some loc) ~where artifacts s)
+         in
+         let args = Value.L.to_strings ~dir args in
+         match prog with
+diff --git a/src/dune_rules/artifacts.ml b/src/dune_rules/artifacts.ml
+index 1e81cdca4..ff2b37f82 100644
+--- a/src/dune_rules/artifacts.ml
++++ b/src/dune_rules/artifacts.ml
+@@ -46,23 +46,18 @@ let local_binaries { local_bins; _ } =
+     | _, Origin _origins -> None)
+ ;;
+ 
+-let analyze_binary t ~dir name =
++let analyze_binary t name =
+   match Filename.is_relative name with
+   | false -> Memo.return (`Resolved (Path.of_filename_relative_to_initial_cwd name))
+   | true ->
+     let* local_bins = Memo.Lazy.force t.local_bins in
+-    let lookup_name =
+-      match Filename.analyze_program_name name with
+-      | Absolute | In_path -> name
+-      | Relative_to_current_dir -> Path.Build.relative dir name |> Path.Build.basename
+-    in
+     let which () =
+-      Context.which t.context lookup_name
++      Context.which t.context name
+       >>| function
+       | None -> `None
+       | Some path -> `Resolved path
+     in
+-    (match Filename.Map.find local_bins lookup_name with
++    (match Filename.Map.find local_bins name with
+      | Some (Resolved p) -> Memo.return (`Resolved (Path.build p.path))
+      | None -> which ()
+      | Some (Origin origins) ->
+@@ -87,8 +82,8 @@ let analyze_binary t ~dir name =
+             ]))
+ ;;
+ 
+-let binary t ?hint ?(where = Install_dir) ~dir ~loc name =
+-  analyze_binary t ~dir name
++let binary t ?hint ?(where = Install_dir) ~loc name =
++  analyze_binary t name
+   >>= function
+   | `Resolved path -> Memo.return @@ Ok path
+   | `None ->
+@@ -112,8 +107,8 @@ let binary t ?hint ?(where = Install_dir) ~dir ~loc name =
+        Ok (Path.build src))
+ ;;
+ 
+-let binary_available t ~dir name =
+-  analyze_binary t ~dir name
++let binary_available t name =
++  analyze_binary t name
+   >>| function
+   | `None -> false
+   | `Resolved _ | `Origin _ -> true
+diff --git a/src/dune_rules/artifacts.mli b/src/dune_rules/artifacts.mli
+index 5ca6d6e16..5294fe419 100644
+--- a/src/dune_rules/artifacts.mli
++++ b/src/dune_rules/artifacts.mli
+@@ -33,12 +33,11 @@ val binary
+   :  t
+   -> ?hint:string
+   -> ?where:where
+-  -> dir:Path.Build.t
+   -> loc:Loc.t option
+   -> Filename.t
+   -> Action.Prog.t Memo.t
+ 
+-val binary_available : t -> dir:Path.Build.t -> string -> bool Memo.t
++val binary_available : t -> string -> bool Memo.t
+ val add_binaries : t -> dir:Path.Build.t -> File_binding.Expanded.t list -> t
+ 
+ val create
+diff --git a/src/dune_rules/coq/coq_config.ml b/src/dune_rules/coq/coq_config.ml
+index 869881b11..09f475667 100644
+--- a/src/dune_rules/coq/coq_config.ml
++++ b/src/dune_rules/coq/coq_config.ml
+@@ -248,12 +248,10 @@ let by_name { coqlib; coqcorelib; coq_native_compiler_default } name =
+       [ "name", Dyn.string name ]
+ ;;
+ 
+-let expand source macro ~dir artifacts_host =
++let expand source macro artifacts_host =
+   let s = Pform.Macro_invocation.Args.whole macro in
+   let open Memo.O in
+-  let* coqc =
+-    Artifacts.binary artifacts_host ~where:Original_path ~dir ~loc:None "coqc"
+-  in
++  let* coqc = Artifacts.binary artifacts_host ~where:Original_path ~loc:None "coqc" in
+   let expand m k s =
+     let+ t = m ~coqc in
+     match t with
+diff --git a/src/dune_rules/coq/coq_config.mli b/src/dune_rules/coq/coq_config.mli
+index c59eb7f5f..8f9c848fe 100644
+--- a/src/dune_rules/coq/coq_config.mli
++++ b/src/dune_rules/coq/coq_config.mli
+@@ -65,6 +65,5 @@ val by_name : t -> string -> Value.t Option.t
+ val expand
+   :  Dune_lang.Template.Pform.t
+   -> Pform.Macro_invocation.t
+-  -> dir:Path.Build.t
+   -> Artifacts.t
+   -> Dune_lang.Value.t list Memo.t
+diff --git a/src/dune_rules/expander.ml b/src/dune_rules/expander.ml
+index 3fb255fe3..0d78c2c15 100644
+--- a/src/dune_rules/expander.ml
++++ b/src/dune_rules/expander.ml
+@@ -664,7 +664,6 @@ let expand_pform_macro
+                 let* artifacts_host = t.artifacts_host in
+                 Artifacts.binary
+                   ~loc:(Some (Dune_lang.Template.Pform.loc source))
+-                  ~dir:t.dir
+                   artifacts_host
+                   s)
+            in
+@@ -693,7 +692,7 @@ let expand_pform_macro
+         Without
+           (let open Memo.O in
+            let* artifacts_host = t.artifacts_host in
+-           let+ b = Artifacts.binary_available artifacts_host ~dir:t.dir s in
++           let+ b = Artifacts.binary_available artifacts_host s in
+            b |> string_of_bool |> string))
+   | File_available ->
+     Direct
+@@ -724,7 +723,7 @@ let expand_pform_macro
+         Without
+           (let open Memo.O in
+            let* artifacts_host = t.artifacts_host in
+-           Coq_config.expand source macro_invocation ~dir:t.dir artifacts_host))
++           Coq_config.expand source macro_invocation artifacts_host))
+   | Ppx ->
+     Need_full_expander
+       (fun t ->
+@@ -748,7 +747,7 @@ let expand_pform_macro
+         Without
+           (let open Memo.O in
+            let* artifacts_host = t.artifacts_host in
+-           Rocq_config.expand source macro_invocation ~dir:t.dir artifacts_host))
++           Rocq_config.expand source macro_invocation artifacts_host))
+ ;;
+ 
+ let expand_pform_gen ~(context : Context.t) ~bindings ~dir ~source (pform : Pform.t)
+diff --git a/src/dune_rules/rocq/rocq_config.ml b/src/dune_rules/rocq/rocq_config.ml
+index 12b7e2b97..a7a209081 100644
+--- a/src/dune_rules/rocq/rocq_config.ml
++++ b/src/dune_rules/rocq/rocq_config.ml
+@@ -257,12 +257,10 @@ let by_name { rocqlib; rocq_native_compiler_default } name =
+       [ "name", Dyn.string name ]
+ ;;
+ 
+-let expand source macro ~dir artifacts_host =
++let expand source macro artifacts_host =
+   let s = Pform.Macro_invocation.Args.whole macro in
+   let open Memo.O in
+-  let* rocq =
+-    Artifacts.binary artifacts_host ~where:Original_path ~dir ~loc:None "rocq"
+-  in
++  let* rocq = Artifacts.binary artifacts_host ~where:Original_path ~loc:None "rocq" in
+   let expand m k s =
+     let+ t = m ~rocq in
+     match t with
+diff --git a/src/dune_rules/rocq/rocq_config.mli b/src/dune_rules/rocq/rocq_config.mli
+index a1935a132..66e0ecdb6 100644
+--- a/src/dune_rules/rocq/rocq_config.mli
++++ b/src/dune_rules/rocq/rocq_config.mli
+@@ -77,6 +77,5 @@ val by_name : t -> string -> Value.t Option.t
+ val expand
+   :  Dune_lang.Template.Pform.t
+   -> Pform.Macro_invocation.t
+-  -> dir:Path.Build.t
+   -> Artifacts.t
+   -> Dune_lang.Value.t list Memo.t
+diff --git a/src/dune_rules/super_context.ml b/src/dune_rules/super_context.ml
+index 08ad63d3a..1b0ba0d38 100644
+--- a/src/dune_rules/super_context.ml
++++ b/src/dune_rules/super_context.ml
+@@ -181,7 +181,7 @@ let add_alias_action t alias ~dir ~loc action =
+ 
+ let resolve_program_memo t ~dir ?where ?hint ~loc bin =
+   let* artifacts = artifacts_host t ~dir in
+-  Artifacts.binary ?hint ?where ~dir ~loc artifacts bin
++  Artifacts.binary ?hint ?where ~loc artifacts bin
+ ;;
+ 
+ let resolve_program t ~dir ?where ?hint ~loc bin =
+diff --git a/test/blackbox-tests/test-cases/bin-available-relative.t b/test/blackbox-tests/test-cases/bin-available-relative.t
+deleted file mode 100644
+index 2b16a9b69..000000000
+--- a/test/blackbox-tests/test-cases/bin-available-relative.t
++++ /dev/null
+@@ -1,71 +0,0 @@
+-Relative paths in %{bin:...} and %{bin-available:...} are resolved from the
+-current directory. See #9564.
+-
+-  $ cat > dune-project << EOF
+-  > (lang dune 3.10)
+-  > 
+-  > (package
+-  >  (name p))
+-  > EOF
+-
+-  $ cat > dune << EOF
+-  > (executable
+-  >  (public_name e)
+-  >  (package p))
+-  > 
+-  > (executable
+-  >  (public_name disabled)
+-  >  (package p)
+-  >  (modules disabled)
+-  >  (enabled_if false))
+-  > 
+-  > (rule
+-  >  (alias all)
+-  >  (action
+-  >   (progn
+-  >    (echo "available e: %{bin-available:./e}\n")
+-  >    (echo "available root foo: %{bin-available:./foo}\n")
+-  >    (echo "available pathonly: %{bin-available:./pathonly}\n")
+-  >    (echo "available dironly: %{bin-available:./dironly}\n")
+-  >    (echo "available disabled: %{bin-available:./disabled}\n")
+-  >    (run %{bin:./pathonly})
+-  >    (run %{bin:./e}))))
+-  > EOF
+-  $ mkdir path-bin
+-  $ cat > path-bin/pathonly << EOF
+-  > #!/bin/sh
+-  > echo "running pathonly"
+-  > EOF
+-  $ chmod +x path-bin/pathonly
+-  $ mkdir dironly
+-  $ export PATH=$PWD:$PWD/path-bin:$PATH
+-  $ mkdir sub
+-  $ cat > sub/dune << EOF
+-  > (executable
+-  >  (public_name nested)
+-  >  (package p)
+-  >  (modules nested))
+-  > 
+-  > (env
+-  >  (_ (binaries (nested.exe as foo))))
+-  > 
+-  > (rule
+-  >  (alias all)
+-  >  (action
+-  >   (echo "available nested foo: %{bin-available:./foo}\n")))
+-  > EOF
+-  $ cat > e.ml << EOF
+-  > let () = print_endline "running e"
+-  > EOF
+-  $ touch sub/nested.ml
+-  $ touch disabled.ml
+-
+-  $ dune build @all
+-  available nested foo: true
+-  available e: true
+-  available root foo: false
+-  available pathonly: true
+-  available dironly: false
+-  available disabled: false
+-  running pathonly
+-  running e
+diff --git a/test/blackbox-tests/test-cases/bin-available.t b/test/blackbox-tests/test-cases/bin-available.t
+index c70c7b8e0..286d61562 100644
+--- a/test/blackbox-tests/test-cases/bin-available.t
++++ b/test/blackbox-tests/test-cases/bin-available.t
+@@ -35,7 +35,7 @@ Test for %{bin-available:...}
+   dune: true
+   local program foo: true
+   non existent program: false
+-  local path foo: true
++  local path foo: false
+   local path bar: false
+   disabled binary is available: false
+   disabled by enabled_if: false

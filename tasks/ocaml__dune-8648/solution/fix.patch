@@ -1,0 +1,190 @@
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index 805733908..bce15fa8e 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -391,14 +391,16 @@ module Lock = struct
+                ~local_packages:opam_file_map
+            with
+            | Error (`Diagnostic_message message) -> Error (context_name, message)
+-           | Ok (summary, lock_dir) ->
++           | Ok (summary, lock_dir, files) ->
+              let summary_message =
+                Dune_pkg.Opam_solver.Summary.selected_packages_message
+                  summary
+                  ~lock_dir_path
+                |> User_message.pp
+              in
+-             Ok (Lock_dir.Write_disk.prepare ~lock_dir_path lock_dir, summary_message))
++             Ok
++               ( Lock_dir.Write_disk.prepare ~lock_dir_path ~files lock_dir
++               , summary_message ))
+        |> Result.List.all)
+       >>| function
+       | Error (context_name, message) ->
+diff --git a/src/dune_pkg/lock_dir.ml b/src/dune_pkg/lock_dir.ml
+index 889c6b9f4..5a4de3852 100644
+--- a/src/dune_pkg/lock_dir.ml
++++ b/src/dune_pkg/lock_dir.ml
+@@ -393,7 +393,14 @@ module Write_disk = struct
+ 
+   type t = unit -> unit
+ 
+-  let prepare ~lock_dir_path lock_dir =
++  module Files_entry = struct
++    type t =
++      { original_file : Path.t
++      ; local_file : Path.Local.t
++      }
++  end
++
++  let prepare ~lock_dir_path ~files lock_dir =
+     let lock_dir_path = Path.source lock_dir_path in
+     let remove_dir_if_exists = safely_remove_lock_dir_if_exists_thunk lock_dir_path in
+     fun () ->
+@@ -408,7 +415,19 @@ module Write_disk = struct
+             Dune_lang.Ast.add_loc ~loc:Loc.none sexp |> Dune_sexp.Cst.concrete)
+         in
+         let pp = Dune_lang.Format.pp_top_sexps ~version:(3, 11) cst in
+-        Format.asprintf "%a" Pp.to_fmt pp |> Io.write_file path)
++        Format.asprintf "%a" Pp.to_fmt pp |> Io.write_file path;
++        Package_name.Map.iteri files ~f:(fun package_name files ->
++          let files_dir =
++            Path.relative lock_dir_path (Package_name.to_string package_name ^ ".files")
++          in
++          Path.mkdir_p files_dir;
++          List.iter files ~f:(fun { Files_entry.original_file; local_file } ->
++            let dst = Path.append_local files_dir local_file in
++            Path.mkdir_p (Path.parent_exn dst);
++            Io.copy_file
++              ~src:original_file
++              ~dst:(Path.append_local files_dir local_file)
++              ())))
+   ;;
+ 
+   let commit t = t ()
+diff --git a/src/dune_pkg/lock_dir.mli b/src/dune_pkg/lock_dir.mli
+index 6ed13a5b4..b8f5c1251 100644
+--- a/src/dune_pkg/lock_dir.mli
++++ b/src/dune_pkg/lock_dir.mli
+@@ -71,7 +71,19 @@ module Write_disk : sig
+   type lock_dir := t
+   type t
+ 
+-  val prepare : lock_dir_path:Path.Source.t -> lock_dir -> t
++  module Files_entry : sig
++    type t =
++      { original_file : Path.t
++      ; local_file : Path.Local.t
++      }
++  end
++
++  val prepare
++    :  lock_dir_path:Path.Source.t
++    -> files:Files_entry.t Package_name.Map.Multi.t
++    -> lock_dir
++    -> t
++
+   val commit : t -> unit
+ end
+ 
+diff --git a/src/dune_pkg/opam_repo.ml b/src/dune_pkg/opam_repo.ml
+index bdc1a4d1a..968ef661f 100644
+--- a/src/dune_pkg/opam_repo.ml
++++ b/src/dune_pkg/opam_repo.ml
+@@ -90,6 +90,12 @@ let get_opam_file_path t opam_package =
+   / "opam"
+ ;;
+ 
++let get_opam_package_files_path t opam_package =
++  get_opam_package_version_dir_path t (OpamPackage.name opam_package)
++  / OpamPackage.to_string opam_package
++  / "files"
++;;
++
+ (* Returns a list containing all versions of a package with a given name *)
+ let all_package_versions t opam_package_name =
+   let version_dir_path = get_opam_package_version_dir_path t opam_package_name in
+diff --git a/src/dune_pkg/opam_repo.mli b/src/dune_pkg/opam_repo.mli
+index 4705d05d0..7f2dcb556 100644
+--- a/src/dune_pkg/opam_repo.mli
++++ b/src/dune_pkg/opam_repo.mli
+@@ -14,3 +14,5 @@ val load_all_versions
+   :  t
+   -> OpamPackage.Name.t
+   -> (OpamFile.OPAM.t list, [ `Package_not_found ]) result
++
++val get_opam_package_files_path : t -> OpamPackage.t -> Path.t
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 192249d12..38fbac5fa 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -455,6 +455,35 @@ let solve_package_list local_packages context =
+   | Ok packages -> Ok (Solver.packages_of_result packages)
+ ;;
+ 
++(* Scan a path recursively down retrieving a list of all files together with their
++   relative path. *)
++let scan_files_entries ~repo_id path =
++  (* TODO Add some cycle detection *)
++  let rec read acc dir =
++    let path = Path.append_local path dir in
++    match Path.readdir_unsorted_with_kinds path with
++    | Ok entries ->
++      List.fold_left entries ~init:acc ~f:(fun acc (filename, kind) ->
++        let local_path = Path.Local.relative dir filename in
++        match (kind : Unix.file_kind) with
++        | S_REG -> local_path :: acc
++        | S_DIR -> read acc local_path
++        | _ ->
++          (* TODO should be an error *)
++          acc)
++    | Error (Unix.ENOENT, _, _) -> acc
++    | Error err ->
++      User_error.raise
++        ?loc:(Option.map ~f:fst repo_id)
++        [ Pp.text "Unable to read file in opam repository:"; Unix_error.Detailed.pp err ]
++  in
++  read [] Path.Local.root
++  |> List.map ~f:(fun local_file ->
++    { Lock_dir.Write_disk.Files_entry.original_file = Path.append_local path local_file
++    ; local_file
++    })
++;;
++
+ let solve_lock_dir solver_env version_preference (repo, repo_id) ~local_packages =
+   let is_local_package package =
+     OpamPackage.Name.Map.mem (OpamPackage.name package) local_packages
+@@ -482,5 +511,14 @@ let solve_lock_dir solver_env version_preference (repo, repo_id) ~local_packages
+       | Ok pkgs_by_name ->
+         Lock_dir.create_latest_version pkgs_by_name ~ocaml:None ~repo_id
+     in
+-    summary, lock_dir)
++    let files =
++      Package_name.Map.of_list_map_exn opam_packages_to_lock ~f:(fun opam_package ->
++        let files_path = Opam_repo.get_opam_package_files_path repo opam_package in
++        ( Package_name.of_string
++            (OpamPackage.Name.to_string (OpamPackage.name opam_package))
++        , scan_files_entries ~repo_id files_path ))
++      |> Package_name.Map.filter_map ~f:(fun files ->
++        if List.is_empty files then None else Some files)
++    in
++    summary, lock_dir, files)
+ ;;
+diff --git a/src/dune_pkg/opam_solver.mli b/src/dune_pkg/opam_solver.mli
+index b3aad305e..f56dae474 100644
+--- a/src/dune_pkg/opam_solver.mli
++++ b/src/dune_pkg/opam_solver.mli
+@@ -1,4 +1,4 @@
+-open! Stdune
++open Import
+ 
+ module Summary : sig
+   (** Some intermediate state from the solve exposed for logging purposes *)
+@@ -13,4 +13,6 @@ val solve_lock_dir
+   -> Version_preference.t
+   -> Opam_repo.t * (Loc.t * Repository_id.t) option
+   -> local_packages:OpamFile.OPAM.t OpamTypes.name_map
+-  -> (Summary.t * Lock_dir.t, [ `Diagnostic_message of _ Pp.t ]) result
++  -> ( Summary.t * Lock_dir.t * Lock_dir.Write_disk.Files_entry.t Package_name.Map.Multi.t
++     , [ `Diagnostic_message of _ Pp.t ] )
++     result

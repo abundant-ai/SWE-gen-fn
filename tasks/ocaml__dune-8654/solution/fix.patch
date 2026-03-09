@@ -1,0 +1,262 @@
+diff --git a/boot/libs.ml b/boot/libs.ml
+index b6a4d69f1..dbcd619c7 100644
+--- a/boot/libs.ml
++++ b/boot/libs.ml
+@@ -83,6 +83,7 @@ let local_libraries =
+   ; ("src/dune_tui", Some "Dune_tui", true, None)
+   ; ("src/dune_config_file", Some "Dune_config_file", false, None)
+   ; ("src/dune_shared_cache", Some "Dune_shared_cache", false, None)
++  ; ("src/dune_patch", Some "Dune_patch", false, None)
+   ; ("src/scheme", Some "Scheme", false, None)
+   ; ("src/dune_rules", Some "Dune_rules", true, None)
+   ; ("src/upgrader", Some "Dune_upgrader", false, None)
+diff --git a/src/dune_patch/dune b/src/dune_patch/dune
+new file mode 100644
+index 000000000..767cae005
+--- /dev/null
++++ b/src/dune_patch/dune
+@@ -0,0 +1,5 @@
++(library
++ (name dune_patch)
++ (libraries stdune fiber dune_engine dune_lang dune_re)
++ (instrumentation
++  (backend bisect_ppx)))
+diff --git a/src/dune_patch/dune_patch.ml b/src/dune_patch/dune_patch.ml
+new file mode 100644
+index 000000000..df6128768
+--- /dev/null
++++ b/src/dune_patch/dune_patch.ml
+@@ -0,0 +1,145 @@
++open Stdune
++
++module Re = struct
++  include Dune_re
++
++  module Group = struct
++    include Group
++
++    let get_opt group n = if Group.test group n then Some (get group n) else None
++  end
++end
++
++include struct
++  open Dune_engine
++  module Action = Action
++  module Process = Process
++  module Utils = Utils
++  module Action_builder = Action_builder
++end
++
++include struct
++  open Dune_lang
++  module Value = Value
++end
++
++let re =
++  let line xs = Re.seq ((Re.bol :: xs) @ [ Re.eol ]) in
++  let followed_by_line xs = Re.seq [ Re.str "\n"; line xs ] in
++  Re.compile
++  @@ Re.seq
++       [ Re.alt
++           [ line [ Re.str {|--- a/|}; Re.group (Re.rep1 Re.notnl) ]
++           ; line [ Re.str {|--- |}; Re.group (Re.rep1 Re.notnl) ]
++           ]
++       ; Re.alt
++           [ followed_by_line [ Re.str {|+++ b/|}; Re.group (Re.rep1 Re.notnl) ]
++           ; followed_by_line [ Re.str {|+++ |}; Re.group (Re.rep1 Re.notnl) ]
++           ]
++       ]
++;;
++
++module Patch = struct
++  (* CR-someday alizter: more parsed infromation about the patch should go here.
++     Eventually we wish to replace the patch command inside the patch action with a pure
++     OCaml implementation. *)
++  type t =
++    | New of Path.Local.t
++    | Delete of Path.Local.t
++    | Replace of Path.Local.t
++end
++
++let patches_of_string patch_string =
++  Re.all re patch_string
++  |> List.filter_map ~f:(fun group ->
++    let open Option.O in
++    (* If these are [Some] then they are [/dev/null] *)
++    let old_file_dev_null = Re.Group.get_opt group 2 in
++    let new_file_dev_null = Re.Group.get_opt group 4 in
++    match old_file_dev_null, new_file_dev_null with
++    | Some _dev_null, Some _ ->
++      (* when both files are /dev/null we don't care about the patch. *)
++      None
++    | Some _, None ->
++      (* New file *)
++      let+ new_file = Re.Group.get_opt group 3 in
++      Patch.New (Path.Local.of_string new_file)
++    | None, Some _ ->
++      (* Delete file *)
++      let+ new_file = Re.Group.get_opt group 1 in
++      Patch.Delete (Path.Local.of_string new_file)
++    | None, None ->
++      (* Replace file *)
++      let+ new_file = Re.Group.get_opt group 3 in
++      Patch.Replace (Path.Local.of_string new_file))
++;;
++
++let prog =
++  lazy
++    (match Bin.which ~path:(Env_path.path Env.initial) "patch" with
++     | Some p -> p
++     | None -> User_error.raise [ Pp.text "patch not found" ])
++;;
++
++let exec display ~patch ~dir ~stderr =
++  let open Fiber.O in
++  let* () = Fiber.return () in
++  (* Read the patch file. *)
++  Io.read_file patch
++  (* Collect all the patches. *)
++  |> patches_of_string
++  (* Depending on whether it is creating a new file or modifying an existing file
++     prepare the files that will be modified accordingly. For modifying existing files
++     this means materializing any symlinks or hardlinks. *)
++  |> List.iter ~f:(function
++    | Patch.New _ | Delete _ -> ()
++    | Replace file ->
++      let file = Path.append_local dir file in
++      let temp = Path.extend_basename file ~suffix:".for_patch" in
++      Io.copy_file ~src:file ~dst:temp ();
++      Path.rename temp file);
++  Process.run
++    ~dir
++    ~display
++    ~stdout_to:Process.(Io.null Out)
++    ~stderr_to:stderr
++    ~stdin_from:Process.(Io.null In)
++    Process.Failure_mode.Strict
++    (Lazy.force prog)
++    [ "-p1"; "-i"; Path.reach_for_running ~from:dir patch ]
++;;
++
++module Spec = struct
++  type ('path, 'target) t = 'path
++
++  let name = "patch"
++  let version = 1
++  let bimap patch f _ = f patch
++  let is_useful_to ~distribute:_ ~memoize = memoize
++
++  let encode patch input _ : Dune_lang.t =
++    List [ Dune_lang.atom_or_quoted_string name; input patch ]
++  ;;
++
++  let action patch ~ectx:_ ~(eenv : Action.Ext.env) =
++    exec !Dune_engine.Clflags.display ~patch ~dir:eenv.working_dir ~stderr:eenv.stderr_to
++  ;;
++end
++
++(* CR-someday alizter: This should be an action builder. *)
++let action ~patch =
++  let module M = struct
++    type path = Path.t
++    type target = Path.Build.t
++
++    module Spec = Spec
++
++    let v = patch
++  end
++  in
++  Action.Extension (module M)
++;;
++
++module For_tests = struct
++  let exec = exec
++end
+diff --git a/src/dune_patch/dune_patch.mli b/src/dune_patch/dune_patch.mli
+new file mode 100644
+index 000000000..3579c3b04
+--- /dev/null
++++ b/src/dune_patch/dune_patch.mli
+@@ -0,0 +1,13 @@
++open Stdune
++open Dune_engine
++
++val action : patch:Path.t -> Action.t
++
++module For_tests : sig
++  val exec
++    :  Dune_engine.Display.t
++    -> patch:Path.t
++    -> dir:Path.t
++    -> stderr:Dune_engine.Process.Io.output Dune_engine.Process.Io.t
++    -> unit Fiber.t
++end
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 7494f6625..84b149705 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -424,7 +424,24 @@ let opam_package_to_lock_file_pkg ~repo ~local_packages opam_package =
+       Loc.none, Package_name.of_string (OpamPackage.Name.to_string name))
+   in
+   let build_command =
++    let patch_step =
++      (* CR-someday alizter: Patches don't take into account filters that are present. For
++         now we take them all. *)
++      match
++        OpamFile.OPAM.patches opam_file
++        |> List.map ~f:(fun (x, _) ->
++          Action.Patch
++            (String_with_vars.make_text Loc.none (OpamFilename.Base.to_string x)))
++      with
++      | [] -> None
++      | [ x ] -> Some x
++      | xs -> Some (Action.Progn xs)
++    in
+     opam_commands_to_action opam_package (OpamFile.OPAM.build opam_file)
++    |> Option.map ~f:(fun action ->
++      match patch_step with
++      | None -> action
++      | Some patch_step -> Action.Progn [ patch_step; action ])
+   in
+   let install_command =
+     opam_commands_to_action opam_package (OpamFile.OPAM.install opam_file)
+diff --git a/src/dune_rules/dune b/src/dune_rules/dune
+index e42e07c76..297d1ddef 100644
+--- a/src/dune_rules/dune
++++ b/src/dune_rules/dune
+@@ -34,6 +34,7 @@
+   dune_config_file
+   dune_shared_cache
+   dune_findlib
++  dune_patch
+   scheme
+   unix)
+  (synopsis "Internal Dune library, do not use!")
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index e0b3ef7b4..d0c763c11 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -679,20 +679,9 @@ module Action_expander = struct
+       let arg = arg |> Value.to_string ~dir in
+       Action.System arg
+     | Patch p ->
+-      let* input = Expander.expand_pform_gen ~mode:Single expander p in
+-      let input = Value.to_string ~dir input in
+-      let+ patch =
+-        let path = Global.env () |> Env_path.path in
+-        let program = "patch" in
+-        Which.which ~path program
+-        >>| function
+-        | Some p -> Ok p
+-        | None ->
+-          let loc = Some (String_with_vars.loc p) in
+-          Error (Action.Prog.Not_found.create ~context:expander.context ~program ~loc ())
+-      in
+-      (* TODO opam has a preprocessing step that we should probably apply *)
+-      Action.Run (patch, Array.Immutable.of_array [| "-p1"; "-i"; input |])
++      let+ input = Expander.expand_pform_gen ~mode:Single expander p in
++      let input = Value.to_path ~dir input in
++      Dune_patch.action ~patch:input
+     | Substitute (input, output) ->
+       let+ input =
+         Expander.expand_pform_gen ~mode:Single expander input >>| Value.to_path ~dir

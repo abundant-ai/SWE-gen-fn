@@ -1,0 +1,281 @@
+diff --git a/bin/alias.ml b/bin/alias.ml
+index b1d2a8dd2..0baa2a08f 100644
+--- a/bin/alias.ml
++++ b/bin/alias.ml
+@@ -25,6 +25,8 @@ let in_dir ~name ~recursive ~contexts dir =
+     User_error.raise
+       [ Pp.textf "@@ on the command line must be followed by a relative path" ]
+   | In_source_dir dir -> { dir; recursive; name; contexts }
++  | In_private_context _ ->
++    User_error.raise [ Pp.textf "no aliases in the testing context" ]
+   | In_install_dir _ ->
+     User_error.raise
+       [ Pp.textf
+diff --git a/bin/printenv.ml b/bin/printenv.ml
+index d4281b905..51c9018e9 100644
+--- a/bin/printenv.ml
++++ b/bin/printenv.ml
+@@ -64,7 +64,7 @@ let term =
+                  dir
+              in
+              dump sctx ~dir)
+-         | External _ ->
++         | In_private_context _ | External _ ->
+            User_error.raise [ Pp.text "Environment is not defined for external paths" ]
+          | In_install_dir _ ->
+            User_error.raise [ Pp.text "Environment is not defined in install dirs" ])
+diff --git a/bin/target.ml b/bin/target.ml
+index 1378f80f0..9b3651601 100644
+--- a/bin/target.ml
++++ b/bin/target.ml
+@@ -163,7 +163,7 @@ let resolve_path path ~(setup : Dune_rules.Main.build_system)
+       >>= (function
+       | Some res -> Memo.return (Ok res)
+       | None -> can't_build path))
+-  | In_install_dir _ ->
++  | In_private_context _ | In_install_dir _ ->
+     matching_target ()
+     >>= (function
+     | Some res -> Memo.return (Ok res)
+diff --git a/bin/util.ml b/bin/util.ml
+index 93f529650..12638ec7e 100644
+--- a/bin/util.ml
++++ b/bin/util.ml
+@@ -2,6 +2,7 @@ open Import
+ 
+ type checked =
+   | In_build_dir of (Context.t * Path.Source.t)
++  | In_private_context of Path.Build.t
+   | In_install_dir of (Context.t * Path.Source.t)
+   | In_source_dir of Path.Source.t
+   | External of Path.External.t
+@@ -45,5 +46,10 @@ let check_path contexts =
+          (match Install.Context.analyze_path name src with
+           | Invalid -> internal_path ()
+           | Install (ctx, path) -> In_install_dir (context_exn ctx, path)
+-          | Normal (ctx, path) -> In_build_dir (context_exn ctx, path)))
++          | Normal (ctx, path) ->
++            if Context_name.equal ctx Dune_rules.Private_context.t.name
++            then
++              In_private_context
++                (Path.Build.append_source Dune_rules.Private_context.t.build_dir path)
++            else In_build_dir (context_exn ctx, path)))
+ ;;
+diff --git a/bin/util.mli b/bin/util.mli
+index 23678e1b6..e0855ad43 100644
+--- a/bin/util.mli
++++ b/bin/util.mli
+@@ -2,6 +2,7 @@ open Import
+ 
+ type checked =
+   | In_build_dir of (Context.t * Path.Source.t)
++  | In_private_context of Path.Build.t
+   | In_install_dir of (Context.t * Path.Source.t)
+   | In_source_dir of Path.Source.t
+   | External of Path.External.t
+diff --git a/src/dune_rules/dune_rules.ml b/src/dune_rules/dune_rules.ml
+index 94ee5f7e9..9e180c2a4 100644
+--- a/src/dune_rules/dune_rules.ml
++++ b/src/dune_rules/dune_rules.ml
+@@ -55,6 +55,7 @@ module Source_tree = Source_tree
+ module Sub_dirs = Sub_dirs
+ module Package = Package
+ module Dialect = Dialect
++module Private_context = Private_context
+ 
+ module Install_rules = struct
+   let install_file = Install_rules.install_file
+diff --git a/src/dune_rules/gen_rules.ml b/src/dune_rules/gen_rules.ml
+index 61c2fea82..007a92c40 100644
+--- a/src/dune_rules/gen_rules.ml
++++ b/src/dune_rules/gen_rules.ml
+@@ -733,7 +733,7 @@ let gen_rules ~sctx ~dir components : Gen_rules.result Memo.t =
+           automatic
+           (* XXX sync this list with the pattern matches above. It's quite ugly
+              we need this, we should rewrite this code to avoid this. *)
+-          (Filename.Set.of_list [ ".js"; "_doc"; ".ppx"; ".dune"; ".topmod"; ".pkg" ])
++          (Filename.Set.of_list [ ".js"; "_doc"; ".ppx"; ".dune"; ".topmod" ])
+     in
+     Source_tree.find_dir src_dir
+     >>= (function
+@@ -781,6 +781,52 @@ let with_context ctx ~f =
+   | Some ctx -> f ctx
+ ;;
+ 
++let analyze_private_context_path components =
++  match components with
++  | [] -> Memo.return `Root
++  | ctx :: components ->
++    (match Context_name.of_string_opt ctx with
++     | None -> Memo.return `Invalid_context
++     | Some ctx ->
++       Per_context.valid ctx
++       >>| (function
++       | true -> `Valid (ctx, components)
++       | false -> `Invalid_context))
++;;
++
++let gen_rules_private_context ~dir components ctx =
++  match components with
++  | [ ".pkg" ] ->
++    Gen_rules.make
++      ~build_dir_only_sub_dirs:
++        (Gen_rules.Build_only_sub_dirs.singleton ~dir Subdir_set.all)
++      (Memo.return Rules.empty)
++    |> Memo.return
++  | [ ".pkg"; pkg_name ] -> Pkg_rules.setup_package_rules ctx ~dir ~pkg_name
++  | ".pkg" :: _ :: _ -> Memo.return @@ Gen_rules.redirect_to_parent Gen_rules.Rules.empty
++  | [] ->
++    let build_dir_only_sub_dirs =
++      Gen_rules.Build_only_sub_dirs.singleton ~dir @@ Subdir_set.of_list [ ".pkg" ]
++    in
++    Memo.return @@ Gen_rules.make ~build_dir_only_sub_dirs (Memo.return Rules.empty)
++  | _ -> Memo.return @@ Gen_rules.rules_here Gen_rules.Rules.empty
++;;
++
++let private_context ~dir components _ctx =
++  analyze_private_context_path components
++  >>= function
++  | `Invalid_context -> Memo.return Gen_rules.unknown_context
++  | `Valid (ctx, components) -> gen_rules_private_context ~dir components ctx
++  | `Root ->
++    let+ contexts = Per_context.list () in
++    let build_dir_only_sub_dirs =
++      Gen_rules.Build_only_sub_dirs.singleton
++        ~dir
++        (Subdir_set.of_list (List.rev_map contexts ~f:Context_name.to_string))
++    in
++    Gen_rules.make ~build_dir_only_sub_dirs (Memo.return Rules.empty)
++;;
++
+ let gen_rules ctx ~dir components =
+   if Context_name.equal ctx Install.Context.install_context.name
+   then (
+@@ -805,17 +851,10 @@ let gen_rules ctx ~dir components =
+           ~build_dir_only_sub_dirs:(Gen_rules.Build_only_sub_dirs.singleton ~dir subdirs)
+           ~directory_targets
+           (Memo.return rules)))
++  else if Context_name.equal ctx Private_context.t.name
++  then private_context ~dir components ctx
+   else (
+     match components with
+-    | [ ".pkg" ] ->
+-      Gen_rules.make
+-        ~build_dir_only_sub_dirs:
+-          (Gen_rules.Build_only_sub_dirs.singleton ~dir Subdir_set.all)
+-        (Memo.return Rules.empty)
+-      |> Memo.return
+-    | [ ".pkg"; pkg_name ] -> Pkg_rules.setup_package_rules ctx ~dir ~pkg_name
+-    | ".pkg" :: _ :: _ ->
+-      Memo.return @@ Gen_rules.redirect_to_parent Gen_rules.Rules.empty
+     | [ ".dune" ] ->
+       has_rules
+         ~dir
+diff --git a/src/dune_rules/main.ml b/src/dune_rules/main.ml
+index e82aec48a..fe217ca61 100644
+--- a/src/dune_rules/main.ml
++++ b/src/dune_rules/main.ml
+@@ -85,7 +85,8 @@ let init
+          let open Memo.O in
+          let+ contexts = Workspace.workspace () >>| Workspace.build_contexts in
+          let open Dune_engine.Build_config.Gen_rules.Context_type in
+-         (Install.Context.install_context, Empty)
++         (Private_context.t, Empty)
++         :: (Install.Context.install_context, Empty)
+          :: List.map contexts ~f:(fun ctx -> ctx, With_sources)))
+     ~cache_config
+     ~cache_debug_flags
+diff --git a/src/dune_rules/per_context.ml b/src/dune_rules/per_context.ml
+index 7bac40441..cadee397d 100644
+--- a/src/dune_rules/per_context.ml
++++ b/src/dune_rules/per_context.ml
+@@ -24,6 +24,8 @@ let all =
+   Context_name.Map.of_list_exn contexts
+ ;;
+ 
++let list () = Memo.Lazy.force all >>| Context_name.Map.keys
++
+ let create_db ?cutoff ~name f =
+   let cutoff = Option.map cutoff ~f:(fun equal -> Context_name.Map.equal ~equal) in
+   let map =
+@@ -33,14 +35,28 @@ let create_db ?cutoff ~name f =
+   in
+   Staged.stage (fun context ->
+     let+ map = Memo.Lazy.force map in
+-    match Context_name.Map.find map context with
+-    | Some v -> v
+-    | None ->
+-      Code_error.raise "invalid context" [ "context", Context_name.to_dyn context ])
++    Context_name.Map.find map context)
++;;
++
++let or_invalid ctx = function
++  | Some s -> s
++  | None -> Code_error.raise "invalid context" [ "context", Context_name.to_dyn ctx ]
+ ;;
+ 
+ let profile =
+-  create_db ~cutoff:Profile.equal ~name:"profile" (function
+-    | `Native ctx | `Target (ctx, _) -> (Workspace.Context.base ctx).profile)
+-  |> Staged.unstage
++  let profile =
++    create_db ~cutoff:Profile.equal ~name:"profile" (function
++      | `Native ctx | `Target (ctx, _) -> (Workspace.Context.base ctx).profile)
++    |> Staged.unstage
++  in
++  fun ctx -> profile ctx >>| or_invalid ctx
++;;
++
++let valid =
++  let find =
++    create_db ~cutoff:Unit.equal ~name:"context-validation" (function
++      | `Native _ | `Target (_, _) -> ())
++    |> Staged.unstage
++  in
++  fun ctx -> find ctx >>| Option.is_some
+ ;;
+diff --git a/src/dune_rules/per_context.mli b/src/dune_rules/per_context.mli
+index bb1004dbb..428eac4f5 100644
+--- a/src/dune_rules/per_context.mli
++++ b/src/dune_rules/per_context.mli
+@@ -3,3 +3,5 @@
+ open Import
+ 
+ val profile : Context_name.t -> Profile.t Memo.t
++val valid : Context_name.t -> bool Memo.t
++val list : unit -> Context_name.t list Memo.t
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 6841222d1..976c46b9c 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -130,7 +130,9 @@ module Paths = struct
+   let extra_source t extra_source = Path.Build.append_local t.extra_sources extra_source
+ 
+   let make name (ctx : Context_name.t) =
+-    let build_dir = Context_name.build_dir ctx in
++    let build_dir =
++      Path.Build.relative Private_context.t.build_dir (Context_name.to_string ctx)
++    in
+     let root = Path.Build.L.relative build_dir [ ".pkg"; Package.Name.to_string name ] in
+     of_root name ~root
+   ;;
+diff --git a/src/dune_rules/private_context.ml b/src/dune_rules/private_context.ml
+new file mode 100644
+index 000000000..62ae8e607
+--- /dev/null
++++ b/src/dune_rules/private_context.ml
+@@ -0,0 +1,3 @@
++open Import
++
++let t = Build_context.create ~name:(Context_name.of_string "_private")
+diff --git a/src/dune_rules/private_context.mli b/src/dune_rules/private_context.mli
+new file mode 100644
+index 000000000..b254eadf6
+--- /dev/null
++++ b/src/dune_rules/private_context.mli
+@@ -0,0 +1,5 @@
++(** dummy context for storing auxilary stuff without polluting the rest *)
++
++open Import
++
++val t : Build_context.t

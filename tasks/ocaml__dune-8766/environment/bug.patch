@@ -1,0 +1,526 @@
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index 8f92cdccf..72ebea2c8 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -158,30 +158,72 @@ module Per_context = struct
+ end
+ 
+ module Print_solver_env = struct
+-  (* The system environment variables used by the solver are taken from the
+-     current system by default but can be overridden by the build context. *)
+-  let override_solver_env_variables
++  (* Add the opam system variables derived from the current system into a
++     solver environment configured in a build context. If variables derived
++     from the current system are also present in the solver environment
++     configured in the build context, an error is raised unless they both have
++     the same value (in which case that value is used). *)
++  let merge_current_system_bindings_into_solver_env_from_context
++    ~context_name
+     ~solver_env_from_context
+     ~sys_bindings_from_current_system
++    ~use_env_from_current_system
+     =
+-    Dune_pkg.Solver_env.(
+-      Variable.Sys.Bindings.extend
+-        sys_bindings_from_current_system
+-        (sys solver_env_from_context)
+-      |> set_sys solver_env_from_context)
++    let sys =
++      match
++        Dune_pkg.Solver_env.(
++          Variable.Sys.Bindings.union
++            (sys solver_env_from_context)
++            sys_bindings_from_current_system)
++      with
++      | Ok solver_env -> solver_env
++      | Error
++          (`Var_in_both_with_different_values
++            (var, value_from_context, value_from_system)) ->
++        let hints =
++          if use_env_from_current_system
++          then
++            [ Pp.text
++                "This can happen if --use-env-from-current-system is passed and the \
++                 build context specifies environment variables which differ from those \
++                 of the current system."
++            ]
++          else []
++        in
++        User_error.raise
++          ~hints
++          [ Pp.textf
++              "Can't create solver environment for context %s"
++              (String.maybe_quoted @@ Dune_engine.Context_name.to_string context_name)
++          ; Pp.textf
++              "Conflicting values for system environment variable: %s"
++              (String.maybe_quoted @@ Dune_pkg.Solver_env.Variable.Sys.to_string var)
++          ; Pp.textf
++              "The value inferred from the current system is: %s"
++              (String.maybe_quoted value_from_system)
++          ; Pp.textf
++              "The value configured in the build context (%s) is: %s"
++              (String.maybe_quoted @@ Dune_engine.Context_name.to_string context_name)
++              (String.maybe_quoted value_from_context)
++          ]
++    in
++    Dune_pkg.Solver_env.set_sys solver_env_from_context sys
+   ;;
+ 
+   let print_solver_env_for_one_context
+     ~sys_bindings_from_current_system
++    ~use_env_from_current_system
+     { Per_context.solver_env = solver_env_from_context
+     ; context_common = { name = context_name; _ }
+     ; _
+     }
+     =
+     let solver_env =
+-      override_solver_env_variables
++      merge_current_system_bindings_into_solver_env_from_context
++        ~context_name
+         ~solver_env_from_context
+         ~sys_bindings_from_current_system
++        ~use_env_from_current_system
+     in
+     Console.print
+       [ Pp.textf
+@@ -195,7 +237,7 @@ module Print_solver_env = struct
+     ~context_name
+     ~all_contexts
+     ~version_preference
+-    ~dont_poll_system_solver_variables
++    ~use_env_from_current_system
+     =
+     let open Fiber.O in
+     let+ per_context =
+@@ -204,13 +246,16 @@ module Print_solver_env = struct
+         ~all_contexts_arg:all_contexts
+         ~version_preference_arg:version_preference
+     and+ sys_bindings_from_current_system =
+-      if dont_poll_system_solver_variables
+-      then Fiber.return Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
+-      else Dune_pkg.Sys_poll.sys_bindings ~path:(Env_path.path Stdune.Env.initial)
++      if use_env_from_current_system
++      then Dune_pkg.Sys_poll.sys_bindings ~path:(Env_path.path Stdune.Env.initial)
++      else Fiber.return Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
+     in
+     List.iter
+       per_context
+-      ~f:(print_solver_env_for_one_context ~sys_bindings_from_current_system)
++      ~f:
++        (print_solver_env_for_one_context
++           ~sys_bindings_from_current_system
++           ~use_env_from_current_system)
+   ;;
+ 
+   let term =
+@@ -222,19 +267,22 @@ module Print_solver_env = struct
+         & flag
+         & info [ "all-contexts" ] ~doc:"Generate the lockdir for all contexts")
+     and+ version_preference = Version_preference.term
+-    and+ dont_poll_system_solver_variables =
++    and+ use_env_from_current_system =
+       Arg.(
+         value
+         & flag
+         & info
+-            [ "dont-poll-system-solver-variables" ]
++            [ "use-env-from-current-system" ]
+             ~doc:
+-              "Don't derive system solver variables from the current system. Values \
+-               assigned to these variables in build contexts will still be used. Note \
+-               that Opam filters that depend on unset variables resolve to the value \
+-               \"undefined\" which is treated as false. For example if a dependency has \
+-               a filter `{os = \"linux\"}` and the variable \"os\" is unset, the \
+-               dependency will be excluded. ")
++              "Set opam system environment variables based on the current system when \
++               solving dependencies. This will restrict packages to just those which can \
++               be installed on the current system. Note that this will mean that the \
++               generated lockdir may not be compatible with other systems. If the build \
++               context(s) specify system environment variables then the solver will use \
++               the union of the environment variables inferred from the current system \
++               and the environment variables set in the build context(s). If the current \
++               system and the build context(s) disagree on the value of an environment \
++               variable then an error is raised.")
+     in
+     let common = Common.forbid_builds common in
+     let config = Common.init common in
+@@ -243,7 +291,7 @@ module Print_solver_env = struct
+         ~context_name
+         ~all_contexts
+         ~version_preference
+-        ~dont_poll_system_solver_variables)
++        ~use_env_from_current_system)
+   ;;
+ 
+   let info =
+@@ -361,6 +409,7 @@ module Lock = struct
+     ~opam_repository_path
+     ~opam_repository_url
+     ~sys_bindings_from_current_system
++    ~use_env_from_current_system
+     =
+     let open Fiber.O in
+     Per_context.check_for_dup_lock_dir_paths per_context;
+@@ -388,9 +437,11 @@ module Lock = struct
+              }
+            ->
+            let solver_env =
+-             Print_solver_env.override_solver_env_variables
++             Print_solver_env.merge_current_system_bindings_into_solver_env_from_context
++               ~context_name
+                ~solver_env_from_context
+                ~sys_bindings_from_current_system
++               ~use_env_from_current_system
+            in
+            let+ repos =
+              get_repos repos solver_env ~opam_repository_path ~opam_repository_url
+@@ -436,8 +487,8 @@ module Lock = struct
+   let lock
+     ~context_name
+     ~all_contexts
+-    ~dont_poll_system_solver_variables
+     ~version_preference
++    ~use_env_from_current_system
+     ~opam_repository_path
+     ~opam_repository_url
+     =
+@@ -448,15 +499,16 @@ module Lock = struct
+         ~all_contexts_arg:all_contexts
+         ~version_preference_arg:version_preference
+     and* sys_bindings_from_current_system =
+-      if dont_poll_system_solver_variables
+-      then Fiber.return Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
+-      else Dune_pkg.Sys_poll.sys_bindings ~path:(Env_path.path Stdune.Env.initial)
++      if use_env_from_current_system
++      then Dune_pkg.Sys_poll.sys_bindings ~path:(Env_path.path Stdune.Env.initial)
++      else Fiber.return Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
+     in
+     solve
+       per_context
+       ~opam_repository_path
+       ~opam_repository_url
+       ~sys_bindings_from_current_system
++      ~use_env_from_current_system
+   ;;
+ 
+   let term =
+@@ -470,19 +522,22 @@ module Lock = struct
+         & flag
+         & info [ "all-contexts" ] ~doc:"Generate the lockdir for all contexts")
+     and+ version_preference = Version_preference.term
+-    and+ dont_poll_system_solver_variables =
++    and+ use_env_from_current_system =
+       Arg.(
+         value
+         & flag
+         & info
+-            [ "dont-poll-system-solver-variables" ]
++            [ "use-env-from-current-system" ]
+             ~doc:
+-              "Don't derive system solver variables from the current system. Values \
+-               assigned to these variables in build contexts will still be used. Note \
+-               that Opam filters that depend on unset variables resolve to the value \
+-               \"undefined\" which is treated as false. For example if a dependency has \
+-               a filter `{os = \"linux\"}` and the variable \"os\" is unset, the \
+-               dependency will be excluded. ")
++              "Set opam system environment variables based on the current system when \
++               solving dependencies. This will restrict packages to just those which can \
++               be installed on the current system. Note that this will mean that the \
++               generated lockdir may not be compatible with other systems. If the build \
++               context(s) specify system environment variables then the solver will use \
++               the union of the environment variables inferred from the current system \
++               and the environment variables set in the build context(s). If the current \
++               system and the build context(s) disagree on the value of an environment \
++               variable then an error is raised.")
+     in
+     let common = Common.forbid_builds common in
+     let config = Common.init common in
+@@ -490,8 +545,8 @@ module Lock = struct
+       lock
+         ~context_name
+         ~all_contexts
+-        ~dont_poll_system_solver_variables
+         ~version_preference
++        ~use_env_from_current_system
+         ~opam_repository_path
+         ~opam_repository_url)
+   ;;
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 6fa14c76d..a550f8eca 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -6,14 +6,34 @@ module type CONTEXT = Opam_0install.S.CONTEXT
+ module Filter : sig
+   type filter := OpamTypes.filter
+ 
+-  (** Substitute variables with their values *)
+-  val resolve_solver_env : Solver_env.t -> filter -> filter
++  (** Substitute variables with their values.
++
++      Comparisons with unset system environment variables resolve to true,
++      treating them as wildcards. This creates a formula which is as permissive
++      as possible within the constraints for system environment variables
++      specified by the user. The intention is to generate lockdirs which will
++      work on as many systems as possible, but to allow the user to constrain
++      this by setting environment variables to handle situations where the most
++      permissive solve is not possible or otherwise produces undesirable
++      outcomes (e.g. when there are mutually-incompatible os-specific packages
++      for different operating systems). *)
++  val resolve_solver_env_treating_unset_sys_variables_as_wildcards
++    :  Solver_env.t
++    -> filter
++    -> filter
+ 
+   val eval_to_bool : filter -> (bool, [ `Not_a_bool of string ]) result
+ end = struct
+   open OpamTypes
+ 
+-  let resolve_solver_env solver_env =
++  (* Returns true iff a variable is an opam system environment variable *)
++  let is_variable_sys variable =
++    OpamVariable.to_string variable
++    |> Solver_env.Variable.Sys.of_string_opt
++    |> Option.is_some
++  ;;
++
++  let resolve_solver_env_treating_unset_sys_variables_as_wildcards solver_env =
+     OpamFilter.map_up (function
+       | FIdent ([], variable, None) as filter ->
+         (match Solver_env.Variable.of_string_opt (OpamVariable.to_string variable) with
+@@ -23,6 +43,23 @@ end = struct
+             | Unset_sys -> filter
+             | String string -> FString string
+             | Bool bool -> FBool bool))
++      | (FOp (FIdent (_, variable, _), _, _) | FOp (_, _, FIdent (_, variable, _))) as
++        filter ->
++        if is_variable_sys variable
++        then
++          (* Comparisons with unset system environment variables resolve to
++             true. This is so that we add dependencies guarded by filters on
++             unset system variables. For example if a package has a linux-only
++             and a macos-only dependency and the user hasn't specified that they
++             only want to solve for a specific os, then we should add both the
++             linux-only and macos-only dependencies to the solution.
++
++             Note that this branch is only followed for unset variables as
++             [OpamFilter.map_up] traverses the formula bottom up, so variables
++             with values in [solver_env] will have been substituted for those
++             values already by the time control gets here.*)
++          FBool true
++        else filter
+       | other -> other)
+   ;;
+ 
+@@ -94,7 +131,11 @@ module Context_for_dune = struct
+     fun t opam ->
+       let available = OpamFile.OPAM.available opam in
+       match
+-        let available_vars_resolved = Filter.resolve_solver_env t.solver_env available in
++        let available_vars_resolved =
++          Filter.resolve_solver_env_treating_unset_sys_variables_as_wildcards
++            t.solver_env
++            available
++        in
+         Filter.eval_to_bool available_vars_resolved
+       with
+       | Ok available -> available
+@@ -163,7 +204,7 @@ module Context_for_dune = struct
+     in
+     Filtered_formula.map_filters
+       filtered_formula
+-      ~f:(Filter.resolve_solver_env solver_env)
++      ~f:(Filter.resolve_solver_env_treating_unset_sys_variables_as_wildcards solver_env)
+     |> OpamFilter.filter_deps
+          ~build:true
+          ~post:true
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index c260dde48..8781ac9b4 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -131,7 +131,22 @@ module Variable = struct
+             ]
+       ;;
+ 
+-      let extend t t' = Map.superpose t' t
++      type union_error = [ `Var_in_both_with_different_values of T.t * string * string ]
++
++      exception E of union_error
++
++      let union a b =
++        try
++          Map.union a b ~f:(fun common_key a_value b_value ->
++            if String.equal a_value b_value
++            then Some a_value
++            else
++              raise
++                (E (`Var_in_both_with_different_values (common_key, a_value, b_value))))
++          |> Result.ok
++        with
++        | E union_error -> Error union_error
++      ;;
+ 
+       let pp t =
+         Pp.enumerate all ~f:(fun variable ->
+diff --git a/src/dune_pkg/solver_env.mli b/src/dune_pkg/solver_env.mli
+index 8b7a6a1e3..5308bb2b4 100644
+--- a/src/dune_pkg/solver_env.mli
++++ b/src/dune_pkg/solver_env.mli
+@@ -37,9 +37,12 @@ module Variable : sig
+       val set : t -> sys_var -> string -> t
+       val get : t -> sys_var -> string option
+ 
+-      (** [extend a b] adds all variables from [b] to [a] overwriting any
+-          existing values of those variables in [a]. *)
+-      val extend : t -> t -> t
++      type union_error =
++        [ `Var_in_both_with_different_values of sys_var * string * string ]
++
++      (** Merge two environments returning an error if they both contain a
++          binding of the same variable to different values. *)
++      val union : t -> t -> (t, union_error) result
+     end
+   end
+ 
+diff --git a/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t b/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
+index 18a5f51d4..fd268d6f0 100644
+--- a/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
++++ b/test/blackbox-tests/test-cases/pkg/env-conditional-dependencies.t
+@@ -20,14 +20,51 @@ dependency:
+   > available: os = "macos"
+   > EOF
+ 
+-With no "os" variable set in the workspace, none of the os-specific
+-dependencies are included.
++Depending on foo should add the macos and linux dependency but not the
++test-only dependency because we don't add transitive test dependencies:
+   $ solve foo
+   Solution for dune.lock:
+   foo.0.0.1
++  foo-linux.0.0.1
++  foo-macos.0.0.1
+   
+ 
+-Create a workspace config that defines separate build contexts for macos and linux.
++A package with different linux and macos dependencies which are mutually
++incompatible:
++  $ mkpkg bar <<EOF
++  > depends: [
++  >   "bar-linux" {os = "linux"}
++  >   "bar-macos" {os = "macos"}
++  > ]
++  > EOF
++  $ mkpkg bar-linux <<EOF
++  > available: os = "linux"
++  > conflicts: [
++  >   "bar-macos"
++  > ]
++  > EOF
++  $ mkpkg bar-macos <<EOF
++  > available: os = "macos"
++  > conflicts: [
++  >   "bar-linux"
++  > ]
++  > EOF
++
++There's no solution to these dependencies:
++  $ solve bar
++  Error: Unable to solve dependencies in build context: default
++  Can't find all required versions.
++  Selected: bar.0.0.1 bar-linux.0.0.1 x.dev
++  - bar-macos -> (problem)
++      bar-linux 0.0.1 requires conflict with all versions
++      Rejected candidates:
++        bar-macos.0.0.1: Incompatible with restriction: conflict with all
++  versions
++  [1]
++
++Since there is no solution available with both the macos and linux dependencies
++we need to generate a lockdir for a single os at a time. Create a workspace
++config that defines separate build contexts for macos and linux.
+   $ cat >dune-workspace <<EOF
+   > (lang dune 3.8)
+   > (context
+@@ -46,13 +83,12 @@ Create a workspace config that defines separate build contexts for macos and lin
+   >     (os macos)))))
+   > EOF
+ 
+-Now the os-specific dependencies are included on their respective systems.
+-  $ dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository --all-contexts
++  $ dune pkg lock --opam-repository-path=mock-opam-repository --all-contexts
+   Solution for dune.macos.lock:
+-  foo.0.0.1
+-  foo-macos.0.0.1
++  bar.0.0.1
++  bar-macos.0.0.1
+   
+   Solution for dune.linux.lock:
+-  foo.0.0.1
+-  foo-linux.0.0.1
++  bar.0.0.1
++  bar-linux.0.0.1
+   
+diff --git a/test/blackbox-tests/test-cases/pkg/helpers.sh b/test/blackbox-tests/test-cases/pkg/helpers.sh
+index a0f9c48ae..59983215c 100644
+--- a/test/blackbox-tests/test-cases/pkg/helpers.sh
++++ b/test/blackbox-tests/test-cases/pkg/helpers.sh
+@@ -44,7 +44,7 @@ mkpkg() {
+ 
+ solve_project() {
+   cat >dune-project
+-  dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository
++  dune pkg lock --opam-repository-path=mock-opam-repository
+ }
+ 
+ make_lockdir() {
+diff --git a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+index 92cfe45a6..f39b76898 100644
+--- a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
++++ b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+@@ -1,5 +1,5 @@
+ Print the solver env when no dune-workspace is present
+-  $ dune pkg print-solver-env --dont-poll-system-solver-variables
++  $ dune pkg print-solver-env
+   Solver environment for context default:
+   - Flags
+     - with-doc = true
+@@ -33,7 +33,7 @@ Add some build contexts with different environments
+   >    (flags (:standard \ with-doc)))))
+   > EOF
+ 
+-  $ dune pkg print-solver-env --all-contexts --dont-poll-system-solver-variables
++  $ dune pkg print-solver-env --all-contexts
+   Solver environment for context no-doc:
+   - Flags
+     - with-doc = false
+diff --git a/test/blackbox-tests/test-cases/pkg/unavailable-packages.t b/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
+index a0f015a5a..177b15abd 100644
+--- a/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
++++ b/test/blackbox-tests/test-cases/pkg/unavailable-packages.t
+@@ -1,13 +1,10 @@
+   $ . ./helpers.sh
+   $ mkrepo
+ 
+-Set up two build contexts: a default one for linux and another for macos.
++Set up two build contexts: a default one for all systems and another just for macos.
+   $ cat >dune-workspace <<EOF
+   > (lang dune 3.8)
+-  > (context (default
+-  >   (solver_env
+-  >    (sys
+-  >     (os linux)))))
++  > (context (default))
+   > (context
+   >  (default
+   >   (name macos)
+@@ -21,8 +18,8 @@ Set up two build contexts: a default one for linux and another for macos.
+ Helper shell function to generate a dune-project file and generate lockdir for both contexts:
+   $ solve_project() {
+   >   cat >dune-project
+-  >   dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository --context=default
+-  >   dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository --context=macos
++  >   dune pkg lock --opam-repository-path=mock-opam-repository --context=default
++  >   dune pkg lock --opam-repository-path=mock-opam-repository --context=macos
+   > }
+ 
+ A package which is only available on linux:

@@ -1,0 +1,464 @@
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 3baaddebe..b4cdb9226 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -60,7 +60,8 @@ module Context_for_dune = struct
+          | Some variable ->
+            (match Solver_env.get solver_env variable with
+             | Unset_sys -> filter
+-            | String string -> FString string))
++            | String string -> FString string
++            | Bool bool -> FBool bool))
+       | other -> other)
+   ;;
+ 
+@@ -139,16 +140,26 @@ module Context_for_dune = struct
+   ;;
+ 
+   let filter_deps t package filtered_formula =
+-    let package_is_local =
+-      OpamPackage.Name.Map.mem (OpamPackage.name package) t.local_packages
++    let solver_env =
++      let package_is_local =
++        OpamPackage.Name.Map.mem (OpamPackage.name package) t.local_packages
++      in
++      if package_is_local
++      then t.solver_env
++      else
++        (* Flag variables pertain only to local packages. This is because these
++           variables enable dependencies on test and documentation packages and
++           we don't want to pull in test and doc dependencies for dependencies
++           of local packages. *)
++        Solver_env.clear_flags t.solver_env
+     in
+-    map_filters filtered_formula ~f:(resolve_solver_env t.solver_env)
++    map_filters filtered_formula ~f:(resolve_solver_env solver_env)
+     |> OpamFilter.filter_deps
+          ~build:true
+          ~post:false
+          ~dev:false
+          ~default:false
+-         ~test:package_is_local
++         ~test:false
+          ~doc:false
+   ;;
+ end
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index 92de377da..e647fc531 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -1,6 +1,66 @@
+ open Import
+ 
+ module Variable = struct
++  module Flag = struct
++    module T = struct
++      type t =
++        [ `With_test
++        | `With_doc
++        ]
++
++      let to_string = function
++        | `With_test -> "with-test"
++        | `With_doc -> "with-doc"
++      ;;
++
++      let compare a b = String.compare (to_string a) (to_string b)
++      let equal a b = Ordering.is_eq (compare a b)
++      let to_dyn t = Dyn.variant (to_string t) []
++      let all = [ `With_test; `With_doc ]
++    end
++
++    include T
++
++    let of_string_opt s = List.find all ~f:(fun t -> String.equal s (to_string t))
++
++    module Set = struct
++      include Set.Of_map (T) (Map.Make (T))
++
++      let all : t = of_list all
++
++      let of_ordered_set ordered_set =
++        Dune_lang.Ordered_set_lang.eval
++          ordered_set
++          ~parse:(fun ~loc string ->
++            match of_string_opt string with
++            | Some flag -> flag
++            | None ->
++              User_error.raise
++                ~loc
++                [ Pp.textf "No such flag: %s" (String.maybe_quoted string)
++                ; Pp.textf
++                    "Valid flags: %s"
++                    (String.enumerate_and
++                       (List.map T.all ~f:(fun v -> String.maybe_quoted @@ to_string v)))
++                ])
++          ~eq:T.equal
++          ~standard:T.all
++        |> of_list
++      ;;
++
++      let decode =
++        let open Decoder in
++        let+ ordered_set = Dune_lang.Ordered_set_lang.decode in
++        of_ordered_set ordered_set
++      ;;
++
++      let pp t =
++        to_list all
++        |> Pp.enumerate ~f:(fun flag -> Pp.textf "%s = %b" (to_string flag) (mem t flag))
++      ;;
++    end
++  end
++
+   module Sys = struct
+     module T = struct
+       type t =
+@@ -114,30 +174,37 @@ module Variable = struct
+   end
+ 
+   type t =
++    | Flag of Flag.t
+     | Sys of Sys.t
+     | Const of Const.t
+ 
+   let of_string_opt string =
+-    match Sys.of_string_opt string with
+-    | Some sys -> Some (Sys sys)
+-    | None -> Const.of_string_opt string |> Option.map ~f:(fun const -> Const const)
++    match Flag.of_string_opt string with
++    | Some flag -> Some (Flag flag)
++    | None ->
++      (match Sys.of_string_opt string with
++       | Some sys -> Some (Sys sys)
++       | None -> Const.of_string_opt string |> Option.map ~f:(fun const -> Const const))
+   ;;
+ end
+ 
+ type t =
+-  { sys : Variable.Sys.Bindings.t
++  { flags : Variable.Flag.Set.t
++  ; sys : Variable.Sys.Bindings.t
+   ; const : Variable.Const.Bindings.t
+   ; repos : Workspace.Repository.Name.t list
+   }
+ 
+ module Fields = struct
++  let flags = "flags"
+   let sys = "sys"
+   let const = "const"
+   let repos = "repositories"
+ end
+ 
+ let default =
+-  { sys = Variable.Sys.Bindings.empty
++  { flags = Variable.Flag.Set.all
++  ; sys = Variable.Sys.Bindings.empty
+   ; const = Variable.Const.bindings
+   ; repos = [ Workspace.Repository.Name.of_string "default" ]
+   }
+@@ -154,30 +221,33 @@ let repos_of_ordered_set ordered_set =
+ let decode =
+   let open Decoder in
+   fields
+-  @@
+-  let+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode
+-  and+ repos = Dune_lang.Ordered_set_lang.field Fields.repos in
+-  let const = default.const in
+-  let repos = repos_of_ordered_set repos in
+-  { sys; const; repos }
++  @@ let+ flags = field Fields.flags ~default:default.flags Variable.Flag.Set.decode
++     and+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode
++     and+ repos = Dune_lang.Ordered_set_lang.field Fields.repos in
++     let const = default.const in
++     let repos = repos_of_ordered_set repos in
++     { flags; sys; const; repos }
+ ;;
+ 
+-let to_dyn { sys; const; repos } =
++let to_dyn { flags; sys; const; repos } =
+   Dyn.record
+-    [ Fields.sys, Variable.Sys.Bindings.to_dyn sys
++    [ Fields.flags, Variable.Flag.Set.to_dyn flags
++    ; Fields.sys, Variable.Sys.Bindings.to_dyn sys
+     ; Fields.const, Variable.Const.Bindings.to_dyn const
+     ; Fields.repos, Dyn.list Workspace.Repository.Name.to_dyn repos
+     ]
+ ;;
+ 
+-let equal { sys; const; repos } t =
+-  Variable.Sys.Bindings.equal sys t.sys
++let equal { flags; sys; const; repos } t =
++  Variable.Flag.Set.equal flags t.flags
++  && Variable.Sys.Bindings.equal sys t.sys
+   && Variable.Const.Bindings.equal const t.const
+   && List.equal Workspace.Repository.Name.equal repos t.repos
+ ;;
+ 
+ let sys { sys; _ } = sys
+ let set_sys t sys = { t with sys }
++let clear_flags t = { t with flags = Variable.Flag.Set.empty }
+ let repos { repos; _ } = repos
+ 
+ let pp =
+@@ -186,10 +256,11 @@ let pp =
+     let pp_heading = Pp.hbox (Pp.text heading) in
+     Pp.concat ~sep:Pp.space [ pp_heading; pp_section ] |> Pp.vbox
+   in
+-  fun { sys; const; repos } ->
++  fun { flags; sys; const; repos } ->
+     Pp.enumerate
+       ~f:Fun.id
+-      [ pp_section "System Environment Variables" (Variable.Sys.Bindings.pp sys)
++      [ pp_section "Flags" (Variable.Flag.Set.pp flags)
++      ; pp_section "System Environment Variables" (Variable.Sys.Bindings.pp sys)
+       ; pp_section "Constants" (Variable.Const.Bindings.pp const)
+       ; pp_section
+           "Repositories"
+@@ -199,13 +270,15 @@ let pp =
+ 
+ module Variable_value = struct
+   type t =
++    | Bool of bool
+     | String of string
+     | Unset_sys
+ end
+ 
+ let get t variable =
+   match (variable : Variable.t) with
+-  | Const const -> Variable_value.String (Variable.Const.Bindings.get t.const const)
++  | Flag flag -> Variable_value.Bool (Variable.Flag.Set.mem t.flags flag)
++  | Const const -> String (Variable.Const.Bindings.get t.const const)
+   | Sys sys ->
+     (match Variable.Sys.Bindings.get t.sys sys with
+      | Some value -> String value
+diff --git a/src/dune_pkg/solver_env.mli b/src/dune_pkg/solver_env.mli
+index fc5b40a85..8b7a6a1e3 100644
+--- a/src/dune_pkg/solver_env.mli
++++ b/src/dune_pkg/solver_env.mli
+@@ -1,6 +1,14 @@
+ open! Stdune
+ 
+ module Variable : sig
++  module Flag : sig
++    (** A boolean variable *)
++    type t =
++      [ `With_test
++      | `With_doc
++      ]
++  end
++
+   module Sys : sig
+     (** Variables describing a system environment. These can be polled from the
+         current system and assigned specific values in dune-workspace but there
+@@ -42,19 +50,17 @@ module Variable : sig
+   end
+ 
+   type t =
++    | Flag of Flag.t
+     | Sys of Sys.t
+     | Const of Const.t
+ 
+   val of_string_opt : string -> t option
+ end
+ 
+-(** A variable environment used by the dependency solver to evaluate package
+-    dependency filters. Opam packages can declare conditional dependencies on
+-    other packages using a language made up of boolean operators and comparisons
+-    of strings. Note that the variables in this environment are those that dune
+-    allows users to configure or derive from their environment. Other variables,
+-    such as the flags "with-test" and "with-doc" are not part of this
+-    environment as dune does not give users access to those variables.. *)
++(** A typed variable environment used by the dependency solver to evaluate
++    package filters. Opam packages can declare conditional dependencies on other
++    packages using a language made up of boolean operators and comparisons of
++    strings. Variables in this language can represent booleans and strings. *)
+ type t
+ 
+ val default : t
+@@ -67,11 +73,15 @@ val set_sys : t -> Variable.Sys.Bindings.t -> t
+ (** [repos t] returns the selected repository names in priority order *)
+ val repos : t -> Workspace.Repository.Name.t list
+ 
++(** Set all the flags to false *)
++val clear_flags : t -> t
++
+ (** A human-readible summary of the variable environment *)
+ val pp : t -> 'a Pp.t
+ 
+ module Variable_value : sig
+   type t =
++    | Bool of bool
+     | String of string
+     | Unset_sys
+ end
+diff --git a/test/blackbox-tests/test-cases/pkg/common-filters-deps.t b/test/blackbox-tests/test-cases/pkg/common-filters-deps.t
+index 393f1d433..7b84892f1 100644
+--- a/test/blackbox-tests/test-cases/pkg/common-filters-deps.t
++++ b/test/blackbox-tests/test-cases/pkg/common-filters-deps.t
+@@ -15,9 +15,8 @@ included.
+   $ mkpkg doc <<EOF
+   > EOF
+ 
+-Note that dune solves packages with with-doc always set to false, so
+-documentation-only deps are omitted from the solution.
+   $ solve "(test :with-test) (doc :with-doc) (dev :with-dev) (build :build) (post :post)"
+   Solution for dune.lock:
+   - build.0.0.1
++  - doc.0.0.1
+   - test.0.0.1
+diff --git a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+index b649a7158..025fc376e 100644
+--- a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
++++ b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+@@ -1,6 +1,9 @@
+ Print the solver env when no dune-workspace is present
+   $ dune pkg print-solver-env --dont-poll-system-solver-variables
+   Solver environment for context default:
++  - Flags
++    - with-doc = true
++    - with-test = true
+   - System Environment Variables
+     - arch (unset)
+     - os (unset)
+@@ -27,27 +30,28 @@ Add some build contexts with different environments
+   >   (name no-doc)
+   >   (lock dune.linux.lock)
+   >   (solver_env
+-  >    (sys
+-  >     (arch x86_64)
+-  >     (os linux)
+-  >     (os-family ubuntu)
+-  >     (os-distribution ubuntu)
+-  >     (os-version 22.04)))))
++  >    (flags (:standard \ with-doc)))))
+   > EOF
+ 
+   $ dune pkg print-solver-env --all-contexts --dont-poll-system-solver-variables
+   Solver environment for context no-doc:
++  - Flags
++    - with-doc = false
++    - with-test = true
+   - System Environment Variables
+-    - arch = x86_64
+-    - os = linux
+-    - os-version = 22.04
+-    - os-distribution = ubuntu
+-    - os-family = ubuntu
++    - arch (unset)
++    - os (unset)
++    - os-version (unset)
++    - os-distribution (unset)
++    - os-family (unset)
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
+   - Repositories
+        default
+   Solver environment for context linux:
++  - Flags
++    - with-doc = true
++    - with-test = true
+   - System Environment Variables
+     - arch (unset)
+     - os = linux
+diff --git a/test/blackbox-tests/test-cases/pkg/solver-flags-per-context.t b/test/blackbox-tests/test-cases/pkg/solver-flags-per-context.t
+new file mode 100644
+index 000000000..e31be4094
+--- /dev/null
++++ b/test/blackbox-tests/test-cases/pkg/solver-flags-per-context.t
+@@ -0,0 +1,95 @@
++  $ . ./helpers.sh
++  $ mkrepo
++
++!! Do not delete this one for the one in helpers.sh as it passes --all-contexts !!
++Helper shell function to generate a dune-project file and generate lockdir:
++
++  $ solve_project() {
++  >   cat >dune-project
++  >   dune pkg lock --opam-repository-path=mock-opam-repository --all-contexts
++  > }
++
++Create a workspace file with some contexts with different combinations of with-test and with-doc flags
++  $ cat >dune-workspace <<EOF
++  > (lang dune 3.8)
++  > (context
++  >  (default))
++  > (context
++  >  (default
++  >   (name default-solver-env)
++  >   (lock default-solver-env.lock)))
++  > (context
++  >  (default
++  >   (name default-solver-flags)
++  >   (lock default-solver-flags.lock)
++  >   (solver_env)))
++  > (context
++  >  (default
++  >   (name empty-solver-flags)
++  >   (lock empty-solver-flags.lock)
++  >   (solver_env
++  >    (flags))))
++  > (context
++  >  (default
++  >   (name with-test-only)
++  >   (lock with-test-only.lock)
++  >   (solver_env
++  >    (flags with-test))))
++  > (context
++  >  (default
++  >   (name with-doc-only)
++  >   (lock with-doc-only.lock)
++  >   (solver_env
++  >    (flags with-doc))))
++  > (context
++  >  (default
++  >   (name with-doc-and-with-test)
++  >   (lock with-doc-and-with-test.lock)
++  >   (solver_env
++  >    (flags with-doc with-test))))
++  > (context
++  >  (default
++  >   (name with-standard-flags)
++  >   (lock with-standard-flags.lock)
++  >   (solver_env
++  >    (flags :standard))))
++  > EOF
++
++  $ mkpkg regular-package <<EOF
++  > EOF
++
++  $ mkpkg test-package <<EOF
++  > EOF
++
++  $ mkpkg doc-package <<EOF
++  > EOF
++
++  $ solve regular-package "(test-package :with-test)" "(doc-package :with-doc)"
++  Solution for with-standard-flags.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  - test-package.0.0.1
++  Solution for with-doc-and-with-test.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  - test-package.0.0.1
++  Solution for with-doc-only.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  Solution for with-test-only.lock:
++  - regular-package.0.0.1
++  - test-package.0.0.1
++  Solution for empty-solver-flags.lock:
++  - regular-package.0.0.1
++  Solution for default-solver-flags.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  - test-package.0.0.1
++  Solution for default-solver-env.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  - test-package.0.0.1
++  Solution for dune.lock:
++  - doc-package.0.0.1
++  - regular-package.0.0.1
++  - test-package.0.0.1

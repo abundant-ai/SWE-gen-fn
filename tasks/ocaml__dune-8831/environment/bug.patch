@@ -1,0 +1,393 @@
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index 0f3a9987e..5325e2eea 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -341,7 +341,7 @@ module Lock = struct
+             ]
+         | Some repo ->
+           let url = Dune_pkg.Pkg_workspace.Repository.opam_url repo in
+-          let repo = Fetch.Opam_repository.of_workspace_repo repo in
++          let repo = Fetch.Opam_repository.of_url url in
+           let+ opam_repository = Fetch.Opam_repository.path repo in
+           (match opam_repository with
+            | Ok { path; repo_id } ->
+diff --git a/src/dune_pkg/dune b/src/dune_pkg/dune
+index 7fa951589..fb0795958 100644
+--- a/src/dune_pkg/dune
++++ b/src/dune_pkg/dune
+@@ -6,7 +6,6 @@
+   fiber
+   chrome_trace
+   dune_engine
+-  dune_digest
+   dune_util
+   dune_stats
+   dune_lang
+diff --git a/src/dune_pkg/fetch.ml b/src/dune_pkg/fetch.ml
+index c32e9eb03..995166104 100644
+--- a/src/dune_pkg/fetch.ml
++++ b/src/dune_pkg/fetch.ml
+@@ -135,16 +135,10 @@ let fetch ~unpack ~checksum ~target (url : OpamUrl.t) =
+ ;;
+ 
+ module Opam_repository = struct
+-  type t = Workspace.Repository.t
++  type t = { url : OpamUrl.t }
+ 
+-  let of_url url =
+-    let name = Workspace.Repository.Name.of_string "unknown" in
+-    let source = OpamUrl.to_string url in
+-    Workspace.Repository.create ~name ~source
+-  ;;
+-
+-  let of_workspace_repo v = v
+-  let default = Workspace.Repository.default
++  let of_url url = { url }
++  let default = of_url @@ OpamUrl.of_string "https://opam.ocaml.org/index.tar.gz"
+ 
+   let is_archive name =
+     List.exists
+@@ -160,19 +154,11 @@ module Opam_repository = struct
+   let path =
+     let open Fiber.O in
+     let ( / ) = Filename.concat in
+-    fun repo ->
+-      let url = Workspace.Repository.opam_url repo in
+-      let name =
+-        repo |> Workspace.Repository.name |> Workspace.Repository.Name.to_string
+-      in
+-      let path_digest =
+-        url |> OpamUrl.to_string |> Dune_digest.string |> Dune_digest.to_string
+-      in
+-      let folder = sprintf "%s-%s" name path_digest in
++    fun { url } ->
+       Fiber.of_thunk
+       @@ fun () ->
+       let target_dir =
+-        Xdg.cache_dir (Lazy.force Dune_util.xdg) / "dune/opam-repositories" / folder
++        Xdg.cache_dir (Lazy.force Dune_util.xdg) / "dune/opam-repository"
+       in
+       let target = target_dir |> Path.External.of_string |> Path.external_ in
+       let unpack = url |> OpamUrl.to_string |> is_archive in
+diff --git a/src/dune_pkg/fetch.mli b/src/dune_pkg/fetch.mli
+index 041c51d17..63e6e661b 100644
+--- a/src/dune_pkg/fetch.mli
++++ b/src/dune_pkg/fetch.mli
+@@ -28,7 +28,6 @@ module Opam_repository : sig
+     }
+ 
+   val of_url : OpamUrl.t -> t
+-  val of_workspace_repo : Workspace.Repository.t -> t
+   val default : t
+   val path : t -> (success, failure) result Fiber.t
+ end
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index bd4ba124f..869bd14d7 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -206,26 +206,19 @@ let default =
+   { flags = Variable.Flag.Set.all
+   ; sys = Variable.Sys.Bindings.empty
+   ; const = Variable.Const.bindings
+-  ; repos = [ Workspace.Repository.Name.of_string "default" ]
++  ; repos = [ Workspace.Repository.Name.of_string ":standard" ] (* TODO *)
+   }
+ ;;
+ 
+-let repos_of_ordered_set ordered_set =
+-  Dune_lang.Ordered_set_lang.eval
+-    ordered_set
+-    ~parse:(fun ~loc string -> Workspace.Repository.Name.parse_string_exn (loc, string))
+-    ~eq:Workspace.Repository.Name.equal
+-    ~standard:default.repos
+-;;
+-
+ let decode =
+   let open Decoder in
+   fields
+   @@ let+ flags = field Fields.flags ~default:default.flags Variable.Flag.Set.decode
+      and+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode
+-     and+ repos = Dune_lang.Ordered_set_lang.field Fields.repos in
++     and+ repos =
++       field Fields.repos ~default:default.repos (repeat Workspace.Repository.Name.decode)
++     in
+      let const = default.const in
+-     let repos = repos_of_ordered_set repos in
+      { flags; sys; const; repos }
+ ;;
+ 
+diff --git a/src/dune_pkg/workspace.ml b/src/dune_pkg/workspace.ml
+index 1e7243b56..530f71d1d 100644
+--- a/src/dune_pkg/workspace.ml
++++ b/src/dune_pkg/workspace.ml
+@@ -34,7 +34,7 @@ module Repository = struct
+ 
+   let equal { name; source } t = Name.equal name t.name && String.equal source t.source
+   let hash { name; source } = Tuple.T2.hash Name.hash String.hash (name, source)
+-  let default = { name = "default"; source = "https://opam.ocaml.org/index.tar.gz" }
++  let default = { name = ":standard"; source = "https://opam.ocaml.org/index.tar.gz" }
+ 
+   let decode =
+     let open Dune_lang.Decoder in
+@@ -44,6 +44,5 @@ module Repository = struct
+        { name; source })
+   ;;
+ 
+-  let create ~name ~source = { name; source }
+   let opam_url { source; _ } = OpamUrl.of_string source
+ end
+diff --git a/src/dune_pkg/workspace.mli b/src/dune_pkg/workspace.mli
+index 140ccd03d..dd1f5e532 100644
+--- a/src/dune_pkg/workspace.mli
++++ b/src/dune_pkg/workspace.mli
+@@ -21,5 +21,4 @@ module Repository : sig
+   end
+ 
+   val name : t -> Name.t
+-  val create : name:Name.t -> source:string -> t
+ end
+diff --git a/test/blackbox-tests/test-cases/pkg/dune b/test/blackbox-tests/test-cases/pkg/dune
+index 3fb9d5441..e4f386d59 100644
+--- a/test/blackbox-tests/test-cases/pkg/dune
++++ b/test/blackbox-tests/test-cases/pkg/dune
+@@ -8,7 +8,7 @@
+ 
+ (cram
+  (deps %{bin:git})
+- (applies_to git-source opam-repository-download multiple-opam-repos))
++ (applies_to git-source opam-repository-download))
+ 
+ (cram
+  (deps %{bin:make})
+diff --git a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+index 025fc376e..92cfe45a6 100644
+--- a/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
++++ b/test/blackbox-tests/test-cases/pkg/just-print-solver-env.t
+@@ -13,7 +13,7 @@ Print the solver env when no dune-workspace is present
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
+   - Repositories
+-       default
++       :standard
+ 
+ Add some build contexts with different environments
+   $ cat >dune-workspace <<EOF
+@@ -47,7 +47,7 @@ Add some build contexts with different environments
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
+   - Repositories
+-       default
++       :standard
+   Solver environment for context linux:
+   - Flags
+     - with-doc = true
+@@ -61,4 +61,4 @@ Add some build contexts with different environments
+   - Constants
+     - opam-version = 2.2.0~alpha-vendored
+   - Repositories
+-       default
++       :standard
+diff --git a/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t b/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t
+deleted file mode 100644
+index f02cd079c..000000000
+--- a/test/blackbox-tests/test-cases/pkg/multiple-opam-repos.t
++++ /dev/null
+@@ -1,134 +0,0 @@
+-We want to test that support for multiple opam repositories works.
+-
+-  $ . ./helpers.sh
+-  $ mkrepo
+-  $ mkpkg foo 1.0 <<EOF
+-  > EOF
+-  $ cd mock-opam-repository
+-  $ git init --quiet
+-  $ git add -A
+-  $ git commit -m "Initial commit" > /dev/null
+-  $ cd ..
+-
+-We move this mock repo to a different place, so we have two mock repos:
+-
+-  $ mv mock-opam-repository old-mock-opam-repository
+-
+-Create a new mock repo, with a different foo package
+-
+-  $ mkrepo
+-  $ mkpkg foo 2.0 <<EOF
+-  > EOF
+-  $ cd mock-opam-repository
+-  $ git init --quiet
+-  $ git add -A
+-  $ git commit -m "Initial commit" > /dev/null
+-  $ cd ..
+-
+-We have to define both repositories in the workspace, but will only use `new`.
+-
+-  $ cat > dune-workspace <<EOF
+-  > (lang dune 3.10)
+-  > (repository
+-  >  (name new)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
+-  > (repository
+-  >  (name old)
+-  >  (source "git+file://$(pwd)/old-mock-opam-repository"))
+-  > (context
+-  >  (default
+-  >   (name default)
+-  >   (solver_env
+-  >    (repositories new))))
+-  > EOF
+-
+-  $ cat > dune-project <<EOF
+-  > (lang dune 3.10)
+-  > 
+-  > (package
+-  >  (name bar)
+-  >  (depends foo))
+-  > EOF
+-  $ cat > dune <<EOF
+-  > EOF
+-
+-Locking should produce the newest package from `new`
+-
+-  $ mkdir dune-workspace-cache
+-  $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock
+-  Solution for dune.lock:
+-  foo.2.0
+-  
+-
+-If we just use `old` we should get the older `foo` package in our lockfile
+-solution:
+-
+-  $ cat > dune-workspace <<EOF
+-  > (lang dune 3.10)
+-  > (repository
+-  >  (name new)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
+-  > (repository
+-  >  (name old)
+-  >  (source "git+file://$(pwd)/old-mock-opam-repository"))
+-  > (context
+-  >  (default
+-  >   (name default)
+-  >   (solver_env
+-  >    (repositories old))))
+-  > EOF
+- 
+-  $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+-  $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock
+-  Solution for dune.lock:
+-  foo.1.0
+-  
+-
+-If we specify both repositories to be used, we should still get the new foo
+-package:
+-
+-  $ cat > dune-workspace <<EOF
+-  > (lang dune 3.10)
+-  > (repository
+-  >  (name new)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
+-  > (repository
+-  >  (name old)
+-  >  (source "git+file://$(pwd)/old-mock-opam-repository"))
+-  > (context
+-  >  (default
+-  >   (name default)
+-  >   (solver_env
+-  >    (repositories new old))))
+-  > EOF
+-
+-  $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+-  $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock
+-  Solution for dune.lock:
+-  foo.2.0
+-  
+-
+-If we use the ordered set language format and try to exclude `new` from the
+-set, we should get a solution that only has `old` and will thus include the
+-older version of foo:
+-
+-  $ cat > dune-workspace <<EOF
+-  > (lang dune 3.10)
+-  > (repository
+-  >  (name new)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
+-  > (repository
+-  >  (name old)
+-  >  (source "git+file://$(pwd)/old-mock-opam-repository"))
+-  > (context
+-  >  (default
+-  >   (name default)
+-  >   (solver_env
+-  >    (repositories new old \ new))))
+-  > EOF
+-
+-  $ rm -r dune-workspace-cache && mkdir dune-workspace-cache
+-  $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock
+-  Solution for dune.lock:
+-  foo.1.0
+-  
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-repository-download.t b/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
+index 7317136c7..7aef54ed5 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-repository-download.t
+@@ -79,19 +79,18 @@ Run Dune and tell it to cache into our custom cache folder.
+ Our custom cache folder should be populated with the unpacked tarball
+ containing the repository:
+ 
+-  $ find fake-xdg-cache | sort | sed s#unknown-[0-9a-f]*#unknown-\$HASH#
++  $ find fake-xdg-cache | sort
+   fake-xdg-cache
+   fake-xdg-cache/dune
+-  fake-xdg-cache/dune/opam-repositories
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/bar
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/bar/bar.0.0.1
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/bar/bar.0.0.1/opam
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/foo
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/foo/foo.0.0.1
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/packages/foo/foo.0.0.1/opam
+-  fake-xdg-cache/dune/opam-repositories/unknown-$HASH/repo
++  fake-xdg-cache/dune/opam-repository
++  fake-xdg-cache/dune/opam-repository/packages
++  fake-xdg-cache/dune/opam-repository/packages/bar
++  fake-xdg-cache/dune/opam-repository/packages/bar/bar.0.0.1
++  fake-xdg-cache/dune/opam-repository/packages/bar/bar.0.0.1/opam
++  fake-xdg-cache/dune/opam-repository/packages/foo
++  fake-xdg-cache/dune/opam-repository/packages/foo/foo.0.0.1
++  fake-xdg-cache/dune/opam-repository/packages/foo/foo.0.0.1/opam
++  fake-xdg-cache/dune/opam-repository/repo
+ 
+ Let's make sure this works with git repositories as well, by putting our repo in git.
+ 
+@@ -119,8 +118,7 @@ reproducible)
+ Now try it with an existing cached dir, which given it is not reproducible should not be included
+ 
+   $ rm -r dune.lock
+-  $ FOLDER=$(ls $(pwd)/fake-xdg-cache-with-git/dune/opam-repositories/)
+-  $ dune pkg lock --opam-repository-path=$(pwd)/fake-xdg-cache-with-git/dune/opam-repositories/$FOLDER
++  $ dune pkg lock --opam-repository-path=$(pwd)/fake-xdg-cache-with-git/dune/opam-repository
+   Solution for dune.lock:
+   bar.0.0.1
+   foo.0.0.1
+@@ -135,13 +133,13 @@ The repository can also be injected via the dune-workspace file
+   $ cat > dune-workspace <<EOF
+   > (lang dune 3.10)
+   > (repository
+-  >  (name foo)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
++  >   (name foo)
++  >   (source "git+file://$(pwd)/mock-opam-repository"))
+   > (context
+-  >  (default
+-  >   (name default)
+-  >   (solver_env
+-  >    (repositories foo))))
++  >   (default
++  >     (name default)
++  >     (solver_env
++  >       (repositories foo))))
+   > EOF
+   $ mkdir dune-workspace-cache
+   $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache dune pkg lock

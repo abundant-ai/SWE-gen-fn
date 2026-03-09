@@ -1,0 +1,94 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index cffccf82a..c6d24c6f2 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,8 +1,3 @@
+-3.9.3 (unreleased)
+-------------------
+-
+-- Fix flushing when using `sendfile` fallback (#8288, @alan-j-hu)
+-
+ 3.9.2 (2023-07-25)
+ ------------------
+ 
+diff --git a/otherlibs/stdune/src/io.ml b/otherlibs/stdune/src/io.ml
+index d183f1607..48cbc3e09 100644
+--- a/otherlibs/stdune/src/io.ml
++++ b/otherlibs/stdune/src/io.ml
+@@ -145,23 +145,17 @@ module Copyfile = struct
+       | Error `Src_missing ->
+         let message = Printf.sprintf "%s: No such file or directory" src in
+         raise (Sys_error message)
+-      | Ok (src, dst, src_size) -> (
+-        let close_fds () =
+-          Unix.close src;
+-          Unix.close dst
+-        in
+-        match sendfile ~src ~dst src_size with
+-        | exception Unix.Unix_error (EINVAL, "sendfile", _) ->
+-          let ic = Unix.in_channel_of_descr src in
+-          let oc = Unix.out_channel_of_descr dst in
+-          Exn.protect
+-            ~f:(fun () -> copy_channels ic oc)
+-            ~finally:(fun () ->
+-              (* we make sure to close the fd's with the channel api to make
+-                 sure everything has been flushed *)
+-              close_both (ic, oc))
+-        | () -> close_fds ()
+-        | exception _ -> close_fds ())
++      | Ok (src, dst, src_size) ->
++        Exn.protect
++          ~f:(fun () ->
++            try sendfile ~src ~dst src_size
++            with Unix.Unix_error (EINVAL, "sendfile", _) ->
++              let ic = Unix.in_channel_of_descr src in
++              let oc = Unix.out_channel_of_descr dst in
++              copy_channels ic oc)
++          ~finally:(fun () ->
++            Unix.close src;
++            Unix.close dst)
+ 
+   let copyfile ?chmod ~src ~dst () =
+     let src_stats =
+diff --git a/test/blackbox-tests/test-cases/dune b/test/blackbox-tests/test-cases/dune
+index 9e8e76c14..aea197992 100644
+--- a/test/blackbox-tests/test-cases/dune
++++ b/test/blackbox-tests/test-cases/dune
+@@ -136,4 +136,4 @@
+  (applies_to github8041)
+  (enabled_if
+   (= %{system} linux))
+- (deps %{bin:strace} %{bin:head}))
++ (deps %{bin:strace}))
+diff --git a/test/blackbox-tests/test-cases/github8041.t b/test/blackbox-tests/test-cases/github8041.t
+index bdb96119c..e26f450db 100644
+--- a/test/blackbox-tests/test-cases/github8041.t
++++ b/test/blackbox-tests/test-cases/github8041.t
+@@ -8,12 +8,11 @@
+   > (rule (copy data.txt data2.txt))
+   > 
+   > (install
+-  >  (files data.txt data2.txt data3.txt)
++  >  (files data.txt data2.txt)
+   >  (section share))
+   > EOF
+ 
+   $ echo contents > data.txt
+-  $ head -c 100000 /dev/zero > data3.txt
+ 
+ If sendfile fails, we should fallback to the portable implementation.
+ 
+@@ -21,13 +20,3 @@ If sendfile fails, we should fallback to the portable implementation.
+ 
+ #8210: data2.txt is copied from readonly-file data.txt (#3092), so it needs to
+ be adequately unlinked before starting the fallback.
+-
+-#8284: the buffer needs to be flushed, or there will be incomplete data in
+-larger files.
+-
+-  $ if cmp -s data3.txt _build/default/data3.txt ; then
+-  >   echo "File copied correctly"
+-  > else
+-  >   echo "File copied incorrectly"
+-  > fi
+-  File copied correctly

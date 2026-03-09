@@ -1,0 +1,135 @@
+diff --git a/doc/changes/9041.md b/doc/changes/9041.md
+deleted file mode 100644
+index b7692c032..000000000
+--- a/doc/changes/9041.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-- Rules that only use internal dune actions (`write-file`, `echo`, etc.) can
+-  now be sandboxed. (#9041, fixes #8854, @rgrinberg)
+diff --git a/src/dune_engine/action.ml b/src/dune_engine/action.ml
+index e083017ae..9d8a9ceff 100644
+--- a/src/dune_engine/action.ml
++++ b/src/dune_engine/action.ml
+@@ -319,6 +319,7 @@ let is_useful_to distribute memoize =
+     | false -> Clearly_not
+ ;;
+ 
++let is_useful_to_sandbox = is_useful_to false false
+ let is_useful_to_distribute = is_useful_to true false
+ let is_useful_to_memoize = is_useful_to true true
+ 
+diff --git a/src/dune_engine/action.mli b/src/dune_engine/action.mli
+index ce0653b30..03d721ed4 100644
+--- a/src/dune_engine/action.mli
++++ b/src/dune_engine/action.mli
+@@ -123,6 +123,14 @@ type is_useful =
+   | Clearly_not
+   | Maybe
+ 
++(** Whether it makes sense to run the action inside a sandbox because it could
++    have harmful side effects, to ensure it only consumes declared dependencies
++    and it does not produce undeclared targets.
++
++    Eg. it is maybe useful to sandbox an arbitrary shell command, but not a
++    directory creation. *)
++val is_useful_to_sandbox : t -> is_useful
++
+ (** Whether it makes sense to lookup the target in the distributed cache.
+ 
+     Eg. there is no point in trying to fetch the result of a local file copy
+diff --git a/src/dune_engine/build_system.ml b/src/dune_engine/build_system.ml
+index 344f49a4a..63d78607f 100644
+--- a/src/dune_engine/build_system.ml
++++ b/src/dune_engine/build_system.ml
+@@ -470,10 +470,22 @@ end = struct
+       let* () = Targets.maybe_async (fun () -> Path.mkdir_p (Path.build dir)) in
+       let is_action_dynamic = Action.is_dynamic action.action in
+       let sandbox_mode =
+-        select_sandbox_mode
+-          ~loc
+-          action.sandbox
+-          ~sandboxing_preference:config.sandboxing_preference
++        match Action.is_useful_to_sandbox action.action with
++        | Clearly_not ->
++          if Sandbox_config.mem action.sandbox Sandbox_mode.none
++          then Sandbox_mode.none
++          else
++            User_error.raise
++              ~loc
++              [ Pp.text
++                  "Rule dependencies are configured to require sandboxing, but the rule \
++                   has no actions that could potentially require sandboxing."
++              ]
++        | Maybe ->
++          select_sandbox_mode
++            ~loc
++            action.sandbox
++            ~sandboxing_preference:config.sandboxing_preference
+       in
+       (* CR-someday amokhov: More [always_rerun] and [can_go_in_shared_cache]
+          to [Rule_cache] too. *)
+diff --git a/test/blackbox-tests/test-cases/corrections.t b/test/blackbox-tests/test-cases/corrections.t
+index 5b005d3e9..454373357 100644
+--- a/test/blackbox-tests/test-cases/corrections.t
++++ b/test/blackbox-tests/test-cases/corrections.t
+@@ -103,7 +103,28 @@ One fix is to not look at it, and flag its existence as an error.
+   differ.
+   [1]
+ 
+-Sandboxing helps since dune will sandbox all actions:
++Sandboxing doesn't necessarily help either because dune thinks
++[diff?] is not worth sandboxing.
+ 
+   $ dune build text-file-corrected
+   $ dune build @correction1 --sandbox copy
++  File "text-file", line 1, characters 0-0:
++  Error: Files _build/default/text-file and _build/default/text-file-corrected
++  differ.
++  [1]
++
++Sandboxing does help if the command producing the
++correction is non-trivial.
++
++  $ cat > dune <<EOF
++  > (rule (alias correction1)
++  >   (deps)
++  >   (action
++  >     (progn
++  >       (bash "true")
++  >       (diff? text-file text-file-corrected)))
++  > )
++  > EOF
++
++  $ dune build @correction1 --sandbox copy
++
+diff --git a/test/blackbox-tests/test-cases/sandboxing.t b/test/blackbox-tests/test-cases/sandboxing.t
+index 18901deb6..f15f511f0 100644
+--- a/test/blackbox-tests/test-cases/sandboxing.t
++++ b/test/blackbox-tests/test-cases/sandboxing.t
+@@ -105,17 +105,18 @@ If rule fails to generate targets, we give a good error message, even with sandb
+   - t
+   [1]
+ 
+-If rule is configured to require sandboxing, but clearly needs none, we sandbox
+-anyway.
++If rule is configured to require sandboxing, but clearly needs none,
++we give an error message:
+ 
+   $ true > dune
+-  $ cat >dune <<EOF
+-  > (rule
+-  >  (target t)
+-  >  (deps (sandbox always))
+-  >  (action (write-file t "")))
+-  > EOF
++  $ echo '(rule (target t) (deps (sandbox always)) (action (echo "")))' >> dune
+   $ dune build t
++  File "dune", line 1, characters 0-60:
++  1 | (rule (target t) (deps (sandbox always)) (action (echo "")))
++      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++  Error: Rule dependencies are configured to require sandboxing, but the rule
++  has no actions that could potentially require sandboxing.
++  [1]
+ 
+ If an action [chdir]s to a non-existing directory, it is created.
+ 

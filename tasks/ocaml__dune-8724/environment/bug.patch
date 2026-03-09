@@ -1,0 +1,745 @@
+diff --git a/src/dune_lang/pform.ml b/src/dune_lang/pform.ml
+index e6e79c1cc..c1c543eb2 100644
+--- a/src/dune_lang/pform.ml
++++ b/src/dune_lang/pform.ml
+@@ -16,6 +16,7 @@ module Var = struct
+         | Doc
+         | Stublibs
+         | Man
++        | Misc
+ 
+       let all =
+         [ Lib, "lib"
+@@ -28,6 +29,7 @@ module Var = struct
+         ; Doc, "doc"
+         ; Stublibs, "stublibs"
+         ; Man, "man"
++        ; Misc, "misc"
+         ]
+       ;;
+ 
+diff --git a/src/dune_lang/pform.mli b/src/dune_lang/pform.mli
+index e801b9d10..fef69d96a 100644
+--- a/src/dune_lang/pform.mli
++++ b/src/dune_lang/pform.mli
+@@ -16,6 +16,7 @@ module Var : sig
+         | Doc
+         | Stublibs
+         | Man
++        | Misc
+ 
+       val of_string : string -> t option
+     end
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 45bd4862a..be4ec3b21 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -249,11 +249,7 @@ let filter_to_blang package filter =
+     let variable_string = OpamVariable.to_string variable in
+     match packages with
+     | [] ->
+-      let pform =
+-        Package_variable.pform_of_opam_ident
+-          ~package_name:(OpamPackage.to_string package)
+-          variable_string
+-      in
++      let pform = Package_variable.pform_of_opam_ident variable_string in
+       Blang.Expr (String_with_vars.make_pform Loc.none pform)
+     | packages ->
+       let blangs =
+@@ -354,10 +350,7 @@ let opam_commands_to_actions package (commands : OpamTypes.command list) =
+              when String.is_prefix ~prefix:"%{" interp
+                   && String.is_suffix ~suffix:"}%" interp ->
+              let ident = String.sub ~pos:2 ~len:(String.length interp - 4) interp in
+-             `Pform
+-               (Package_variable.pform_of_opam_ident
+-                  ~package_name:(OpamPackage.to_string package)
+-                  ident)
++             `Pform (Package_variable.pform_of_opam_ident ident)
+            | other ->
+              User_error.raise
+                [ Pp.textf
+@@ -379,9 +372,7 @@ let opam_commands_to_actions package (commands : OpamTypes.command list) =
+         | CIdent ident ->
+           String_with_vars.make_pform
+             Loc.none
+-            (Package_variable.pform_of_opam_ident
+-               ~package_name:(OpamPackage.to_string package)
+-               ident))
++            (Package_variable.pform_of_opam_ident ident))
+     in
+     match terms with
+     | program :: args ->
+diff --git a/src/dune_pkg/package_variable.ml b/src/dune_pkg/package_variable.ml
+index 6b68a1672..bab3e2cee 100644
+--- a/src/dune_pkg/package_variable.ml
++++ b/src/dune_pkg/package_variable.ml
+@@ -57,40 +57,26 @@ let to_macro_invocation { name; scope } =
+   | Package package_name ->
+     { Pform.Macro_invocation.macro = Pkg
+     ; payload =
+-        Pform.Payload.of_args [ Package_name.to_string package_name; Name.to_string name ]
++        Pform.Payload.of_args [ Name.to_string name; Package_name.to_string package_name ]
+     }
+ ;;
+ 
+ let to_pform t = Pform.Macro (to_macro_invocation t)
+ 
+-let package_variable package variable =
+-  match package, variable with
+-  | _, ("root" | "hash" | "build-id" | "misc" | "opam-version") ->
+-    `Unsupported_variable variable
+-  | "_", variable -> `Package_variable (self_scoped (Name.of_string variable))
+-  | package, variable ->
+-    `Package_variable
+-      (package_scoped (Name.of_string variable) (Package_name.of_string package))
+-;;
+-
+ let of_opam_ident ident =
+   match String.lsplit2 ident ~on:':' with
+-  | Some (package, variable) -> package_variable package variable
++  | Some ("_", variable) -> `Package_variable (self_scoped (Name.of_string variable))
++  | Some (package, variable) ->
++    `Package_variable
++      (package_scoped (Name.of_string variable) (Package_name.of_string package))
+   | None ->
+     (match Pform.Var.of_opam_global_variable_name ident with
+      | Some var -> `Global_variable var
+-     | None -> package_variable "_" ident)
++     | None -> `Package_variable (self_scoped (Name.of_string ident)))
+ ;;
+ 
+-let pform_of_opam_ident ~package_name ident =
++let pform_of_opam_ident ident =
+   match of_opam_ident ident with
+   | `Package_variable t -> to_pform t
+   | `Global_variable var -> Pform.Var var
+-  | `Unsupported_variable name ->
+-    User_error.raise
+-      [ Pp.textf
+-          "Variable %S occuring in opam package %S is not supported."
+-          name
+-          package_name
+-      ]
+ ;;
+diff --git a/src/dune_pkg/package_variable.mli b/src/dune_pkg/package_variable.mli
+index 4a1af67b9..10eccb815 100644
+--- a/src/dune_pkg/package_variable.mli
++++ b/src/dune_pkg/package_variable.mli
+@@ -30,16 +30,10 @@ val of_macro_invocation
+ 
+ val to_pform : t -> Pform.t
+ 
+-(** Parse an opam variable name.
+-
+-    Identifiers beginning with "<package>:" are treated as package-scoped variables unless
+-    <package> is "_" in which case they are treated as self-scoped.
+-
+-    Identifiers without the "<package>:" prefix are treated as self-scoped unless they are
+-    the name of an opam global variable.
+-
+-    Global variables are encoded as pform variables while all other variables are encoded
+-    as pform macros with the [Macro.Pkg] macro.
+-
+-    Raises a user error if the variable is unsupported. *)
+-val pform_of_opam_ident : package_name:string -> string -> Pform.t
++(** Parse an opam variable name. Identifiers beginning with "<package>:" are
++    treated as package-scoped variables unless <package> is "_" in which case
++    they are treated as self-scoped. Identifiers without the "<package>:"
++    prefix are treated as self-scoped unless they are the name of an opam
++    global variable. Global variables are encoded as pform variables while all
++    other variables are encoded as pform macros with the [Macro.Pkg] macro. *)
++val pform_of_opam_ident : string -> Pform.t
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 30b76c98a..13e97a29b 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -450,6 +450,7 @@ module Action_expander = struct
+       | Doc -> Doc
+       | Stublibs -> Stublibs
+       | Man -> Man
++      | Misc -> Misc
+     ;;
+ 
+     let section_dir_of_root
+@@ -467,6 +468,7 @@ module Action_expander = struct
+       | Man -> roots.man
+       | Toplevel -> Path.relative roots.lib_root "toplevel"
+       | Stublibs -> Path.relative roots.lib_root "stublibs"
++      | Misc -> assert false
+     ;;
+ 
+     let sys_poll_var accessor =
+diff --git a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+index 0a5fb969a..32c383b83 100644
+--- a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
++++ b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+@@ -145,7 +145,7 @@ Package which has boolean where string was expected. This should be caught while
+    (progn
+     (run echo %{pkg-self:local_var})
+     (run echo %{pkg-self:explicit_local_var})
+-    (run echo %{pkg:foo:package_var})
++    (run echo %{pkg:package_var:foo})
+     (run echo %{os_family})))
+ 
+   $ solve_project <<EOF
+@@ -210,7 +210,7 @@ Package which has boolean where string was expected. This should be caught while
+     (when
+      (and
+       %{pkg-self:with-test}
+-      (< %{pkg:ocaml:version} 5.0.0))
++      (< %{pkg:version:ocaml} 5.0.0))
+      (run echo h))
+     (when
+      true
+@@ -219,13 +219,13 @@ Package which has boolean where string was expected. This should be caught while
+      (not false)
+      (run echo j))
+     (when
+-     %{pkg:foo:installed}
++     %{pkg:installed:foo}
+      (run echo k))
+     (when
+-     (< %{pkg:foo:version} 0.4)
++     (< %{pkg:version:foo} 0.4)
+      (run echo l))
+     (when
+-     (and %{pkg:foo:installed} %{pkg:bar:installed} %{pkg:baz:installed})
++     (and %{pkg:installed:foo} %{pkg:installed:bar} %{pkg:installed:baz})
+      (run echo m))))
+ 
+   $ solve_project <<EOF
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/dune b/test/blackbox-tests/test-cases/pkg/opam-var/dune
+deleted file mode 100644
+index 4378a41ce..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/dune
++++ /dev/null
+@@ -1,25 +0,0 @@
+-(cram
+- (deps opam-var-helpers.sh)
+- (applies_to :whole_subtree))
+-
+-(cram
+- (deps opam-vars)
+- (applies_to opam-var-os))
+-
+-(data_only_dirs fake_opam_root)
+-
+-; We trick opam into thinking it has a config file with fake_opam_root so that we can
+-; access the os variables without having to do opam init
+-
+-(rule
+- (target opam-vars)
+- (deps fake_opam_root/config)
+- (action
+-  (with-stdout-to
+-   %{target}
+-   (progn
+-    (run %{bin:opam} var --root fake_opam_root arch)
+-    (run %{bin:opam} var --root fake_opam_root os)
+-    (run %{bin:opam} var --root fake_opam_root os-distribution)
+-    (run %{bin:opam} var --root fake_opam_root os-family)
+-    (run %{bin:opam} var --root fake_opam_root os-version)))))
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/fake_opam_root/config b/test/blackbox-tests/test-cases/pkg/opam-var/fake_opam_root/config
+deleted file mode 100644
+index d26f3f6e1..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/fake_opam_root/config
++++ /dev/null
+@@ -1 +0,0 @@
+-opam-version: "2.0"
+\ No newline at end of file
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-global.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-global.t
+deleted file mode 100644
+index 4375e52b9..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-global.t
++++ /dev/null
+@@ -1,56 +0,0 @@
+-  $ . ./opam-var-helpers.sh
+-
+-Here we test the translation and implementation of global opam variables. OS specific
+-variables can be found in `opam-var-os.t`.
+-
+-  $ mkrepo
+-  > mkpkg testpkg << EOF
+-  > opam-version: "2.0"
+-  > build: [
+-  >   [ "echo" jobs ]
+-  >   [ "echo" make ]
+-  >   [ "echo" user ] 
+-  >   [ "echo" group ]
+-  > ]
+-  > EOF
+-  > solve testpkg
+-  Solution for dune.lock:
+-  testpkg.0.0.1
+-  
+-  $ cat dune.lock/testpkg.pkg
+-  (version 0.0.1)
+-  
+-  (build
+-   (progn
+-    (run echo %{jobs})
+-    (run echo %{make})
+-    (run echo %{user})
+-    (run echo %{group})))
+-
+-The implementation of %{user} uses Unix.getlogin which doesn't work in our Linux CI job.
+-Therefore we modify the lockfile here to remove that from the opam file:
+-
+-  $ mkpkg testpkg << EOF
+-  > opam-version: "2.0"
+-  > build: [
+-  >   [ "echo" jobs ]
+-  >   [ "echo" make ]
+-  >   [ "echo" group ]
+-  > ]
+-  > EOF
+-  > solve testpkg
+-  Solution for dune.lock:
+-  testpkg.0.0.1
+-  
+-If this is fixed, we should use $(whoami) to compare the output.
+-
+-The value for "jobs" should always be 1.
+-
+-  $ MAKE="$(which make)"
+-  > GROUP="$(id -gn)"
+-  > build_pkg testpkg 2>&1 \
+-  > | sed "s/$GROUP/GROUP/g" | sed "s#$MAKE#MAKE#g"
+-  File "dune.lock/testpkg.pkg", line 5, characters 12-19:
+-  5 |   (run echo %{jobs})
+-                  ^^^^^^^
+-  Error: Unknown variable %{jobs}
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-helpers.sh b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-helpers.sh
+deleted file mode 100644
+index db00bdaf3..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-helpers.sh
++++ /dev/null
+@@ -1,12 +0,0 @@
+-
+-. ../helpers.sh
+-
+-solve() {
+-  solve_project <<EOF
+-(lang dune 3.11)
+- (package
+-  (name x)
+-  (allow_empty)
+-  (depends $@))
+-EOF
+-}
+\ No newline at end of file
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-os.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-os.t
+deleted file mode 100644
+index fd615322b..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-os.t
++++ /dev/null
+@@ -1,45 +0,0 @@
+-  $ . ./opam-var-helpers.sh
+-
+-Here we test global opam variables that are system specific. Since these values change
+-between systems, we can't hardcode them in the test. Instead, we use the opam var command
+-to compare their values.
+-
+-# arch os os-distribution os-family os-version user group
+-
+-
+-  $ mkrepo
+-  > mkpkg testpkg <<EOF
+-  > opam-version: "2.0"
+-  > build: [
+-  >   ["echo" arch]
+-  >   ["echo" os]
+-  >   ["echo" os-distribution]
+-  >   ["echo" os-family]
+-  >   ["echo" os-version]
+-  > ]
+-  > EOF
+-  > solve testpkg
+-  Solution for dune.lock:
+-  testpkg.0.0.1
+-  
+-  $ cat dune.lock/testpkg.pkg 
+-  (version 0.0.1)
+-  
+-  (build
+-   (progn
+-    (run echo %{arch})
+-    (run echo %{pkg-self:os})
+-    (run echo %{os_distribution})
+-    (run echo %{os_family})
+-    (run echo %{os_version})))
+-
+-We write all the dune values to a file and then diff them with the output of opam var.
+-
+-  $ build_pkg testpkg 2> dune-vars
+-  [1]
+-
+-The two files should be identical.
+-
+-  $ diff -q --label="opam-vars"  opam-vars --label="dune-vars" dune-vars 
+-  Files opam-vars and dune-vars differ
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-pkg.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-pkg.t
+deleted file mode 100644
+index a79055a52..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-pkg.t
++++ /dev/null
+@@ -1,236 +0,0 @@
+-  $ . ./opam-var-helpers.sh
+-
+-Here we test the translation and implementation of opam package variables.
+-
+-We echo each package variable. 
+-
+-  $ mkrepo
+-  > mkpkg "testpkg" <<'EOF' 
+-  > opam-version: "2.0"
+-  > depends: [ "foo" ]
+-  > build: [
+-  >   [ "echo" "1"     name ]
+-  >   [ "echo" "2"   _:name ]
+-  >   [ "echo" "3" foo:name ]
+-  >   [ "echo" "4"     version ]
+-  >   [ "echo" "5"   _:version ]
+-  >   [ "echo" "6" foo:version ]
+-  >   [ "echo" "7"   _:depends ]
+-  >   [ "echo" "8" foo:depends ]
+-  >   [ "echo" "9"    _:installed ]
+-  >   [ "echo" "10" foo:installed ]
+-  >   [ "echo" "11"   _:enable ]
+-  >   [ "echo" "12" foo:enable ]
+-  >   [ "echo" "13"   _:pinned ]
+-  >   [ "echo" "14" foo:pinned ]
+-  >   [ "echo" "15"   _:bin ]
+-  >   [ "echo" "16" foo:bin ]
+-  >   [ "echo" "17"   _:sbin ]
+-  >   [ "echo" "18" foo:sbin ]
+-  >   [ "echo" "19"   _:lib ]
+-  >   [ "echo" "20" foo:lib ]
+-  >   [ "echo" "21"   _:man ]
+-  >   [ "echo" "22" foo:man ]
+-  >   [ "echo" "23"   _:doc ]
+-  >   [ "echo" "24" foo:doc ]
+-  >   [ "echo" "25"   _:share ]
+-  >   [ "echo" "26" foo:share ]
+-  >   [ "echo" "27"   _:etc ]
+-  >   [ "echo" "28" foo:etc ]
+-  >   [ "echo" "29"   _:build ]
+-  >   [ "echo" "30" foo:build ]
+-  >   [ "echo" "31"   _:dev ]
+-  >   [ "echo" "32" foo:dev ]
+-  >   [ "echo" "33"   _:opamfile ]
+-  >   [ "echo" "34" foo:opamfile ]
+-  >   [ "echo" "35"     with-test ]
+-  >   [ "echo" "36"   _:with-test ]
+-  >   [ "echo" "37" foo:with-test ]
+-  >   [ "echo" "38"     with-doc ]
+-  >   [ "echo" "39"   _:with-doc ]
+-  >   [ "echo" "40" foo:with-doc ]
+-  >   [ "echo" "41"   _:with-dev-setup ]
+-  >   [ "echo" "42" foo:with-dev-setup ]
+-  > ]
+-  > EOF
+-  > mkpkg "foo" <<EOF
+-  > opam-version: "2.0"
+-  > EOF
+-  > solve testpkg
+-  Solution for dune.lock:
+-  foo.0.0.1
+-  testpkg.0.0.1
+-  
+-Inspecting the lockfile we can see how each opam package variable was translated into a
+-corresponding Dune version.
+-
+-  $ cat dune.lock/testpkg.pkg
+-  (version 0.0.1)
+-  
+-  (build
+-   (progn
+-    (run echo 1 %{pkg-self:name})
+-    (run echo 2 %{pkg-self:name})
+-    (run echo 3 %{pkg:foo:name})
+-    (run echo 4 %{pkg-self:version})
+-    (run echo 5 %{pkg-self:version})
+-    (run echo 6 %{pkg:foo:version})
+-    (run echo 7 %{pkg-self:depends})
+-    (run echo 8 %{pkg:foo:depends})
+-    (run echo 9 %{pkg-self:installed})
+-    (run echo 10 %{pkg:foo:installed})
+-    (run echo 11 %{pkg-self:enable})
+-    (run echo 12 %{pkg:foo:enable})
+-    (run echo 13 %{pkg-self:pinned})
+-    (run echo 14 %{pkg:foo:pinned})
+-    (run echo 15 %{pkg-self:bin})
+-    (run echo 16 %{pkg:foo:bin})
+-    (run echo 17 %{pkg-self:sbin})
+-    (run echo 18 %{pkg:foo:sbin})
+-    (run echo 19 %{pkg-self:lib})
+-    (run echo 20 %{pkg:foo:lib})
+-    (run echo 21 %{pkg-self:man})
+-    (run echo 22 %{pkg:foo:man})
+-    (run echo 23 %{pkg-self:doc})
+-    (run echo 24 %{pkg:foo:doc})
+-    (run echo 25 %{pkg-self:share})
+-    (run echo 26 %{pkg:foo:share})
+-    (run echo 27 %{pkg-self:etc})
+-    (run echo 28 %{pkg:foo:etc})
+-    (run echo 29 %{pkg-self:build})
+-    (run echo 30 %{pkg:foo:build})
+-    (run echo 31 %{pkg-self:dev})
+-    (run echo 32 %{pkg:foo:dev})
+-    (run echo 33 %{pkg-self:opamfile})
+-    (run echo 34 %{pkg:foo:opamfile})
+-    (run echo 35 %{pkg-self:with-test})
+-    (run echo 36 %{pkg-self:with-test})
+-    (run echo 37 %{pkg:foo:with-test})
+-    (run echo 38 %{pkg-self:with-doc})
+-    (run echo 39 %{pkg-self:with-doc})
+-    (run echo 40 %{pkg:foo:with-doc})
+-    (run echo 41 %{pkg-self:with-dev-setup})
+-    (run echo 42 %{pkg:foo:with-dev-setup})))
+-  
+-  (deps foo)
+-
+-The values here are not important, but Dune should be able to interpret the variables.
+-
+-  $ build_pkg testpkg
+-  File "dune.lock/testpkg.pkg", line 5, characters 14-30:
+-  5 |   (run echo 1 %{pkg-self:name})
+-                    ^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 6, characters 14-30:
+-  6 |   (run echo 2 %{pkg-self:name})
+-                    ^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 8, characters 14-33:
+-  8 |   (run echo 4 %{pkg-self:version})
+-                    ^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 9, characters 14-33:
+-  9 |   (run echo 5 %{pkg-self:version})
+-                    ^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 11, characters 14-33:
+-  11 |   (run echo 7 %{pkg-self:depends})
+-                     ^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 12, characters 14-32:
+-  12 |   (run echo 8 %{pkg:foo:depends})
+-                     ^^^^^^^^^^^^^^^^^^
+-  Error: invalid section "depends"
+-  File "dune.lock/testpkg.pkg", line 13, characters 14-35:
+-  13 |   (run echo 9 %{pkg-self:installed})
+-                     ^^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 15, characters 15-33:
+-  15 |   (run echo 11 %{pkg-self:enable})
+-                      ^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 17, characters 15-33:
+-  17 |   (run echo 13 %{pkg-self:pinned})
+-                      ^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 19, characters 15-30:
+-  19 |   (run echo 15 %{pkg-self:bin})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 21, characters 15-31:
+-  21 |   (run echo 17 %{pkg-self:sbin})
+-                      ^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 23, characters 15-30:
+-  23 |   (run echo 19 %{pkg-self:lib})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 25, characters 15-30:
+-  25 |   (run echo 21 %{pkg-self:man})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 27, characters 15-30:
+-  27 |   (run echo 23 %{pkg-self:doc})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 29, characters 15-32:
+-  29 |   (run echo 25 %{pkg-self:share})
+-                      ^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 31, characters 15-30:
+-  31 |   (run echo 27 %{pkg-self:etc})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 33, characters 15-32:
+-  33 |   (run echo 29 %{pkg-self:build})
+-                      ^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 34, characters 15-31:
+-  34 |   (run echo 30 %{pkg:foo:build})
+-                      ^^^^^^^^^^^^^^^^
+-  Error: invalid section "build"
+-  File "dune.lock/testpkg.pkg", line 35, characters 15-30:
+-  35 |   (run echo 31 %{pkg-self:dev})
+-                      ^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 37, characters 15-35:
+-  37 |   (run echo 33 %{pkg-self:opamfile})
+-                      ^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 38, characters 15-34:
+-  38 |   (run echo 34 %{pkg:foo:opamfile})
+-                      ^^^^^^^^^^^^^^^^^^^
+-  Error: invalid section "opamfile"
+-  File "dune.lock/testpkg.pkg", line 39, characters 15-36:
+-  39 |   (run echo 35 %{pkg-self:with-test})
+-                      ^^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 40, characters 15-36:
+-  40 |   (run echo 36 %{pkg-self:with-test})
+-                      ^^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 41, characters 15-35:
+-  41 |   (run echo 37 %{pkg:foo:with-test})
+-                      ^^^^^^^^^^^^^^^^^^^^
+-  Error: invalid section "with-test"
+-  File "dune.lock/testpkg.pkg", line 42, characters 15-35:
+-  42 |   (run echo 38 %{pkg-self:with-doc})
+-                      ^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 43, characters 15-35:
+-  43 |   (run echo 39 %{pkg-self:with-doc})
+-                      ^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 44, characters 15-34:
+-  44 |   (run echo 40 %{pkg:foo:with-doc})
+-                      ^^^^^^^^^^^^^^^^^^^
+-  Error: invalid section "with-doc"
+-  File "dune.lock/testpkg.pkg", line 45, characters 15-41:
+-  45 |   (run echo 41 %{pkg-self:with-dev-setup})
+-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+-  Error: Unknown macro %{pkg-self:..}
+-  File "dune.lock/testpkg.pkg", line 46, characters 15-40:
+-  46 |   (run echo 42 %{pkg:foo:with-dev-setup})))
+-                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+-  Error: invalid section "with-dev-setup"
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t
+deleted file mode 100644
+index 1ab632e04..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-switch.t
++++ /dev/null
+@@ -1,65 +0,0 @@
+-  $ . ./opam-var-helpers.sh
+-
+-These opam variables are known as "switch variables" in opam, but since in Dune we don't
+-have switches, we consider them glboal variables. To keep inline with opam we consider
+-there to be a single switch named "dune" and all the installation locations should be in
+-the package building directories.
+-
+-Note that misc is not supported in dune and a test for it can be found in
+-opam-var-unsupported.t
+-  $ mkrepo
+-  $ mkpkg testpkg <<EOF
+-  > opam-version: "2.0"
+-  > build: [
+-  >   [ "echo" switch ]
+-  >   [ "echo" build ]
+-  >   [ "echo" prefix ]
+-  >   [ "echo" lib ]
+-  >   [ "echo" libexec ]
+-  >   [ "echo" bin ]
+-  >   [ "echo" sbin ]
+-  >   [ "echo" share ]
+-  >   [ "echo" doc ]
+-  >   [ "echo" etc ]
+-  >   [ "echo" man ]
+-  >   [ "echo" toplevel ]
+-  >   [ "echo" stublibs ]
+-  > ]
+-  > EOF
+-  > solve testpkg
+-  Solution for dune.lock:
+-  testpkg.0.0.1
+-  
+-  $ cat dune.lock/testpkg.pkg
+-  (version 0.0.1)
+-  
+-  (build
+-   (progn
+-    (run echo %{switch})
+-    (run echo %{build})
+-    (run echo %{prefix})
+-    (run echo %{lib})
+-    (run echo %{libexec})
+-    (run echo %{bin})
+-    (run echo %{sbin})
+-    (run echo %{share})
+-    (run echo %{doc})
+-    (run echo %{etc})
+-    (run echo %{man})
+-    (run echo %{toplevel})
+-    (run echo %{stublibs})))
+-
+-  $ build_pkg testpkg
+-  dune
+-  .
+-  ../target
+-  ../target/lib
+-  ../target/lib
+-  ../target/bin
+-  ../target/sbin
+-  ../target/share
+-  ../target/doc
+-  ../target/etc
+-  ../target/man
+-  ../target/lib/toplevel
+-  ../target/lib/stublibs
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t
+deleted file mode 100644
+index f432ba54e..000000000
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t
++++ /dev/null
+@@ -1,44 +0,0 @@
+-  $ . ./opam-var-helpers.sh
+-
+-  $ mkrepo
+-  > fail_solve() {
+-  >   mkpkg testpkg <<EOF
+-  > opam-version: "2.0"
+-  > build: [ "echo" $1 ]
+-  > EOF
+-  >   solve_output=$(solve testpkg 2>&1)
+-  >   if [ $? -eq 0 ]; then
+-  >     echo "Expected solve to fail, but it succeeded" >&2
+-  >   else
+-  >     echo "$solve_output" >&2
+-  >   fi
+-  > }
+-
+-opam variables that are explicitly unsupported in dune
+-
+-These should all have nice error messages explaining that they are not supported.
+-
+-# opam-version
+-  $ fail_solve opam-version
+-  Error: Variable "opam-version" occuring in opam package "testpkg.0.0.1" is
+-  not supported.
+-# root
+-  $ fail_solve root 
+-  Error: Variable "root" occuring in opam package "testpkg.0.0.1" is not
+-  supported.
+-# _:hash
+-  $ fail_solve _:hash
+-  Error: Variable "hash" occuring in opam package "testpkg.0.0.1" is not
+-  supported.
+-# _:build-id
+-  $ fail_solve _:build-id
+-  Error: Variable "build-id" occuring in opam package "testpkg.0.0.1" is not
+-  supported.
+-# misc
+-  $ fail_solve misc
+-  Error: Variable "misc" occuring in opam package "testpkg.0.0.1" is not
+-  supported.
+-# _:misc
+-  $ fail_solve _:misc
+-  Error: Variable "misc" occuring in opam package "testpkg.0.0.1" is not
+-  supported.

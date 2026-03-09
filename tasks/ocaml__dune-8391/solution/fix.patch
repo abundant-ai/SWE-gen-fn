@@ -1,0 +1,205 @@
+diff --git a/src/dune_lang/string_with_vars.ml b/src/dune_lang/string_with_vars.ml
+index ff38195ea..322bc5763 100644
+--- a/src/dune_lang/string_with_vars.ml
++++ b/src/dune_lang/string_with_vars.ml
+@@ -47,13 +47,27 @@ let compare_no_loc { quoted; parts; loc = _ } t =
+ let equal_no_loc t1 t2 = Ordering.is_eq (compare_no_loc t1 t2)
+ let make_text ?(quoted = false) loc s = { quoted; loc; parts = [ Text s ] }
+ 
+-let make_pform ?(quoted = false) loc pform =
++let part_of_pform loc pform =
+   let source =
+     match Pform.encode_to_latest_dune_lang_version pform with
+     | Success { name; payload } -> { Template.Pform.loc; name; payload }
+     | Pform_was_deleted -> assert false
+   in
+-  { quoted; loc; parts = [ Pform (source, pform) ] }
++  Pform (source, pform)
++;;
++
++let make_pform ?(quoted = false) loc pform =
++  let part = part_of_pform loc pform in
++  { quoted; loc; parts = [ part ] }
++;;
++
++let make ?(quoted = false) loc parts =
++  let parts =
++    List.map parts ~f:(function
++      | `Text s -> Text s
++      | `Pform p -> part_of_pform loc p)
++  in
++  { quoted; loc; parts }
+ ;;
+ 
+ let literal ~quoted ~loc s = { parts = [ Text s ]; quoted; loc }
+diff --git a/src/dune_lang/string_with_vars.mli b/src/dune_lang/string_with_vars.mli
+index 6ec98c067..65837e04b 100644
+--- a/src/dune_lang/string_with_vars.mli
++++ b/src/dune_lang/string_with_vars.mli
+@@ -39,6 +39,10 @@ val virt_pform : ?quoted:bool -> string * int * int * int -> Pform.t -> t
+ val virt_text : string * int * int * int -> string -> t
+ val make_pform : ?quoted:bool -> Loc.t -> Pform.t -> t
+ val make_text : ?quoted:bool -> Loc.t -> string -> t
++
++(** Concatenate a list of parts. *)
++val make : ?quoted:bool -> Loc.t -> [ `Text of string | `Pform of Pform.t ] list -> t
++
+ val is_pform : t -> Pform.t -> bool
+ val has_pforms : t -> bool
+ 
+diff --git a/src/dune_pkg/dune b/src/dune_pkg/dune
+index 46ebccb2d..81be2f8ee 100644
+--- a/src/dune_pkg/dune
++++ b/src/dune_pkg/dune
+@@ -10,6 +10,7 @@
+   dune_stats
+   dune_lang
+   dune_console
++  dune_re
+   opam_core
+   opam_repository
+   opam_format
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index cde4d0159..a0cab72d1 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -230,7 +230,15 @@ module Summary = struct
+   ;;
+ end
+ 
+-let opam_commands_to_actions (commands : OpamTypes.command list) =
++let opam_command_to_string_debug (args, _filter_opt) =
++  List.map args ~f:(fun (simple_arg, _filter_opt) ->
++    match simple_arg with
++    | OpamTypes.CString s -> String.quoted s
++    | CIdent ident -> ident)
++  |> String.concat ~sep:" "
++;;
++
++let opam_commands_to_actions package (commands : OpamTypes.command list) =
+   let pform_of_ident ident =
+     let scope, variable =
+       match String.lsplit2 ident ~on:':' with
+@@ -251,13 +259,37 @@ let opam_commands_to_actions (commands : OpamTypes.command list) =
+        | None ->
+          Pform.(Macro { macro = Pkg; payload = Payload.of_args [ "var"; "_"; variable ] }))
+   in
+-  List.filter_map commands ~f:(fun (args, _filter_opt) ->
++  List.filter_map commands ~f:(fun ((args, _filter_opt) as command) ->
++    let interpolate_opam_variables s =
++      Dune_re.Seq.split_full OpamFilter.string_interp_regex s
++      |> Seq.map ~f:(function
++        | `Text text -> `Text text
++        | `Delim group ->
++          (match Dune_re.Group.get group 0 with
++           | "%%" -> `Text "%"
++           | interp
++             when String.is_prefix ~prefix:"%{" interp
++                  && String.is_suffix ~suffix:"}%" interp ->
++             let ident = String.sub ~pos:2 ~len:(String.length interp - 4) interp in
++             `Pform (pform_of_ident ident)
++           | other ->
++             User_error.raise
++               [ Pp.textf
++                   "Encountered malformed variable interpolation while processing \
++                    commands for package %s."
++                   (OpamPackage.to_string package)
++               ; Pp.text "The variable interpolation:"
++               ; Pp.text other
++               ; Pp.text "The full command:"
++               ; Pp.text (opam_command_to_string_debug command)
++               ]))
++      |> List.of_seq
++      |> String_with_vars.make Loc.none
++    in
+     let terms =
+       List.map args ~f:(fun (simple_arg, _filter_opt) ->
+         match simple_arg with
+-        | OpamTypes.CString s ->
+-          (* TODO: apply replace string interpolation variables with pforms *)
+-          String_with_vars.make_text Loc.none s
++        | OpamTypes.CString s -> interpolate_opam_variables s
+         | CIdent ident -> String_with_vars.make_pform Loc.none (pform_of_ident ident))
+     in
+     match terms with
+@@ -269,8 +301,8 @@ let opam_commands_to_actions (commands : OpamTypes.command list) =
+    [None] if the command list is empty
+    [Some (Action.Run ...)] if there is a single command
+    [Some (Action.Progn [Action.Run ...; ...])] if there are multiple commands *)
+-let opam_commands_to_action (commands : OpamTypes.command list) =
+-  match opam_commands_to_actions commands with
++let opam_commands_to_action package (commands : OpamTypes.command list) =
++  match opam_commands_to_actions package commands with
+   | [] -> None
+   | [ action ] -> Some action
+   | actions -> Some (Action.Progn actions)
+@@ -302,8 +334,12 @@ let opam_package_to_lock_file_pkg ~repo ~local_packages opam_package =
+     |> List.map ~f:(fun name ->
+       Loc.none, Package_name.of_string (OpamPackage.Name.to_string name))
+   in
+-  let build_command = opam_commands_to_action (OpamFile.OPAM.build opam_file) in
+-  let install_command = opam_commands_to_action (OpamFile.OPAM.install opam_file) in
++  let build_command =
++    opam_commands_to_action opam_package (OpamFile.OPAM.build opam_file)
++  in
++  let install_command =
++    opam_commands_to_action opam_package (OpamFile.OPAM.install opam_file)
++  in
+   { Lock_dir.Pkg.build_command; install_command; deps; info; exported_env = [] }
+ ;;
+ 
+diff --git a/vendor/opam/src/format/opamFilter.mli b/vendor/opam/src/format/opamFilter.mli
+index 51d83ef1f..1787b24b1 100644
+--- a/vendor/opam/src/format/opamFilter.mli
++++ b/vendor/opam/src/format/opamFilter.mli
+@@ -8,6 +8,7 @@
+ (*  exception on linking described in the file LICENSE.                   *)
+ (*                                                                        *)
+ (**************************************************************************)
++module Re = Dune_re
+ 
+ (** Formulas on variables, as used in opam files build scripts
+ 
+@@ -50,6 +51,10 @@ val fold_down_left: ('a -> filter -> 'a) -> 'a -> filter -> 'a
+ (** Maps on all nodes of a filter, bottom-up *)
+ val map_up: (filter -> filter) -> filter -> filter
+ 
++(** Regex matching string interpolation syntax (["%%"], ["%{xxx}%"], or
++    ["%{xxx"] if unclosed) *)
++val string_interp_regex : Re.re
++
+ (** Returns all the variables appearing in a filter (including the ones within
+     string interpolations *)
+ val variables: filter -> full_variable list
+diff --git a/vendor/update-opam.sh b/vendor/update-opam.sh
+index 8588f3d3f..592b69e6d 100755
+--- a/vendor/update-opam.sh
++++ b/vendor/update-opam.sh
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ 
+-version=7d5c4217c11c18f1405d58702409ed7290668135
++version=d3c96a02c4747b2ae4c8648a1f15d13c0efde832
+ 
+ set -e -o pipefail
+ 
+@@ -173,6 +173,19 @@ index 2857654a9..53f11d870 100644
+  let log fmt = OpamConsole.log "XSYS" fmt
+  
+  (* Run commands *)
++
++diff --git a/vendor/opam/src/format/opamFilter.mli b/vendor/opam/src/format/opamFilter.mli
++index a2f01d179..1787b24b1 100644
++--- a/vendor/opam/src/format/opamFilter.mli
+++++ b/vendor/opam/src/format/opamFilter.mli
++@@ -8,6 +8,7 @@
++ (*  exception on linking described in the file LICENSE.                   *)
++ (*                                                                        *)
++ (**************************************************************************)
+++module Re = Dune_re
++
++ (** Formulas on variables, as used in opam files build scripts
++
+ EOF
+ 
+ for subpackage in core repository format state

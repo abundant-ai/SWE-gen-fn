@@ -1,0 +1,509 @@
+diff --git a/doc/changes/8350.md b/doc/changes/8350.md
+new file mode 100644
+index 000000000..afed7fb49
+--- /dev/null
++++ b/doc/changes/8350.md
+@@ -0,0 +1,2 @@
++- Deprecate install destination paths beginning with ".." to prevent packages
++  escaping their designated installation directories. (#8350, @gridbugs)
+diff --git a/doc/stanzas/install.rst b/doc/stanzas/install.rst
+index 9e82381bc..0d8842593 100644
+--- a/doc/stanzas/install.rst
++++ b/doc/stanzas/install.rst
+@@ -106,6 +106,16 @@ installed with mode ``0o644`` (``rw-r--r--``).
+ Note that all files in the install stanza must be specified by relative paths
+ only. It is an error to specify files by absolute paths.
+ 
++Also note that as of dune-lang 3.11 (ie. ``(lang dune 3.11)`` in
++``dune-project``) it is deprecated to use the ``as`` keyword to specify a
++destination beginning with ``..``. Dune intends for files associated with a
++package to only be installed under specific directories in the file system
++implied by the installation section (e.g. ``share``, ``bin``, ``doc``, etc.)
++and the package name. Starting destination paths with ``..`` allows packages to
++install files to arbitrary locations on the file system. In 3.11 this behaviour
++is still supported (as some projects may depend on it) but will generate a
++warning and will be removed in a future version of Dune.
++
+ Including Files in the Install Stanza
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/src/dune_rules/dune_file.ml b/src/dune_rules/dune_file.ml
+index 4b6b9b82c..b58946b3c 100644
+--- a/src/dune_rules/dune_file.ml
++++ b/src/dune_rules/dune_file.ml
+@@ -1179,6 +1179,7 @@ module Executables = struct
+     type t =
+       { names : (Loc.t * string) list
+       ; public : public option
++      ; dune_syntax : Syntax.Version.t
+       }
+ 
+     let names t = t.names
+@@ -1319,7 +1320,7 @@ module Executables = struct
+                 (pluralize "public_name" ~multi)
+             ]
+       in
+-      { names; public }
++      { names; public; dune_syntax }
+     ;;
+ 
+     let install_conf t ~ext ~enabled_if =
+@@ -1328,7 +1329,10 @@ module Executables = struct
+           List.map2 t.names public_names ~f:(fun (locn, name) (locp, pub) ->
+             Option.map pub ~f:(fun pub ->
+               Install_entry.File.of_file_binding
+-                (File_binding.Unexpanded.make ~src:(locn, name ^ ext) ~dst:(locp, pub))))
++                (File_binding.Unexpanded.make
++                   ~src:(locn, name ^ ext)
++                   ~dst:(locp, pub)
++                   ~dune_syntax:t.dune_syntax)))
+           |> List.filter_opt
+         in
+         { Install_conf.section = Section Bin
+diff --git a/src/dune_rules/file_binding.ml b/src/dune_rules/file_binding.ml
+index e690f5464..8e193d1c9 100644
+--- a/src/dune_rules/file_binding.ml
++++ b/src/dune_rules/file_binding.ml
+@@ -4,18 +4,69 @@ open Memo.O
+ type ('src, 'dst) t =
+   { src : 'src
+   ; dst : 'dst option
++      (* The [dune_syntax] field is used for validation which has different
++         behaviour depending on the version of dune syntax in use. *)
++  ; dune_syntax : Syntax.Version.t
+   }
+ 
+-let equal f g { src; dst } t = f src t.src && Option.equal g dst t.dst
++let equal f g { src; dst; dune_syntax } t =
++  f src t.src
++  && Option.equal g dst t.dst
++  && Syntax.Version.equal dune_syntax t.dune_syntax
++;;
++
++let relative_path_starts_with_parent relative_path =
++  match String.lsplit2 relative_path ~on:'/' with
++  | None -> Filename.(equal relative_path parent_dir_name)
++  | Some (first, _) -> String.equal first Filename.parent_dir_name
++;;
++
++let validate_dst_for_install_stanza
++  ~relative_dst_path_starts_with_parent_error_when
++  ~loc
++  dst
++  dune_syntax
++  =
++  if relative_path_starts_with_parent dst
++  then (
++    match relative_dst_path_starts_with_parent_error_when with
++    | `Deprecation_warning_from_3_11 ->
++      let open Syntax.Version.Infix in
++      if dune_syntax >= (3, 11)
++      then
++        User_warning.emit
++          ~loc
++          [ Pp.textf
++              "The destination path %s begins with %s which will become an error in a \
++               future version of Dune. Destinations of files in install stanzas \
++               beginning with %s will be disallowed to prevent a package's installed \
++               files from escaping that package's install directories."
++              (String.maybe_quoted dst)
++              (String.maybe_quoted Filename.parent_dir_name)
++              (String.maybe_quoted Filename.parent_dir_name)
++          ]
++    | `Always_error ->
++      User_error.raise
++        ~loc
++        [ Pp.textf
++            "The destination path %s begins with %s which is not allowed. Destinations \
++             in install stanzas may not begin with %s to prevent a package's installed \
++             files from escaping that package's install directories."
++            (String.maybe_quoted dst)
++            (String.maybe_quoted Filename.parent_dir_name)
++            (String.maybe_quoted Filename.parent_dir_name)
++        ])
++;;
+ 
+ module Expanded = struct
+   type nonrec t = (Loc.t * Path.Build.t, Loc.t * string) t
+ 
+-  let to_dyn { src; dst } =
++  let to_dyn { src; dst; dune_syntax } =
+     let open Dyn in
+     record
+       [ "src", pair Loc.to_dyn Path.Build.to_dyn src
+       ; "dst", option (pair Loc.to_dyn string) dst
++      ; "dune_syntax", Syntax.Version.to_dyn dune_syntax
+       ]
+   ;;
+ 
+@@ -23,7 +74,7 @@ module Expanded = struct
+   let dst t = Option.map ~f:snd t.dst
+   let src_loc t = fst t.src
+ 
+-  let dst_basename { src = _, src; dst } =
++  let dst_basename { src = _, src; dst; dune_syntax = _ } =
+     match dst with
+     | Some (_, dst) -> dst
+     | None ->
+@@ -32,22 +83,35 @@ module Expanded = struct
+   ;;
+ 
+   let dst_path t ~dir = Path.Build.relative dir (dst_basename t)
++
++  let validate_for_install_stanza ~relative_dst_path_starts_with_parent_error_when t =
++    Option.iter t.dst ~f:(fun (loc, dst) ->
++      validate_dst_for_install_stanza
++        ~relative_dst_path_starts_with_parent_error_when
++        ~loc
++        dst
++        t.dune_syntax)
++  ;;
+ end
+ 
+ module Unexpanded = struct
+   type nonrec t = (String_with_vars.t, String_with_vars.t) t
+ 
+-  let to_dyn { src; dst } =
++  let to_dyn { src; dst; dune_syntax } =
+     let open Dyn in
+     record
+-      [ "src", String_with_vars.to_dyn src; "dst", option String_with_vars.to_dyn dst ]
++      [ "src", String_with_vars.to_dyn src
++      ; "dst", option String_with_vars.to_dyn dst
++      ; "dune_syntax", Syntax.Version.to_dyn dune_syntax
++      ]
+   ;;
+ 
+   let equal = equal String_with_vars.equal_no_loc String_with_vars.equal_no_loc
+ 
+-  let make ~src:(locs, src) ~dst:(locd, dst) =
++  let make ~src:(locs, src) ~dst:(locd, dst) ~dune_syntax =
+     { src = String_with_vars.make_text locs src
+     ; dst = Some (String_with_vars.make_text locd dst)
++    ; dune_syntax
+     }
+   ;;
+ 
+@@ -55,8 +119,19 @@ module Unexpanded = struct
+ 
+   let destination_relative_to_install_path t ~section ~expand ~expand_partial =
+     let+ src = expand_partial t.src
+-    and+ dst = Memo.Option.map ~f:expand t.dst in
+-    Install.Entry.adjust_dst ~section ~src ~dst
++    and+ dst_loc_opt =
++      Memo.Option.map t.dst ~f:(fun dst ->
++        let loc = String_with_vars.loc dst in
++        let+ dst = expand dst in
++        dst, loc)
++    in
++    Option.iter dst_loc_opt ~f:(fun (dst, loc) ->
++      validate_dst_for_install_stanza
++        ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
++        ~loc
++        dst
++        t.dune_syntax);
++    Install.Entry.adjust_dst ~section ~src ~dst:(Option.map dst_loc_opt ~f:fst)
+   ;;
+ 
+   let expand t ~dir ~f =
+@@ -75,7 +150,7 @@ module Unexpanded = struct
+         let+ loc, p = f dst in
+         Some (loc, p)
+     in
+-    { src; dst }
++    { src; dst; dune_syntax = t.dune_syntax }
+   ;;
+ 
+   let decode =
+@@ -87,34 +162,37 @@ module Unexpanded = struct
+         | Atom _ -> true
+         | _ -> false
+       and+ s = String_with_vars.decode
+-      and+ version = Dune_lang.Syntax.get_exn Stanza.syntax in
+-      if (not is_atom) && version < (1, 6)
++      and+ dune_syntax = Dune_lang.Syntax.get_exn Stanza.syntax in
++      if (not is_atom) && dune_syntax < (1, 6)
+       then (
+         let what =
+           (if String_with_vars.has_pforms s then "variables" else "quoted strings")
+           |> sprintf "Using %s here"
+         in
+         Dune_lang.Syntax.Error.since (String_with_vars.loc s) Stanza.syntax (1, 6) ~what)
+-      else s
++      else s, dune_syntax
+     in
+     peek_exn
+     >>= function
+-    | Atom _ | Quoted_string _ | Template _ -> decode >>| fun src -> { src; dst = None }
++    | Atom _ | Quoted_string _ | Template _ ->
++      decode >>| fun (src, dune_syntax) -> { src; dst = None; dune_syntax }
+     | List (_, [ _; Atom (_, A "as"); _ ]) ->
+       enter
+-        (let* src = decode in
++        (let* src, dune_syntax = decode in
+          keyword "as"
+-         >>> let* dst = decode in
+-             return { src; dst = Some dst })
++         >>> let* dst, _ = decode in
++             return { src; dst = Some dst; dune_syntax })
+     | sexp ->
+       User_error.raise
+         ~loc:(Dune_lang.Ast.loc sexp)
+         [ Pp.text "Invalid format, <name> or (<name> as <install-as>) expected" ]
+   ;;
+ 
++  let dune_syntax t = t.dune_syntax
++
+   module L = struct
+     let decode = Dune_lang.Decoder.repeat decode
+-    let strings_with_vars { src; dst } = src :: Option.to_list dst
++    let strings_with_vars { src; dst; dune_syntax = _ } = src :: Option.to_list dst
+ 
+     let find_pform fbs =
+       List.find_map fbs ~f:(fun fb ->
+diff --git a/src/dune_rules/file_binding.mli b/src/dune_rules/file_binding.mli
+index 6fb5ae825..c1bfd2c29 100644
+--- a/src/dune_rules/file_binding.mli
++++ b/src/dune_rules/file_binding.mli
+@@ -8,6 +8,12 @@ module Expanded : sig
+   val dst : t -> string option
+   val src_loc : t -> Loc.t
+   val dst_path : t -> dir:Path.Build.t -> Path.Build.t
++
++  val validate_for_install_stanza
++    :  relative_dst_path_starts_with_parent_error_when:
++         [ `Deprecation_warning_from_3_11 | `Always_error ]
++    -> t
++    -> unit
+ end
+ 
+ module Unexpanded : sig
+@@ -15,8 +21,9 @@ module Unexpanded : sig
+ 
+   val to_dyn : t -> Dyn.t
+   val equal : t -> t -> bool
+-  val make : src:Loc.t * string -> dst:Loc.t * string -> t
++  val make : src:Loc.t * string -> dst:Loc.t * string -> dune_syntax:Syntax.Version.t -> t
+   val decode : t Dune_lang.Decoder.t
++  val dune_syntax : t -> Syntax.Version.t
+ 
+   val expand
+     :  t
+diff --git a/src/dune_rules/gen_rules.ml b/src/dune_rules/gen_rules.ml
+index 0f349bb88..6b51ddd51 100644
+--- a/src/dune_rules/gen_rules.ml
++++ b/src/dune_rules/gen_rules.ml
+@@ -236,6 +236,7 @@ let gen_rules
+           install_conf.dirs
+           ~expand_str
+           ~dir:ctx_dir
++          ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
+       in
+       List.map (files_expanded @ dirs_expanded) ~f:(fun fb ->
+         File_binding.Expanded.src fb |> Path.build)
+diff --git a/src/dune_rules/install_entry.ml b/src/dune_rules/install_entry.ml
+index f894700da..5987458a1 100644
+--- a/src/dune_rules/install_entry.ml
++++ b/src/dune_rules/install_entry.ml
+@@ -42,7 +42,7 @@ module File = struct
+       file_binding_decode <|> glob_files_decode
+     ;;
+ 
+-    let to_file_bindings_unexpanded t ~expand_str ~dir =
++    let to_file_bindings_unexpanded t ~expand_str ~dir ~dune_syntax =
+       match t with
+       | File_binding file_binding -> Memo.return [ file_binding ]
+       | Glob_files glob_files ->
+@@ -51,11 +51,11 @@ module File = struct
+         let glob_loc = String_with_vars.loc glob_files.glob in
+         List.map paths ~f:(fun path ->
+           let src = glob_loc, path in
+-          File_binding.Unexpanded.make ~src ~dst:src)
++          File_binding.Unexpanded.make ~src ~dst:src ~dune_syntax)
+     ;;
+ 
+-    let to_file_bindings_expanded t ~expand_str ~dir =
+-      to_file_bindings_unexpanded t ~expand_str ~dir
++    let to_file_bindings_expanded t ~expand_str ~dir ~dune_syntax =
++      to_file_bindings_unexpanded t ~expand_str ~dir ~dune_syntax
+       |> Memo.bind
+            ~f:
+              (Memo.List.map
+@@ -66,40 +66,72 @@ module File = struct
+     ;;
+   end
+ 
+-  type t = Without_include.t Recursive_include.t
++  type t =
++    { entry : Without_include.t Recursive_include.t
++    ; dune_syntax : Syntax.Version.t
++    }
+ 
+   let decode =
+-    Recursive_include.decode
+-      ~base_term:Without_include.decode
+-      ~include_keyword:"include"
+-      ~non_sexp_behaviour:`User_error
+-      ~include_allowed_in_versions:(`Since (3, 5))
+-  ;;
+-
+-  let expand_include = Recursive_include.expand_include
+-
+-  let expand_include_multi ts ~expand_str ~dir =
+-    Memo.List.concat_map ts ~f:(expand_include ~expand_str ~dir)
++    let open Dune_lang.Decoder in
++    let+ entry =
++      Recursive_include.decode
++        ~base_term:Without_include.decode
++        ~include_keyword:"include"
++        ~non_sexp_behaviour:`User_error
++        ~include_allowed_in_versions:(`Since (3, 5))
++    and+ dune_syntax = Dune_lang.Syntax.get_exn Stanza.syntax in
++    { entry; dune_syntax }
+   ;;
+ 
+   let of_file_binding file_binding =
+-    Recursive_include.of_base (Without_include.File_binding file_binding)
++    let entry = Recursive_include.of_base (Without_include.File_binding file_binding) in
++    let dune_syntax = File_binding.Unexpanded.dune_syntax file_binding in
++    { entry; dune_syntax }
+   ;;
+ 
+   let to_file_bindings_unexpanded ts ~expand_str ~dir =
+-    expand_include_multi ts ~expand_str ~dir
++    let open Memo.O in
++    Memo.List.concat_map ts ~f:(fun { entry; dune_syntax } ->
++      let+ with_include_expanded =
++        Recursive_include.expand_include entry ~expand_str ~dir
++      in
++      List.map with_include_expanded ~f:(fun entry -> entry, dune_syntax))
+     |> Memo.bind
+          ~f:
+-           (Memo.List.concat_map
+-              ~f:(Without_include.to_file_bindings_unexpanded ~expand_str ~dir))
++           (Memo.List.concat_map ~f:(fun (entry, dune_syntax) ->
++              Without_include.to_file_bindings_unexpanded
++                ~expand_str
++                ~dir
++                ~dune_syntax
++                entry))
+   ;;
+ 
+   let to_file_bindings_expanded ts ~expand_str ~dir =
+-    expand_include_multi ts ~expand_str ~dir
+-    |> Memo.bind
+-         ~f:
+-           (Memo.List.concat_map
+-              ~f:(Without_include.to_file_bindings_expanded ~expand_str ~dir))
++    let open Memo.O in
++    let+ file_bindings_expanded =
++      Memo.List.concat_map ts ~f:(fun { entry; dune_syntax } ->
++        let+ with_include_expanded =
++          Recursive_include.expand_include entry ~expand_str ~dir
++        in
++        List.map with_include_expanded ~f:(fun entry -> entry, dune_syntax))
++      |> Memo.bind
++           ~f:
++             (Memo.List.concat_map ~f:(fun (entry, dune_syntax) ->
++                Without_include.to_file_bindings_expanded
++                  ~expand_str
++                  ~dir
++                  ~dune_syntax
++                  entry))
++    in
++    (* Note that validation is deferred until after file bindings have been
++       expanded as a path may be invalid due to the contents of a variable
++       whose value is unknown until prior to this point. *)
++    List.iter
++      file_bindings_expanded
++      ~f:
++        (File_binding.Expanded.validate_for_install_stanza
++           ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11);
++    file_bindings_expanded
+   ;;
+ end
+ 
+@@ -114,14 +146,29 @@ module Dir = struct
+ 
+   type t = File_binding.Unexpanded.t Recursive_include.t
+ 
+-  let to_file_bindings_expanded ts ~expand_str ~dir =
+-    Memo.List.concat_map ts ~f:(Recursive_include.expand_include ~expand_str ~dir)
+-    |> Memo.bind
+-         ~f:
+-           (Memo.List.map
+-              ~f:
+-                (File_binding.Unexpanded.expand
+-                   ~dir
+-                   ~f:(expand_str_with_check_for_local_path ~expand_str)))
++  let to_file_bindings_expanded
++    ts
++    ~expand_str
++    ~dir
++    ~relative_dst_path_starts_with_parent_error_when
++    =
++    let open Memo.O in
++    let+ file_bindings_expanded =
++      Memo.List.concat_map ts ~f:(Recursive_include.expand_include ~expand_str ~dir)
++      >>= Memo.List.map
++            ~f:
++              (File_binding.Unexpanded.expand
++                 ~dir
++                 ~f:(expand_str_with_check_for_local_path ~expand_str))
++    in
++    (* Note that validation is deferred until after file bindings have been
++       expanded as a path may be invalid due to the contents of a variable
++       whose value is unknown until prior to this point. *)
++    List.iter
++      file_bindings_expanded
++      ~f:
++        (File_binding.Expanded.validate_for_install_stanza
++           ~relative_dst_path_starts_with_parent_error_when);
++    file_bindings_expanded
+   ;;
+ end
+diff --git a/src/dune_rules/install_entry.mli b/src/dune_rules/install_entry.mli
+index d046e190c..e395885a1 100644
+--- a/src/dune_rules/install_entry.mli
++++ b/src/dune_rules/install_entry.mli
+@@ -36,5 +36,7 @@ module Dir : sig
+     :  t list
+     -> expand_str:(String_with_vars.t -> string Memo.t)
+     -> dir:Path.Build.t
++    -> relative_dst_path_starts_with_parent_error_when:
++         [ `Deprecation_warning_from_3_11 | `Always_error ]
+     -> File_binding.Expanded.t list Memo.t
+ end
+diff --git a/src/dune_rules/install_rules.ml b/src/dune_rules/install_rules.ml
+index 4d5d06283..48627bb74 100644
+--- a/src/dune_rules/install_rules.ml
++++ b/src/dune_rules/install_rules.ml
+@@ -391,14 +391,26 @@ end = struct
+         Install.Entry.Sourced.create ~loc entry)
+     and+ files_from_dirs =
+       let* dirs_expanded =
+-        Install_entry.Dir.to_file_bindings_expanded i.dirs ~expand_str ~dir
++        Install_entry.Dir.to_file_bindings_expanded
++          i.dirs
++          ~expand_str
++          ~dir
++          ~relative_dst_path_starts_with_parent_error_when:`Deprecation_warning_from_3_11
+       in
+       Memo.List.map dirs_expanded ~f:(fun fb ->
+         let loc = File_binding.Expanded.src_loc fb in
+         let+ entry = make_entry ~kind:`Directory fb in
+         Install.Entry.Sourced.create ~loc entry)
+     and+ source_trees =
+-      Install_entry.Dir.to_file_bindings_expanded i.source_trees ~expand_str ~dir
++      (* There's no deprecation warning when a relative destination path
++         starts with a parent in this feature. It's safe to raise an error in
++         this case as installing source trees was added in the same dune version
++         that we deprecated starting a destination install path with "..". *)
++      Install_entry.Dir.to_file_bindings_expanded
++        i.source_trees
++        ~expand_str
++        ~dir
++        ~relative_dst_path_starts_with_parent_error_when:`Always_error
+       >>= Memo.List.map ~f:(fun fb ->
+         let loc = File_binding.Expanded.src_loc fb in
+         let* entry = make_entry ~kind:`Source_tree fb in

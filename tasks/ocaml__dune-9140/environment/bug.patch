@@ -1,0 +1,327 @@
+diff --git a/src/dune_pkg/dune_pkg.ml b/src/dune_pkg/dune_pkg.ml
+index daf590843..ba89b7fdf 100644
+--- a/src/dune_pkg/dune_pkg.ml
++++ b/src/dune_pkg/dune_pkg.ml
+@@ -7,7 +7,6 @@ module Opam_solver = Opam_solver
+ module Package_variable = Package_variable
+ module Package_dependency = Package_dependency
+ module Repository_id = Repository_id
+-module Rev_store = Rev_store
+ module Solver_env = Solver_env
+ module Solver_stats = Solver_stats
+ module Substs = Substs
+diff --git a/src/dune_pkg/rev_store.ml b/src/dune_pkg/rev_store.ml
+index b79db13b8..8f317016e 100644
+--- a/src/dune_pkg/rev_store.ml
++++ b/src/dune_pkg/rev_store.ml
+@@ -2,73 +2,12 @@ open Stdune
+ open Dune_vcs
+ module Process = Dune_engine.Process
+ module Display = Dune_engine.Display
+-module Scheduler = Dune_engine.Scheduler
+ module Re = Dune_re
+-module Flock = Dune_util.Flock
+ open Fiber.O
+ 
+ type t = { dir : Path.t }
+-
+-let lock_path { dir } =
+-  let parent = dir |> Path.parent_exn in
+-  Path.relative parent "rev-store.lock"
+-;;
+-
+ type rev = Rev of string
+ 
+-(* Async-inspired variation of [Fiber.repeat_until] *)
+-let rec repeat_until_finished state f =
+-  let* computation = f state in
+-  match computation with
+-  | `Repeat state -> repeat_until_finished state f
+-  | `Finished result -> Fiber.return result
+-;;
+-
+-let attempt_to_lock flock lock ~max_tries =
+-  let sleep_duration = 0.1 in
+-  repeat_until_finished max_tries (function
+-    | 0 -> Fiber.return @@ `Finished (Ok `Failure)
+-    | retry ->
+-      (match Flock.lock_non_block flock lock with
+-       | Ok `Success as ok -> Fiber.return @@ `Finished ok
+-       | Ok `Failure ->
+-         let+ () = Scheduler.sleep sleep_duration in
+-         `Repeat (retry - 1)
+-       | err -> Fiber.return @@ `Finished err))
+-;;
+-
+-let with_flock lock_path ~f =
+-  let open Fiber.O in
+-  let parent = Path.parent_exn lock_path in
+-  Path.mkdir_p parent;
+-  let fd = Unix.openfile (Path.to_string lock_path) [ Unix.O_CREAT; O_RDONLY ] 0o644 in
+-  let flock = Flock.create fd in
+-  let max_tries = 50 in
+-  Fiber.finalize
+-    ~finally:(fun () ->
+-      (* closing the fd releases the flock automatically *)
+-      match Unix_error.Detailed.catch Unix.close fd with
+-      | Ok () ->
+-        (* delete the lock to signal to the user we don't hold a lock *)
+-        Fiber.return @@ Path.unlink_no_err lock_path
+-      | Error detailed -> Unix_error.Detailed.raise detailed)
+-    (fun () ->
+-      let* acquired = attempt_to_lock flock Flock.Exclusive ~max_tries in
+-      match acquired with
+-      | Ok `Success -> f ()
+-      | Ok `Failure ->
+-        Code_error.raise
+-          (sprintf "Couldn't acquire lock after %d attempts to lock" max_tries)
+-          []
+-      | Error error ->
+-        User_error.raise
+-          [ Pp.textf
+-              "Failed to get a lock for the revision store at %s: %s"
+-              (Path.to_string_maybe_quoted lock_path)
+-              (Unix.error_message error)
+-          ])
+-;;
+-
+ let equal { dir } t = Path.equal dir t.dir
+ let display = Display.Quiet
+ let failure_mode = Process.Failure_mode.Strict
+@@ -146,19 +85,17 @@ let show =
+ 
+ let load_or_create ~dir =
+   let t = { dir } in
+-  let lock = lock_path t in
+   let* () = Fiber.return () in
+   let+ () =
+-    with_flock lock ~f:(fun () ->
+-      match Fpath.mkdir_p (Path.to_string dir) with
+-      | Already_exists -> Fiber.return ()
+-      | Created -> run t [ "init"; "--bare" ]
+-      | exception Unix.Unix_error (e, x, y) ->
+-        User_error.raise
+-          [ Pp.textf "%s isn't a directory" (Path.to_string_maybe_quoted dir)
+-          ; Pp.textf "reason: %s" (Unix_error.Detailed.to_string_hum (e, x, y))
+-          ]
+-          ~hints:[ Pp.text "delete this file or check its permissions" ])
++    match Fpath.mkdir_p (Path.to_string dir) with
++    | Already_exists -> Fiber.return ()
++    | Created -> run t [ "init"; "--bare" ]
++    | exception Unix.Unix_error (e, x, y) ->
++      User_error.raise
++        [ Pp.textf "%s isn't a directory" (Path.to_string_maybe_quoted dir)
++        ; Pp.textf "reason: %s" (Unix_error.Detailed.to_string_hum (e, x, y))
++        ]
++        ~hints:[ Pp.text "delete this file or check its permissions" ]
+   in
+   t
+ ;;
+@@ -295,7 +232,7 @@ module Remote = struct
+   ;;
+ end
+ 
+-let remote_exists dir ~name =
++let remote_exists { dir } ~name =
+   (* TODO read this directly from .git/config *)
+   let stdout_to = make_stdout () in
+   let stderr_to = make_stderr () in
+@@ -309,20 +246,18 @@ let remote_exists dir ~name =
+   | 128 | _ -> false
+ ;;
+ 
+-let add_repo ({ dir } as t) ~source =
++let add_repo t ~source =
+   (* TODO add this directly using .git/config *)
+   let handle = source |> Dune_digest.string |> Dune_digest.to_string in
+-  let lock = lock_path t in
+-  with_flock lock ~f:(fun () ->
+-    let* exists = remote_exists dir ~name:handle in
+-    let* () =
+-      match exists with
+-      | true -> Fiber.return ()
+-      | false -> run t [ "remote"; "add"; handle; source ]
+-    in
+-    let remote : Remote.t = { repo = t; handle } in
+-    let+ () = Remote.update remote in
+-    remote)
++  let* exists = remote_exists t ~name:handle in
++  let* () =
++    match exists with
++    | true -> Fiber.return ()
++    | false -> run t [ "remote"; "add"; handle; source ]
++  in
++  let remote : Remote.t = { repo = t; handle } in
++  let+ () = Remote.update remote in
++  remote
+ ;;
+ 
+ let content_of_files t files =
+diff --git a/test/blackbox-tests/test-cases/pkg/dune b/test/blackbox-tests/test-cases/pkg/dune
+index e73854986..b3fce4cb0 100644
+--- a/test/blackbox-tests/test-cases/pkg/dune
++++ b/test/blackbox-tests/test-cases/pkg/dune
+@@ -12,13 +12,7 @@
+ 
+ (cram
+  (deps %{bin:git})
+- (applies_to :whole_subtree))
+-
+-(cram
+- (applies_to rev-store-lock)
+- (enabled_if
+-  (= %{system} linux))
+- (deps %{bin:strace}))
++ (applies_to git-source opam-repository-download multiple-opam-repos))
+ 
+ (cram
+  (deps %{bin:git} %{bin:awk} %{bin:cmp})
+diff --git a/test/blackbox-tests/test-cases/pkg/rev-store-lock.t b/test/blackbox-tests/test-cases/pkg/rev-store-lock.t
+deleted file mode 100644
+index 621785379..000000000
+--- a/test/blackbox-tests/test-cases/pkg/rev-store-lock.t
++++ /dev/null
+@@ -1,54 +0,0 @@
+-Testing whether the revision store locks properly.
+-
+-To start with we create a repository in with a `foo` package.
+-
+-  $ . ./helpers.sh
+-  $ mkrepo
+-  $ mkpkg foo 1.0 <<EOF
+-  > EOF
+-  $ cd mock-opam-repository
+-  $ git init --quiet
+-  $ git add -A
+-  $ git commit --quiet -m "Initial commit"
+-  $ cd ..
+-
+-We set this repository as sole source for opam repositories.
+-
+-  $ cat > dune-workspace <<EOF
+-  > (lang dune 3.10)
+-  > (repository
+-  >  (name mock)
+-  >  (source "git+file://$(pwd)/mock-opam-repository"))
+-  > (context
+-  >  (default
+-  >   (name default)
+-  >   (repositories mock)))
+-  > EOF
+-
+-We set the project up to depend on `foo`
+-
+-  $ cat > dune-project <<EOF
+-  > (lang dune 3.10)
+-  > 
+-  > (package
+-  >  (name bar)
+-  >  (depends foo))
+-  > EOF
+-  $ cat > dune <<EOF
+-  > EOF
+-
+-Creating a lock should thus work.
+-
+-  $ mkdir dune-workspace-cache
+-  $ XDG_CACHE_HOME=$(pwd)/fake-xdg-cache dune pkg lock
+-  Solution for dune.lock:
+-  - foo.1.0
+-
+-There should also be some kind of error message if getting the revision store
+-lock fails (simulated here with a failing flock(2) call):
+-
+-  $ XDG_CACHE_HOME=$(pwd)/dune-workspace-cache strace -e inject=flock:error=EBADFD -o /dev/null dune pkg lock
+-  Error: Failed to get a lock for the revision store at
+-  $TESTCASE_ROOT/dune-workspace-cache/dune/rev-store.lock:
+-  File descriptor in bad state
+-  [1]
+diff --git a/test/expect-tests/dune_pkg/dune b/test/expect-tests/dune_pkg/dune
+index 3c71dfb2f..de5c9212d 100644
+--- a/test/expect-tests/dune_pkg/dune
++++ b/test/expect-tests/dune_pkg/dune
+@@ -1,7 +1,7 @@
+ (library
+  (name dune_pkg_unit_tests)
+  (inline_tests
+-  (deps plaintext.md tarball.tar.gz %{bin:git}))
++  (deps plaintext.md tarball.tar.gz))
+  (libraries
+   dune_tests_common
+   stdune
+@@ -9,7 +9,6 @@
+   dune_engine
+   dune_util
+   dune_lang
+-  dune_vcs
+   fiber
+   opam_core
+   threads.posix
+diff --git a/test/expect-tests/dune_pkg/rev_store_tests.ml b/test/expect-tests/dune_pkg/rev_store_tests.ml
+deleted file mode 100644
+index dc80e2539..000000000
+--- a/test/expect-tests/dune_pkg/rev_store_tests.ml
++++ /dev/null
+@@ -1,62 +0,0 @@
+-open Stdune
+-open Fiber.O
+-module Scheduler = Dune_engine.Scheduler
+-module Process = Dune_engine.Process
+-module Display = Dune_engine.Display
+-module Rev_store = Dune_pkg.Rev_store
+-module Vcs = Dune_vcs.Vcs
+-
+-let () = Dune_tests_common.init ()
+-
+-let run thunk =
+-  let on_event _config _event = () in
+-  let config : Scheduler.Config.t =
+-    { concurrency = 1
+-    ; stats = None
+-    ; insignificant_changes = `Ignore
+-    ; signal_watcher = `No
+-    ; watch_exclusions = []
+-    }
+-  in
+-  Scheduler.Run.go config ~on_event thunk
+-;;
+-
+-let display = Display.Quiet
+-let output_limit = Sys.max_string_length
+-let make_stdout () = Process.Io.make_stdout ~output_on_success:Swallow ~output_limit
+-let make_stderr () = Process.Io.make_stderr ~output_on_success:Swallow ~output_limit
+-
+-let create_repo_at dir =
+-  let stdout_to = make_stdout () in
+-  let stderr_to = make_stdout () in
+-  let git =
+-    let git = Lazy.force Vcs.git in
+-    Process.run ~dir ~display ~stdout_to ~stderr_to Process.Failure_mode.Strict git
+-  in
+-  Path.mkdir_p dir;
+-  let* () = git [ "init" ] in
+-  let entry_name = "entry" in
+-  let entry = Path.relative dir entry_name in
+-  Io.write_lines entry [ "just some content" ];
+-  let* () = git [ "add"; entry_name ] in
+-  git [ "commit"; "-m 'Initial commit'" ]
+-;;
+-
+-let%expect_test "adding remotes" =
+-  let cwd = Path.External.cwd () |> Path.external_ in
+-  let dir = Path.relative cwd "git-repo" in
+-  run (fun () ->
+-    let* rev_store = Rev_store.load_or_create ~dir in
+-    let remote_path = Path.relative cwd "git-remote" in
+-    let* () = create_repo_at remote_path in
+-    let source = Path.to_string remote_path in
+-    let* _remote = Rev_store.add_repo rev_store ~source in
+-    print_endline "Creating first remote succeeded";
+-    let* _remote' = Rev_store.add_repo rev_store ~source in
+-    print_endline "Adding same remote succeeded";
+-    Fiber.return ());
+-  [%expect {|
+-    Creating first remote succeeded
+-    Adding same remote succeeded
+-    |}]
+-;;

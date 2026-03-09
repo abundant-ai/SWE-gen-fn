@@ -1,0 +1,153 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2ce947f..7a32938b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,24 +4,6 @@ All notable changes to this project will be documented in this file. From versio
+ 
+ ## Unreleased
+ 
+-### Added
+-
+-- Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+-- Add a `HINT` when the LISTEN channel stops working due to a PostgreSQL bug by @laurenceisla in #4581
+-- Add string slicing operator for `jwt-role-claim-key` by @taimoorzaeem in #4599
+-- Log host, port and pg version of listener database connection by @mkleczek in #4617 #4618
+-- Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
+-  + Removed unnecessary double count when building the `Content-Range`.
+-
+-### Fixed
+-
+-- Don't hide async exceptions in logs by @stevechavez in #4646
+-
+-### Changed
+-
+-- Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+-  + Now fails at startup. Prior to this, it failed with `PGRST205` on requests related to these schemas.
+-
+ ## [14.4] - 2026-01-29
+ 
+ ### Fixed
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 64e31b19..411694fd 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -9,24 +9,18 @@ Some of its functionality includes:
+ - Producing HTTP Headers according to RFCs.
+ - Content Negotiation
+ -}
+-{-# LANGUAGE RecordWildCards     #-}
+-{-# LANGUAGE ScopedTypeVariables #-}
+-{-# LANGUAGE ViewPatterns        #-}
++{-# LANGUAGE RecordWildCards #-}
+ module PostgREST.App
+   ( postgrest
+   , run
+   ) where
+ 
+ 
+-import GHC.IO.Exception (IOErrorType (..))
+-import System.IO.Error  (ioeGetErrorType)
+-
+ import Control.Monad.Except     (liftEither)
+ import Data.Either.Combinators  (mapLeft, whenLeft)
+ import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+-import Network.Wai.Handler.Warp (defaultSettings, setHost,
+-                                 setOnException, setPort,
++import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
+ 
+ import qualified Data.Text.Encoding       as T
+@@ -69,6 +63,7 @@ type Handler = ExceptT Error
+ 
+ run :: AppState -> IO ()
+ run appState = do
++  let observer = AppState.getObserver appState
+   conf@AppConfig{..} <- AppState.getConfig appState
+ 
+   AppState.schemaCacheLoader appState -- Loads the initial SchemaCache
+@@ -84,24 +79,7 @@ run appState = do
+     address <- resolveSocketToAddress (AppState.getSocketREST appState)
+     observer $ AppServerAddressObs address
+ 
+-  Warp.runSettingsSocket (serverSettings conf & setOnException onWarpException) (AppState.getSocketREST appState) app
+-  where
+-    observer = AppState.getObserver appState
+-
+-    onWarpException :: Maybe Wai.Request -> SomeException -> IO ()
+-    onWarpException _ ex =
+-      when (shouldDisplayException ex) $
+-        observer $ WarpErrorObs $ show ex
+-
+-    -- Similar to wai defaultShouldDisplayException in
+-    -- https://github.com/yesodweb/wai//blob/8c3882c60f6abe043889fc20c7efd3fa9747fa4a/warp/Network/Wai/Handler/Warp/Settings.hs#L251-L258
+-    -- but without omitting AsyncException since it's important to log for ThreadKilled, StackOverflow and other cases.
+-    -- We want to reuse this to avoid flooding the logs for some transient failure cases.
+-    shouldDisplayException :: SomeException -> Bool
+-    shouldDisplayException se
+-        | Just (_ :: Warp.InvalidRequest) <- fromException se = False
+-        | Just (ioeGetErrorType -> et) <- fromException se, et == ResourceVanished || et == InvalidArgument = False
+-        | otherwise = True
++  Warp.runSettingsSocket (serverSettings conf) (AppState.getSocketREST appState) app
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+ serverSettings AppConfig{..} =
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index b93d67e5..bc4e6311 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -63,7 +63,6 @@ data Observation
+   | PoolRequestFullfilled
+   | JwtCacheLookup Bool
+   | JwtCacheEviction
+-  | WarpErrorObs Text
+ 
+ data ObsFatalError = ServerAuthError | ServerPgrstBug | ServerError42P05 | ServerError08P01
+ 
+@@ -158,8 +157,6 @@ observationMessage = \case
+     "Looked up a JWT in JWT cache"
+   JwtCacheEviction ->
+     "Evicted entry from JWT cache"
+-  WarpErrorObs txt ->
+-    "Warp server error: " <> txt
+   where
+     showMillis :: Double -> Text
+     showMillis x = toS $ showFFloat (Just 1) x ""
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index c970a8d3..2cfbb939 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -3,7 +3,6 @@
+ import re
+ 
+ import pytest
+-import requests
+ 
+ from postgrest import run
+ 
+@@ -55,25 +54,6 @@ def test_openapi_in_big_schema(defaultenv):
+         assert response.status_code == 200
+ 
+ 
+-def test_stackoverflow_is_logged(defaultenv):
+-    "Stack overflow errors should be logged with the Warp error message"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_SCHEMAS": "apflora",
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-    }
+-
+-    with run(env=env, wait_max_seconds=30, no_startup_stdout=False) as postgrest:
+-        with pytest.raises(requests.exceptions.ConnectionError):
+-            postgrest.session.get("/")
+-
+-        output = postgrest.read_stdout(nlines=10)
+-        output.extend(postgrest.read_stdout(nlines=10))
+-
+-        assert any("Warp server error: stack overflow" in line for line in output)
+-
+-
+ # See: https://github.com/PostgREST/postgrest/issues/3329
+ def test_should_not_fail_with_stack_overflow(defaultenv):
+     "requesting a non-existent relationship should not fail with stack overflow due to fuzzy search of candidates"

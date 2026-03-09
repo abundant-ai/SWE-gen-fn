@@ -1,0 +1,527 @@
+diff --git a/otherlibs/stdune/src/loc0.ml b/otherlibs/stdune/src/loc0.ml
+index ff86a2331..78d3acf42 100644
+--- a/otherlibs/stdune/src/loc0.ml
++++ b/otherlibs/stdune/src/loc0.ml
+@@ -93,3 +93,10 @@ let start_pos_cnum = function
+   | Same_file t -> Compact_position.cnum t.start
+   | Same_line t -> Compact_position.Same_line_loc.start_cnum t.loc
+ ;;
++
++let stop_pos_cnum = function
++  | No_loc | In_file _ -> Lexbuf.Loc.none.stop.pos_cnum
++  | Lexbuf_loc loc -> loc.stop.pos_cnum
++  | Same_file t -> Compact_position.cnum t.stop
++  | Same_line t -> Compact_position.Same_line_loc.stop_cnum t.loc
++;;
+diff --git a/otherlibs/stdune/src/loc0.mli b/otherlibs/stdune/src/loc0.mli
+index 0aea2e295..1cb7c3a48 100644
+--- a/otherlibs/stdune/src/loc0.mli
++++ b/otherlibs/stdune/src/loc0.mli
+@@ -16,3 +16,4 @@ val is_none : t -> bool
+ val to_dyn : t -> Dyn.t
+ val set_start_to_stop : t -> t
+ val start_pos_cnum : t -> int
++val stop_pos_cnum : t -> int
+diff --git a/src/dune_lang/pform.ml b/src/dune_lang/pform.ml
+index 63b28675b..bc8a22c33 100644
+--- a/src/dune_lang/pform.ml
++++ b/src/dune_lang/pform.ml
+@@ -1,5 +1,6 @@
+ open Stdune
+ open Dune_sexp
++module Payload = Template.Pform.Payload
+ 
+ module Var = struct
+   module Pkg = struct
+@@ -352,18 +353,83 @@ module Macro = struct
+     | Artifact ext -> variant "Artifact" [ Artifact.to_dyn ext ]
+     | Pkg -> variant "Pkg" []
+   ;;
++
++  let encode = function
++    | Exe -> Ok "exe"
++    | Dep -> Ok "dep"
++    | Bin -> Ok "bin"
++    | Lib { lib_exec = false; lib_private = false } -> Ok "lib"
++    | Lib { lib_exec = true; lib_private = false } -> Ok "libexec"
++    | Lib { lib_exec = false; lib_private = true } -> Ok "lib-private"
++    | Lib { lib_exec = true; lib_private = true } -> Ok "libexec-private"
++    | Lib_available -> Ok "lib-available"
++    | Bin_available -> Ok "bin-available"
++    | Version -> Ok "version"
++    | Read -> Ok "read"
++    | Read_strings -> Ok "read-strings"
++    | Read_lines -> Ok "read-lines"
++    | Path_no_dep -> Error `Pform_was_deleted
++    | Ocaml_config -> Ok "ocaml-config"
++    | Coq_config -> Ok "coq"
++    | Env -> Ok "env"
++    | Pkg -> Ok "pkg"
++    | Artifact a -> Ok (String.drop (Artifact.ext a) 1)
++  ;;
++end
++
++module Macro_invocation = struct
++  type t =
++    { macro : Macro.t
++    ; payload : Payload.t
++    }
++
++  let to_dyn { macro; payload } =
++    Dyn.record [ "macro", Macro.to_dyn macro; "payload", Payload.to_dyn payload ]
++  ;;
++
++  let compare { macro; payload } t =
++    let open Ordering.O in
++    let= () = Macro.compare macro t.macro in
++    Payload.compare payload t.payload
++  ;;
++
++  module Args = struct
++    let whole { payload; _ } = Payload.Args.whole payload
++
++    let lsplit2 { payload; macro } loc =
++      Payload.Args.lsplit2 ~loc payload
++      |> Result.map_error ~f:(fun (user_message : User_message.t) ->
++        let paragraphs =
++          match Macro.encode macro with
++          | Ok name ->
++            let header = Pp.textf "Incorrect arguments for macro %s." name in
++            header :: user_message.paragraphs
++          | Error `Pform_was_deleted -> user_message.paragraphs
++        in
++        { user_message with paragraphs })
++    ;;
++
++    let lsplit2_exn t loc =
++      match lsplit2 t loc with
++      | Ok args -> args
++      | Error user_message -> raise (User_error.E user_message)
++    ;;
++
++    let split { payload; _ } = Payload.Args.split payload
++  end
+ end
+ 
+ module T = struct
+   type t =
+     | Var of Var.t
+-    | Macro of Macro.t * string
++    | Macro of Macro_invocation.t
+ 
+   let to_dyn e =
+     let open Dyn in
+     match e with
+-    | Var v -> pair string Var.to_dyn ("Var", v)
+-    | Macro (m, s) -> triple string Macro.to_dyn string ("Macro", m, s)
++    | Var v -> variant "Var" [ Var.to_dyn v ]
++    | Macro macro_invocation ->
++      variant "Macro" [ Macro_invocation.to_dyn macro_invocation ]
+   ;;
+ 
+   let compare x y =
+@@ -371,10 +437,7 @@ module T = struct
+     | Var x, Var y -> Var.compare x y
+     | Var _, _ -> Lt
+     | _, Var _ -> Gt
+-    | Macro (m1, s1), Macro (m2, s2) ->
+-      let open Ordering.O in
+-      let= () = Macro.compare m1 m2 in
+-      String.compare s1 s2
++    | Macro a, Macro b -> Macro_invocation.compare a b
+   ;;
+ end
+ 
+@@ -384,7 +447,7 @@ module Map = Map.Make (T)
+ type encode_result =
+   | Success of
+       { name : string
+-      ; payload : string option
++      ; payload : Payload.t option
+       }
+   | Pform_was_deleted
+ 
+@@ -441,31 +504,10 @@ let encode_to_latest_dune_lang_version t =
+      with
+      | None -> Pform_was_deleted
+      | Some name -> Success { name; payload = None })
+-  | Macro (x, payload) ->
+-    (match
+-       match x with
+-       | Exe -> Some "exe"
+-       | Dep -> Some "dep"
+-       | Bin -> Some "bin"
+-       | Lib { lib_exec = false; lib_private = false } -> Some "lib"
+-       | Lib { lib_exec = true; lib_private = false } -> Some "libexec"
+-       | Lib { lib_exec = false; lib_private = true } -> Some "lib-private"
+-       | Lib { lib_exec = true; lib_private = true } -> Some "libexec-private"
+-       | Lib_available -> Some "lib-available"
+-       | Bin_available -> Some "bin-available"
+-       | Version -> Some "version"
+-       | Read -> Some "read"
+-       | Read_strings -> Some "read-strings"
+-       | Read_lines -> Some "read-lines"
+-       | Path_no_dep -> None
+-       | Ocaml_config -> Some "ocaml-config"
+-       | Coq_config -> Some "coq"
+-       | Env -> Some "env"
+-       | Pkg -> Some "pkg"
+-       | Artifact a -> Some (String.drop (Artifact.ext a) 1)
+-     with
+-     | None -> Pform_was_deleted
+-     | Some name -> Success { name; payload = Some payload })
++  | Macro { macro; payload } ->
++    (match Macro.encode macro with
++     | Error `Pform_was_deleted -> Pform_was_deleted
++     | Ok name -> Success { name; payload = Some payload })
+ ;;
+ 
+ let describe_kind = function
+@@ -714,7 +756,7 @@ module Env = struct
+   let parse t (pform : Template.Pform.t) =
+     match pform.payload with
+     | None -> Var (parse t.vars t.syntax_version pform)
+-    | Some payload -> Macro (parse t.macros t.syntax_version pform, payload)
++    | Some payload -> Macro { macro = parse t.macros t.syntax_version pform; payload }
+   ;;
+ 
+   let unsafe_parse_without_checking_version map (pform : Template.Pform.t) =
+@@ -730,7 +772,8 @@ module Env = struct
+   let unsafe_parse_without_checking_version t (pform : Template.Pform.t) =
+     match pform.payload with
+     | None -> Var (unsafe_parse_without_checking_version t.vars pform)
+-    | Some payload -> Macro (unsafe_parse_without_checking_version t.macros pform, payload)
++    | Some payload ->
++      Macro { macro = unsafe_parse_without_checking_version t.macros pform; payload }
+   ;;
+ 
+   let to_dyn { syntax_version; vars; macros } =
+@@ -762,7 +805,8 @@ module Env = struct
+   let all_known { syntax_version = _; vars; macros } =
+     String.Map.union
+       (String.Map.map vars ~f:(fun x -> Var (With_versioning_info.get_data x)))
+-      (String.Map.map macros ~f:(fun x -> Macro (With_versioning_info.get_data x, "")))
++      (String.Map.map macros ~f:(fun x ->
++         Macro { macro = With_versioning_info.get_data x; payload = Payload.of_string "" }))
+       ~f:(fun _ _ _ -> assert false)
+   ;;
+ end
+diff --git a/src/dune_lang/pform.mli b/src/dune_lang/pform.mli
+index 6fbb8536c..77c6cda58 100644
+--- a/src/dune_lang/pform.mli
++++ b/src/dune_lang/pform.mli
+@@ -1,5 +1,6 @@
+ open Stdune
+ open Dune_sexp
++module Payload = Template.Pform.Payload
+ 
+ module Var : sig
+   module Pkg : sig
+@@ -131,9 +132,29 @@ module Macro : sig
+   val to_dyn : t -> Dyn.t
+ end
+ 
++module Macro_invocation : sig
++  type t =
++    { macro : Macro.t
++    ; payload : Payload.t
++    }
++
++  (** Similar to [Payload.Args] but incorporates the macro name into error messages *)
++  module Args : sig
++    (** Treat the entire payload as a single string argument. *)
++    val whole : t -> string
++
++    (** Split the payload on the first ':' character raising a [User_error] if the
++        payload contains no ':' characters. *)
++    val lsplit2_exn : t -> Loc.t -> string * string
++
++    (** Split the payload on all ':' characters *)
++    val split : t -> string list
++  end
++end
++
+ type t =
+   | Var of Var.t
+-  | Macro of Macro.t * string
++  | Macro of Macro_invocation.t
+ 
+ val compare : t -> t -> Ordering.t
+ val to_dyn : t -> Dyn.t
+@@ -141,7 +162,7 @@ val to_dyn : t -> Dyn.t
+ type encode_result =
+   | Success of
+       { name : string
+-      ; payload : string option
++      ; payload : Payload.t option
+       }
+   | Pform_was_deleted
+ 
+diff --git a/src/dune_rules/expander.ml b/src/dune_rules/expander.ml
+index 0e59e8ef7..ad6cb10c1 100644
+--- a/src/dune_rules/expander.ml
++++ b/src/dune_rules/expander.ml
+@@ -297,13 +297,9 @@ let file_of_lib { Artifacts.Public_libs.context; public_libs } ~loc ~lib ~file =
+   Path.relative dir file
+ ;;
+ 
+-let expand_lib_variable t source ~arg:s ~lib_exec ~lib_private =
++let expand_lib_variable t source ~lib ~file ~lib_exec ~lib_private =
+   let loc = Dune_lang.Template.Pform.loc source in
+-  let lib, file =
+-    match String.lsplit2 s ~on:':' with
+-    | None -> User_error.raise ~loc [ Pp.textf "invalid %%{lib:...} form: %s" s ]
+-    | Some (lib, f) -> Lib_name.parse_string_exn (loc, lib), f
+-  in
++  let lib = Lib_name.parse_string_exn (loc, lib) in
+   let scope = if lib_exec then t.scope_host else t.scope in
+   let p =
+     let open Resolve.Memo.O in
+@@ -370,7 +366,7 @@ let expand_lib_variable t source ~arg:s ~lib_exec ~lib_private =
+                       (Lib_name.to_string lib))
+                ]
+        | _ ->
+-         if (not lib_exec) || (not Sys.win32) || Filename.extension s = ".exe"
++         if (not lib_exec) || (not Sys.win32) || Filename.extension file = ".exe"
+          then dep p
+          else (
+            let p_exe = Path.extend_basename p ~suffix:".exe" in
+@@ -548,8 +544,9 @@ let expand_pform_gen ~(context : Context.t) ~bindings ~dir ~source (pform : Pfor
+             | None ->
+               let loc = Dune_lang.Template.Pform.loc source in
+               User_error.raise ~loc [ Pp.text "No toolchain defined for this context" ]))
+-     | Macro (macro, s) ->
+-       (match macro with
++     | Macro macro_invocation ->
++       let s = Pform.Macro_invocation.Args.whole macro_invocation in
++       (match macro_invocation.macro with
+         | Pkg -> Code_error.raise "pkg forms aren't possible here" []
+         | Ocaml_config ->
+           static
+@@ -610,7 +607,13 @@ let expand_pform_gen ~(context : Context.t) ~bindings ~dir ~source (pform : Pfor
+                  dep (Action.Prog.ok_exn prog)))
+         | Lib { lib_exec; lib_private } ->
+           Need_full_expander
+-            (fun t -> With (expand_lib_variable t source ~arg:s ~lib_exec ~lib_private))
++            (fun t ->
++              let lib, file =
++                Pform.Macro_invocation.Args.lsplit2_exn
++                  macro_invocation
++                  (Dune_lang.Template.Pform.payload_loc source)
++              in
++              With (expand_lib_variable t source ~lib ~file ~lib_exec ~lib_private))
+         | Lib_available ->
+           Need_full_expander
+             (fun t ->
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index b7296661c..9c1b7b92e 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -508,8 +508,8 @@ module Action_expander = struct
+         let roots = Paths.install_roots paths in
+         let dir = section_dir_of_root roots section in
+         Memo.return [ Value.Dir dir ]
+-      | Macro (Pkg, arg) ->
+-        (match String.split arg ~on:':' with
++      | Macro macro_invocation ->
++        (match Pform.Macro_invocation.Args.split macro_invocation with
+          | [ "var"; name; var ] ->
+            let variables, paths =
+              let name = if name = "_" then paths.name else Package.Name.of_string name in
+diff --git a/src/dune_rules/preprocess.ml b/src/dune_rules/preprocess.ml
+index 56fcbe219..bb3fe463e 100644
+--- a/src/dune_rules/preprocess.ml
++++ b/src/dune_rules/preprocess.ml
+@@ -198,7 +198,10 @@ let remove_future_syntax (t : 'a t) ~(for_ : Pp_flag_consumer.t) v
+       Action
+         ( loc
+         , Run
+-            ( String_with_vars.make_pform loc (Macro (Bin, "ocaml-syntax-shims"))
++            ( String_with_vars.make_pform
++                loc
++                (Macro
++                   { macro = Bin; payload = Pform.Payload.of_string "ocaml-syntax-shims" })
+             , (match for_ with
+                | Compiler -> [ String_with_vars.make_text loc "-dump-ast" ]
+                | Merlin ->
+diff --git a/src/dune_sexp/lexer.mll b/src/dune_sexp/lexer.mll
+index 7e78cd9cf..37b1c1aff 100644
+--- a/src/dune_sexp/lexer.mll
++++ b/src/dune_sexp/lexer.mll
+@@ -348,7 +348,7 @@ and template_variable = parse
+       (* -2 to account for the "%{" *)
+       let start = { start with pos_cnum = start.pos_cnum - 2 } in
+       let loc = Loc.create ~start ~stop:(Lexing.lexeme_end_p lexbuf) in
+-      Template.Pform { loc ; name ; payload }
++      Template.Pform { loc ; name ; payload = Option.map ~f:Template.Pform.Payload.of_string payload }
+   }
+   | '}' | eof
+     { error lexbuf "%{...} forms cannot be empty" }
+diff --git a/src/dune_sexp/template.ml b/src/dune_sexp/template.ml
+index b9a9c2b9a..adbc8c67b 100644
+--- a/src/dune_sexp/template.ml
++++ b/src/dune_sexp/template.ml
+@@ -2,25 +2,77 @@ open! Stdune
+ module Format = Stdlib.Format
+ 
+ module Pform = struct
++  module Payload = struct
++    type t = string
++
++    let of_string t = t
++    let to_string t = t
++    let to_dyn = Dyn.string
++    let compare = String.compare
++
++    module Args = struct
++      let sep = ':'
++      let whole t = t
++
++      let lsplit2 ?(loc = Loc.none) t =
++        match String.lsplit2 t ~on:sep with
++        | Some args -> Ok args
++        | None ->
++          Error
++            (User_error.make
++               ~loc
++               [ Pp.textf
++                   "Expected two arguments separated by '%c' but no '%c' found."
++                   sep
++                   sep
++               ])
++      ;;
++
++      let split t = String.split t ~on:sep
++    end
++  end
++
+   type t =
+     { loc : Loc.t
+     ; name : string
+-    ; payload : string option
++    ; payload : Payload.t option
+     }
+ 
+   let loc (t : t) = t.loc
++
++  let payload_loc t =
++    if Option.is_some t.payload
++    then (
++      let loc_with_start =
++        Loc.set_start
++          t.loc
++          { (Loc.start t.loc) with
++            (* Add 3 for the "%{" at the start of the pform and then ":"
++               separating the name from the payload *)
++            pos_cnum = Loc.start_pos_cnum t.loc + String.length t.name + 3
++          }
++      in
++      Loc.set_stop
++        loc_with_start
++        { (Loc.stop loc_with_start) with
++          (* Subtract 1 for the "}" at the end of the pform *)
++          pos_cnum = Loc.stop_pos_cnum loc_with_start - 1
++        })
++    else Loc.none
++  ;;
++
+   let name { name; _ } = name
+ 
+   let compare_no_loc { name; payload; loc = _ } t =
+     let open Ordering.O in
+     let= () = String.compare name t.name in
+-    Option.compare String.compare payload t.payload
++    Option.compare Payload.compare payload t.payload
+   ;;
+ 
+   let full_name t =
+     match t.payload with
+     | None -> t.name
+-    | Some v -> t.name ^ ":" ^ v
++    | Some v -> t.name ^ ":" ^ Payload.to_string v
+   ;;
+ 
+   let payload t = t.payload
+@@ -29,12 +81,12 @@ module Pform = struct
+     let before, after = "%{", "}" in
+     match payload with
+     | None -> before ^ name ^ after
+-    | Some p -> before ^ name ^ ":" ^ p ^ after
++    | Some p -> before ^ name ^ ":" ^ Payload.to_string p ^ after
+   ;;
+ 
+   let to_dyn { loc = _; name; payload } =
+     let open Dyn in
+-    record [ "name", string name; "payload", option string payload ]
++    record [ "name", string name; "payload", option Payload.to_dyn payload ]
+   ;;
+ 
+   let with_name t ~name = { t with name }
+@@ -43,7 +95,7 @@ module Pform = struct
+     to_string
+       (match t.payload with
+        | None -> t
+-       | Some _ -> { t with payload = Some ".." })
++       | Some _ -> { t with payload = Some (Payload.of_string "..") })
+   ;;
+ 
+   let describe_kind t =
+@@ -90,7 +142,7 @@ end = struct
+      | None -> ()
+      | Some payload ->
+        Buffer.add_char buf ':';
+-       Buffer.add_string buf payload);
++       Buffer.add_string buf (Pform.Payload.to_string payload));
+     Buffer.add_string buf after
+   ;;
+ 
+diff --git a/src/dune_sexp/template.mli b/src/dune_sexp/template.mli
+index edae33689..2ff742429 100644
+--- a/src/dune_sexp/template.mli
++++ b/src/dune_sexp/template.mli
+@@ -1,20 +1,43 @@
+ open! Stdune
+ 
+ module Pform : sig
++  module Payload : sig
++    type t
++
++    val of_string : string -> t
++    val to_string : t -> string
++    val to_dyn : t -> Dyn.t
++    val compare : t -> t -> Ordering.t
++
++    module Args : sig
++      (** Treat the entire payload as a single string argument. *)
++      val whole : t -> string
++
++      (** Split the payload on the first ':' character returning [None] if the
++          payload contains no ':' characters. The [loc] argument is used for
++          error reporting. *)
++      val lsplit2 : ?loc:Loc.t -> t -> (string * string, User_message.t) result
++
++      (** Split the payload on all ':' characters *)
++      val split : t -> string list
++    end
++  end
++
+   type t =
+     { loc : Loc.t
+     ; name : string
+-    ; payload : string option
++    ; payload : Payload.t option
+     }
+ 
+   val to_string : t -> string
+   val to_dyn : t -> Dyn.t
+   val name : t -> string
+   val loc : t -> Loc.t
++  val payload_loc : t -> Loc.t
+   val full_name : t -> string
+ 
+   (** Variables do not have a payload. While macros always do. *)
+-  val payload : t -> string option
++  val payload : t -> Payload.t option
+ 
+   val with_name : t -> name:string -> t
+ 

@@ -1,0 +1,128 @@
+diff --git a/doc/changes/8948.md b/doc/changes/8948.md
+deleted file mode 100644
+index 6d530a1be..000000000
+--- a/doc/changes/8948.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-- Absent packages shouldn't prevent all rules from being loaded (#8948, fixes
+-  #8630, @rgrinberg)
+diff --git a/src/dune_rules/package_db.ml b/src/dune_rules/package_db.ml
+index ea55beef6..4600b3898 100644
+--- a/src/dune_rules/package_db.ml
++++ b/src/dune_rules/package_db.ml
+@@ -29,34 +29,31 @@ let find_package ctx pkg =
+ 
+ let create ctx = Memo.return ctx
+ 
+-let section_of_any_package_site any_package pkg_name loc site =
+-  let sites =
+-    match any_package with
+-    | Build _ ->
+-      (* TODO We should be able to extract this information after the package
+-         is built *)
+-      Site.Map.empty
+-    | Local p -> p.sites
+-    | Installed p -> p.sites
++let section_of_site t ~loc ~pkg ~site =
++  let+ sites =
++    let+ pkg = find_package t pkg in
++    Option.map pkg ~f:(function
++      | Build _ ->
++        (* TODO We should be able to extract this information after the package
++           is built *)
++        Site.Map.empty
++      | Local p -> p.sites
++      | Installed p -> p.sites)
+   in
+-  match Site.Map.find sites site with
+-  | Some section -> section
++  match sites with
+   | None ->
+     User_error.raise
+       ~loc
+-      [ Pp.textf
+-          "Package %s doesn't define a site %s"
+-          (Package.Name.to_string pkg_name)
+-          (Site.to_string site)
+-      ]
+-;;
+-
+-let section_of_site t ~loc ~pkg:pkg_name ~site =
+-  find_package t pkg_name
+-  >>| function
+-  | None ->
+-    User_error.raise
+-      ~loc
+-      [ Pp.textf "The package %s is not found" (Package.Name.to_string pkg_name) ]
+-  | Some pkg -> section_of_any_package_site pkg pkg_name loc site
++      [ Pp.textf "The package %s is not found" (Package.Name.to_string pkg) ]
++  | Some sites ->
++    (match Site.Map.find sites site with
++     | Some section -> section
++     | None ->
++       User_error.raise
++         ~loc
++         [ Pp.textf
++             "Package %s doesn't define a site %s"
++             (Package.Name.to_string pkg)
++             (Site.to_string site)
++         ])
+ ;;
+diff --git a/src/dune_rules/package_db.mli b/src/dune_rules/package_db.mli
+index a27a9a5e6..7564b46ed 100644
+--- a/src/dune_rules/package_db.mli
++++ b/src/dune_rules/package_db.mli
+@@ -10,13 +10,6 @@ type any_package =
+ val create : Context_name.t -> t Memo.t
+ val find_package : t -> Package.Name.t -> any_package option Memo.t
+ 
+-val section_of_any_package_site
+-  :  any_package
+-  -> Package.Name.t
+-  -> Loc.t
+-  -> Site.t
+-  -> Dune_section.t
+-
+ val section_of_site
+   :  t
+   -> loc:Loc.t
+diff --git a/src/dune_rules/super_context.ml b/src/dune_rules/super_context.ml
+index 942578bc8..331503883 100644
+--- a/src/dune_rules/super_context.ml
++++ b/src/dune_rules/super_context.ml
+@@ -357,19 +357,9 @@ let add_packages_env context ~base stanzas packages =
+           stanzas
+           ~init:Package.Name.Map.empty
+           ~f:(fun _ stanza acc ->
+-            let add_in_package_sites pkg_name site loc =
+-              let+ pkg = Package_db.find_package package_db pkg_name in
+-              match pkg with
+-              | None ->
+-                (* Really ugly to supress errors like this. Instead,
+-                   executables that rely on sites should declare that
+-                   in their dependencies *)
+-                acc
+-              | Some pkg ->
+-                let section =
+-                  Package_db.section_of_any_package_site pkg pkg_name loc site
+-                in
+-                add_in_package_section acc pkg_name section
++            let add_in_package_sites pkg site loc =
++              let+ section = Package_db.section_of_site package_db ~loc ~pkg ~site in
++              add_in_package_section acc pkg section
+             in
+             match stanza with
+             | Dune_file.Install { section = Site { pkg; site; loc }; _ } ->
+diff --git a/test/blackbox-tests/test-cases/eager-package-lookup.t b/test/blackbox-tests/test-cases/eager-package-lookup.t
+index 95abf89a5..6e48abc2d 100644
+--- a/test/blackbox-tests/test-cases/eager-package-lookup.t
++++ b/test/blackbox-tests/test-cases/eager-package-lookup.t
+@@ -17,3 +17,8 @@ Github issue #8630
+   > EOF
+ 
+   $ dune build foo
++  File "dune", line 2, characters 16-31:
++  2 |  (section (site (foobarpkg baz)))
++                      ^^^^^^^^^^^^^^^
++  Error: The package foobarpkg is not found
++  [1]

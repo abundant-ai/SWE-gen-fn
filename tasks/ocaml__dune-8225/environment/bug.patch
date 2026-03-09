@@ -1,0 +1,479 @@
+diff --git a/otherlibs/stdune/src/path.mli b/otherlibs/stdune/src/path.mli
+index 8e3c2e768..2b8530487 100644
+--- a/otherlibs/stdune/src/path.mli
++++ b/otherlibs/stdune/src/path.mli
+@@ -268,8 +268,6 @@ val descendant : t -> of_:t -> t option
+ val is_descendant : t -> of_:t -> bool
+ val append_local : t -> Local.t -> t
+ val append_source : t -> Source.t -> t
+-
+-(** [extend_basename p ~suffix] adds [suffix] at the end of the path *)
+ val extend_basename : t -> suffix:Filename.t -> t
+ 
+ (** Extract the build context from a path. For instance, representing paths as
+diff --git a/src/dune_pkg/dune_pkg.ml b/src/dune_pkg/dune_pkg.ml
+index 0f6bf199b..1238dc35c 100644
+--- a/src/dune_pkg/dune_pkg.ml
++++ b/src/dune_pkg/dune_pkg.ml
+@@ -5,6 +5,5 @@ module Opam_file = Opam_file
+ module Opam_repo = Opam_repo
+ module Opam_solver = Opam_solver
+ module Solver_env = Solver_env
+-module Substs = Substs
+ module Sys_poll = Sys_poll
+ module Version_preference = Version_preference
+diff --git a/src/dune_pkg/substs.ml b/src/dune_pkg/substs.ml
+deleted file mode 100644
+index 69f55eaff..000000000
+--- a/src/dune_pkg/substs.ml
++++ /dev/null
+@@ -1,56 +0,0 @@
+-open Stdune
+-
+-module Variable = struct
+-  type t = OpamVariable.t
+-
+-  let to_dyn v = Dyn.string @@ OpamVariable.to_string v
+-  let compare a b = Ordering.of_int @@ OpamVariable.compare a b
+-  let encode v = Dune_lang.atom_or_quoted_string @@ OpamVariable.to_string v
+-  let of_string = OpamVariable.of_string
+-end
+-
+-module Var = struct
+-  module T = struct
+-    type t =
+-      { package : Dune_lang.Package_name.t option
+-      ; variable : Variable.t
+-      }
+-
+-    let compare a b =
+-      match Option.compare Dune_lang.Package_name.compare a.package b.package with
+-      | Eq -> Ordering.of_int @@ OpamVariable.compare a.variable b.variable
+-      | otherwise -> otherwise
+-    ;;
+-
+-    let to_dyn { package; variable } =
+-      Dyn.pair
+-        (Dyn.option Dune_lang.Package_name.to_dyn)
+-        Variable.to_dyn
+-        (package, variable)
+-    ;;
+-  end
+-
+-  include Comparable.Make (T)
+-  include T
+-end
+-
+-module Map = Var.Map
+-
+-let subst env self ~src ~dst =
+-  let self' = self |> Dune_lang.Package_name.to_string |> OpamPackage.Name.of_string in
+-  let env full_variable =
+-    let variable = OpamVariable.Full.variable full_variable in
+-    let package =
+-      OpamVariable.Full.package ~self:self' full_variable
+-      |> Option.map ~f:(fun package ->
+-        package |> OpamPackage.Name.to_string |> Dune_lang.Package_name.of_string)
+-    in
+-    let key = { Var.T.package; variable } in
+-    match Map.find env key with
+-    | Some _ as v -> v
+-    | None -> Map.find env { Var.T.package = Some self; variable }
+-  in
+-  let src = OpamFilename.of_string (Path.to_string src) in
+-  let dst = OpamFilename.of_string (Path.Build.to_string dst) in
+-  OpamFilter.expand_interpolations_in_file_full env ~src ~dst
+-;;
+diff --git a/src/dune_pkg/substs.mli b/src/dune_pkg/substs.mli
+deleted file mode 100644
+index 98edca56b..000000000
+--- a/src/dune_pkg/substs.mli
++++ /dev/null
+@@ -1,32 +0,0 @@
+-open Stdune
+-
+-module Variable : sig
+-  type t
+-
+-  val compare : t -> t -> Ordering.t
+-  val to_dyn : t -> Dyn.t
+-  val encode : t -> Dune_lang.t
+-  val of_string : string -> t
+-end
+-
+-module Var : sig
+-  type t =
+-    { package : Dune_lang.Package_name.t option
+-    ; variable : Variable.t
+-    }
+-
+-  val compare : t -> t -> Ordering.t
+-
+-  include Comparable_intf.S with type key := t
+-
+-  val to_dyn : t -> Dyn.t
+-end
+-
+-module Map = Var.Map
+-
+-val subst
+-  :  OpamVariable.variable_contents Map.t
+-  -> Dune_lang.Package_name.t
+-  -> src:Path.t
+-  -> dst:Path.Build.t
+-  -> unit
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index a24f48d67..6ca1e9c98 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -3,6 +3,7 @@ open Memo.O
+ open Dune_pkg
+ 
+ (* TODO
++   - substitutions
+    - post dependencies
+    - build dependencies
+    - cross compilation
+@@ -357,57 +358,28 @@ end
+ 
+ module Substitute = struct
+   module Spec = struct
+-    type ('path, 'target) t =
+-      (* XXX it's not good to serialize the substitution map like this. We're
+-         essentially implementing the same substitution procedure but in two
+-         different places: action geeneration, and action execution.
+-
+-         The two implementations are bound to drift. Better would be to
+-         reconstruct everything that is needed to call our one and only
+-         substitution function. *)
+-      OpamVariable.variable_contents Substs.Map.t
+-      * Dune_lang.Package_name.t
+-      * 'path
+-      * 'target
++    type ('path, 'target) t = 'path * 'target
+ 
+     let name = "substitute"
+     let version = 1
+-    let bimap (e, s, i, o) f g = e, s, f i, g o
++    let bimap (i, o) f g = f i, g o
+     let is_useful_to ~distribute:_ ~memoize = memoize
+ 
+-    let encode (e, s, i, o) input output : Dune_lang.t =
+-      let e =
+-        Substs.Map.to_list_map e ~f:(fun { Substs.Var.package; variable } v ->
+-          let k =
+-            let package =
+-              Dune_sexp.Encoder.option Dune_lang.Package_name.encode package
+-            in
+-            Dune_sexp.List [ package; Substs.Variable.encode variable ]
+-          in
+-          let v =
+-            Dune_lang.atom_or_quoted_string (OpamVariable.string_of_variable_contents v)
+-          in
+-          Dune_sexp.List [ k; v ])
+-      in
+-      let s = Dune_lang.Package_name.encode s in
+-      List [ Dune_lang.atom_or_quoted_string name; List e; s; input i; output o ]
++    let encode (i, o) input output : Dune_lang.t =
++      List [ Dune_lang.atom_or_quoted_string name; input i; output o ]
+     ;;
+ 
+-    let action (env, self, src, dst) ~ectx:_ ~eenv:_ =
+-      let open Fiber.O in
+-      let+ () = Fiber.return () in
+-      Substs.subst env ~src self ~dst
+-    ;;
++    let action _ ~ectx:_ ~eenv:_ = assert false
+   end
+ 
+-  let action ~env ~name ~input ~output =
++  let action ~input ~output =
+     let module M = struct
+       type path = Path.t
+       type target = Path.Build.t
+ 
+       module Spec = Spec
+ 
+-      let v = env, name, input, output
++      let v = input, output
+     end
+     in
+     Action.Extension (module M)
+@@ -582,54 +554,6 @@ module Action_expander = struct
+     ;;
+   end
+ 
+-  let substitute_env (expander : Expander.t) =
+-    let setenv package variable value env =
+-      let var = { Substs.Var.package = Some package; variable } in
+-      Substs.Map.add_exn env var value
+-    in
+-    let env =
+-      (* values set with withenv *)
+-      Env.Map.map expander.env ~f:Env_update.string_of_env_values
+-      |> Env.Map.to_list_map ~f:(fun variable value ->
+-        (* TODO why is [package = None]? *)
+-        ( { Substs.Var.package = None; variable = Substs.Variable.of_string variable }
+-        , OpamVariable.S value ))
+-      |> Substs.Map.of_list_exn
+-    in
+-    Dune_lang.Package_name.Map.foldi
+-      expander.deps
+-      ~init:env
+-      ~f:(fun name (var_conts, paths) env ->
+-        let env =
+-          String.Map.foldi var_conts ~init:env ~f:(fun key value env ->
+-            let key = Substs.Variable.of_string key in
+-            setenv name key value env)
+-        in
+-        let install_paths = Paths.install_paths paths in
+-        List.fold_left
+-          ~init:env
+-          ~f:(fun env (var_name, section) ->
+-            let key = Substs.Variable.of_string var_name in
+-            let section =
+-              OpamVariable.S (Path.to_string (Install.Paths.get install_paths section))
+-            in
+-            setenv name key section env)
+-          [ "lib", Section.Lib
+-          ; "lib_root", Lib_root
+-          ; "libexec", Libexec
+-          ; "libexec_root", Libexec_root
+-          ; "bin", Bin
+-          ; "sbin", Sbin
+-          ; "toplevel", Toplevel
+-          ; "share", Share
+-          ; "share_root", Share_root
+-          ; "etc", Etc
+-          ; "doc", Doc
+-          ; "stublibs", Stublibs
+-          ; "man", Man
+-          ])
+-  ;;
+-
+   let rec expand (action : Action_unexpanded.t) ~(expander : Expander.t) =
+     let dir = Path.build expander.paths.source_dir in
+     match action with
+@@ -647,7 +571,7 @@ module Action_expander = struct
+       Action.System arg
+     | Patch p ->
+       let* input = Expander.expand_pform_gen ~mode:Single expander p in
+-      let input = Value.to_string ~dir input in
++      let input = input |> Value.to_string ~dir in
+       let+ patch =
+         let path = Global.env () |> Env_path.path in
+         let program = "patch" in
+@@ -661,17 +585,14 @@ module Action_expander = struct
+       (* TODO opam has a preprocessing step that we should probably apply *)
+       Action.Run (patch, Array.Immutable.of_array [| "-p1"; "-i"; input |])
+     | Substitute (input, output) ->
+-      let+ input =
+-        Expander.expand_pform_gen ~mode:Single expander input >>| Value.to_path ~dir
+-      and+ output =
+-        let+ output = Expander.expand_pform_gen ~mode:Single expander output in
+-        Value.to_path ~dir output
+-        |> (* TODO this needs proper error handling *) Path.as_in_build_dir_exn
+-      in
+-      let env = substitute_env expander in
+-      Substitute.action ~env ~name:expander.paths.name ~input ~output
++      let* input = Expander.expand_pform_gen ~mode:Single expander input in
++      let input = input |> Value.to_path ~dir in
++      let+ output = Expander.expand_pform_gen ~mode:Single expander output in
++      let output = output |> Value.to_path ~dir |> Path.as_in_build_dir_exn in
++      Substitute.action ~input ~output
+     | Withenv (updates, action) ->
+-      let* env, updates =
++      let* action = expand action ~expander in
++      let+ _env, updates =
+         Memo.List.fold_left
+           ~init:(expander.env, [])
+           updates
+@@ -694,8 +615,6 @@ module Action_expander = struct
+             in
+             env, update :: updates)
+       in
+-      let expander = { expander with env } in
+-      let+ action = expand action ~expander in
+       List.fold_left updates ~init:action ~f:(fun action (k, v) ->
+         Action.Setenv (k, v, action))
+     | _ ->
+diff --git a/test/blackbox-tests/test-cases/pkg/substitute.t b/test/blackbox-tests/test-cases/pkg/substitute.t
+deleted file mode 100644
+index 8ba5721af..000000000
+--- a/test/blackbox-tests/test-cases/pkg/substitute.t
++++ /dev/null
+@@ -1,128 +0,0 @@
+-The test-source folder has a file to use substitution on.
+-
+-  $ mkdir test-source
+-  $ cat >test-source/foo.ml.in <<EOF
+-  > This file will be fed to the substitution mechanism
+-  > EOF
+-  $ mkdir dune.lock
+-  $ cat >dune.lock/lock.dune <<EOF
+-  > (lang package 0.1)
+-  > EOF
+-  $ cat >dune.lock/test.pkg <<EOF
+-  > (source (copy $PWD/test-source))
+-  > (build
+-  >  (progn
+-  >   (substitute foo.ml.in foo.ml)
+-  >   (system "cat foo.ml")))
+-  > EOF
+-
+-This should take the `foo.ml.in`, do the substitutions and create `foo.ml`:
+-
+-  $ dune build .pkg/test/target/
+-  This file will be fed to the substitution mechanism
+-
+-This should also work with any other filename combination:
+-
+-  $ cat >test-source/foo.ml.template <<EOF
+-  > This is using a different file suffix
+-  > EOF
+-  $ cat >dune.lock/test.pkg <<EOF
+-  > (source (copy $PWD/test-source))
+-  > (build
+-  >  (progn
+-  >   (substitute foo.ml.template not-a-prefix)
+-  >   (system "cat not-a-prefix")))
+-  > EOF
+-
+-This should take the `foo.ml.template`, do the substitution and create
+-`foo.ml`, thus be more flexible that the OPAM `substs` field:
+-
+-  $ dune build .pkg/test/target/
+-  This is using a different file suffix
+-
+-Undefined variables, how do they substitute?
+-
+-  $ cat >test-source/variables.ml.in <<EOF
+-  > We substitute this '%%{var}%%' into '%{var}%'
+-  > EOF
+-  $ cat >dune.lock/test.pkg <<EOF
+-  > (source (copy $PWD/test-source))
+-  > (build
+-  >  (progn
+-  >   (substitute variables.ml.in variables.ml)
+-  >   (system "cat variables.ml")))
+-  > EOF
+-  $ dune build .pkg/test/target/
+-  We substitute this '%{var}%' into ''
+-
+-Now with variables set
+-
+-  $ cat >test-source/defined.ml.in <<EOF
+-  > We substitute '%%{name}%%' into '%{name}%' and '%%{_:name}%%' into '%{_:name}%'
+-  > And '%%{version}%%' is set to '%{version}%'
+-  > There is also some paths set:
+-  > '%%{lib}%%' is '%{lib}%'
+-  > '%%{lib_root}%%' is '%{lib_root}%'
+-  > '%%{libexec}%%' is '%{libexec}%'
+-  > '%%{libexec_root}%%' is '%{libexec_root}%'
+-  > '%%{bin}%%' is '%{bin}%'
+-  > '%%{sbin}%%' is '%{sbin}%'
+-  > '%%{toplevel}%%' is '%{toplevel}%'
+-  > '%%{share}%%' is '%{share}%'
+-  > '%%{share_root}%%' is '%{share_root}%'
+-  > '%%{etc}%%' is '%{etc}%'
+-  > '%%{doc}%%' is '%{doc}%'
+-  > '%%{stublibs}%%' is '%{stublibs}%'
+-  > '%%{man}%%' is '%{man}%'
+-  > Finally, '%%{custom}%%' is '%{custom}%'
+-  > EOF
+-  $ cat >dune.lock/test.pkg <<EOF
+-  > (source (copy $PWD/test-source))
+-  > (build
+-  >  (progn
+-  >   (withenv
+-  >    ((= custom defined-here))
+-  >    (substitute defined.ml.in defined.ml))
+-  >   (system "cat defined.ml")))
+-  > EOF
+-  $ dune build .pkg/test/target/
+-  We substitute '%{name}%' into 'test' and '%{_:name}%' into 'test'
+-  And '%{version}%' is set to 'dev'
+-  There is also some paths set:
+-  '%{lib}%' is '_build/default/.pkg/test/target/lib/test'
+-  '%{lib_root}%' is '_build/default/.pkg/test/target/lib'
+-  '%{libexec}%' is '_build/default/.pkg/test/target/lib/test'
+-  '%{libexec_root}%' is '_build/default/.pkg/test/target/lib'
+-  '%{bin}%' is '_build/default/.pkg/test/target/bin'
+-  '%{sbin}%' is '_build/default/.pkg/test/target/sbin'
+-  '%{toplevel}%' is '_build/default/.pkg/test/target/lib/toplevel'
+-  '%{share}%' is '_build/default/.pkg/test/target/share/test'
+-  '%{share_root}%' is '_build/default/.pkg/test/target/share'
+-  '%{etc}%' is '_build/default/.pkg/test/target/etc/test'
+-  '%{doc}%' is '_build/default/.pkg/test/target/doc/test'
+-  '%{stublibs}%' is '_build/default/.pkg/test/target/lib/stublibs'
+-  '%{man}%' is '_build/default/.pkg/test/target/man'
+-  Finally, '%{custom}%' is 'defined-here'
+-
+-It is also possible to use variables of your dependencies:
+-
+-  $ mkdir dependency-source
+-  $ cat >dune.lock/dependency.pkg <<EOF
+-  > (source (copy $PWD/dependency-source))
+-  > EOF
+-  $ cat >dune.lock/test.pkg <<EOF
+-  > (source (copy $PWD/test-source))
+-  > ; adding deps breaks cat
+-  > ;(deps dependency)
+-  > (build
+-  >  (progn
+-  >   (substitute dependencies.ml.in dependencies.ml)
+-  >   (system "cat dependencies.ml")))
+-  > EOF
+-  $ cat >test-source/dependencies.ml.in <<EOF
+-  > There is also some paths set:
+-  > '%%{dependency:lib}%%' is '%{dependency:lib}%'
+-  > EOF
+-  $ dune build .pkg/test/target/
+-  There is also some paths set:
+-  '%{dependency:lib}%' is '_build/default/.pkg/test/target/lib/test'
+diff --git a/vendor/opam/src/format/opamFilter.ml b/vendor/opam/src/format/opamFilter.ml
+index 8651e2300..d60abc796 100644
+--- a/vendor/opam/src/format/opamFilter.ml
++++ b/vendor/opam/src/format/opamFilter.ml
+@@ -418,10 +418,12 @@ let ident_string ?default env id = value_string ?default (resolve_ident env id)
+ 
+ let ident_bool ?default env id = value_bool ?default (resolve_ident env id)
+ 
+-(* Substitute the file contents and specify the source and destination *)
+-let expand_interpolations_in_file_full env ~src ~dst =
++(* Substitute the file contents *)
++let expand_interpolations_in_file env file =
++  let f = OpamFilename.of_basename file in
++  let src = OpamFilename.add_extension f "in" in
+   let ic = OpamFilename.open_in_bin src in
+-  let oc = OpamFilename.open_out_bin dst in
++  let oc = OpamFilename.open_out_bin f in
+   (* Determine if the input file parses in opam-file-format *)
+   let is_opam_format =
+     try
+@@ -454,12 +456,6 @@ let expand_interpolations_in_file_full env ~src ~dst =
+   close_in ic;
+   close_out oc
+ 
+-(* Substitute the file contents *)
+-let expand_interpolations_in_file env file =
+-  let file = OpamFilename.of_basename file in
+-  let src = OpamFilename.add_extension file "in" in
+-  expand_interpolations_in_file_full env ~src ~dst:file
+-
+ (* Apply filters and interpolations to package commands *)
+ 
+ let arguments env (a,f) =
+diff --git a/vendor/opam/src/format/opamFilter.mli b/vendor/opam/src/format/opamFilter.mli
+index 51d83ef1f..b446a6550 100644
+--- a/vendor/opam/src/format/opamFilter.mli
++++ b/vendor/opam/src/format/opamFilter.mli
+@@ -129,8 +129,6 @@ val ident_string: ?default:string -> env -> fident -> string
+ (** Like [ident_value], but casts the result to a bool *)
+ val ident_bool: ?default:bool -> env -> fident -> bool
+ 
+-val expand_interpolations_in_file_full: env -> src:filename -> dst:filename -> unit
+-
+ (** Rewrites [basename].in to [basename], expanding interpolations.
+     If the first line begins ["opam-version:"], assumes that expansion of
+     variables within strings should be properly escaped. In particular, this

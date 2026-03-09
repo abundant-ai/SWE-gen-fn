@@ -1,0 +1,145 @@
+diff --git a/otherlibs/stdune/src/appendable_list.ml b/otherlibs/stdune/src/appendable_list.ml
+index 28c58bfab..247026f53 100644
+--- a/otherlibs/stdune/src/appendable_list.ml
++++ b/otherlibs/stdune/src/appendable_list.ml
+@@ -1,13 +1,54 @@
+-type 'a t = 'a list -> 'a list
+-
+-let empty k = k
+-let singleton x k = x :: k
+-let to_list l = l []
+-let ( @ ) a b k = a (b k)
+-let cons x xs = singleton x @ xs
+-
+-let rec concat l k =
+-  match l with
+-  | [] -> k
+-  | t :: l -> t (concat l k)
++type 'a t =
++  | Empty
++  | Singleton of 'a
++  | Cons of 'a * 'a t
++  | List of 'a list
++  | Append of 'a t * 'a t
++  | Concat of 'a t list
++
++let empty = Empty
++let singleton x = Singleton x
++
++let ( @ ) a b =
++  match a, b with
++  | Empty, _ -> b
++  | _, Empty -> a
++  | Singleton a, _ -> Cons (a, b)
++  | _, _ -> Append (a, b)
++;;
++
++let cons x xs = Cons (x, xs)
++
++let to_list_rev =
++  let rec loop1 acc t stack =
++    match t with
++    | Empty -> loop0 acc stack
++    | Singleton x -> loop0 (x :: acc) stack
++    | Cons (x, xs) -> loop1 (x :: acc) xs stack
++    | List xs -> loop0 (List.rev_append xs acc) stack
++    | Append (xs, ys) -> loop1 acc xs (ys :: stack)
++    | Concat [] -> loop0 acc stack
++    | Concat (x :: xs) -> loop1 acc x (Concat xs :: stack)
++  and loop0 acc stack =
++    match stack with
++    | [] -> acc
++    | t :: stack -> loop1 acc t stack
++  in
++  fun t -> loop1 [] t []
+ ;;
++
++let to_list xs = List.rev (to_list_rev xs)
++
++let rec is_empty = function
++  | List (_ :: _) | Singleton _ | Cons _ -> false
++  | Append (x, y) -> is_empty x && is_empty y
++  | Concat xs -> is_empty_list xs
++  | List [] | Empty -> true
++
++and is_empty_list = function
++  | [] -> true
++  | x :: xs -> is_empty x && is_empty_list xs
++;;
++
++let concat list = Concat list
++let of_list x = List x
+diff --git a/otherlibs/stdune/src/appendable_list.mli b/otherlibs/stdune/src/appendable_list.mli
+index f29e35501..2f0c1b061 100644
+--- a/otherlibs/stdune/src/appendable_list.mli
++++ b/otherlibs/stdune/src/appendable_list.mli
+@@ -7,5 +7,10 @@ val empty : 'a t
+ val singleton : 'a -> 'a t
+ val ( @ ) : 'a t -> 'a t -> 'a t
+ val cons : 'a -> 'a t -> 'a t
+-val concat : 'a t list -> 'a t
+ val to_list : 'a t -> 'a list
++val to_list_rev : 'a t -> 'a list
++val of_list : 'a list -> 'a t
++val concat : 'a t list -> 'a t
++
++(** The current implementation is slow, don't use it on a hot path. *)
++val is_empty : _ t -> bool
+diff --git a/src/dune_engine/load_rules.ml b/src/dune_engine/load_rules.ml
+index 8bf5e8c8f..40bc1cbf7 100644
+--- a/src/dune_engine/load_rules.ml
++++ b/src/dune_engine/load_rules.ml
+@@ -380,8 +380,8 @@ end = struct
+   ;;
+ 
+   let compute_alias_expansions ~(collected : Rules.Dir_rules.ready) ~dir =
+-    let aliases = collected.aliases in
+     let+ aliases =
++      let aliases = collected.aliases in
+       if Alias.Name.Map.mem aliases Alias.Name.default
+       then Memo.return aliases
+       else
+@@ -398,7 +398,10 @@ end = struct
+             }
+     in
+     Alias.Name.Map.map aliases ~f:(fun { Rules.Dir_rules.Alias_spec.expansions } ->
+-      Appendable_list.to_list expansions)
++      (* CR-soon rgrinberg: hide this reversal behind the interface from
++         [Alias_spec]. The order doesn't really matter, as we're just
++         collecting the dependencies that are attached to the alias *)
++      Appendable_list.to_list_rev expansions)
+   ;;
+ 
+   let add_non_fallback_rules ~init ~source_files rules =
+diff --git a/src/dune_engine/rules.ml b/src/dune_engine/rules.ml
+index fa0d60b8a..99aa08be9 100644
+--- a/src/dune_engine/rules.ml
++++ b/src/dune_engine/rules.ml
+@@ -10,7 +10,6 @@ module Dir_rules = struct
+ 
+     type t = { expansions : (Loc.t * item) Appendable_list.t } [@@unboxed]
+ 
+-    let empty = { expansions = Appendable_list.empty }
+     let union x y = { expansions = Appendable_list.( @ ) x.expansions y.expansions }
+   end
+ 
+@@ -47,9 +46,16 @@ module Dir_rules = struct
+         | Alias { name; spec } -> Right (name, spec))
+     in
+     let aliases =
+-      Alias.Name.Map.of_list_multi aliases
+-      |> Alias.Name.Map.map ~f:(fun specs ->
+-        List.fold_left specs ~init:Alias_spec.empty ~f:Alias_spec.union)
++      let add_item what = function
++        | None -> Some what
++        | Some base -> Some (Alias_spec.union what base)
++      in
++      (* This accumulates the aliases in reverse order, but there's another
++         reversal whenever the expansion is inspected. The order doesn't really
++         matter, but it does change the tests. So it's nice to maintain it if
++         possible *)
++      List.fold_left aliases ~init:Alias.Name.Map.empty ~f:(fun acc (name, item) ->
++        Alias.Name.Map.update acc name ~f:(add_item item))
+     in
+     { rules; aliases }
+   ;;

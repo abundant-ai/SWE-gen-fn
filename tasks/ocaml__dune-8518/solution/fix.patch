@@ -1,0 +1,162 @@
+diff --git a/doc/changes/8518.md b/doc/changes/8518.md
+new file mode 100644
+index 000000000..42978c2b9
+--- /dev/null
++++ b/doc/changes/8518.md
+@@ -0,0 +1,2 @@
++- Ignore internal promote rules when `--ignore-promoted-rules` is set (#8518,
++  fix #8417, @rgrinberg)
+diff --git a/src/dune_rules/dune_file.ml b/src/dune_rules/dune_file.ml
+index 0ccce3d67..33e279042 100644
+--- a/src/dune_rules/dune_file.ml
++++ b/src/dune_rules/dune_file.ml
+@@ -2463,21 +2463,12 @@ type t =
+   ; stanzas : Stanzas.t
+   }
+ 
+-let is_promoted_rule =
+-  let is_promoted_mode version = function
+-    | Rule.Mode.Promote { only = None; lifetime; _ } ->
+-      if version >= (3, 5)
+-      then (
+-        match lifetime with
+-        | Unlimited -> true
+-        | Until_clean -> false)
+-      else true
+-    | _ -> false
+-  in
+-  fun version rule ->
+-    match rule with
+-    | Rule { mode; _ } | Menhir_stanza.T { mode; _ } -> is_promoted_mode version mode
+-    | _ -> false
++let is_promoted_rule version rule =
++  match rule with
++  | Rule { mode; _ } | Menhir_stanza.T { mode; _ } ->
++    let until_clean = if version >= (3, 5) then `Keep else `Ignore in
++    Rule_mode_decoder.is_ignored mode ~until_clean
++  | _ -> false
+ ;;
+ 
+ let parse sexps ~dir ~file ~project =
+diff --git a/src/dune_rules/rule_mode_decoder.ml b/src/dune_rules/rule_mode_decoder.ml
+index d741edfe7..f4ca2cddf 100644
+--- a/src/dune_rules/rule_mode_decoder.ml
++++ b/src/dune_rules/rule_mode_decoder.ml
+@@ -99,3 +99,15 @@ end
+ 
+ let decode = sum mode_decoders
+ let field = field "mode" decode ~default:Rule.Mode.Standard
++
++let is_ignored (mode : Rule.Mode.t) ~until_clean =
++  !Clflags.ignore_promoted_rules
++  &&
++  match mode with
++  | Promote { only = None; lifetime = Unlimited; _ } -> true
++  | Promote { only = None; lifetime = Until_clean; _ } ->
++    (match until_clean with
++     | `Ignore -> true
++     | `Keep -> false)
++  | _ -> false
++;;
+diff --git a/src/dune_rules/rule_mode_decoder.mli b/src/dune_rules/rule_mode_decoder.mli
+index 490689334..03504b797 100644
+--- a/src/dune_rules/rule_mode_decoder.mli
++++ b/src/dune_rules/rule_mode_decoder.mli
+@@ -15,3 +15,11 @@ end
+ 
+ val decode : Rule.Mode.t Dune_lang.Decoder.t
+ val field : Rule.Mode.t Dune_lang.Decoder.fields_parser
++
++(** [is_ignored mode ~until_clean] will return if a rule with [mode] should be
++    ignored whenever [--ignored-promoted-rules] is set.
++
++    [until_clean] is used to set if [(promote (until-clean))] is ignored as
++    considered by this function. Old versions of dune would incorrectly ignore
++    this, so we need to maintain the old behavior for now. *)
++val is_ignored : Rule.Mode.t -> until_clean:[ `Ignore | `Keep ] -> bool
+diff --git a/src/dune_rules/simple_rules.ml b/src/dune_rules/simple_rules.ml
+index 57865850d..c640727c3 100644
+--- a/src/dune_rules/simple_rules.ml
++++ b/src/dune_rules/simple_rules.ml
+@@ -134,9 +134,7 @@ let user_rule sctx ?extra_bindings ~dir ~expander (rule : Rule.t) =
+       else action
+     in
+     (match rule_kind ~rule ~action with
+-     | No_alias ->
+-       let+ targets = add_user_rule sctx ~dir ~rule ~action ~expander in
+-       Some targets
++     | No_alias -> add_user_rule sctx ~dir ~rule ~action ~expander
+      | Aliases_with_targets (aliases, alias_target) ->
+        let* () =
+          let aliases = List.map ~f:(Alias.make ~dir) aliases in
+@@ -145,8 +143,7 @@ let user_rule sctx ?extra_bindings ~dir ~expander (rule : Rule.t) =
+              alias
+              (Action_builder.path (Path.build alias_target)))
+        in
+-       let+ targets = add_user_rule sctx ~dir ~rule ~action ~expander in
+-       Some targets
++       add_user_rule sctx ~dir ~rule ~action ~expander
+      | Aliases_only aliases ->
+        let aliases = List.map ~f:(Alias.make ~dir) aliases in
+        let* action = interpret_and_add_locks ~expander rule.locks action.build in
+diff --git a/src/dune_rules/super_context.ml b/src/dune_rules/super_context.ml
+index 402f6ab95..716d0143c 100644
+--- a/src/dune_rules/super_context.ml
++++ b/src/dune_rules/super_context.ml
+@@ -255,24 +255,31 @@ let extend_action t ~dir build =
+ ;;
+ 
+ let make_rule t ?mode ?loc ~dir { Action_builder.With_targets.build; targets } =
+-  let build = extend_action t build ~dir in
+-  Rule.make
+-    ?mode
+-    ~info:(Rule.Info.of_loc_opt loc)
+-    ~context:(Some (Context.build_context (Env_tree.context t)))
+-    ~targets
+-    build
++  match mode with
++  | Some mode when Rule_mode_decoder.is_ignored mode ~until_clean:`Keep -> None
++  | _ ->
++    let build = extend_action t build ~dir in
++    Some
++      (Rule.make
++         ?mode
++         ~info:(Rule.Info.of_loc_opt loc)
++         ~context:(Some (Context.build_context (Env_tree.context t)))
++         ~targets
++         build)
+ ;;
+ 
+ let add_rule t ?mode ?loc ~dir build =
+-  let rule = make_rule t ?mode ?loc ~dir build in
+-  Rules.Produce.rule rule
++  match make_rule t ?mode ?loc ~dir build with
++  | None -> Memo.return ()
++  | Some rule -> Rules.Produce.rule rule
+ ;;
+ 
+ let add_rule_get_targets t ?mode ?loc ~dir build =
+-  let rule = make_rule t ?mode ?loc ~dir build in
+-  let+ () = Rules.Produce.rule rule in
+-  rule.targets
++  match make_rule t ?mode ?loc ~dir build with
++  | None -> Memo.return None
++  | Some rule ->
++    let+ () = Rules.Produce.rule rule in
++    Some rule.targets
+ ;;
+ 
+ let add_rules t ?loc ~dir builds = Memo.parallel_iter builds ~f:(add_rule ?loc t ~dir)
+diff --git a/src/dune_rules/super_context.mli b/src/dune_rules/super_context.mli
+index c54b78043..cdc5fc302 100644
+--- a/src/dune_rules/super_context.mli
++++ b/src/dune_rules/super_context.mli
+@@ -69,7 +69,7 @@ val add_rule_get_targets
+   -> ?loc:Loc.t
+   -> dir:Path.Build.t
+   -> Action.Full.t Action_builder.With_targets.t
+-  -> Targets.Validated.t Memo.t
++  -> Targets.Validated.t option Memo.t
+ 
+ val add_rules
+   :  t

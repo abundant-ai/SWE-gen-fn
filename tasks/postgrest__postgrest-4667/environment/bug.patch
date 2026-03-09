@@ -1,0 +1,599 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a98c00be..a74472ac 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,7 +12,6 @@ All notable changes to this project will be documented in this file. From versio
+ - Log host, port and pg version of listener database connection by @mkleczek in #4617 #4618
+ - Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
+   + Removed unnecessary double count when building the `Content-Range`.
+-- Add config `client_error_verbosity` to customize error verbosity by @taimoorzaeem in #4088, #3980, #3824
+ 
+ ### Changed
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 1a6a1693..ed51daaa 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -195,53 +195,6 @@ app.settings.*
+ 
+   The :code:`current_setting` function has `an optional boolean second <https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET>`_ argument to avoid it from raising an error if the value was not defined. Default values to :code:`app.settings` can then be given by combining this argument with :code:`coalesce` and :code:`nullif` : :code:`coalesce(nullif(current_setting('app.settings.my_custom_variable', true), ''), 'default value')`. The use of :code:`nullif` is necessary because if set in a transaction, the setting is sometimes not "rolled back" to :code:`null`. See also :ref:`this section <guc_req_headers_cookies_claims>` for more information on this behaviour.
+ 
+-.. _client-error-verbosity:
+-
+-client-error-verbosity
+-----------------------
+-
+-  =============== =======================
+-  **Type**        String
+-  **Default**     verbose
+-  **Reloadable**  Y
+-  **Environment** PGRST_CLIENT_ERROR_VERBOSITY
+-  **In-Database** pgrst.client_error_verbosity
+-  =============== =======================
+-
+-  Specifies the verbosity of PostgREST errors.
+-
+-  With ``verbose``, ``code``, ``message``, ``details`` and ``hint`` are returned.
+-
+-  .. code:: bash
+-
+-    curl "localhost:3000/itemsxx"
+-
+-  .. code-block:: json
+-
+-    {
+-        "code": "PGRST205",
+-        "message": "Could not find the table 'public.itemsxx' in the schema cache",
+-        "details": "Perhaps you meant the table 'public.items'",
+-        "hint": null
+-    }
+-
+-  With ``minimal``, just ``code`` and ``message`` are returned.
+-
+-  .. code:: bash
+-
+-    curl "localhost:3000/itemsxx"
+-
+-  .. code-block:: json
+-
+-    {
+-        "code": "PGRST205",
+-        "message": "Could not find the table 'public.itemsxx' in the schema cache"
+-    }
+-
+-  .. note::
+-
+-    This setting only affects client side error messages. Server side logs are not affected by this setting.
+-
+ .. _db-aggregates-enabled:
+ 
+ db-aggregates-enabled
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 44fdb2a9..9f207de1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -119,31 +119,30 @@ postgrest logLevel appState connWorker =
+   Logger.middleware logLevel Auth.getRole $
+     -- fromJust can be used, because the auth middleware will **always** add
+     -- some AuthResult to the vault.
+-    \req respond -> do
+-      appConf@AppConfig{..} <- AppState.getConfig appState -- the config must be read again because it can reload
+-      case fromJust $ Auth.getResult req of
+-        Left err -> respond $ Error.errorResponseFor configClientErrorVerbosity err
+-        Right authResult -> do
+-          maybeSchemaCache <- AppState.getSchemaCache appState
+-
+-          let
+-            eitherResponse :: IO (Either Error Wai.Response)
+-            eitherResponse =
+-              runExceptT $ postgrestResponse appState appConf maybeSchemaCache authResult req
+-
+-          response <- either (Error.errorResponseFor configClientErrorVerbosity) identity <$> eitherResponse
+-          -- Launch the connWorker when the connection is down. The postgrest
+-          -- function can respond successfully (with a stale schema cache) before
+-          -- the connWorker is done. However, when there's an empty schema cache
+-          -- postgrest responds with the error `PGRST002`; this means that the schema
+-          -- cache is still loading, so we don't launch the connWorker here because
+-          -- it would duplicate the loading process, e.g. https://github.com/PostgREST/postgrest/issues/3704
+-          -- TODO: this process may be unnecessary when the Listener is enabled. Revisit once https://github.com/PostgREST/postgrest/issues/1766 is done
+-          when (isServiceUnavailable response && isJust maybeSchemaCache) connWorker
+-          resp <- do
+-            delay <- AppState.getNextDelay appState
+-            return $ addRetryHint delay response
+-          respond resp
++    \req respond -> case fromJust $ Auth.getResult req of
++      Left err -> respond $ Error.errorResponseFor err
++      Right authResult -> do
++        appConf <- AppState.getConfig appState -- the config must be read again because it can reload
++        maybeSchemaCache <- AppState.getSchemaCache appState
++
++        let
++          eitherResponse :: IO (Either Error Wai.Response)
++          eitherResponse =
++            runExceptT $ postgrestResponse appState appConf maybeSchemaCache authResult req
++
++        response <- either Error.errorResponseFor identity <$> eitherResponse
++        -- Launch the connWorker when the connection is down. The postgrest
++        -- function can respond successfully (with a stale schema cache) before
++        -- the connWorker is done. However, when there's an empty schema cache
++        -- postgrest responds with the error `PGRST002`; this means that the schema
++        -- cache is still loading, so we don't launch the connWorker here because
++        -- it would duplicate the loading process, e.g. https://github.com/PostgREST/postgrest/issues/3704
++        -- TODO: this process may be unnecessary when the Listener is enabled. Revisit once https://github.com/PostgREST/postgrest/issues/1766 is done
++        when (isServiceUnavailable response && isJust maybeSchemaCache) connWorker
++        resp <- do
++          delay <- AppState.getNextDelay appState
++          return $ addRetryHint delay response
++        respond resp
+ 
+ postgrestResponse
+   :: AppState.AppState
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index fbc68530..a5706a74 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -29,7 +29,6 @@ module PostgREST.Config
+   , addTargetSessionAttrs
+   , exampleConfigFile
+   , audMatchesCfg
+-  , Verbosity (..)
+   ) where
+ 
+ import qualified Data.Aeson             as JSON
+@@ -74,7 +73,6 @@ audMatchesCfg =  maybe (const True) (==) . configJwtAudience
+ 
+ data AppConfig = AppConfig
+   { configAppSettings              :: [(Text, Text)]
+-  , configClientErrorVerbosity     :: Verbosity
+   , configDbAggregates             :: Bool
+   , configDbAnonRole               :: Maybe BS.ByteString
+   , configDbChannel                :: Text
+@@ -136,15 +134,6 @@ dumpLogLevel = \case
+   LogInfo  -> "info"
+   LogDebug -> "debug"
+ 
+-data Verbosity
+-  = Minimal
+-  | Verbose
+-
+-dumpClientErrorVerbosity :: Verbosity -> Text
+-dumpClientErrorVerbosity = \case
+-  Minimal -> "minimal"
+-  Verbose -> "verbose"
+-
+ data OpenAPIMode = OAFollowPriv | OAIgnorePriv | OADisabled
+   deriving Eq
+ 
+@@ -161,8 +150,7 @@ toText conf =
+   where
+     -- apply conf to all pgrst settings
+     pgrstSettings = (\(k, v) -> (k, v conf)) <$>
+-      [("client-error-verbosity",    q . dumpClientErrorVerbosity . configClientErrorVerbosity)
+-      ,("db-aggregates-enabled",         T.toLower . show . configDbAggregates)
++      [("db-aggregates-enabled",         T.toLower . show . configDbAggregates)
+       ,("db-anon-role",              q . T.decodeUtf8 . fromMaybe "" . configDbAnonRole)
+       ,("db-channel",                q . configDbChannel)
+       ,("db-channel-enabled",            T.toLower . show . configDbChannelEnabled)
+@@ -266,7 +254,6 @@ parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> Rol
+ parser optPath env dbSettings roleSettings roleIsolationLvl =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+-    <*> parseErrorVerbosity "client-error-verbosity"
+     <*> (fromMaybe False <$> optBool "db-aggregates-enabled")
+     <*> (fmap encodeUtf8 <$> optString "db-anon-role")
+     <*> (fromMaybe "pgrst" <$> optString "db-channel")
+@@ -323,14 +310,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> optInt "internal-schema-cache-load-sleep"
+     <*> optInt "internal-schema-cache-relationship-load-sleep"
+   where
+-    parseErrorVerbosity :: C.Key -> C.Parser C.Config Verbosity
+-    parseErrorVerbosity k =
+-      optString k >>= \case
+-        Nothing        -> pure Verbose -- default
+-        Just "minimal" -> pure Minimal
+-        Just "verbose" -> pure Verbose
+-        Just _         -> fail "Invalid client-error-verbosity. Check your configuration."
+-
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+       where
+@@ -663,9 +642,6 @@ exampleConfigFile = S.unlines
+   [ "## Admin server used for checks. It's disabled by default unless a port is specified."
+   , "# admin-server-port = 3001"
+   , ""
+-  , "# PostgREST error json verbosity config"
+-  , "# client-error-verbosity = \"verbose\""
+-  , ""
+   , "## The database role to use when no client authentication is provided"
+   , "# db-anon-role = \"anon\""
+   , ""
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index e25cb87f..aff4b5b8 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -46,7 +46,6 @@ dbSettingsNames :: [Text]
+ dbSettingsNames =
+   (prefix <>) <$>
+   ["db_aggregates_enabled"
+-  ,"client_error_verbosity"
+   ,"db_anon_role"
+   ,"db_pre_config"
+   ,"db_extra_search_path"
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index a3595681..0bfcb72c 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -42,7 +42,6 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.MediaType (MediaType (..))
+ import qualified PostgREST.MediaType as MediaType
+ 
+-import PostgREST.Config                   (Verbosity (..))
+ import PostgREST.SchemaCache              (SchemaCache (SchemaCache, dbTablesFuzzyIndex))
+ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..),
+                                            Schema)
+@@ -58,30 +57,26 @@ import PostgREST.Error.Types
+ import Protolude
+ 
+ -- | Encode Error to ByteString
+-errorPayload :: (ErrorBody a, ErrorHeaders a) => Verbosity -> a -> LByteString
+-errorPayload verb = JSON.encode . toJsonPgrstError verb
++errorPayload :: (ErrorBody a, ErrorHeaders a) => a -> LByteString
++errorPayload = JSON.encode . toJsonPgrstError
+   where
+-    toJsonPgrstError :: (ErrorBody a, ErrorHeaders a) => Verbosity -> a -> JSON.Value
+-    toJsonPgrstError Verbose err = JSON.object [
++    toJsonPgrstError :: (ErrorBody a, ErrorHeaders a) => a -> JSON.Value
++    toJsonPgrstError err = JSON.object [
+         "code"    .= code err
+       , "message" .= message err
+       , "details" .= details err
+       , "hint"    .= hint err
+       ]
+-    toJsonPgrstError Minimal err = JSON.object [
+-        "code"    .= code err
+-      , "message" .= message err
+-      ]
+ 
+ -- | Create HTTP response from Error
+-errorResponseFor :: (ErrorBody a, ErrorHeaders a) => Verbosity -> a -> Response
+-errorResponseFor verb err =
++errorResponseFor :: (ErrorBody a, ErrorHeaders a) => a -> Response
++errorResponseFor err =
+   let
+     baseHeader = MediaType.toContentType MTApplicationJSON
+     cLHeader body = (,) "Content-Length" (show $ LBS.length body) :: Header
+     pSHeader code' = ("Proxy-Status", "PostgREST; error=" <> T.encodeUtf8 code')
+   in
+-  responseLBS (status err) (baseHeader : cLHeader (errorPayload verb err) : pSHeader (code err) : headers err) $ errorPayload verb err
++  responseLBS (status err) (baseHeader : cLHeader (errorPayload err) : pSHeader (code err) : headers err) $ errorPayload err
+ 
+ class ErrorHeaders a where
+   status  :: a -> HTTP.Status
+diff --git a/src/PostgREST/Error/Types.hs b/src/PostgREST/Error/Types.hs
+index eb2f13db..778e558f 100644
+--- a/src/PostgREST/Error/Types.hs
++++ b/src/PostgREST/Error/Types.hs
+@@ -25,6 +25,7 @@ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.SchemaCache.Relationship (Relationship (..),
+                                            RelationshipsMap)
+ import PostgREST.SchemaCache.Routine      (Routine (..))
++
+ import Protolude
+ 
+ data Error
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index ad990308..0878671c 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -24,7 +24,6 @@ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Pool.Observation     as SQL
+ import           Network.HTTP.Types.Status  (Status)
+ import           Numeric                    (showFFloat)
+-import           PostgREST.Config           (Verbosity (..))
+ import           PostgREST.Config.PgVersion
+ import qualified PostgREST.Error            as Error
+ import           PostgREST.Query            (MainQuery)
+@@ -95,7 +94,7 @@ observationMessage = \case
+   ExitDBFatalError ServerError08P01 usageErr ->
+     "Connection poolers in statement mode are not supported." <> jsonMessage usageErr
+   SchemaCacheEmptyObs ->
+-    T.decodeUtf8 . LBS.toStrict . Error.errorPayload Verbose $ Error.NoSchemaCacheError
++    T.decodeUtf8 . LBS.toStrict . Error.errorPayload $ Error.NoSchemaCacheError
+   SchemaCacheErrorObs dbSchemas extraPaths usageErr ->
+     "Failed to load the schema cache using "
+       <> "db-schemas=" <> T.intercalate "," (toList dbSchemas)
+@@ -168,7 +167,7 @@ observationMessage = \case
+     showMillis :: Double -> Text
+     showMillis x = toS $ showFFloat (Just 1) x ""
+ 
+-    jsonMessage err = T.decodeUtf8 . LBS.toStrict . Error.errorPayload Verbose $ Error.PgError False err
++    jsonMessage err = T.decodeUtf8 . LBS.toStrict . Error.errorPayload $ Error.PgError False err
+ 
+ 
+     showListenerConnError :: SQL.ConnectionError -> Text
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index bae52d28..24ee29b4 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -62,7 +62,7 @@ data PgrstResponse = PgrstResponse {
+ 
+ actionResponse :: DbResult -> ApiRequest -> (Text, Text) -> AppConfig -> SchemaCache -> Schema -> Bool -> Either Error.Error PgrstResponse
+ 
+-actionResponse (DbCrudResult plan@WrappedReadPlan{pMedia, wrHdrsOnly=headersOnly, crudQi=identifier} RSStandard{..}) ctxApiRequest@ApiRequest{..} _ AppConfig{..} _ _ _ = do
++actionResponse (DbCrudResult plan@WrappedReadPlan{pMedia, wrHdrsOnly=headersOnly, crudQi=identifier} RSStandard{..}) ctxApiRequest@ApiRequest{..} _ _ _ _ _ = do
+   let
+     (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+     cLHeader = if headersOnly then mempty else [ contentLengthHeader bod ]
+@@ -79,7 +79,7 @@ actionResponse (DbCrudResult plan@WrappedReadPlan{pMedia, wrHdrsOnly=headersOnly
+       ++ cLHeader
+       ++ contentTypeHeaders pMedia ctxApiRequest
+       ++ prefHeader
+-    bod | status == HTTP.status416 = Error.errorPayload configClientErrorVerbosity $ Error.ApiRequestErr $ Error.InvalidRange $
++    bod | status == HTTP.status416 = Error.errorPayload $ Error.ApiRequestErr $ Error.InvalidRange $
+                                      Error.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         | headersOnly              = mempty
+         | otherwise                = LBS.fromStrict rsBody
+@@ -178,12 +178,12 @@ actionResponse (DbCrudResult plan@MutateReadPlan{mrMutation=MutationDelete, pMed
+ 
+   Right $ PgrstResponse ovStatus ovHeaders body
+ 
+-actionResponse (DbCrudResult plan@CallReadPlan{pMedia, crInvMthd=invMethod, crProc=proc} RSStandard {..}) ctxApiRequest@ApiRequest{..} _ AppConfig{..} _ _ _ = do
++actionResponse (DbCrudResult plan@CallReadPlan{pMedia, crInvMthd=invMethod, crProc=proc} RSStandard {..}) ctxApiRequest@ApiRequest{..} _ _ _ _ _ = do
+   let
+     (status, contentRange) =
+       RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+     rsOrErrBody = if status == HTTP.status416
+-      then Error.errorPayload configClientErrorVerbosity $ Error.ApiRequestErr $ Error.InvalidRange
++      then Error.errorPayload $ Error.ApiRequestErr $ Error.InvalidRange
+         $ Error.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+       else LBS.fromStrict rsBody
+     isHeadMethod = invMethod == InvRead True
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index ab6a6f15..0655e5c4 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index 22bc2049..53a13a7b 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index 22bc2049..53a13a7b 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index acbd1750..87909425 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/jwt-role-claim-key1.config b/test/io/configs/expected/jwt-role-claim-key1.config
+index 6e9bc26f..319a4932 100644
+--- a/test/io/configs/expected/jwt-role-claim-key1.config
++++ b/test/io/configs/expected/jwt-role-claim-key1.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/jwt-role-claim-key2.config b/test/io/configs/expected/jwt-role-claim-key2.config
+index 938ab2f1..535dc9e2 100644
+--- a/test/io/configs/expected/jwt-role-claim-key2.config
++++ b/test/io/configs/expected/jwt-role-claim-key2.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/jwt-role-claim-key3.config b/test/io/configs/expected/jwt-role-claim-key3.config
+index c0fcd2c4..c052f2df 100644
+--- a/test/io/configs/expected/jwt-role-claim-key3.config
++++ b/test/io/configs/expected/jwt-role-claim-key3.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/jwt-role-claim-key4.config b/test/io/configs/expected/jwt-role-claim-key4.config
+index 3168929b..a3f8e8df 100644
+--- a/test/io/configs/expected/jwt-role-claim-key4.config
++++ b/test/io/configs/expected/jwt-role-claim-key4.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/jwt-role-claim-key5.config b/test/io/configs/expected/jwt-role-claim-key5.config
+index b3460f6f..0cfcd55d 100644
+--- a/test/io/configs/expected/jwt-role-claim-key5.config
++++ b/test/io/configs/expected/jwt-role-claim-key5.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index 6896b78e..ebb54e0e 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "minimal"
+ db-aggregates-enabled = false
+ db-anon-role = "pre_config_role"
+ db-channel = "postgrest"
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index 86aede75..9077fdbd 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "minimal"
+ db-aggregates-enabled = false
+ db-anon-role = "anonymous"
+ db-channel = "postgrest"
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index a131be04..2b0ab43a 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "minimal"
+ db-aggregates-enabled = true
+ db-anon-role = "root"
+ db-channel = "postgrest"
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index 2d00d680..cb474bcd 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/expected/utf-8.config b/test/io/configs/expected/utf-8.config
+index c06c50f3..dc822601 100644
+--- a/test/io/configs/expected/utf-8.config
++++ b/test/io/configs/expected/utf-8.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "verbose"
+ db-aggregates-enabled = false
+ db-anon-role = ""
+ db-channel = "pgrst"
+diff --git a/test/io/configs/no-defaults-env.yaml b/test/io/configs/no-defaults-env.yaml
+index d9fea4c4..bda8e9b2 100644
+--- a/test/io/configs/no-defaults-env.yaml
++++ b/test/io/configs/no-defaults-env.yaml
+@@ -1,6 +1,5 @@
+ PGRST_APP_SETTINGS_test2: test
+ PGRST_APP_SETTINGS_test: test
+-PGRST_CLIENT_ERROR_VERBOSITY: minimal
+ PGRST_DB_AGGREGATES_ENABLED: true
+ PGRST_DB_ANON_ROLE: root
+ PGRST_DB_CHANNEL: postgrest
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index f0e03e42..ceeb5dbd 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -1,4 +1,3 @@
+-client-error-verbosity = "minimal"
+ db-aggregates-enabled = true
+ db-anon-role = "root"
+ db-channel = "postgrest"
+diff --git a/test/io/fixtures/db_config.sql b/test/io/fixtures/db_config.sql
+index bf7880f4..1c234ba7 100644
+--- a/test/io/fixtures/db_config.sql
++++ b/test/io/fixtures/db_config.sql
+@@ -2,7 +2,6 @@ CREATE ROLE db_config_authenticator LOGIN NOINHERIT;
+ 
+ -- reloadable config options
+ -- these settings will override the values in configs/no-defaults.config, so they must be different
+-ALTER ROLE db_config_authenticator SET pgrst.client_error_verbosity = 'minimal';
+ ALTER ROLE db_config_authenticator SET pgrst.db_aggregates_enabled = 'false';
+ ALTER ROLE db_config_authenticator SET pgrst.db_anon_role = 'anonymous';
+ ALTER ROLE db_config_authenticator SET pgrst.db_extra_search_path = 'public, extensions';
+@@ -57,7 +56,6 @@ ALTER ROLE db_config_authenticator SET pgrst.server_unix_socket_mode = 'ignored'
+ -- other authenticator reloadable config options
+ -- these settings will override the values in configs/no-defaults.config, so they must be different
+ CREATE ROLE other_authenticator LOGIN NOINHERIT;
+-ALTER ROLE other_authenticator SET pgrst.client_error_verbosity = 'minimal';
+ ALTER ROLE other_authenticator SET pgrst.db_aggregates_enabled = 'false';
+ ALTER ROLE other_authenticator SET pgrst.db_extra_search_path = 'public, extensions, other';
+ ALTER ROLE other_authenticator SET pgrst.db_max_rows = '100';
+diff --git a/test/io/test_cli.py b/test/io/test_cli.py
+index 72351fc3..8135fcce 100644
+--- a/test/io/test_cli.py
++++ b/test/io/test_cli.py
+@@ -286,17 +286,6 @@ def test_jwt_secret_min_length(defaultenv):
+     assert "The JWT secret must be at least 32 characters long." in error
+ 
+ 
+-def test_invalid_client_error_verbosity(defaultenv):
+-    "Given an invalid value for client-error-verbosity, Postgrest should exit with a non-zero exit code."
+-    env = {
+-        **defaultenv,
+-        "PGRST_CLIENT_ERROR_VERBOSITY": "invalid",
+-    }
+-
+-    error = cli(["--dump-config"], env=env, expect_error=True)
+-    assert "Invalid client-error-verbosity. Check your configuration." in error
+-
+-
+ @pytest.mark.parametrize("restricted_schema", FIXTURES["restrictedschemas"])
+ def test_restricted_db_schemas(restricted_schema, defaultenv):
+     "Should print error when db-schemas config contain pg_catalog or information_schema"
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 79b38606..ba55727b 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1757,35 +1757,3 @@ def test_server_timing_transaction_duration(defaultenv, metapostgrest):
+         ]
+ 
+         assert 2000 <= response_dur < 3000
+-
+-
+-def test_client_error_verbosity_config(defaultenv):
+-    "Test PostgREST errors with different error verbosity settings"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_CLIENT_ERROR_VERBOSITY": "minimal",  # hide details and hint
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/itemsxx")
+-        assert response.status_code == 404
+-        assert response.json() == {
+-            "code": "PGRST205",
+-            "message": "Could not find the table 'public.itemsxx' in the schema cache",
+-        }
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_CLIENT_ERROR_VERBOSITY": "verbose",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/itemsxx")
+-        assert response.status_code == 404
+-        assert response.json() == {
+-            "code": "PGRST205",
+-            "message": "Could not find the table 'public.itemsxx' in the schema cache",
+-            "details": None,
+-            "hint": "Perhaps you meant the table 'public.items'",
+-        }
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 00501649..a35d7db9 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -40,7 +40,7 @@ import PostgREST.Config                  (AppConfig (..),
+                                           JSPathExp (..),
+                                           LogLevel (..),
+                                           OpenAPIMode (..),
+-                                          Verbosity (..), parseSecret)
++                                          parseSecret)
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..))
+ import Prometheus                        (Counter, getCounter)
+ import Protolude                         hiding (get, toS)
+@@ -121,7 +121,6 @@ baseCfg :: AppConfig
+ baseCfg = let secret = encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   AppConfig {
+     configAppSettings               = [ ("app.settings.app_host", "localhost") , ("app.settings.external_api_secret", "0123456789abcdef") ]
+-  , configClientErrorVerbosity      = Verbose
+   , configDbAggregates              = False
+   , configDbAnonRole                = Just "postgrest_test_anonymous"
+   , configDbChannel                 = mempty

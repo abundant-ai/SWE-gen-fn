@@ -1,0 +1,548 @@
+diff --git a/src/dune_pkg/dune_pkg.ml b/src/dune_pkg/dune_pkg.ml
+index 00b5c0863..c114c03a8 100644
+--- a/src/dune_pkg/dune_pkg.ml
++++ b/src/dune_pkg/dune_pkg.ml
+@@ -7,6 +7,7 @@ module Opam_solver = Opam_solver
+ module Package_variable = Package_variable
+ module Repository_id = Repository_id
+ module Solver_env = Solver_env
++module Solver_stats = Solver_stats
+ module Substs = Substs
+ module Sys_poll = Sys_poll
+ module Version_preference = Version_preference
+diff --git a/src/dune_pkg/lock_dir.ml b/src/dune_pkg/lock_dir.ml
+index 36468c38e..d923791b3 100644
+--- a/src/dune_pkg/lock_dir.ml
++++ b/src/dune_pkg/lock_dir.ml
+@@ -311,6 +311,7 @@ type t =
+   ; packages : Pkg.t Package_name.Map.t
+   ; ocaml : (Loc.t * Package_name.t) option
+   ; repos : Repositories.t
++  ; expanded_solver_variable_bindings : Solver_stats.Expanded_variable_bindings.t
+   }
+ 
+ let remove_locs t =
+@@ -320,23 +321,28 @@ let remove_locs t =
+   }
+ ;;
+ 
+-let equal { version; packages; ocaml; repos } t =
++let equal { version; packages; ocaml; repos; expanded_solver_variable_bindings } t =
+   Syntax.Version.equal version t.version
+   && Option.equal (Tuple.T2.equal Loc.equal Package_name.equal) ocaml t.ocaml
+   && Repositories.equal repos t.repos
+   && Package_name.Map.equal packages t.packages ~equal:Pkg.equal
++  && Solver_stats.Expanded_variable_bindings.equal
++       expanded_solver_variable_bindings
++       t.expanded_solver_variable_bindings
+ ;;
+ 
+-let to_dyn { version; packages; ocaml; repos } =
++let to_dyn { version; packages; ocaml; repos; expanded_solver_variable_bindings } =
+   Dyn.record
+     [ "version", Syntax.Version.to_dyn version
+     ; "packages", Package_name.Map.to_dyn Pkg.to_dyn packages
+     ; "ocaml", Dyn.option (Tuple.T2.to_dyn Loc.to_dyn_hum Package_name.to_dyn) ocaml
+     ; "repos", Repositories.to_dyn repos
++    ; ( "expanded_solver_variable_bindings"
++      , Solver_stats.Expanded_variable_bindings.to_dyn expanded_solver_variable_bindings )
+     ]
+ ;;
+ 
+-let create_latest_version packages ~ocaml ~repos =
++let create_latest_version packages ~ocaml ~repos ~expanded_solver_variable_bindings =
+   let version = Syntax.greatest_supported_version Dune_lang.Pkg.syntax in
+   let complete, used =
+     match repos with
+@@ -347,17 +353,19 @@ let create_latest_version packages ~ocaml ~repos =
+       complete, Some used
+   in
+   let repos : Repositories.t = { complete; used } in
+-  { version; packages; ocaml; repos }
++  { version; packages; ocaml; repos; expanded_solver_variable_bindings }
+ ;;
+ 
+ let default_path = Path.Source.(relative root "dune.lock")
+-let metadata = "lock.dune"
++let metadata_filename = "lock.dune"
+ 
+ module Metadata = Dune_sexp.Versioned_file.Make (Unit)
+ 
+ let () = Metadata.Lang.register Dune_lang.Pkg.syntax ()
+ 
+-let encode_metadata { version; ocaml; repos; packages = _ } =
++let encode_metadata
++  { version; ocaml; repos; packages = _; expanded_solver_variable_bindings }
++  =
+   let open Encoder in
+   let base =
+     list
+@@ -372,16 +380,30 @@ let encode_metadata { version; ocaml; repos; packages = _ } =
+      | None -> []
+      | Some ocaml -> [ list sexp [ string "ocaml"; Package_name.encode (snd ocaml) ] ])
+   @ [ list sexp (string "repositories" :: Repositories.encode repos) ]
++  @
++  if Solver_stats.Expanded_variable_bindings.is_empty expanded_solver_variable_bindings
++  then []
++  else
++    [ list
++        sexp
++        (string "expanded_solver_variable_bindings"
++         :: Solver_stats.Expanded_variable_bindings.encode
++              expanded_solver_variable_bindings)
++    ]
+ ;;
+ 
+ let decode_metadata =
+   let open Decoder in
+   fields
+     (let+ ocaml = field_o "ocaml" (located Package_name.decode)
+-     and+ repos =
+-       field "repositories" ~default:Repositories.default Repositories.decode
++     and+ repos = field "repositories" ~default:Repositories.default Repositories.decode
++     and+ expanded_solver_variable_bindings =
++       field
++         "expanded_solver_variable_bindings"
++         ~default:Solver_stats.Expanded_variable_bindings.empty
++         Solver_stats.Expanded_variable_bindings.decode
+      in
+-     ocaml, repos)
++     ocaml, repos, expanded_solver_variable_bindings)
+ ;;
+ 
+ module Package_filename = struct
+@@ -396,7 +418,7 @@ module Package_filename = struct
+ end
+ 
+ let file_contents_by_path t =
+-  (metadata, encode_metadata t)
++  (metadata_filename, encode_metadata t)
+   :: (Package_name.Map.to_list t.packages
+       |> List.map ~f:(fun (name, pkg) ->
+         Package_filename.of_package_name name, Pkg.encode pkg))
+@@ -415,13 +437,13 @@ module Write_disk = struct
+       (match Path.is_directory path with
+        | false -> Error `Not_directory
+        | true ->
+-         let metadata_path = Path.relative path metadata in
++         let metadata_path = Path.relative path metadata_filename in
+          (match Path.exists metadata_path && not (Path.is_directory metadata_path) with
+           | false -> Error `No_metadata_file
+           | true ->
+             (match Metadata.load metadata_path ~f:(Fun.const decode_metadata) with
+              | Ok _unused -> Ok `Is_existing_lock_dir
+-             | Error exn -> Error (`Failed_to_parse_metadata exn))))
++             | Error exn -> Error (`Failed_to_parse_metadata (metadata_path, exn)))))
+   ;;
+ 
+   (* Removes the exitsing lock directory at the specified path if it exists and
+@@ -438,8 +460,15 @@ module Write_disk = struct
+         match e with
+         | `Not_directory -> Pp.text "Specified lock dir path is not a directory"
+         | `No_metadata_file ->
+-          Pp.textf "Specified lock dir lacks metadata file (%s)" metadata
+-        | `Failed_to_parse_metadata exn -> Exn.pp exn
++          Pp.textf "Specified lock dir lacks metadata file (%s)" metadata_filename
++        | `Failed_to_parse_metadata (path, exn) ->
++          Pp.concat
++            ~sep:Pp.newline
++            [ Pp.textf
++                "Unable to parse lock directory metadata file (%s):"
++                (Path.to_string_maybe_quoted path)
++            ; Exn.pp exn
++            ]
+       in
+       User_error.raise
+         [ Pp.textf
+@@ -501,17 +530,17 @@ module Make_load (Io : sig
+ struct
+   let load_metadata metadata_file_path =
+     let open Io.O in
+-    let+ syntax, version, ocaml, repos =
++    let+ syntax, version, ocaml, repos, expanded_solver_variable_bindings =
+       Io.with_lexbuf_from_file metadata_file_path ~f:(fun lexbuf ->
+         Metadata.parse_contents
+           lexbuf
+           ~f:(fun { Metadata.Lang.Instance.syntax; data = (); version } ->
+             let open Decoder in
+-            let+ ocaml, repos = decode_metadata in
+-            syntax, version, ocaml, repos))
++            let+ ocaml, repos, expanded_solver_variable_bindings = decode_metadata in
++            syntax, version, ocaml, repos, expanded_solver_variable_bindings))
+     in
+     if String.equal (Syntax.name syntax) (Syntax.name Dune_lang.Pkg.syntax)
+-    then version, ocaml, repos
++    then version, ocaml, repos, expanded_solver_variable_bindings
+     else
+       User_error.raise
+         [ Pp.textf
+@@ -560,8 +589,8 @@ struct
+   let load lock_dir_path =
+     let open Io.O in
+     check_path lock_dir_path;
+-    let* version, ocaml, repos =
+-      load_metadata (Path.Source.relative lock_dir_path metadata)
++    let* version, ocaml, repos, expanded_solver_variable_bindings =
++      load_metadata (Path.Source.relative lock_dir_path metadata_filename)
+     in
+     let+ packages =
+       Io.readdir_with_kinds lock_dir_path
+@@ -576,7 +605,7 @@ struct
+         package_name, pkg)
+       >>| Package_name.Map.of_list_exn
+     in
+-    { version; packages; ocaml; repos }
++    { version; packages; ocaml; repos; expanded_solver_variable_bindings }
+   ;;
+ end
+ 
+diff --git a/src/dune_pkg/lock_dir.mli b/src/dune_pkg/lock_dir.mli
+index 6b2d24abb..eb3aa90a3 100644
+--- a/src/dune_pkg/lock_dir.mli
++++ b/src/dune_pkg/lock_dir.mli
+@@ -47,6 +47,10 @@ type t =
+   ; packages : Pkg.t Package_name.Map.t
+   ; ocaml : (Loc.t * Package_name.t) option
+   ; repos : Repositories.t
++  ; expanded_solver_variable_bindings : Solver_stats.Expanded_variable_bindings.t
++      (** Stores the solver variables that were evaluated while solving
++          dependencies. Can be used to determine if a lockdir is compatible
++          with a particular system. *)
+   }
+ 
+ val remove_locs : t -> t
+@@ -57,12 +61,15 @@ val create_latest_version
+   :  Pkg.t Package_name.Map.t
+   -> ocaml:(Loc.t * Package_name.t) option
+   -> repos:Opam_repo.t list option
++  -> expanded_solver_variable_bindings:Solver_stats.Expanded_variable_bindings.t
+   -> t
+ 
+ val default_path : Path.Source.t
+ 
+ module Metadata : Dune_sexp.Versioned_file.S with type data := unit
+ 
++val metadata_filename : Filename.t
++
+ module Write_disk : sig
+   type lock_dir := t
+   type t
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 47f8fdc1a..ab70160ee 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -35,14 +35,15 @@ module Context_for_dune = struct
+     ; local_packages : OpamFile.OPAM.t OpamPackage.Name.Map.t
+     ; solver_env : Solver_env.t
+     ; dune_version : OpamPackage.Version.t
++    ; stats_updater : Solver_stats.Updater.t
+     }
+ 
+-  let create ~solver_env ~repos ~local_packages ~version_preference =
++  let create ~solver_env ~repos ~local_packages ~version_preference ~stats_updater =
+     let dune_version =
+       let major, minor = Dune_lang.Stanza.latest_version in
+       OpamPackage.Version.of_string @@ sprintf "%d.%d" major minor
+     in
+-    { repos; version_preference; local_packages; solver_env; dune_version }
++    { repos; version_preference; local_packages; solver_env; dune_version; stats_updater }
+   ;;
+ 
+   type rejection = Unavailable
+@@ -71,7 +72,9 @@ module Context_for_dune = struct
+   ;;
+ 
+   (* Substitute variables with their values *)
+-  let resolve_solver_env (solver_env : Solver_env.t)
++  let resolve_solver_env
++    (solver_env : Solver_env.t)
++    (stats_updater : Solver_stats.Updater.t)
+     : OpamTypes.filter -> OpamTypes.filter
+     =
+     OpamFilter.map_up (function
+@@ -79,6 +82,7 @@ module Context_for_dune = struct
+         (match Solver_env.Variable.of_string_opt (OpamVariable.to_string variable) with
+          | None -> filter
+          | Some variable ->
++           Solver_stats.Updater.expand_variable stats_updater variable;
+            (match Solver_env.get solver_env variable with
+             | Unset_sys -> filter
+             | String string -> FString string))
+@@ -94,7 +98,9 @@ module Context_for_dune = struct
+     fun t opam ->
+       let available = OpamFile.OPAM.available opam in
+       match
+-        let available_vars_resolved = resolve_solver_env t.solver_env available in
++        let available_vars_resolved =
++          resolve_solver_env t.solver_env t.stats_updater available
++        in
+         eval_to_bool available_vars_resolved
+       with
+       | Ok available -> available
+@@ -164,7 +170,7 @@ module Context_for_dune = struct
+     let package_is_local =
+       OpamPackage.Name.Map.mem (OpamPackage.name package) t.local_packages
+     in
+-    map_filters filtered_formula ~f:(resolve_solver_env t.solver_env)
++    map_filters filtered_formula ~f:(resolve_solver_env t.solver_env t.stats_updater)
+     |> OpamFilter.filter_deps
+          ~build:true
+          ~post:false
+@@ -634,13 +640,19 @@ let solve_lock_dir
+   let is_local_package package =
+     OpamPackage.Name.Map.mem (OpamPackage.name package) local_packages
+   in
++  let stats_updater = Solver_stats.Updater.init () in
+   let context =
+     let local_packages =
+       OpamPackage.Name.Map.map
+         (fun (w : Opam_repo.With_file.t) -> w.opam_file)
+         local_packages
+     in
+-    Context_for_dune.create ~solver_env ~repos ~version_preference ~local_packages
++    Context_for_dune.create
++      ~solver_env
++      ~repos
++      ~version_preference
++      ~local_packages
++      ~stats_updater
+   in
+   solve_package_list (OpamPackage.Name.Map.keys local_packages) context
+   >>| Result.map ~f:(fun solution ->
+@@ -672,7 +684,17 @@ let solve_lock_dir
+           let name = Package_name.of_string "ocaml" in
+           Option.some_if (Package_name.Map.mem pkgs_by_name name) (Loc.none, name)
+         in
+-        Lock_dir.create_latest_version pkgs_by_name ~ocaml ~repos:(Some repos)
++        let stats = Solver_stats.Updater.snapshot stats_updater in
++        let expanded_solver_variable_bindings =
++          Solver_stats.Expanded_variable_bindings.of_variable_set
++            stats.expanded_variables
++            solver_env
++        in
++        Lock_dir.create_latest_version
++          pkgs_by_name
++          ~ocaml
++          ~repos:(Some repos)
++          ~expanded_solver_variable_bindings
+     in
+     let files =
+       opam_packages_to_lock
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index d39adbb2e..c946d6532 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -90,6 +90,7 @@ module Variable = struct
+       | `Opam_version -> "opam-version"
+     ;;
+ 
++    let to_dyn t = Dyn.string (to_string t)
+     let all = [ `Opam_version ]
+     let of_string_opt s = List.find all ~f:(fun t -> String.equal s (to_string t))
+ 
+@@ -113,15 +114,46 @@ module Variable = struct
+     let bindings = { Bindings.opam_version = OpamVersion.to_string OpamVersion.current }
+   end
+ 
+-  type t =
+-    | Sys of Sys.t
+-    | Const of Const.t
+-
+-  let of_string_opt string =
+-    match Sys.of_string_opt string with
+-    | Some sys -> Some (Sys sys)
+-    | None -> Const.of_string_opt string |> Option.map ~f:(fun const -> Const const)
+-  ;;
++  module T = struct
++    type t =
++      | Sys of Sys.t
++      | Const of Const.t
++
++    let to_dyn = function
++      | Sys sys -> Dyn.variant "Sys" [ Sys.to_dyn sys ]
++      | Const const -> Dyn.variant "Const" [ Const.to_dyn const ]
++    ;;
++
++    let of_string_opt string =
++      match Sys.of_string_opt string with
++      | Some sys -> Some (Sys sys)
++      | None -> Const.of_string_opt string |> Option.map ~f:(fun const -> Const const)
++    ;;
++
++    let to_string = function
++      | Sys sys -> Sys.to_string sys
++      | Const const -> Const.to_string const
++    ;;
++
++    let compare a b = String.compare (to_string a) (to_string b)
++    let equal a b = String.equal (to_string a) (to_string b)
++
++    let decode =
++      let open Dune_lang.Decoder in
++      let+ loc, string = located string in
++      match of_string_opt string with
++      | Some t -> t
++      | None ->
++        User_error.raise
++          ~loc
++          [ Pp.textf "No such variable: %s" (String.maybe_quoted string) ]
++    ;;
++
++    let encode t = Encoder.string (to_string t)
++  end
++
++  include Comparable.Make (T)
++  include T
+ end
+ 
+ type t =
+diff --git a/src/dune_pkg/solver_env.mli b/src/dune_pkg/solver_env.mli
+index 36393f13c..78187face 100644
+--- a/src/dune_pkg/solver_env.mli
++++ b/src/dune_pkg/solver_env.mli
+@@ -48,7 +48,15 @@ module Variable : sig
+     | Sys of Sys.t
+     | Const of Const.t
+ 
++  val to_string : t -> string
+   val of_string_opt : string -> t option
++
++  include Comparable_intf.S with type key := t
++
++  val equal : t -> t -> bool
++  val to_dyn : t -> Dyn.t
++  val decode : t Dune_lang.Decoder.t
++  val encode : t Dune_lang.Encoder.t
+ end
+ 
+ (** A variable environment used by the dependency solver to evaluate package
+diff --git a/src/dune_pkg/solver_stats.ml b/src/dune_pkg/solver_stats.ml
+new file mode 100644
+index 000000000..da2542056
+--- /dev/null
++++ b/src/dune_pkg/solver_stats.ml
+@@ -0,0 +1,91 @@
++open! Import
++open! Stdune
++
++type t = { expanded_variables : Solver_env.Variable.Set.t }
++
++let empty = { expanded_variables = Solver_env.Variable.Set.empty }
++
++module Updater = struct
++  type stats = t
++  type t = stats ref
++
++  let init () = ref empty
++  let snapshot t = !t
++
++  let expand_variable t variable =
++    let { expanded_variables } = !t in
++    t := { expanded_variables = Solver_env.Variable.Set.add expanded_variables variable }
++  ;;
++end
++
++module Expanded_variable_bindings = struct
++  type t =
++    { variable_values : (Solver_env.Variable.t * string) list
++    ; unset_variables : Solver_env.Variable.t list
++    }
++
++  let empty = { variable_values = []; unset_variables = [] }
++
++  let is_empty { variable_values; unset_variables } =
++    List.is_empty variable_values && List.is_empty unset_variables
++  ;;
++
++  let of_variable_set variables solver_env =
++    Solver_env.Variable.Set.to_list variables
++    |> List.fold_left ~init:empty ~f:(fun acc variable ->
++      match Solver_env.get solver_env variable with
++      | String string ->
++        { acc with variable_values = (variable, string) :: acc.variable_values }
++      | Unset_sys -> { acc with unset_variables = variable :: acc.unset_variables })
++  ;;
++
++  let decode =
++    let open Dune_lang.Decoder in
++    fields
++      (let+ variable_values =
++         field
++           "variable_values"
++           ~default:[]
++           (repeat (pair Solver_env.Variable.decode string))
++       and+ unset_variables =
++         field "unset_variables" ~default:[] (repeat Solver_env.Variable.decode)
++       in
++       { variable_values; unset_variables })
++  ;;
++
++  let encode { variable_values; unset_variables } =
++    let open Dune_lang.Encoder in
++    (if List.is_empty variable_values
++     then []
++     else
++       [ Dune_sexp.List
++           (string "variable_values"
++            :: List.map ~f:(pair Solver_env.Variable.encode string) variable_values)
++       ])
++    @
++    if List.is_empty unset_variables
++    then []
++    else
++      [ Dune_sexp.List
++          (string "unset_variables"
++           :: List.map ~f:Solver_env.Variable.encode unset_variables)
++      ]
++  ;;
++
++  let equal { variable_values; unset_variables } t =
++    List.equal
++      (Tuple.T2.equal Solver_env.Variable.equal String.equal)
++      variable_values
++      t.variable_values
++    && List.equal Solver_env.Variable.equal unset_variables t.unset_variables
++  ;;
++
++  let to_dyn { variable_values; unset_variables } =
++    Dyn.record
++      [ ( "variable_values"
++        , Dyn.list (Tuple.T2.to_dyn Solver_env.Variable.to_dyn Dyn.string) variable_values
++        )
++      ; "unset_variables", Dyn.list Solver_env.Variable.to_dyn unset_variables
++      ]
++  ;;
++end
+diff --git a/src/dune_pkg/solver_stats.mli b/src/dune_pkg/solver_stats.mli
+new file mode 100644
+index 000000000..b13e6b84f
+--- /dev/null
++++ b/src/dune_pkg/solver_stats.mli
+@@ -0,0 +1,27 @@
++open! Import
++
++type t = { expanded_variables : Solver_env.Variable.Set.t }
++
++module Updater : sig
++  type stats = t
++  type t
++
++  val init : unit -> t
++  val snapshot : t -> stats
++  val expand_variable : t -> Solver_env.Variable.t -> unit
++end
++
++module Expanded_variable_bindings : sig
++  type t =
++    { variable_values : (Solver_env.Variable.t * string) list
++    ; unset_variables : Solver_env.Variable.t list
++    }
++
++  val empty : t
++  val is_empty : t -> bool
++  val of_variable_set : Solver_env.Variable.Set.t -> Solver_env.t -> t
++  val decode : t Dune_lang.Decoder.t
++  val encode : t -> Dune_lang.t list
++  val equal : t -> t -> bool
++  val to_dyn : t -> Dyn.t
++end

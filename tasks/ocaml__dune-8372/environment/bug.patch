@@ -1,0 +1,225 @@
+diff --git a/src/dune_lang/pform.ml b/src/dune_lang/pform.ml
+index 7c08c0532..d4383943f 100644
+--- a/src/dune_lang/pform.ml
++++ b/src/dune_lang/pform.ml
+@@ -55,6 +55,8 @@ module Var = struct
+       | Jobs
+       | Arch
+       | Section_dir of Section.t
++      | Name
++      | Version
+ 
+     let compare = Poly.compare
+ 
+@@ -73,6 +75,8 @@ module Var = struct
+       | Arch -> variant "Arch" []
+       | Section_dir section ->
+         variant "Section_dir" [ string (Section.to_string section) ]
++      | Name -> variant "Name" []
++      | Version -> variant "Version" []
+     ;;
+ 
+     let encode_to_latest_dune_lang_version = function
+@@ -87,6 +91,8 @@ module Var = struct
+       | Jobs -> "jobs"
+       | Arch -> "arch"
+       | Section_dir section -> Section.to_string section
++      | Name -> "name"
++      | Version -> "version"
+     ;;
+   end
+ 
+@@ -207,6 +213,8 @@ module Var = struct
+        | "group" -> Some (Pkg Group)
+        | "jobs" -> Some (Pkg Jobs)
+        | "arch" -> Some (Pkg Arch)
++       | "name" -> Some (Pkg Name)
++       | "version" -> Some (Pkg Version)
+        | _ -> None)
+   ;;
+ end
+diff --git a/src/dune_lang/pform.mli b/src/dune_lang/pform.mli
+index 890591a2e..b85e88752 100644
+--- a/src/dune_lang/pform.mli
++++ b/src/dune_lang/pform.mli
+@@ -33,6 +33,8 @@ module Var : sig
+       | Jobs
+       | Arch
+       | Section_dir of Section.t
++      | Name
++      | Version
+ 
+     val compare : t -> t -> Ordering.t
+     val to_dyn : t -> Dyn.t
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index cde4d0159..ee180da79 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -230,35 +230,61 @@ module Summary = struct
+   ;;
+ end
+ 
+-let opam_commands_to_actions (commands : OpamTypes.command list) =
+-  let pform_of_ident ident =
+-    let scope, variable =
+-      match String.lsplit2 ident ~on:':' with
+-      | None -> `Self_or_global, ident
+-      | Some ("_", variable) -> `Self, variable
+-      | Some (package, variable) -> `Package package, variable
++let opam_command_to_string_debug (args, _filter_opt) =
++  List.map args ~f:(fun (simple_arg, _filter_opt) ->
++    match simple_arg with
++    | OpamTypes.CString s -> String.quoted s
++    | CIdent ident -> ident)
++  |> String.concat ~sep:" "
++;;
++
++let opam_commands_to_actions package (commands : OpamTypes.command list) =
++  let pform_of_ident_opt ident =
++    let `Self, variable =
++      match String.split ident ~on:':' with
++      | [ variable ] | [ "_"; variable ] -> `Self, variable
++      | _ ->
++        (* TODO *)
++        Code_error.raise
++          "Evaluating package variables for non-self packages not yet implemented"
++          [ "While processing package:", Dyn.string (OpamPackage.to_string package)
++          ; "Variable:", Dyn.string ident
++          ]
+     in
+-    match scope with
+-    | `Package package ->
+-      (* TODO: abstract how the var package variables are encoded into multi-argument macros *)
+-      Pform.(
+-        Macro { macro = Pkg; payload = Payload.of_args [ "var"; package; variable ] })
+-    | `Self ->
+-      Pform.(Macro { macro = Pkg; payload = Payload.of_args [ "var"; "_"; variable ] })
+-    | `Self_or_global ->
+-      (match Pform.Var.of_opam_global_variable_name variable with
+-       | Some var -> Pform.Var var
+-       | None ->
+-         Pform.(Macro { macro = Pkg; payload = Payload.of_args [ "var"; "_"; variable ] }))
++    match Pform.Var.of_opam_global_variable_name variable with
++    | Some pkg_var -> Ok Pform.(Var pkg_var)
++    | None -> Error (`Unknown_variable variable)
+   in
+-  List.filter_map commands ~f:(fun (args, _filter_opt) ->
++  List.filter_map commands ~f:(fun ((args, _filter_opt) as command) ->
+     let terms =
+       List.map args ~f:(fun (simple_arg, _filter_opt) ->
+         match simple_arg with
+         | OpamTypes.CString s ->
+           (* TODO: apply replace string interpolation variables with pforms *)
+           String_with_vars.make_text Loc.none s
+-        | CIdent ident -> String_with_vars.make_pform Loc.none (pform_of_ident ident))
++        | CIdent ident ->
++          (match pform_of_ident_opt ident with
++           | Ok pform -> String_with_vars.make_pform Loc.none pform
++           | Error (`Unknown_variable variable) ->
++             (* Note that the variable name is always quoted to clarify
++                the error message in cases where the grammar of the
++                sentence would otherwise be unclear, such as:
++
++                - Encountered unknown variable type while processing...
++                - Encountered unknown variable name while processing...
++
++                In these examples, the words "type" and "name" are variable
++                names but it would be easy for users to misunderstand those
++                error messages without quotes. *)
++             User_error.raise
++               [ Pp.textf
++                   "Encountered unknown variable %S while processing commands for \
++                    package %s."
++                   variable
++                   (OpamPackage.to_string package)
++               ; Pp.text "The full command:"
++               ; Pp.text (opam_command_to_string_debug command)
++               ]))
+     in
+     match terms with
+     | program :: args -> Some (Action.run program args)
+@@ -269,8 +295,8 @@ let opam_commands_to_actions (commands : OpamTypes.command list) =
+    [None] if the command list is empty
+    [Some (Action.Run ...)] if there is a single command
+    [Some (Action.Progn [Action.Run ...; ...])] if there are multiple commands *)
+-let opam_commands_to_action (commands : OpamTypes.command list) =
+-  match opam_commands_to_actions commands with
++let opam_commands_to_action package (commands : OpamTypes.command list) =
++  match opam_commands_to_actions package commands with
+   | [] -> None
+   | [ action ] -> Some action
+   | actions -> Some (Action.Progn actions)
+@@ -302,8 +328,12 @@ let opam_package_to_lock_file_pkg ~repo ~local_packages opam_package =
+     |> List.map ~f:(fun name ->
+       Loc.none, Package_name.of_string (OpamPackage.Name.to_string name))
+   in
+-  let build_command = opam_commands_to_action (OpamFile.OPAM.build opam_file) in
+-  let install_command = opam_commands_to_action (OpamFile.OPAM.install opam_file) in
++  let build_command =
++    opam_commands_to_action opam_package (OpamFile.OPAM.build opam_file)
++  in
++  let install_command =
++    opam_commands_to_action opam_package (OpamFile.OPAM.install opam_file)
++  in
+   { Lock_dir.Pkg.build_command; install_command; deps; info; exported_env = [] }
+ ;;
+ 
+diff --git a/src/dune_sexp/template.ml b/src/dune_sexp/template.ml
+index 6f18d18fc..f9dcadc22 100644
+--- a/src/dune_sexp/template.ml
++++ b/src/dune_sexp/template.ml
+@@ -30,8 +30,6 @@ module Pform = struct
+ 
+       let split t = String.split t ~on:sep
+     end
+-
+-    let of_args = String.concat ~sep:(String.make 1 Args.sep)
+   end
+ 
+   type t =
+diff --git a/src/dune_sexp/template.mli b/src/dune_sexp/template.mli
+index 58496cc79..88373b7cf 100644
+--- a/src/dune_sexp/template.mli
++++ b/src/dune_sexp/template.mli
+@@ -8,7 +8,6 @@ module Pform : sig
+     val to_string : t -> string
+     val to_dyn : t -> Dyn.t
+     val compare : t -> t -> Ordering.t
+-    val of_args : string list -> t
+ 
+     module Args : sig
+       (** Treat the entire payload as a single string argument. *)
+diff --git a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+index f53979a3f..d858cfa68 100644
+--- a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
++++ b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+@@ -36,6 +36,11 @@ Generate a mock opam repository
+   > install: [ make "install" ]
+   > EOF
+ 
++  $ mkpkg with-unknown-variable <<EOF
++  > opam-version: "2.0"
++  > build: [ fake "install" ]
++  > EOF
++
+   $ solve_project <<EOF
+   > (lang dune 3.8)
+   > (package
+@@ -49,4 +54,16 @@ Generate a mock opam repository
+   $ cat dune.lock/standard-dune.pkg
+   (version 0.0.1)
+   (install (run %{make} install))
+-  (build (progn (run dune subst) (run dune build -p %{pkg:var:_:name} -j %{jobs} @install @runtest @doc)))
++  (build (progn (run dune subst) (run dune build -p %{name} -j %{jobs} @install @runtest @doc)))
++
++  $ solve_project <<EOF
++  > (lang dune 3.8)
++  > (package
++  >  (name x)
++  >  (depends with-unknown-variable))
++  > EOF
++  Error: Encountered unknown variable "fake" while processing commands for
++  package with-unknown-variable.0.0.1.
++  The full command:
++  fake "install"
++  [1]

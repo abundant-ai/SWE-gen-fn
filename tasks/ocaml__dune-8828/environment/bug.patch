@@ -1,0 +1,409 @@
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index e361dd77b..72ebea2c8 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -417,21 +417,12 @@ module Lock = struct
+        effects after performing validation so that if materializing any
+        lockdir would fail then no side effect takes place. *)
+     (let* local_packages =
+-       let+ project =
++       let+ dune_package_map =
+          let+ source_dir = Memo.run (Source_tree.root ()) in
+-         Source_tree.Dir.project source_dir
++         let project = Source_tree.Dir.project source_dir in
++         Dune_project.packages project
+        in
+-       Dune_project.packages project
+-       |> Package.Name.Map.map ~f:(fun pkg ->
+-         let opam_file = Package.to_opam_file pkg in
+-         let file =
+-           Path.source
+-           @@
+-           match pkg.has_opam_file with
+-           | Generated | Exists false -> Dune_project.file project
+-           | Exists true -> pkg.opam_file
+-         in
+-         { Opam_repo.With_file.opam_file; file })
++       Package.Name.Map.map dune_package_map ~f:Package.to_opam_file
+      in
+      let+ solutions =
+        Fiber.parallel_map
+diff --git a/src/dune_pkg/opam_repo.ml b/src/dune_pkg/opam_repo.ml
+index 08493755d..faf4f06fc 100644
+--- a/src/dune_pkg/opam_repo.ml
++++ b/src/dune_pkg/opam_repo.ml
+@@ -170,36 +170,27 @@ let all_package_versions t opam_package_name =
+   | Ok version_dirs -> Some (List.map version_dirs ~f:OpamPackage.of_string)
+ ;;
+ 
+-module With_file = struct
+-  type t =
+-    { opam_file : OpamFile.OPAM.t
+-    ; file : Path.t
+-    }
+-end
+-
+ (* Reads an opam package definition from an "opam" file in this repository
+    corresponding to a package (name and version). *)
+ let load_opam_package t opam_package =
+   let open Option.O in
+-  let+ opam_file_path = get_opam_file_path t opam_package in
+-  let opam_file =
+-    Path.to_string opam_file_path
+-    |> OpamFilename.raw
+-    |> OpamFile.make
+-    |> OpamFile.OPAM.read
+-  in
+-  { With_file.opam_file; file = opam_file_path }
++  let* opam_file_path = get_opam_file_path t opam_package in
++  Some
++    (OpamFile.OPAM.read
++       (OpamFile.make (OpamFilename.raw (Path.to_string opam_file_path))))
+ ;;
+ 
+ let load_all_versions ts opam_package_name =
+-  match List.filter_map ts ~f:(fun t -> all_package_versions t opam_package_name) with
++  let versions =
++    List.filter_map ts ~f:(fun t -> all_package_versions t opam_package_name)
++  in
++  match versions with
+   | [] -> Error `Package_not_found
+   | pkgs ->
+-    List.concat pkgs
++    pkgs
++    |> List.concat
+     |> List.filter_map ~f:(fun opam_pkg ->
+-      List.find_map ts ~f:(fun t ->
+-        load_opam_package t opam_pkg
+-        |> Option.map ~f:(fun (with_file : With_file.t) -> with_file.opam_file)))
++      List.find_map ts ~f:(fun t -> load_opam_package t opam_pkg))
+     |> Result.ok
+ ;;
+ 
+diff --git a/src/dune_pkg/opam_repo.mli b/src/dune_pkg/opam_repo.mli
+index 0ea972c9f..246c983a8 100644
+--- a/src/dune_pkg/opam_repo.mli
++++ b/src/dune_pkg/opam_repo.mli
+@@ -24,15 +24,8 @@ val of_opam_repo_dir_path
+ val repo_id : t -> Repository_id.t option
+ val serializable : t -> Serializable.t option
+ 
+-module With_file : sig
+-  type t =
+-    { opam_file : OpamFile.OPAM.t
+-    ; file : Path.t
+-    }
+-end
+-
+ (** Load package metadata for a single package *)
+-val load_opam_package : t -> OpamPackage.t -> With_file.t option
++val load_opam_package : t -> OpamPackage.t -> OpamFile.OPAM.t option
+ 
+ (** Load package metadata for all versions of a package with a given name *)
+ val load_all_versions
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index 058eceef2..a550f8eca 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -242,7 +242,7 @@ let opam_command_to_string_debug (args, _filter_opt) =
+   |> String.concat ~sep:" "
+ ;;
+ 
+-let filter_to_blang loc package filter =
++let filter_to_blang package filter =
+   let fident_to_blang packages variable string_converter =
+     if Option.is_some string_converter
+     then
+@@ -254,7 +254,11 @@ let filter_to_blang loc package filter =
+     let variable_string = OpamVariable.to_string variable in
+     match packages with
+     | [] ->
+-      let pform = Package_variable.pform_of_opam_ident (loc, variable_string) in
++      let pform =
++        Package_variable.pform_of_opam_ident
++          ~package_name:(OpamPackage.to_string package)
++          variable_string
++      in
+       Blang.Expr (String_with_vars.make_pform Loc.none pform)
+     | packages ->
+       let blangs =
+@@ -286,7 +290,6 @@ let filter_to_blang loc package filter =
+        | Blang.Expr sw -> sw
+        | _ ->
+          User_error.raise
+-           ~loc
+            [ Pp.textf
+                "Expected string or identifier but found conjunction of identifiers: %s"
+                (OpamFilter.to_string filter)
+@@ -345,7 +348,8 @@ let filter_to_blang loc package filter =
+   filter_to_blang filter
+ ;;
+ 
+-let opam_commands_to_actions loc package (commands : OpamTypes.command list) =
++let opam_commands_to_actions package (commands : OpamTypes.command list) =
++  let package_name = OpamPackage.to_string package in
+   List.filter_map commands ~f:(fun ((args, filter) as command) ->
+     let terms =
+       let interpolate_opam_variables s =
+@@ -359,10 +363,9 @@ let opam_commands_to_actions loc package (commands : OpamTypes.command list) =
+                when String.is_prefix ~prefix:"%{" interp
+                     && String.is_suffix ~suffix:"}%" interp ->
+                let ident = String.sub ~pos:2 ~len:(String.length interp - 4) interp in
+-               `Pform (Package_variable.pform_of_opam_ident (loc, ident))
++               `Pform (Package_variable.pform_of_opam_ident ~package_name ident)
+              | other ->
+                User_error.raise
+-                 ~loc
+                  [ Pp.textf
+                      "Encountered malformed variable interpolation while processing \
+                       commands for package %s."
+@@ -381,7 +384,7 @@ let opam_commands_to_actions loc package (commands : OpamTypes.command list) =
+         | CIdent ident ->
+           String_with_vars.make_pform
+             Loc.none
+-            (Package_variable.pform_of_opam_ident (loc, ident)))
++            (Package_variable.pform_of_opam_ident ident ~package_name))
+     in
+     match terms with
+     | [] -> None
+@@ -390,7 +393,7 @@ let opam_commands_to_actions loc package (commands : OpamTypes.command list) =
+         let action = Action.run program args in
+         match filter with
+         | None -> action
+-        | Some filter -> Action.When (filter_to_blang loc package filter, action)
++        | Some filter -> Action.When (filter_to_blang package filter, action)
+       in
+       Some action)
+ ;;
+@@ -430,21 +433,17 @@ let opam_package_to_lock_file_pkg context_for_dune ~repos ~local_packages opam_p
+   let name = OpamPackage.name opam_package in
+   let version = OpamPackage.version opam_package |> OpamPackage.Version.to_string in
+   let dev = OpamPackage.Name.Map.mem name local_packages in
+-  let opam_file, loc =
+-    let { Opam_repo.With_file.opam_file; file } =
+-      match OpamPackage.Name.Map.find_opt name local_packages with
+-      | Some local_package -> local_package
+-      | None ->
+-        let opam_files =
+-          List.filter_map repos ~f:(fun repo ->
+-            Opam_repo.load_opam_package repo opam_package)
+-        in
+-        (match opam_files with
+-         | [ opam_file ] -> opam_file
+-         | _ -> Code_error.raise "Couldn't map opam package to a repository" [])
+-    in
+-    let loc = Loc.in_file file in
+-    opam_file, loc
++  let opam_file =
++    match OpamPackage.Name.Map.find_opt name local_packages with
++    | Some local_package -> local_package
++    | None ->
++      let opam_files =
++        List.filter_map repos ~f:(fun repo ->
++          Opam_repo.load_opam_package repo opam_package)
++      in
++      (match opam_files with
++       | [ opam_file ] -> opam_file
++       | _ -> Code_error.raise "Couldn't map opam package to a repository" [])
+   in
+   let extra_sources =
+     OpamFile.OPAM.extra_sources opam_file
+@@ -514,10 +513,10 @@ let opam_package_to_lock_file_pkg context_for_dune ~repos ~local_packages opam_p
+         in
+         match filter with
+         | None -> action
+-        | Some filter -> Action.When (filter_to_blang loc opam_package filter, action))
++        | Some filter -> Action.When (filter_to_blang opam_package filter, action))
+     in
+     let build_step =
+-      opam_commands_to_actions loc opam_package (OpamFile.OPAM.build opam_file)
++      opam_commands_to_actions opam_package (OpamFile.OPAM.build opam_file)
+     in
+     List.concat [ subst_step; patch_step; build_step ]
+     |> make_action
+@@ -525,7 +524,7 @@ let opam_package_to_lock_file_pkg context_for_dune ~repos ~local_packages opam_p
+   in
+   let install_command =
+     OpamFile.OPAM.install opam_file
+-    |> opam_commands_to_actions loc opam_package
++    |> opam_commands_to_actions opam_package
+     |> make_action
+     |> Option.map ~f:build_env
+   in
+@@ -535,7 +534,7 @@ let opam_package_to_lock_file_pkg context_for_dune ~repos ~local_packages opam_p
+   { Lock_dir.Pkg.build_command; install_command; deps; info; exported_env }
+ ;;
+ 
+-let solve_package_list local_package_names context =
++let solve_package_list local_packages context =
+   let result =
+     try
+       (* [Solver.solve] returns [Error] when it's unable to find a solution to
+@@ -544,7 +543,7 @@ let solve_package_list local_package_names context =
+          an unexpected opam exception from crashing dune, we catch all
+          exceptions raised by the solver and report them as [User_error]s
+          instead. *)
+-      Solver.solve context local_package_names
++      Solver.solve context (OpamPackage.Name.Map.keys local_packages)
+     with
+     | OpamPp.(Bad_format _ | Bad_format_list _ | Bad_version _) as bad_format ->
+       User_error.raise [ Pp.text (OpamPp.string_of_bad_format bad_format) ]
+@@ -577,7 +576,6 @@ let scan_files_entries path =
+     | Error (Unix.ENOENT, _, _) -> acc
+     | Error err ->
+       User_error.raise
+-        ~loc:(Loc.in_file path)
+         [ Pp.text "Unable to read file in opam repository:"; Unix_error.Detailed.pp err ]
+   in
+   read [] Path.Local.root
+@@ -601,14 +599,9 @@ let solve_lock_dir solver_env version_preference repos ~local_packages =
+     OpamPackage.Name.Map.mem (OpamPackage.name package) local_packages
+   in
+   let context =
+-    let local_packages =
+-      OpamPackage.Name.Map.map
+-        (fun (w : Opam_repo.With_file.t) -> w.opam_file)
+-        local_packages
+-    in
+     Context_for_dune.create ~solver_env ~repos ~version_preference ~local_packages
+   in
+-  solve_package_list (OpamPackage.Name.Map.keys local_packages) context
++  solve_package_list local_packages context
+   |> Result.map ~f:(fun solution ->
+     (* don't include local packages in the lock dir *)
+     let opam_packages_to_lock = List.filter solution ~f:(Fun.negate is_local_package) in
+diff --git a/src/dune_pkg/opam_solver.mli b/src/dune_pkg/opam_solver.mli
+index 5ce22b334..7541be209 100644
+--- a/src/dune_pkg/opam_solver.mli
++++ b/src/dune_pkg/opam_solver.mli
+@@ -20,5 +20,5 @@ val solve_lock_dir
+   :  Solver_env.t
+   -> Version_preference.t
+   -> Opam_repo.t list
+-  -> local_packages:Opam_repo.With_file.t Package_name.Map.t
++  -> local_packages:OpamFile.OPAM.t Package_name.Map.t
+   -> (Solver_result.t, [ `Diagnostic_message of _ Pp.t ]) result
+diff --git a/src/dune_pkg/package_variable.ml b/src/dune_pkg/package_variable.ml
+index 4f956cf53..ba43e6095 100644
+--- a/src/dune_pkg/package_variable.ml
++++ b/src/dune_pkg/package_variable.ml
+@@ -94,10 +94,15 @@ let of_opam_ident ident =
+         Result.map variable ~f:(fun var -> `Package_variable (self_scoped var)))
+ ;;
+ 
+-let pform_of_opam_ident (loc, ident) =
++let pform_of_opam_ident ~package_name ident =
+   match of_opam_ident ident with
+   | Ok (`Package_variable t) -> to_pform t
+   | Ok (`Global_variable var) -> Pform.Var var
+   | Error (`Unsupported_variable name) ->
+-    User_error.raise ~loc [ Pp.textf "Variable %S is not supported." name ]
++    User_error.raise
++      [ Pp.textf
++          "Variable %S occuring in opam package %S is not supported."
++          name
++          package_name
++      ]
+ ;;
+diff --git a/src/dune_pkg/package_variable.mli b/src/dune_pkg/package_variable.mli
+index d146f28c8..4a1af67b9 100644
+--- a/src/dune_pkg/package_variable.mli
++++ b/src/dune_pkg/package_variable.mli
+@@ -42,4 +42,4 @@ val to_pform : t -> Pform.t
+     as pform macros with the [Macro.Pkg] macro.
+ 
+     Raises a user error if the variable is unsupported. *)
+-val pform_of_opam_ident : Loc.t * string -> Pform.t
++val pform_of_opam_ident : package_name:string -> string -> Pform.t
+diff --git a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+index fecee84a0..a887bef1e 100644
+--- a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
++++ b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+@@ -132,7 +132,6 @@ Package which has boolean where string was expected. This should be caught while
+     (run echo %{os_family})))
+ 
+   $ solve with-malformed-interpolation
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/with-malformed-interpolation/with-malformed-interpolation.0.0.1/opam", line 1, characters 0-0:
+   Error: Encountered malformed variable interpolation while processing commands
+   for package with-malformed-interpolation.0.0.1.
+   The variable interpolation:
+@@ -203,7 +202,6 @@ Package which has boolean where string was expected. This should be caught while
+      (run echo m))))
+ 
+   $ solve filter-error-invalid-conjunction
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/filter-error-invalid-conjunction/filter-error-invalid-conjunction.0.0.1/opam", line 1, characters 0-0:
+   Error: Expected string or identifier but found conjunction of identifiers:
+   foo+bar+baz:version
+   ...while processing commands for package:
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-package-files-unix-error.t b/test/blackbox-tests/test-cases/pkg/opam-package-files-unix-error.t
+index 056c24b67..86a732943 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-package-files-unix-error.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-package-files-unix-error.t
+@@ -27,7 +27,6 @@ The error message should have a location for the opam repository.
+ This does not currently seem to be the case.
+ 
+   $ solve with-patch
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/with-patch/with-patch.0.0.1/files/dir", line 1, characters 0-0:
+   Error: Unable to read file in opam repository:
+   opendir($TESTCASE_ROOT/mock-opam-repository/packages/with-patch/with-patch.0.0.1/files/dir): Permission denied
+   [1]
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t
+index 4b04582eb..d5c2e0423 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-var/opam-var-unsupported.t
+@@ -19,37 +19,37 @@ These should all have nice error messages explaining that they are not supported
+ 
+ # opam-version
+   $ fail_solve opam-version
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "opam-version" is not supported.
++  Error: Variable "opam-version" occuring in opam package "testpkg.0.0.1" is
++  not supported.
+ # root
+   $ fail_solve root 
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "root" is not supported.
++  Error: Variable "root" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:hash
+   $ fail_solve _:hash
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "hash" is not supported.
++  Error: Variable "hash" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:build-id
+   $ fail_solve _:build-id
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "build-id" is not supported.
++  Error: Variable "build-id" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # misc
+   $ fail_solve misc
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "misc" is not supported.
++  Error: Variable "misc" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:misc
+   $ fail_solve _:misc
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "misc" is not supported.
++  Error: Variable "misc" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:depends
+   $ fail_solve _:depends
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "depends" is not supported.
++  Error: Variable "depends" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:build
+   $ fail_solve _:build
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "build" is not supported.
++  Error: Variable "build" occuring in opam package "testpkg.0.0.1" is not
++  supported.
+ # _:opamfile
+   $ fail_solve _:opamfile
+-  File "$TESTCASE_ROOT/mock-opam-repository/packages/testpkg/testpkg.0.0.1/opam", line 1, characters 0-0:
+-  Error: Variable "opamfile" is not supported.
++  Error: Variable "opamfile" occuring in opam package "testpkg.0.0.1" is not
++  supported.

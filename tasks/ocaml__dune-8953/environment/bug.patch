@@ -1,0 +1,202 @@
+diff --git a/doc/changes/package-dirs.md b/doc/changes/package-dirs.md
+deleted file mode 100644
+index 230c5660b..000000000
+--- a/doc/changes/package-dirs.md
++++ /dev/null
+@@ -1,3 +0,0 @@
+-- Mark installed directories in `dune-package` files. This fixes `(package)`
+-  dependencies against packages that contain such directories. (#8953, fixes
+-  #8915, @emillon)
+diff --git a/src/dune_rules/dep_conf_eval.ml b/src/dune_rules/dep_conf_eval.ml
+index 8c340ec59..1c49e3fc2 100644
+--- a/src/dune_rules/dep_conf_eval.ml
++++ b/src/dune_rules/dep_conf_eval.ml
+@@ -106,21 +106,6 @@ let add_sandbox_config acc (dep : Dep_conf.t) =
+   | _ -> acc
+ ;;
+ 
+-let rec dir_contents ~loc d =
+-  match Path.Untracked.readdir_unsorted_with_kinds d with
+-  | Error e -> Unix_error.Detailed.raise e
+-  | Ok contents ->
+-    List.concat_map contents ~f:(fun (entry, kind) ->
+-      let path = Path.relative d entry in
+-      match kind with
+-      | S_REG -> [ path ]
+-      | S_DIR -> dir_contents ~loc path
+-      | _ ->
+-        User_error.raise
+-          ~loc
+-          [ Pp.text "Encountered a special file while expanding dependency." ])
+-;;
+-
+ let rec dep expander : Dep_conf.t -> _ = function
+   | Include s ->
+     (* TODO this is wrong. we shouldn't allow bindings here if we are in an
+@@ -197,12 +182,12 @@ let rec dep expander : Dep_conf.t -> _ = function
+            let version =
+              Dune_project.dune_version @@ Scope.project @@ Expander.scope expander
+            in
+-           let loc = String_with_vars.loc p in
+            if version < (2, 9)
+            then
+              Action_builder.fail
+                { fail =
+                    (fun () ->
++                     let loc = String_with_vars.loc p in
+                      User_error.raise
+                        ~loc
+                        [ Pp.textf
+@@ -215,11 +200,8 @@ let rec dep expander : Dep_conf.t -> _ = function
+                List.concat_map
+                  ~f:(fun (s, l) ->
+                    let dir = Section.Map.find_exn pkg.sections s in
+-                   List.concat_map l ~f:(fun (kind, d) ->
+-                     let path = Path.relative dir (Install.Entry.Dst.to_string d) in
+-                     match kind with
+-                     | `File -> [ path ]
+-                     | `Dir -> dir_contents ~loc path))
++                   List.map l ~f:(fun d ->
++                     Path.relative dir (Install.Entry.Dst.to_string d)))
+                  pkg.files
+              in
+              Action_builder.paths files)
+diff --git a/src/dune_rules/dune_package.ml b/src/dune_rules/dune_package.ml
+index 78b8ac237..07cd91fa3 100644
+--- a/src/dune_rules/dune_package.ml
++++ b/src/dune_rules/dune_package.ml
+@@ -357,31 +357,6 @@ module Entry = struct
+   ;;
+ end
+ 
+-type path = [ `File | `Dir ] * Install.Entry.Dst.t
+-
+-let decode_path =
+-  let open Dune_lang.Decoder in
+-  let* ast = peek_exn in
+-  match ast with
+-  | Atom _ ->
+-    let+ f = Install.Entry.Dst.decode in
+-    `File, f
+-  | _ ->
+-    fields
+-      (let+ d = field "dir" Install.Entry.Dst.decode in
+-       `Dir, d)
+-;;
+-
+-let encode_path = function
+-  | `File, f -> Install.Entry.Dst.encode f
+-  | `Dir, d -> Dune_lang.Encoder.constr "dir" Install.Entry.Dst.encode d
+-;;
+-
+-let path_to_dyn = function
+-  | `File, f -> Install.Entry.Dst.to_dyn f
+-  | `Dir, d -> Dyn.variant "dir" [ Install.Entry.Dst.to_dyn d ]
+-;;
+-
+ type t =
+   { name : Package.Name.t
+   ; entries : Entry.t Lib_name.Map.t
+@@ -389,7 +364,7 @@ type t =
+   ; sections : Path.t Section.Map.t
+   ; sites : Section.t Site.Map.t
+   ; dir : Path.t
+-  ; files : (Section.t * path list) list
++  ; files : (Section.t * Install.Entry.Dst.t list) list
+   }
+ 
+ let decode ~lang ~dir =
+@@ -404,7 +379,10 @@ let decode ~lang ~dir =
+   and+ sites =
+     field ~default:[] "sites" (repeat (pair (located Site.decode) Section.decode))
+   and+ files =
+-    field ~default:[] "files" (repeat (pair Section.decode (enter (repeat decode_path))))
++    field
++      ~default:[]
++      "files"
++      (repeat (pair Section.decode (enter (repeat Install.Entry.Dst.decode))))
+   and+ entries = leftover_fields_as_sums (Entry.cstrs ~lang ~dir) in
+   let entries =
+     List.map entries ~f:(fun e ->
+@@ -464,7 +442,7 @@ let encode ~dune_version { entries; name; version; dir; sections; sites; files }
+           (pair Section.encode (Dune_lang.Path.Local.encode ~dir))
+           (Section.Map.to_list sections)
+       ; field_l "sites" (pair Site.encode Section.encode) sites
+-      ; field_l "files" (pair Section.encode (list encode_path)) files
++      ; field_l "files" (pair Section.encode (list Install.Entry.Dst.encode)) files
+       ]
+   in
+   let list s = Dune_lang.List s in
+@@ -493,7 +471,7 @@ let to_dyn { entries; name; version; dir; sections; sites; files } =
+     ; "dir", Path.to_dyn dir
+     ; "sections", Section.Map.to_dyn Path.to_dyn sections
+     ; "sites", Site.Map.to_dyn Section.to_dyn sites
+-    ; "files", (list (pair Section.to_dyn (list path_to_dyn))) files
++    ; "files", (list (pair Section.to_dyn (list Install.Entry.Dst.to_dyn))) files
+     ]
+ ;;
+ 
+diff --git a/src/dune_rules/dune_package.mli b/src/dune_rules/dune_package.mli
+index a1cd77f54..6bd5c82e3 100644
+--- a/src/dune_rules/dune_package.mli
++++ b/src/dune_rules/dune_package.mli
+@@ -46,8 +46,6 @@ module Entry : sig
+   val to_dyn : t Dyn.builder
+ end
+ 
+-type path = [ `File | `Dir ] * Install.Entry.Dst.t
+-
+ type t =
+   { name : Package.Name.t
+   ; entries : Entry.t Lib_name.Map.t
+@@ -55,7 +53,7 @@ type t =
+   ; sections : Path.t Section.Map.t
+   ; sites : Section.t Site.Map.t
+   ; dir : Path.t
+-  ; files : (Section.t * path list) list
++  ; files : (Section.t * Install.Entry.Dst.t list) list
+   }
+ 
+ val to_dyn : t Dyn.builder
+diff --git a/src/dune_rules/install_rules.ml b/src/dune_rules/install_rules.ml
+index c5aa1c2b9..060775af9 100644
+--- a/src/dune_rules/install_rules.ml
++++ b/src/dune_rules/install_rules.ml
+@@ -676,13 +676,7 @@ end = struct
+     let+ files =
+       let+ map = Stanzas_to_entries.stanzas_to_entries sctx in
+       Package.Name.Map.Multi.find map pkg_name
+-      |> List.map ~f:(fun (e : Install.Entry.Sourced.t) ->
+-        let kind =
+-          match e.entry.kind with
+-          | `File -> `File
+-          | `Directory | `Source_tree -> `Dir
+-        in
+-        e.entry.section, (kind, e.entry.dst))
++      |> List.map ~f:(fun (e : Install.Entry.Sourced.t) -> e.entry.section, e.entry.dst)
+       |> Section.Map.of_list_multi
+       |> Section.Map.to_list
+     in
+diff --git a/test/blackbox-tests/test-cases/directory-targets/installed-dependency.t b/test/blackbox-tests/test-cases/directory-targets/installed-dependency.t
+index d7bce9d44..771ece414 100644
+--- a/test/blackbox-tests/test-cases/directory-targets/installed-dependency.t
++++ b/test/blackbox-tests/test-cases/directory-targets/installed-dependency.t
+@@ -26,7 +26,7 @@ Allow directories to be installable
+   (lang dune 3.11)
+   (name foo)
+   (sections (lib .) (share ../../share/foo))
+-  (files (lib (META dune-package)) (share ((dir bar))))
++  (files (lib (META dune-package)) (share (bar)))
+   $ dune install --root a --prefix $PWD/prefix --display short
+   Installing $TESTCASE_ROOT/prefix/lib/foo/META
+   Installing $TESTCASE_ROOT/prefix/lib/foo/dune-package
+@@ -45,4 +45,9 @@ Allow directories to be installable
+ 
+   $ OCAMLPATH=$PWD/prefix/lib/:$OCAMLPATH dune build --root=b @foo --display=short
+   Entering directory 'b'
++  Error: File unavailable:
++  $TESTCASE_ROOT/prefix/share/foo/bar
++  This is not a regular file (S_DIR)
++  -> required by alias foo in dune:1
+   Leaving directory 'b'
++  [1]

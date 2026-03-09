@@ -1,0 +1,135 @@
+diff --git a/src/dune_pkg/dune b/src/dune_pkg/dune
+index fb0795958..7fa951589 100644
+--- a/src/dune_pkg/dune
++++ b/src/dune_pkg/dune
+@@ -6,6 +6,7 @@
+   fiber
+   chrome_trace
+   dune_engine
++  dune_digest
+   dune_util
+   dune_stats
+   dune_lang
+diff --git a/src/dune_pkg/fetch.ml b/src/dune_pkg/fetch.ml
+index 995166104..c32e9eb03 100644
+--- a/src/dune_pkg/fetch.ml
++++ b/src/dune_pkg/fetch.ml
+@@ -135,10 +135,16 @@ let fetch ~unpack ~checksum ~target (url : OpamUrl.t) =
+ ;;
+ 
+ module Opam_repository = struct
+-  type t = { url : OpamUrl.t }
++  type t = Workspace.Repository.t
+ 
+-  let of_url url = { url }
+-  let default = of_url @@ OpamUrl.of_string "https://opam.ocaml.org/index.tar.gz"
++  let of_url url =
++    let name = Workspace.Repository.Name.of_string "unknown" in
++    let source = OpamUrl.to_string url in
++    Workspace.Repository.create ~name ~source
++  ;;
++
++  let of_workspace_repo v = v
++  let default = Workspace.Repository.default
+ 
+   let is_archive name =
+     List.exists
+@@ -154,11 +160,19 @@ module Opam_repository = struct
+   let path =
+     let open Fiber.O in
+     let ( / ) = Filename.concat in
+-    fun { url } ->
++    fun repo ->
++      let url = Workspace.Repository.opam_url repo in
++      let name =
++        repo |> Workspace.Repository.name |> Workspace.Repository.Name.to_string
++      in
++      let path_digest =
++        url |> OpamUrl.to_string |> Dune_digest.string |> Dune_digest.to_string
++      in
++      let folder = sprintf "%s-%s" name path_digest in
+       Fiber.of_thunk
+       @@ fun () ->
+       let target_dir =
+-        Xdg.cache_dir (Lazy.force Dune_util.xdg) / "dune/opam-repository"
++        Xdg.cache_dir (Lazy.force Dune_util.xdg) / "dune/opam-repositories" / folder
+       in
+       let target = target_dir |> Path.External.of_string |> Path.external_ in
+       let unpack = url |> OpamUrl.to_string |> is_archive in
+diff --git a/src/dune_pkg/fetch.mli b/src/dune_pkg/fetch.mli
+index 63e6e661b..041c51d17 100644
+--- a/src/dune_pkg/fetch.mli
++++ b/src/dune_pkg/fetch.mli
+@@ -28,6 +28,7 @@ module Opam_repository : sig
+     }
+ 
+   val of_url : OpamUrl.t -> t
++  val of_workspace_repo : Workspace.Repository.t -> t
+   val default : t
+   val path : t -> (success, failure) result Fiber.t
+ end
+diff --git a/src/dune_pkg/solver_env.ml b/src/dune_pkg/solver_env.ml
+index 869bd14d7..bd4ba124f 100644
+--- a/src/dune_pkg/solver_env.ml
++++ b/src/dune_pkg/solver_env.ml
+@@ -206,19 +206,26 @@ let default =
+   { flags = Variable.Flag.Set.all
+   ; sys = Variable.Sys.Bindings.empty
+   ; const = Variable.Const.bindings
+-  ; repos = [ Workspace.Repository.Name.of_string ":standard" ] (* TODO *)
++  ; repos = [ Workspace.Repository.Name.of_string "default" ]
+   }
+ ;;
+ 
++let repos_of_ordered_set ordered_set =
++  Dune_lang.Ordered_set_lang.eval
++    ordered_set
++    ~parse:(fun ~loc string -> Workspace.Repository.Name.parse_string_exn (loc, string))
++    ~eq:Workspace.Repository.Name.equal
++    ~standard:default.repos
++;;
++
+ let decode =
+   let open Decoder in
+   fields
+   @@ let+ flags = field Fields.flags ~default:default.flags Variable.Flag.Set.decode
+      and+ sys = field Fields.sys ~default:default.sys Variable.Sys.Bindings.decode
+-     and+ repos =
+-       field Fields.repos ~default:default.repos (repeat Workspace.Repository.Name.decode)
+-     in
++     and+ repos = Dune_lang.Ordered_set_lang.field Fields.repos in
+      let const = default.const in
++     let repos = repos_of_ordered_set repos in
+      { flags; sys; const; repos }
+ ;;
+ 
+diff --git a/src/dune_pkg/workspace.ml b/src/dune_pkg/workspace.ml
+index 530f71d1d..1e7243b56 100644
+--- a/src/dune_pkg/workspace.ml
++++ b/src/dune_pkg/workspace.ml
+@@ -34,7 +34,7 @@ module Repository = struct
+ 
+   let equal { name; source } t = Name.equal name t.name && String.equal source t.source
+   let hash { name; source } = Tuple.T2.hash Name.hash String.hash (name, source)
+-  let default = { name = ":standard"; source = "https://opam.ocaml.org/index.tar.gz" }
++  let default = { name = "default"; source = "https://opam.ocaml.org/index.tar.gz" }
+ 
+   let decode =
+     let open Dune_lang.Decoder in
+@@ -44,5 +44,6 @@ module Repository = struct
+        { name; source })
+   ;;
+ 
++  let create ~name ~source = { name; source }
+   let opam_url { source; _ } = OpamUrl.of_string source
+ end
+diff --git a/src/dune_pkg/workspace.mli b/src/dune_pkg/workspace.mli
+index dd1f5e532..140ccd03d 100644
+--- a/src/dune_pkg/workspace.mli
++++ b/src/dune_pkg/workspace.mli
+@@ -21,4 +21,5 @@ module Repository : sig
+   end
+ 
+   val name : t -> Name.t
++  val create : name:Name.t -> source:string -> t
+ end

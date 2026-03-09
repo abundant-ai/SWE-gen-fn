@@ -1,0 +1,145 @@
+diff --git a/doc/changes/8949.md b/doc/changes/8949.md
+new file mode 100644
+index 000000000..bde8b159c
+--- /dev/null
++++ b/doc/changes/8949.md
+@@ -0,0 +1,2 @@
++- Correctly determine the stanza of menhir modules when `(include_subdirs
++  qualified)` is enabled (@rgrinberg, #8949, fixes #7610)
+diff --git a/src/dune_rules/gen_rules.ml b/src/dune_rules/gen_rules.ml
+index ebf9ae7a6..9e1fb6c20 100644
+--- a/src/dune_rules/gen_rules.ml
++++ b/src/dune_rules/gen_rules.ml
+@@ -248,10 +248,22 @@ let gen_rules_for_stanzas
+         | true ->
+           let* ml_sources = Dir_contents.ocaml dir_contents in
+           (match
++             let base_path =
++               match Ml_sources.include_subdirs ml_sources with
++               | Include Unqualified | No -> []
++               | Include Qualified ->
++                 Path.Local.descendant
++                   (Path.Build.local ctx_dir)
++                   ~of_:(Path.Build.local (Dir_contents.dir dir_contents))
++                 |> Option.value_exn
++                 |> Path.Local.explode
++                 |> List.map ~f:Module_name.of_string
++             in
+              Menhir_rules.module_names m
+              |> List.find_map ~f:(fun name ->
+                let open Option.O in
+-               let* origin = Ml_sources.find_origin ml_sources name in
++               let path = base_path @ [ name ] in
++               let* origin = Ml_sources.find_origin ml_sources path in
+                List.find_map cctxs ~f:(fun (loc, cctx) ->
+                  Option.some_if (Loc.equal loc (Ml_sources.Origin.loc origin)) cctx))
+            with
+diff --git a/src/dune_rules/ml_sources.ml b/src/dune_rules/ml_sources.ml
+index aa886f6bf..f8dec3ac1 100644
+--- a/src/dune_rules/ml_sources.ml
++++ b/src/dune_rules/ml_sources.ml
+@@ -14,6 +14,12 @@ module Origin = struct
+     | Executables e -> e.buildable.loc
+     | Melange mel -> mel.loc
+   ;;
++
++  let to_dyn = function
++    | Library _ -> Dyn.variant "Library" [ Dyn.Opaque ]
++    | Executables _ -> Dyn.variant "Executables" [ Dyn.Opaque ]
++    | Melange _ -> Dyn.variant "Melange" [ Dyn.Opaque ]
++  ;;
+ end
+ 
+ module Modules = struct
+@@ -183,9 +189,18 @@ end
+ type t =
+   { modules : Modules.t
+   ; artifacts : Artifacts.t Memo.Lazy.t
++  ; include_subdirs : Dune_file.Include_subdirs.t
++  }
++
++let include_subdirs t = t.include_subdirs
++
++let empty =
++  { modules = Modules.empty
++  ; artifacts = Memo.Lazy.of_val Artifacts.empty
++  ; include_subdirs = No
+   }
++;;
+ 
+-let empty = { modules = Modules.empty; artifacts = Memo.Lazy.of_val Artifacts.empty }
+ let artifacts t = Memo.Lazy.force t.artifacts
+ 
+ let modules_of_files ~path ~dialects ~dir ~files =
+@@ -195,7 +210,7 @@ let modules_of_files ~path ~dialects ~dir ~files =
+       name, Module.File.make dialect (Path.relative dir fn)
+     in
+     let loc = Loc.in_dir dir in
+-    String.Set.to_list files
++    Filename.Set.to_list files
+     |> List.filter_partition_map ~f:(fun fn ->
+       (* we aren't using Filename.extension because we want to handle
+          filenames such as foo.cppo.ml *)
+@@ -265,11 +280,7 @@ let modules_and_obj_dir t ~for_ =
+ ;;
+ 
+ let modules t ~for_ = modules_and_obj_dir t ~for_ |> fst
+-
+-let find_origin (t : t) name =
+-  (* TODO generalize to any path *)
+-  Module_name.Path.Map.find t.modules.rev_map [ name ]
+-;;
++let find_origin (t : t) path = Module_name.Path.Map.find t.modules.rev_map path
+ 
+ let virtual_modules ~lookup_vlib vlib =
+   let info = Lib.info vlib in
+@@ -565,5 +576,5 @@ let make
+         ~libs:modules_of_stanzas.libraries
+         ~exes:modules_of_stanzas.executables)
+   in
+-  { modules; artifacts }
++  { modules; artifacts; include_subdirs }
+ ;;
+diff --git a/src/dune_rules/ml_sources.mli b/src/dune_rules/ml_sources.mli
+index 843e6158a..fdb36850a 100644
+--- a/src/dune_rules/ml_sources.mli
++++ b/src/dune_rules/ml_sources.mli
+@@ -12,6 +12,7 @@ module Origin : sig
+     | Melange of Melange_stanzas.Emit.t
+ 
+   val loc : t -> Loc.t
++  val to_dyn : t -> Dyn.t
+ end
+ 
+ module Artifacts : sig
+@@ -38,7 +39,7 @@ val modules_and_obj_dir : t -> for_:for_ -> Modules.t * Path.Build.t Obj_dir.t
+ val modules : t -> for_:for_ -> Modules.t
+ 
+ (** Find out the origin of the stanza for a given module *)
+-val find_origin : t -> Module_name.t -> Origin.t option
++val find_origin : t -> Module_name.Path.t -> Origin.t option
+ 
+ val empty : t
+ 
+@@ -49,6 +50,8 @@ val empty : t
+     all virtual modules are implemented - make sure that we construct [Module.t]
+     with the correct [kind] *)
+ 
++val include_subdirs : t -> Dune_file.Include_subdirs.t
++
+ val make
+   :  Dune_file.t
+   -> dir:Path.Build.t
+diff --git a/src/dune_rules/top_module.ml b/src/dune_rules/top_module.ml
+index abd4406f9..6f5c01353 100644
+--- a/src/dune_rules/top_module.ml
++++ b/src/dune_rules/top_module.ml
+@@ -33,7 +33,7 @@ let find_module sctx src =
+     let* dir_contents = drop_rules @@ fun () -> Dir_contents.get sctx ~dir in
+     let* ocaml = Dir_contents.ocaml dir_contents in
+     let stanza =
+-      match Ml_sources.find_origin ocaml module_name with
++      match Ml_sources.find_origin ocaml [ module_name ] with
+       | Some (Executables exes) -> Some (`Executables exes)
+       | Some (Library lib) -> Some (`Library lib)
+       | None | Some (Melange _) -> None

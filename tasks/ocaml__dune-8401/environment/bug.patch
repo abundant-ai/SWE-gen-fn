@@ -1,0 +1,259 @@
+diff --git a/bin/installed_libraries.ml b/bin/installed_libraries.ml
+index 2416cdcba..3a5bb21c2 100644
+--- a/bin/installed_libraries.ml
++++ b/bin/installed_libraries.ml
+@@ -21,7 +21,9 @@ let term =
+        let open Memo.O in
+        let* ctxs = Context.DB.all () in
+        let ctx = List.hd ctxs in
+-       let* findlib = Findlib.create ctx.name in
++       let* findlib =
++         Findlib.create ~paths:ctx.findlib_paths ~lib_config:ctx.ocaml.lib_config
++       in
+        let* all_packages = Findlib.all_packages findlib in
+        if na
+        then (
+diff --git a/src/dune_rules/context.ml b/src/dune_rules/context.ml
+index bbcc18fef..89618dc55 100644
+--- a/src/dune_rules/context.ml
++++ b/src/dune_rules/context.ml
+@@ -711,21 +711,6 @@ module DB = struct
+     Memo.exec memo
+   ;;
+ 
+-  let create_db ~name f =
+-    let map =
+-      Memo.lazy_ ~name (fun () ->
+-        let+ map = all () in
+-        Context_name.Map.of_list_map_exn map ~f:(fun context ->
+-          context.name, Memo.lazy_ (fun () -> f context)))
+-    in
+-    Staged.stage (fun context ->
+-      let* map = Memo.Lazy.force map in
+-      match Context_name.Map.find map context with
+-      | Some v -> Memo.Lazy.force v
+-      | None ->
+-        Code_error.raise "invalid context" [ "context", Context_name.to_dyn context ])
+-  ;;
+-
+   let by_dir dir =
+     let context =
+       match Dune_engine.Dpath.analyse_dir (Path.build dir) with
+diff --git a/src/dune_rules/context.mli b/src/dune_rules/context.mli
+index ddd109d54..1a5db04dc 100644
+--- a/src/dune_rules/context.mli
++++ b/src/dune_rules/context.mli
+@@ -105,9 +105,4 @@ module DB : sig
+   val get : Context_name.t -> t Memo.t
+   val all : unit -> t list Memo.t
+   val by_dir : Path.Build.t -> t Memo.t
+-
+-  val create_db
+-    :  name:string
+-    -> (t -> 'a Memo.t)
+-    -> (Context_name.t -> 'a Memo.t) Staged.t
+ end
+diff --git a/src/dune_rules/dep_conf_eval.ml b/src/dune_rules/dep_conf_eval.ml
+index 7b6c5ef8b..28ca56472 100644
+--- a/src/dune_rules/dep_conf_eval.ml
++++ b/src/dune_rules/dep_conf_eval.ml
+@@ -158,7 +158,7 @@ let rec dep expander = function
+          let context = Expander.context expander in
+          Action_builder.of_memo
+            (let open Memo.O in
+-            let* sites = Sites.create context.name in
++            let* sites = Sites.create context in
+             Sites.find_package sites pkg)
+          >>= function
+          | Some (Local pkg) ->
+diff --git a/src/dune_rules/findlib.ml b/src/dune_rules/findlib.ml
+index 69adeb528..385813877 100644
+--- a/src/dune_rules/findlib.ml
++++ b/src/dune_rules/findlib.ml
+@@ -456,6 +456,13 @@ let all_packages t =
+     Lib_name.compare (Dune_package.Entry.name a) (Dune_package.Entry.name b))
+ ;;
+ 
++let create ~paths ~(lib_config : Lib_config.t) =
++  let stdlib_dir = lib_config.stdlib_dir in
++  let version = lib_config.ocaml_version in
++  let+ builtins = Meta.builtins ~stdlib_dir ~version in
++  { DB.stdlib_dir; paths; builtins; lib_config }
++;;
++
+ let lib_config (t : t) = t.lib_config
+ 
+ let all_broken_packages t =
+@@ -467,19 +474,23 @@ let all_broken_packages t =
+   |> List.sort ~compare:(fun (a, _) (b, _) -> Package.Name.compare a b)
+ ;;
+ 
+-let create ~paths ~(lib_config : Lib_config.t) =
+-  let stdlib_dir = lib_config.stdlib_dir in
+-  let version = lib_config.ocaml_version in
+-  let+ builtins = Meta.builtins ~stdlib_dir ~version in
+-  { DB.stdlib_dir; paths; builtins; lib_config }
+-;;
++let create =
++  let module Input = struct
++    type t = Path.t list * Lib_config.t
+ 
+-module For_tests = struct
+-  let create = create
+-end
++    let equal (paths, libs) (paths', libs') =
++      List.equal Path.equal paths paths' && Lib_config.equal libs libs'
++    ;;
+ 
+-let create =
+-  Context.DB.create_db ~name:"findlib" (fun context ->
+-    create ~paths:context.findlib_paths ~lib_config:context.ocaml.lib_config)
+-  |> Staged.unstage
++    let hash = Tuple.T2.hash (List.hash Path.hash) Lib_config.hash
++    let to_dyn = Dyn.pair (Dyn.list Path.to_dyn) Lib_config.to_dyn
++  end
++  in
++  let memo =
++    Memo.create
++      "lib-installed"
++      ~input:(module Input)
++      (fun (paths, lib_config) -> create ~paths ~lib_config)
++  in
++  fun ~paths ~lib_config -> Memo.exec memo (paths, lib_config)
+ ;;
+diff --git a/src/dune_rules/findlib.mli b/src/dune_rules/findlib.mli
+index 2bb071bfc..5801d082f 100644
+--- a/src/dune_rules/findlib.mli
++++ b/src/dune_rules/findlib.mli
+@@ -5,6 +5,7 @@ open Import
+ (** Findlib database *)
+ type t
+ 
++val create : paths:Path.t list -> lib_config:Lib_config.t -> t Memo.t
+ val lib_config : t -> Lib_config.t
+ val findlib_predicates_set_by_dune : Variant.Set.t
+ 
+@@ -32,9 +33,3 @@ val all_packages : t -> Dune_package.Entry.t list Memo.t
+ 
+ (** List all the packages that have broken [dune-package] files *)
+ val all_broken_packages : t -> (Package.Name.t * User_message.t) list Memo.t
+-
+-val create : Context_name.t -> t Memo.t
+-
+-module For_tests : sig
+-  val create : paths:Path.t list -> lib_config:Lib_config.t -> t Memo.t
+-end
+diff --git a/src/dune_rules/install_rules.ml b/src/dune_rules/install_rules.ml
+index 4d5d06283..c515562d1 100644
+--- a/src/dune_rules/install_rules.ml
++++ b/src/dune_rules/install_rules.ml
+@@ -505,7 +505,7 @@ end = struct
+               Install.Entry.Sourced.create entry :: acc)
+             else acc))
+     and+ l =
+-      let* sites = Sites.create ctx.name in
++      let* sites = Sites.create ctx in
+       Dune_file.fold_stanzas stanzas ~init:[] ~f:(fun dune_file stanza acc ->
+         let dir = Path.Build.append_source ctx.build_dir dune_file.dir in
+         let named_entries =
+diff --git a/src/dune_rules/lib.ml b/src/dune_rules/lib.ml
+index fa6b9eef8..82343bfd7 100644
+--- a/src/dune_rules/lib.ml
++++ b/src/dune_rules/lib.ml
+@@ -1799,7 +1799,9 @@ module DB = struct
+ 
+   let installed (context : Context.t) =
+     let open Memo.O in
+-    let+ findlib = Findlib.create context.name in
++    let+ findlib =
++      Findlib.create ~paths:context.findlib_paths ~lib_config:context.ocaml.lib_config
++    in
+     create_from_findlib findlib ~instrument_with:context.instrument_with
+   ;;
+ 
+diff --git a/src/dune_rules/sites.ml b/src/dune_rules/sites.ml
+index 61f03e6be..f26a56912 100644
+--- a/src/dune_rules/sites.ml
++++ b/src/dune_rules/sites.ml
+@@ -1,20 +1,21 @@
+ open Import
+ open Memo.O
+ 
+-type t = Context_name.t
++type t =
++  { packages : Package.t Package.Name.Map.t
++  ; findlib : Findlib.t
++  }
+ 
+ type any_package =
+   | Local of Package.t
+   | Installed of Dune_package.t
+ 
+-let find_package ctx pkg =
+-  let* packages = Only_packages.get () in
+-  match Package.Name.Map.find packages pkg with
++let find_package t pkg =
++  match Package.Name.Map.find t.packages pkg with
+   | Some p -> Memo.return (Some (Local p))
+   | None ->
+     let open Memo.O in
+-    let* findlib = Findlib.create ctx in
+-    Findlib.find_root_package findlib pkg
++    Findlib.find_root_package t.findlib pkg
+     >>| (function
+     | Ok p -> Some (Installed p)
+     | Error Not_found -> None
+@@ -22,7 +23,13 @@ let find_package ctx pkg =
+       User_error.raise [ User_message.pp user_message ])
+ ;;
+ 
+-let create ctx = Memo.return ctx
++let create (context : Context.t) =
++  let* packages = Only_packages.get () in
++  let+ findlib =
++    Findlib.create ~paths:context.findlib_paths ~lib_config:context.ocaml.lib_config
++  in
++  { packages; findlib }
++;;
+ 
+ let section_of_site t ~loc ~pkg ~site =
+   let+ sites =
+diff --git a/src/dune_rules/sites.mli b/src/dune_rules/sites.mli
+index d75291edb..ec83790f7 100644
+--- a/src/dune_rules/sites.mli
++++ b/src/dune_rules/sites.mli
+@@ -6,7 +6,7 @@ type any_package =
+   | Local of Package.t
+   | Installed of Dune_package.t
+ 
+-val create : Context_name.t -> t Memo.t
++val create : Context.t -> t Memo.t
+ val find_package : t -> Package.Name.t -> any_package option Memo.t
+ 
+ val section_of_site
+diff --git a/src/dune_rules/super_context.ml b/src/dune_rules/super_context.ml
+index 268904f6e..5170c5806 100644
+--- a/src/dune_rules/super_context.ml
++++ b/src/dune_rules/super_context.ml
+@@ -454,7 +454,7 @@ let create ~(context : Context.t) ~host ~packages ~stanzas =
+           | Some s -> Some (Section.Set.add s section))
+       in
+       let+ package_sections =
+-        let* sites = Sites.create context.name in
++        let* sites = Sites.create context in
+         Dune_file.Memo_fold.fold_stanzas
+           stanzas
+           ~init:Package.Name.Map.empty
+diff --git a/test/expect-tests/findlib_tests.ml b/test/expect-tests/findlib_tests.ml
+index c513c5b6b..7269a8d0e 100644
+--- a/test/expect-tests/findlib_tests.ml
++++ b/test/expect-tests/findlib_tests.ml
+@@ -41,7 +41,7 @@ let findlib =
+     }
+   in
+   Memo.lazy_ (fun () ->
+-    Findlib.For_tests.create ~paths:[ Path.outside_build_dir db_path ] ~lib_config)
++    Findlib.create ~paths:[ Path.outside_build_dir db_path ] ~lib_config)
+ ;;
+ 
+ let resolve_pkg s =

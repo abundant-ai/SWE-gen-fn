@@ -1,0 +1,452 @@
+diff --git a/src/dune_rules/dir_contents.ml b/src/dune_rules/dir_contents.ml
+index 8745cc0d2..fc684bdba 100644
+--- a/src/dune_rules/dir_contents.ml
++++ b/src/dune_rules/dir_contents.ml
+@@ -412,7 +412,7 @@ end = struct
+     >>= function
+     | Is_component_of_a_group_but_not_the_root { group_root; stanzas = _ } ->
+       Memo.return @@ Group_part group_root
+-    | Generated | Source_only _ ->
++    | Lock_dir | Generated | Source_only _ ->
+       Memo.return @@ Standalone_or_root (Standalone_or_root.empty ~dir)
+     | Standalone (st_dir, d) ->
+       Memo.return @@ Standalone_or_root (make_standalone sctx st_dir ~dir d)
+diff --git a/src/dune_rules/dir_status.ml b/src/dune_rules/dir_status.ml
+index 9a2040c24..164b2b7ca 100644
+--- a/src/dune_rules/dir_status.ml
++++ b/src/dune_rules/dir_status.ml
+@@ -29,6 +29,7 @@ end
+ 
+ module T = struct
+   type t =
++    | Lock_dir
+     | Generated
+     | Source_only of Source_tree.Dir.t
+     | (* Directory not part of a multi-directory group *)
+@@ -47,7 +48,7 @@ type enclosing_group =
+   | Group_root of Path.Build.t
+ 
+ let current_group dir = function
+-  | Generated | Source_only _ | Standalone _ -> No_group
++  | Lock_dir | Generated | Source_only _ | Standalone _ -> No_group
+   | Group_root _ -> Group_root dir
+   | Is_component_of_a_group_but_not_the_root { group_root; _ } -> Group_root group_root
+ ;;
+@@ -144,7 +145,7 @@ end = struct
+     let rec walk st_dir ~dir ~local =
+       DB.get ~dir
+       >>= function
+-      | Generated | Source_only _ | Standalone _ | Group_root _ ->
++      | Lock_dir | Generated | Source_only _ | Standalone _ | Group_root _ ->
+         Memo.return Appendable_list.empty
+       | Is_component_of_a_group_but_not_the_root { stanzas; group_root = _ } ->
+         walk_children st_dir ~dir ~local
+@@ -206,9 +207,13 @@ end = struct
+   ;;
+ 
+   let get_impl dir =
+-    (match Path.Build.drop_build_context dir with
++    (match Path.Build.extract_build_context dir with
+      | None -> Memo.return None
+-     | Some dir -> Source_tree.find_dir dir)
++     | Some (ctx, dir) ->
++       Source_tree.find_dir dir
++       >>| (function
++        | None -> None
++        | Some src_dir -> Some (ctx, src_dir)))
+     >>= function
+     | None ->
+       enclosing_group ~dir
+@@ -216,23 +221,31 @@ end = struct
+        | No_group -> Generated
+        | Group_root group_root ->
+          Is_component_of_a_group_but_not_the_root { stanzas = None; group_root })
+-    | Some st_dir ->
+-      let build_dir_is_project_root =
+-        let project_root = Source_tree.Dir.project st_dir |> Dune_project.root in
+-        Source_tree.Dir.path st_dir |> Path.Source.equal project_root
+-      in
+-      Only_packages.stanzas_in_dir dir
++    | Some (ctx, st_dir) ->
++      let src_dir = Source_tree.Dir.path st_dir in
++      Pkg_rules.lock_dir_path (Context_name.of_string ctx)
++      >>| (function
++             | None -> false
++             | Some of_ -> Path.Source.is_descendant ~of_ src_dir)
+       >>= (function
+-       | Some d -> has_dune_file ~dir st_dir ~build_dir_is_project_root d
+-       | None ->
+-         if build_dir_is_project_root
+-         then Memo.return (Source_only st_dir)
+-         else
+-           enclosing_group ~dir
+-           >>| (function
+-            | No_group -> Source_only st_dir
+-            | Group_root group_root ->
+-              Is_component_of_a_group_but_not_the_root { stanzas = None; group_root }))
++       | true -> Memo.return Lock_dir
++       | false ->
++         let build_dir_is_project_root =
++           let project_root = Source_tree.Dir.project st_dir |> Dune_project.root in
++           Source_tree.Dir.path st_dir |> Path.Source.equal project_root
++         in
++         Only_packages.stanzas_in_dir dir
++         >>= (function
++          | Some d -> has_dune_file ~dir st_dir ~build_dir_is_project_root d
++          | None ->
++            if build_dir_is_project_root
++            then Memo.return (Source_only st_dir)
++            else
++              enclosing_group ~dir
++              >>| (function
++               | No_group -> Source_only st_dir
++               | Group_root group_root ->
++                 Is_component_of_a_group_but_not_the_root { stanzas = None; group_root })))
+   ;;
+ 
+   let get =
+@@ -243,6 +256,8 @@ end
+ 
+ let directory_targets t ~dir =
+   match t with
++  | Lock_dir | Generated | Source_only _ | Is_component_of_a_group_but_not_the_root _ ->
++    Memo.return Path.Build.Map.empty
+   | Standalone (_, dune_file) -> extract_directory_targets ~dir dune_file.stanzas
+   | Group_root { components; dune_file; _ } ->
+     let f ~dir stanzas acc =
+@@ -252,6 +267,4 @@ let directory_targets t ~dir =
+     components
+     >>= Memo.List.fold_left ~init ~f:(fun acc { Group_component.dir; stanzas; _ } ->
+       f ~dir stanzas acc)
+-  | Generated | Source_only _ | Is_component_of_a_group_but_not_the_root _ ->
+-    Memo.return Path.Build.Map.empty
+ ;;
+diff --git a/src/dune_rules/dir_status.mli b/src/dune_rules/dir_status.mli
+index 016e2aebe..aaf295788 100644
+--- a/src/dune_rules/dir_status.mli
++++ b/src/dune_rules/dir_status.mli
+@@ -26,6 +26,7 @@ module Group_root : sig
+ end
+ 
+ type t =
++  | Lock_dir
+   | Generated
+   | Source_only of Source_tree.Dir.t
+   | Standalone of Source_tree.Dir.t * Dune_file.t
+diff --git a/src/dune_rules/gen_rules.ml b/src/dune_rules/gen_rules.ml
+index d7f0b2f99..b0254cc47 100644
+--- a/src/dune_rules/gen_rules.ml
++++ b/src/dune_rules/gen_rules.ml
+@@ -502,65 +502,69 @@ let gen_automatic_subdir_rules sctx ~dir ~nearest_src_dir ~src_dir =
+       Automatic_subdir.gen_rules ~sctx ~dir kind)
+ ;;
+ 
+-let gen_rules_regular_directory sctx ~components ~dir =
+-  let src_dir = Path.Build.drop_build_context_exn dir in
+-  let+ rules =
+-    let* st_dir = Source_tree.find_dir src_dir in
+-    let* nearest_src_dir =
+-      match st_dir with
+-      | Some dir -> Memo.return (Some dir)
+-      | None -> Source_tree.find_dir (Path.Source.parent_exn src_dir)
+-    in
++let gen_rules_regular_directory sctx ~src_dir ~components ~dir =
++  Dir_status.DB.get ~dir
++  >>= function
++  | Lock_dir -> Memo.return Gen_rules.no_rules
++  | dir_status ->
+     let+ rules =
+-      let* dir_status = Dir_status.DB.get ~dir in
+-      let+ make_rules =
+-        let+ directory_targets = Dir_status.directory_targets dir_status ~dir in
+-        let allowed_subdirs =
+-          let automatic = Automatic_subdir.subdirs components in
+-          let toplevel =
+-            match components with
+-            | _ :: _ -> Filename.Set.empty
+-            | [] ->
+-              (* XXX sync this list with the pattern matches above. It's quite ugly
+-                 we need this, we should rewrite this code to avoid this. *)
+-              Filename.Set.of_list [ ".js"; "_doc"; ".ppx"; ".dune"; ".topmod" ]
++      let* st_dir = Source_tree.find_dir src_dir in
++      let* nearest_src_dir =
++        match st_dir with
++        | Some dir -> Memo.return (Some dir)
++        | None -> Source_tree.find_dir (Path.Source.parent_exn src_dir)
++      in
++      let+ rules =
++        let+ make_rules =
++          let+ directory_targets = Dir_status.directory_targets dir_status ~dir in
++          let allowed_subdirs =
++            let automatic = Automatic_subdir.subdirs components in
++            let toplevel =
++              match components with
++              | _ :: _ -> Filename.Set.empty
++              | [] ->
++                (* XXX sync this list with the pattern matches above. It's quite ugly
++                   we need this, we should rewrite this code to avoid this. *)
++                Filename.Set.of_list [ ".js"; "_doc"; ".ppx"; ".dune"; ".topmod" ]
++            in
++            Filename.Set.union automatic toplevel
+           in
+-          Filename.Set.union automatic toplevel
++          fun rules ->
++            let rules =
++              let+ automatic_subdir_rules =
++                gen_automatic_subdir_rules sctx ~dir ~nearest_src_dir ~src_dir
++              and+ project_rules =
++                match st_dir with
++                | None -> Memo.return Rules.empty
++                | Some st_dir -> gen_project_rules sctx st_dir
++              and+ rules = rules in
++              Rules.union (Rules.union project_rules automatic_subdir_rules) rules
++            in
++            Gen_rules.rules_for ~dir ~directory_targets ~allowed_subdirs rules
+         in
+-        fun rules ->
+-          let rules =
+-            let+ automatic_subdir_rules =
+-              gen_automatic_subdir_rules sctx ~dir ~nearest_src_dir ~src_dir
+-            and+ project_rules =
+-              match st_dir with
+-              | None -> Memo.return Rules.empty
+-              | Some st_dir -> gen_project_rules sctx st_dir
+-            and+ rules = rules in
+-            Rules.union (Rules.union project_rules automatic_subdir_rules) rules
+-          in
+-          Gen_rules.rules_for ~dir ~directory_targets ~allowed_subdirs rules
++        match dir_status with
++        | Lock_dir -> Gen_rules.rules_here Gen_rules.Rules.empty
++        | Source_only source_dir ->
++          gen_rules_source_only sctx ~dir source_dir |> make_rules |> Gen_rules.rules_here
++        | Generated | Is_component_of_a_group_but_not_the_root _ ->
++          Memo.return Rules.empty |> make_rules |> Gen_rules.redirect_to_parent
++        | Standalone (source_dir, _) | Group_root { source_dir; _ } ->
++          gen_rules_standalone_or_root sctx ~dir ~source_dir
++          |> make_rules
++          |> Gen_rules.rules_here
+       in
+-      match dir_status with
+-      | Source_only source_dir ->
+-        gen_rules_source_only sctx ~dir source_dir |> make_rules |> Gen_rules.rules_here
+-      | Generated | Is_component_of_a_group_but_not_the_root _ ->
+-        Memo.return Rules.empty |> make_rules |> Gen_rules.redirect_to_parent
+-      | Standalone (source_dir, _) | Group_root { source_dir; _ } ->
+-        gen_rules_standalone_or_root sctx ~dir ~source_dir
+-        |> make_rules
+-        |> Gen_rules.rules_here
+-    in
+-    match Opam_create.gen_rules sctx ~dir ~nearest_src_dir ~src_dir with
+-    | None -> rules
+-    | Some opam_rules ->
+-      Gen_rules.map_rules rules ~f:(Gen_rules.Rules.combine_exn opam_rules)
+-  and+ melange_rules = Melange_rules.setup_emit_js_rules sctx ~dir in
+-  Gen_rules.combine melange_rules rules
++      match Opam_create.gen_rules sctx ~dir ~nearest_src_dir ~src_dir with
++      | None -> rules
++      | Some opam_rules ->
++        Gen_rules.map_rules rules ~f:(Gen_rules.Rules.combine_exn opam_rules)
++    and+ melange_rules = Melange_rules.setup_emit_js_rules sctx ~dir in
++    Gen_rules.combine melange_rules rules
+ ;;
+ 
+ (* Once [gen_rules] has decided what to do with the directory, it should end
+    with [has_rules] or [redirect_to_parent] *)
+ let gen_rules ctx sctx ~dir components : Gen_rules.result Memo.t =
++  let src_dir = Path.Build.drop_build_context_exn dir in
+   match components with
+   | [ ".dune"; "ccomp" ] ->
+     has_rules ~dir Subdir_set.empty (fun () ->
+@@ -606,7 +610,7 @@ let gen_rules ctx sctx ~dir components : Gen_rules.result Memo.t =
+       ~dir
+       (Subdir_set.of_set (Filename.Set.of_list [ "ccomp" ]))
+       (fun () -> Configurator_rules.gen_rules ctx)
+-  | _ -> gen_rules_regular_directory sctx ~components ~dir
++  | _ -> gen_rules_regular_directory sctx ~src_dir ~components ~dir
+ ;;
+ 
+ let with_context ctx ~f =
+@@ -670,9 +674,5 @@ let gen_rules ctx ~dir components =
+           (Memo.return rules)))
+   else if Context_name.equal ctx Private_context.t.name
+   then private_context ~dir components ctx
+-  else
+-    Per_context.valid ctx
+-    >>= function
+-    | false -> Memo.return Gen_rules.unknown_context
+-    | true -> gen_rules ctx (Super_context.find_exn ctx) ~dir components
++  else gen_rules ctx (Super_context.find_exn ctx) ~dir components
+ ;;
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 7e6200262..4c4806732 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -95,19 +95,23 @@ module Lock_dir = struct
+         | false -> None
+         | true -> Some ctx')
+     with
+-    | None -> default_path
+-    | Some (Default { lock; _ }) -> Option.value lock ~default:default_path
+-    | Some (Opam _) -> assert false
++    | None -> Some default_path
++    | Some (Default { lock; _ }) -> Some (Option.value lock ~default:default_path)
++    | Some (Opam _) -> None
+   ;;
+ 
+-  let get (ctx : Context_name.t) : t Memo.t = get_path ctx >>= Load.load
++  let get (ctx : Context_name.t) : t Memo.t =
++    get_path ctx >>| Option.value_exn >>= Load.load
++  ;;
+ 
+   let lock_dir_active ctx =
+     if !Clflags.ignore_lock_directory
+     then Memo.return false
+     else
+-      let* path = get_path ctx in
+-      Fs_memo.dir_exists (In_source_dir path)
++      get_path ctx
++      >>= function
++      | None -> Memo.return false
++      | Some path -> Fs_memo.dir_exists (In_source_dir path)
+   ;;
+ end
+ 
+@@ -249,7 +253,7 @@ module Pkg = struct
+     ; deps : t list
+     ; info : Pkg_info.t
+     ; paths : Paths.t
+-    ; files_dir : Path.Source.t
++    ; files_dir : Path.Build.t
+     ; mutable exported_env : string Env_update.t list
+     }
+ 
+@@ -891,10 +895,12 @@ end = struct
+           | `System_provided -> None)
+         >>| List.filter_opt
+       and+ files_dir =
+-        let+ lock_dir = Lock_dir.get_path ctx in
+-        Path.Source.relative
+-          lock_dir
+-          (sprintf "%s.files" (Package.Name.to_string info.name))
++        let+ lock_dir = Lock_dir.get_path ctx >>| Option.value_exn in
++        Path.Build.append_source
++          (Context_name.build_dir ctx)
++          (Path.Source.relative
++             lock_dir
++             (sprintf "%s.files" (Package.Name.to_string info.name)))
+       in
+       let id = Pkg.Id.gen () in
+       let paths = Paths.make name ctx in
+@@ -1301,56 +1307,6 @@ module Fetch = struct
+   ;;
+ end
+ 
+-module Copy_tree = struct
+-  module Spec = struct
+-    type ('path, 'target) t = 'path * 'target
+-
+-    let name = "copy-tree"
+-    let version = 1
+-    let bimap (src, dst) f g = f src, g dst
+-    let is_useful_to ~memoize = memoize
+-
+-    let encode (src, dst) dep target : Dune_lang.t =
+-      List [ Dune_lang.atom_or_quoted_string name; dep src; target dst ]
+-    ;;
+-
+-    let action (root, dst) ~ectx:_ ~eenv:_ =
+-      let open Fiber.O in
+-      let+ () = Fiber.return () in
+-      Install_action.Spec.collect [ root ] []
+-      |> List.iter ~f:(fun src ->
+-        let dst =
+-          Path.append_local (Path.build dst) (Path.drop_prefix_exn src ~prefix:root)
+-        in
+-        let old_permissions =
+-          match Path.Untracked.stat dst with
+-          | Error _ -> None
+-          | Ok s ->
+-            Path.unlink dst;
+-            Some s.st_perm
+-        in
+-        Io.copy_file
+-          ~chmod:(fun default -> Option.value old_permissions ~default)
+-          ~src
+-          ~dst
+-          ())
+-    ;;
+-  end
+-
+-  let action ~src ~dst =
+-    let module M = struct
+-      type path = Path.t
+-      type target = Path.Build.t
+-
+-      module Spec = Spec
+-
+-      let v = src, dst
+-    end
+-    in
+-    Action.Extension (module M)
+-  ;;
+-end
+-
+ let add_env env action =
+   Action_builder.With_targets.map action ~f:(Action.Full.add_env env)
+ ;;
+@@ -1415,13 +1371,29 @@ let build_rule context_name ~source_deps (pkg : Pkg.t) =
+     let+ build_and_install =
+       let+ copy_action =
+         let+ copy_action =
+-          Fs_memo.dir_exists (In_source_dir pkg.files_dir)
+-          >>| function
+-          | false -> []
++          Fs_memo.dir_exists
++            (In_source_dir (Path.Build.drop_build_context_exn pkg.files_dir))
++          >>= function
++          | false -> Memo.return []
+           | true ->
+-            [ Copy_tree.action ~src:(Path.source pkg.files_dir) ~dst:pkg.paths.source_dir
+-              |> Action.Full.make
+-              |> Action_builder.With_targets.return
++            let+ deps, source_deps = Source_deps.files (Path.build pkg.files_dir) in
++            let open Action_builder.O in
++            [ Action_builder.with_no_targets
++              @@ (Action_builder.deps deps
++                  >>> (Path.Set.to_list_map source_deps ~f:(fun src ->
++                         let dst =
++                           let local_path =
++                             Path.drop_prefix_exn src ~prefix:(Path.build pkg.files_dir)
++                           in
++                           Path.Build.append_local pkg.paths.source_dir local_path
++                         in
++                         Action.progn
++                           [ Action.mkdir (Path.Build.parent_exn dst)
++                           ; Action.copy src dst
++                           ])
++                       |> Action.concurrent
++                       |> Action.Full.make
++                       |> Action_builder.return))
+             ]
+         in
+         copy_action
+@@ -1585,6 +1557,7 @@ let which context =
+ ;;
+ 
+ let lock_dir_active = Lock_dir.lock_dir_active
++let lock_dir_path = Lock_dir.get_path
+ 
+ let exported_env context =
+   let+ all_packages = all_packages context in
+diff --git a/src/dune_rules/pkg_rules.mli b/src/dune_rules/pkg_rules.mli
+index 624524cf1..88cd6b7ac 100644
+--- a/src/dune_rules/pkg_rules.mli
++++ b/src/dune_rules/pkg_rules.mli
+@@ -15,6 +15,7 @@ val setup_rules
+   -> Context_name.t
+   -> Build_config.Gen_rules.t Memo.t
+ 
++val lock_dir_path : Context_name.t -> Path.Source.t option Memo.t
+ val lock_dir_active : Context_name.t -> bool Memo.t
+ val ocaml_toolchain : Context_name.t -> Ocaml_toolchain.t Action_builder.t option Memo.t
+ val which : Context_name.t -> (Filename.t -> Path.t option Memo.t) Staged.t

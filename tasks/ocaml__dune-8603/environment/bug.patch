@@ -1,0 +1,339 @@
+diff --git a/bin/dune_init.ml b/bin/dune_init.ml
+index 33f7d8a0a..945925ad4 100644
+--- a/bin/dune_init.ml
++++ b/bin/dune_init.ml
+@@ -195,37 +195,6 @@ module Init_context = struct
+   ;;
+ end
+ 
+-module Public_name = struct
+-  include Lib_name
+-  module Pkg = Dune_lang.Package_name.Opam_compatible
+-
+-  let is_opam_compatible l =
+-    Lib_name.package_name l |> Dune_lang.Package_name.is_opam_compatible
+-  ;;
+-
+-  let of_string_user_error (loc, s) =
+-    let open Result.O in
+-    let* l = of_string_user_error (loc, s) in
+-    if is_opam_compatible l
+-    then Ok l
+-    else
+-      let open Pp.O in
+-      let descr =
+-        Pp.text
+-          "Public names are composed of an opam package name and optional dot-separated \
+-           string suffixes."
+-        ++ Pp.newline
+-        ++ Pkg.description_of_valid_string
+-      in
+-      Error (User_error.make [ descr ])
+-  ;;
+-
+-  let of_name_exn name =
+-    let s = Dune_lang.Atom.to_string name in
+-    of_string_user_error (Loc.none, s) |> User_error.ok_exn
+-  ;;
+-end
+-
+ module Component = struct
+   module Options = struct
+     module Common = struct
+@@ -237,12 +206,12 @@ module Component = struct
+     end
+ 
+     module Executable = struct
+-      type t = { public : Public_name.t option }
++      type t = { public : Dune_lang.Atom.t option }
+     end
+ 
+     module Library = struct
+       type t =
+-        { public : Public_name.t option
++        { public : Dune_lang.Atom.t option
+         ; inline_tests : bool
+         }
+     end
+@@ -339,7 +308,8 @@ module Component = struct
+       if List.mem ~equal:Dune_lang.Atom.equal set elem then set else elem :: set
+     ;;
+ 
+-    let public_name_field = Encoder.field_o "public_name" Public_name.encode
++    let public_name_encoder atom = Atom atom
++    let public_name_field = Encoder.field_o "public_name" public_name_encoder
+ 
+     let executable (common : Options.Common.t) (options : Options.Executable.t) =
+       make "executable" common [ public_name_field options.public ]
+@@ -468,7 +438,7 @@ module Component = struct
+         let libraries = Stanza_cst.add_to_list_set common.name common.libraries in
+         bin
+           { context = { context with dir = Path.relative dir "bin" }
+-          ; options = { public = Some (Public_name.of_name_exn common.name) }
++          ; options = { public = Some common.name }
+           ; common = { common with libraries; name = Dune_lang.Atom.of_string "main" }
+           }
+       in
+@@ -479,10 +449,7 @@ module Component = struct
+       let lib_target =
+         src
+           { context = { context with dir = Path.relative dir "lib" }
+-          ; options =
+-              { public = Some (Public_name.of_name_exn common.name)
+-              ; inline_tests = options.inline_tests
+-              }
++          ; options = { public = Some common.name; inline_tests = options.inline_tests }
+           ; common
+           }
+       in
+diff --git a/bin/dune_init.mli b/bin/dune_init.mli
+index 3c4dc97ce..1d959e513 100644
+--- a/bin/dune_init.mli
++++ b/bin/dune_init.mli
+@@ -12,14 +12,6 @@ module Init_context : sig
+   val make : string option -> t Memo.t
+ end
+ 
+-module Public_name : sig
+-  type t
+-
+-  val to_string : t -> string
+-  val of_string_user_error : Loc.t * string -> (t, User_message.t) result
+-  val of_name_exn : Dune_lang.Atom.t -> t
+-end
+-
+ (** A [Component.t] is a set of files that can be built or included as part of a
+     build. *)
+ module Component : sig
+@@ -36,13 +28,13 @@ module Component : sig
+ 
+     (** Options for executable components *)
+     module Executable : sig
+-      type t = { public : Public_name.t option }
++      type t = { public : Dune_lang.Atom.t option }
+     end
+ 
+     (** Options for library components *)
+     module Library : sig
+       type t =
+-        { public : Public_name.t option
++        { public : Dune_lang.Atom.t option
+         ; inline_tests : bool
+         }
+     end
+diff --git a/bin/init.ml b/bin/init.ml
+index d843fe107..e9b1c943b 100644
+--- a/bin/init.ml
++++ b/bin/init.ml
+@@ -79,27 +79,23 @@ let context_cwd : Init_context.t Term.t =
+ module Public_name = struct
+   type t =
+     | Use_name
+-    | Public_name of Public_name.t
++    | Public_name of Dune_lang.Atom.t
+ 
+   let public_name_to_string = function
+     | Use_name -> "<default>"
+-    | Public_name p -> Public_name.to_string p
++    | Public_name p -> Dune_lang.Atom.to_string p
+   ;;
+ 
+   let public_name (common : Component.Options.Common.t) = function
+     | None -> None
+-    | Some Use_name -> Some (Public_name.of_name_exn common.name)
++    | Some Use_name -> Some common.name
+     | Some (Public_name n) -> Some n
+   ;;
+ 
+   let conv =
+-    let parser s =
+-      if String.is_empty s
+-      then Ok Use_name
+-      else (
+-        match Public_name.of_string_user_error (Loc.none, s) with
+-        | Ok n -> Ok (Public_name n)
+-        | Error e -> Error (`Msg (User_message.to_string e)))
++    let parser = function
++      | "" -> Ok Use_name
++      | s -> component_name_parser s |> Result.map ~f:(fun a -> Public_name a)
+     in
+     let printer ppf public_name =
+       Format.pp_print_string ppf (public_name_to_string public_name)
+diff --git a/doc/changes/init-public-names.md b/doc/changes/init-public-names.md
+deleted file mode 100644
+index 7e9a60ad6..000000000
+--- a/doc/changes/init-public-names.md
++++ /dev/null
+@@ -1 +0,0 @@
+-- dune init: parse `--public` as a public name (#8603, fixes #7108, @emillon)
+diff --git a/src/dune_lang/package_name.ml b/src/dune_lang/package_name.ml
+index e8f8a410a..2f5e6ae95 100644
+--- a/src/dune_lang/package_name.ml
++++ b/src/dune_lang/package_name.ml
+@@ -15,52 +15,47 @@ include (
+     Dune_util.Stringlike with type t := t)
+ 
+ module Opam_compatible = struct
+-  let description_of_valid_string =
+-    Pp.text
+-      "Package names can contain letters, numbers, '-', '_' and '+', and need to contain \
+-       at least a letter."
+-  ;;
++  include Dune_util.Stringlike.Make (struct
++      type t = string
+ 
+-  module T = struct
+-    type t = string
+-
+-    let module_ = "Package.Name.Strict"
+-    let description = "opam package name"
+-    let to_string s = s
+-    let description_of_valid_string = Some description_of_valid_string
++      let module_ = "Package.Name.Strict"
++      let description = "opam package name"
++      let to_string s = s
+ 
+-    let is_letter = function
+-      | 'a' .. 'z' | 'A' .. 'Z' -> true
+-      | _ -> false
+-    ;;
++      let description_of_valid_string =
++        Some
++          (Pp.textf
++             "Package names can contain letters, numbers, '-', '_' and '+', and need to \
++              contain at least a letter.")
++      ;;
+ 
+-    let is_other_valid_char = function
+-      | '0' .. '9' | '-' | '+' | '_' -> true
+-      | _ -> false
+-    ;;
++      let is_letter = function
++        | 'a' .. 'z' | 'A' .. 'Z' -> true
++        | _ -> false
++      ;;
+ 
+-    let is_valid_char c = is_letter c || is_other_valid_char c
++      let is_other_valid_char = function
++        | '0' .. '9' | '-' | '+' | '_' -> true
++        | _ -> false
++      ;;
+ 
+-    let is_valid_string s =
+-      let all_chars_valid = String.for_all s ~f:is_valid_char in
+-      let has_one_letter = String.exists s ~f:is_letter in
+-      all_chars_valid && has_one_letter
+-    ;;
++      let is_valid_char c = is_letter c || is_other_valid_char c
+ 
+-    let of_string_opt s = Option.some_if (is_valid_string s) s
++      let is_valid_string s =
++        let all_chars_valid = String.for_all s ~f:is_valid_char in
++        let has_one_letter = String.exists s ~f:is_letter in
++        all_chars_valid && has_one_letter
++      ;;
+ 
+-    let make_valid s =
+-      let replaced = String.map s ~f:(fun c -> if is_valid_char c then c else '_') in
+-      if is_valid_string replaced then replaced else "p" ^ replaced
+-    ;;
++      let of_string_opt s = Option.some_if (is_valid_string s) s
+ 
+-    let hint_valid = Some make_valid
+-  end
++      let make_valid s =
++        let replaced = String.map s ~f:(fun c -> if is_valid_char c then c else '_') in
++        if is_valid_string replaced then replaced else "p" ^ replaced
++      ;;
+ 
+-  include Dune_util.Stringlike.Make (T)
++      let hint_valid = Some make_valid
++    end)
+ 
+-  let make_valid = T.make_valid
+   let to_package_name s = s
+ end
+-
+-let is_opam_compatible s = Option.is_some (Opam_compatible.of_string_opt (to_string s))
+diff --git a/src/dune_lang/package_name.mli b/src/dune_lang/package_name.mli
+index 75f2e58f5..6849029cd 100644
+--- a/src/dune_lang/package_name.mli
++++ b/src/dune_lang/package_name.mli
+@@ -20,9 +20,5 @@ module Opam_compatible : sig
+     type package_name
+ 
+     val to_package_name : t -> package_name
+-    val description_of_valid_string : _ Pp.t
+-    val make_valid : string -> string
+   end
+   with type package_name := t
+-
+-val is_opam_compatible : t -> bool
+diff --git a/test/blackbox-tests/test-cases/dune-init/github7108.t b/test/blackbox-tests/test-cases/dune-init/github7108.t
+index 44e395d09..61388f2f2 100644
+--- a/test/blackbox-tests/test-cases/dune-init/github7108.t
++++ b/test/blackbox-tests/test-cases/dune-init/github7108.t
+@@ -1,4 +1,10 @@
+ #7108: foo-bar is a valid public name, we should accept it.
+ 
+   $ dune init lib foo_bar --public foo-bar
+-  Success: initialized library component named foo_bar
++  dune: option '--public': invalid component name `foo-bar'
++        Library names must be non-empty and composed only of the
++        following
++        characters: 'A'..'Z', 'a'..'z', '_' or '0'..'9'.
++  Usage: dune init library [OPTION]… NAME [PATH]
++  Try 'dune init library --help' or 'dune --help' for more information.
++  [1]
+diff --git a/test/blackbox-tests/test-cases/dune-init/public-implicit-invalid.t b/test/blackbox-tests/test-cases/dune-init/public-implicit-invalid.t
+deleted file mode 100644
+index 60a61f312..000000000
+--- a/test/blackbox-tests/test-cases/dune-init/public-implicit-invalid.t
++++ /dev/null
+@@ -1,9 +0,0 @@
+-When a public name is implicit from the name, it should still be validated as a
+-public name.
+-
+-  $ dune init lib 0 --public
+-  Error: Public names are composed of an opam package name and optional
+-  dot-separated string suffixes.
+-  Package names can contain letters, numbers, '-', '_' and '+', and need to
+-  contain at least a letter.
+-  [1]
+diff --git a/test/blackbox-tests/test-cases/dune-init/public-sublibrary.t b/test/blackbox-tests/test-cases/dune-init/public-sublibrary.t
+index 3dbb9d3dd..9507ea99d 100644
+--- a/test/blackbox-tests/test-cases/dune-init/public-sublibrary.t
++++ b/test/blackbox-tests/test-cases/dune-init/public-sublibrary.t
+@@ -1,4 +1,10 @@
+ Sub-library names should be accepted:
+ 
+   $ dune init lib lib_s1_s2 --public lib.sub1.sub2
+-  Success: initialized library component named lib_s1_s2
++  dune: option '--public': invalid component name `lib.sub1.sub2'
++        Library names must be non-empty and composed only of the
++        following
++        characters: 'A'..'Z', 'a'..'z', '_' or '0'..'9'.
++  Usage: dune init library [OPTION]… NAME [PATH]
++  Try 'dune init library --help' or 'dune --help' for more information.
++  [1]
+diff --git a/test/blackbox-tests/test-cases/github3046.t b/test/blackbox-tests/test-cases/github3046.t
+index 9a95f1ce4..cfb9536e1 100644
+--- a/test/blackbox-tests/test-cases/github3046.t
++++ b/test/blackbox-tests/test-cases/github3046.t
+@@ -25,12 +25,10 @@ are given as parameters
+ `dune init lib foo --public="some/invalid&name!"` returns an informative parsing error
+ 
+   $ dune init lib foo --public="some/invalid&name!"
+-  dune: option '--public': Public names are composed of an opam package name
+-        and optional
+-        dot-separated string suffixes.
+-        Package names can contain letters, numbers, '-', '_' and '+', and need
+-        to
+-        contain at least a letter.
++  dune: option '--public': invalid component name `some/invalid&name!'
++        Library names must be non-empty and composed only of the
++        following
++        characters: 'A'..'Z', 'a'..'z', '_' or '0'..'9'.
+   Usage: dune init library [OPTION]… NAME [PATH]
+   Try 'dune init library --help' or 'dune --help' for more information.
+   [1]

@@ -1,0 +1,11 @@
+Dune currently derives the workspace root used when constructing execution parameters (notably the workspace root embedded in BUILD_PATH_PREFIX_MAP) differently depending on whether a rule is executed as an internal rule or as an external rule. This makes the workspace root in BUILD_PATH_PREFIX_MAP inconsistent across rule kinds, which can lead to non-uniform path remapping and can break reproducibility/caching expectations when the same build actions are executed through different execution backends.
+
+Add support for explicitly setting the workspace root as part of the execution parameters so that both internal and external rule execution use the same workspace root value without requiring code changes. When a workspace root override is provided, BUILD_PATH_PREFIX_MAP must reflect this overridden root consistently for all executed actions.
+
+After the change, cache workflows must continue to behave correctly in typical scenarios:
+
+- Building a target with cache enabled should store results into the shared cache, and subsequent rebuilds after deleting the build directory (but keeping the cache) should restore results from cache without unexpected shared-cache misses.
+- When cache storage mode is hardlink, restored outputs in the build directory should be hardlinked with the cached entries (hardlink counts greater than 1). When cache storage mode is copy, restored outputs should not be hardlinked (hardlink count should remain 1).
+- The reproducibility check controlled by the configuration field cache-check-probability must continue to work: when set to 1.0, non-reproducible rules (ones that read an undeclared input) should trigger a warning reporting a cache store error that includes both the digest stored in cache and the newly computed digest; when unset or set to 0.0 the check should be skipped; and values outside [0, 1] must be rejected with the error message: "Error: The reproducibility check probability must be in the range [0, 1]."
+
+The key requirement is that the workspace root used in BUILD_PATH_PREFIX_MAP must be customizable via execution parameters and applied uniformly across internal and external rule execution, without regressing the cache store/restore behavior or the reproducibility check behavior described above.

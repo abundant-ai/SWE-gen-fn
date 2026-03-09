@@ -1,0 +1,610 @@
+diff --git a/boot/libs.ml b/boot/libs.ml
+index 5db34e374..97b7a9cb8 100644
+--- a/boot/libs.ml
++++ b/boot/libs.ml
+@@ -88,6 +88,7 @@ let local_libraries =
+   ; ("src/scheme", Some "Scheme", false, None)
+   ; ("src/dune_rules", Some "Dune_rules", true, None)
+   ; ("src/upgrader", Some "Dune_upgrader", false, None)
++  ; ("src/dune_pkg_outdated", Some "Dune_pkg_outdated", false, None)
+   ; ("vendor/cmdliner/src", None, false, None)
+   ; ("otherlibs/dune-build-info/src", Some "Build_info", false,
+     Some "Build_info_data")
+diff --git a/src/dune_pkg/opam_repo.ml b/src/dune_pkg/opam_repo.ml
+index f6dbb2ee9..f999c6544 100644
+--- a/src/dune_pkg/opam_repo.ml
++++ b/src/dune_pkg/opam_repo.ml
+@@ -55,6 +55,12 @@ let repo_id t =
+   serializable.repo_id
+ ;;
+ 
++let source t =
++  let open Option.O in
++  let+ serializable = serializable t in
++  serializable.source
++;;
++
+ let validate_repo_file opam_repo_dir_path =
+   let opam_repo_file_path = opam_repo_dir_path / "repo" in
+   let repo =
+diff --git a/src/dune_pkg/opam_repo.mli b/src/dune_pkg/opam_repo.mli
+index 0ea972c9f..961d44a8b 100644
+--- a/src/dune_pkg/opam_repo.mli
++++ b/src/dune_pkg/opam_repo.mli
+@@ -22,6 +22,7 @@ val of_opam_repo_dir_path
+   -> t
+ 
+ val repo_id : t -> Repository_id.t option
++val source : t -> string option
+ val serializable : t -> Serializable.t option
+ 
+ module With_file : sig
+diff --git a/src/dune_pkg_outdated/dune b/src/dune_pkg_outdated/dune
+new file mode 100644
+index 000000000..6a1671da4
+--- /dev/null
++++ b/src/dune_pkg_outdated/dune
+@@ -0,0 +1,6 @@
++(library
++ (name dune_pkg_outdated)
++ (synopsis "[Internal] Implementation of dune pkg outdated")
++ (libraries stdune dune_lang dune_pkg opam_format)
++ (instrumentation
++  (backend bisect_ppx)))
+diff --git a/src/dune_pkg_outdated/dune_pkg_outdated.ml b/src/dune_pkg_outdated/dune_pkg_outdated.ml
+new file mode 100644
+index 000000000..bd18e6722
+--- /dev/null
++++ b/src/dune_pkg_outdated/dune_pkg_outdated.ml
+@@ -0,0 +1,196 @@
++open Import
++
++type candidate =
++  { is_immediate_dep_of_local_package : bool
++  ; name : Package_name.t
++  ; outdated_version : string
++  ; newer_version : string
++  }
++
++type result =
++  | Better_candidate of candidate
++  | Package_not_found of Package_name.t
++  | Package_is_best_candidate
++
++type t = result list
++
++let total_number_of_packages l = List.length l
++
++let outdated_packages l =
++  List.filter_map l ~f:(function
++    | Better_candidate entry -> Some entry
++    | _ -> None)
++;;
++
++let number_of_outdated_packages l = outdated_packages l |> List.length
++
++let number_of_outdated_packages_that_are_immediate_deps l =
++  outdated_packages l
++  |> List.filter ~f:(fun x -> x.is_immediate_dep_of_local_package)
++  |> List.length
++;;
++
++let packages_that_were_not_found l =
++  List.filter_map l ~f:(function
++    | Package_not_found name -> Some name
++    | _ -> None)
++;;
++
++let explain_results_to_user results ~transitive ~lock_dir_path =
++  let number_of_outdated_immediate_deps =
++    number_of_outdated_packages_that_are_immediate_deps results
++  in
++  let number_of_outdated_deps = number_of_outdated_packages results in
++  let total_number_of_deps = total_number_of_packages results in
++  (* Depending on the number of immediate outdated and transitive outdated dependencies
++     we give different messages. Therefore we need to determine what we have. *)
++  let transitive_status =
++    if number_of_outdated_deps = 0
++    then `No_transitive_deps_outdated
++    else if number_of_outdated_deps = total_number_of_deps
++    then `All_transitive_deps_outdated
++    else `Some_transitive_deps_outdated
++  in
++  let transitive_helper ~all_of =
++    if transitive || number_of_outdated_immediate_deps = number_of_outdated_deps
++    then []
++    else
++      [ Pp.text
++          ("Showing immediate dependencies, use --transitive to see "
++           ^ if all_of then "them all." else "the rest.")
++      ]
++  in
++  let packages_in_lockdir_are ~all_of count =
++    (Pp.tag User_message.Style.Warning
++     @@ Pp.textf
++          "%d/%d packages in %s are outdated."
++          count
++          total_number_of_deps
++          (Path.Source.to_string_maybe_quoted lock_dir_path))
++    :: transitive_helper ~all_of
++  in
++  match transitive_status with
++  (* If there are no outdated transitive deps then everything is up to date. *)
++  | `No_transitive_deps_outdated ->
++    [ Pp.tag User_message.Style.Success
++      @@ Pp.textf "%s is up to date." (Path.Source.to_string_maybe_quoted lock_dir_path)
++    ]
++  | `All_transitive_deps_outdated ->
++    packages_in_lockdir_are ~all_of:true number_of_outdated_deps
++  | `Some_transitive_deps_outdated ->
++    packages_in_lockdir_are ~all_of:false number_of_outdated_deps
++;;
++
++let better_candidate
++  ~repos
++  ~(local_packages : Opam_repo.With_file.t Package_name.Map.t)
++  (pkg : Lock_dir.Pkg.t)
++  : result
++  =
++  let pkg_name = pkg.info.name |> Package_name.to_string |> OpamPackage.Name.of_string in
++  let is_immediate_dep_of_local_package =
++    Package_name.Map.exists local_packages ~f:(fun { Opam_repo.With_file.opam_file; _ } ->
++      OpamFile.OPAM.depends opam_file
++      |> OpamFilter.filter_deps
++           ~build:true
++           ~post:false
++           ~dev:false
++           ~default:false
++           ~test:false
++           ~doc:false
++      |> OpamFormula.atoms
++      |> List.exists ~f:(fun (name', _) -> OpamPackage.Name.equal pkg_name name'))
++  in
++  match Opam_repo.load_all_versions repos pkg_name with
++  | Error `Package_not_found -> Package_not_found pkg.info.name
++  | Ok versions ->
++    (match
++       List.max versions ~f:(fun x y ->
++         Ordering.of_int
++           (OpamPackage.Version.compare
++              (OpamFile.OPAM.version x)
++              (OpamFile.OPAM.version y)))
++     with
++     | Some newest_opam_file ->
++       let version = OpamFile.OPAM.version newest_opam_file in
++       (match
++          OpamPackage.Version.of_string pkg.info.version
++          |> OpamPackage.Version.compare version
++          |> Ordering.of_int
++        with
++        | Lt | Eq -> Package_is_best_candidate
++        | Gt ->
++          Better_candidate
++            { is_immediate_dep_of_local_package
++            ; name = pkg.info.name
++            ; newer_version = version |> OpamPackage.Version.to_string
++            ; outdated_version = pkg.info.version
++            })
++     | None -> Package_not_found pkg.info.name)
++;;
++
++let pp results ~transitive ~lock_dir_path =
++  let outdated_packages =
++    match
++      List.filter_map
++        (outdated_packages results)
++        ~f:
++          (fun
++            { is_immediate_dep_of_local_package; name; outdated_version; newer_version }
++          ->
++          (* If --transitive is passed, then we always print the available package. If
++             not, then we only print it if it is an immediate dependency of a local
++             package. *)
++          if transitive || is_immediate_dep_of_local_package
++          then
++            (* CR-someday alizter: Create table printing helpers in Console and use
++               those to align output. *)
++            Some
++              (Pp.concat
++                 [ Pp.verbatim (Dune_lang.Package_name.to_string name)
++                 ; Pp.space
++                 ; Pp.tag
++                     (User_message.Style.Ansi_styles [ `Fg_bright_red ])
++                     (Pp.verbatim outdated_version)
++                 ; Pp.text " < "
++                 ; Pp.tag
++                     (User_message.Style.Ansi_styles [ `Fg_bright_green ])
++                     (Pp.verbatim newer_version)
++                 ])
++          else None)
++    with
++    | [] -> []
++    | outdated_packages -> [ Pp.enumerate ~f:Fun.id outdated_packages ]
++  in
++  explain_results_to_user ~transitive ~lock_dir_path results @ outdated_packages
++  |> Pp.concat_map ~sep:Pp.newline ~f:Pp.box
++  |> Pp.hovbox
++;;
++
++let find ~repos ~local_packages packages =
++  Package_name.Map.to_list_map packages ~f:(fun _name pkg ->
++    better_candidate ~repos ~local_packages pkg)
++;;
++
++module For_tests = struct
++  type nonrec result = result
++
++  let package_is_best_candidate = Package_is_best_candidate
++
++  let better_candidate
++    ~is_immediate_dep_of_local_package
++    ~name
++    ~newer_version
++    ~outdated_version
++    =
++    Better_candidate
++      { is_immediate_dep_of_local_package
++      ; name = Package_name.of_string name
++      ; newer_version
++      ; outdated_version
++      }
++  ;;
++
++  let explain_results = explain_results_to_user
++  let pp = pp
++end
+diff --git a/src/dune_pkg_outdated/dune_pkg_outdated.mli b/src/dune_pkg_outdated/dune_pkg_outdated.mli
+new file mode 100644
+index 000000000..706968bbe
+--- /dev/null
++++ b/src/dune_pkg_outdated/dune_pkg_outdated.mli
+@@ -0,0 +1,54 @@
++open Import
++
++(** Library for finding and printing outdated packges in the dune_pkg lock directory. *)
++
++(** [t] represents the result of searching for outdated packages in a lock directory. *)
++type t
++
++(** [find ~repos ~local_packages packages] searches for outdated packages in the given
++    collection of [packages] by consulting the [repos] and [local_packages].*)
++val find
++  :  repos:Opam_repo.t list
++  -> local_packages:Opam_repo.With_file.t Package_name.Map.t
++  -> Lock_dir.Pkg.t Package_name.Map.t
++  -> t
++
++(** [pp t ~transitive ~lock_dir_path] returns a specially constructed user message
++    explaining the outdated packages. It begins with a summary detailing the number of
++    affected packages and then lists all the packages requested.
++
++    - [transitive] indiciates whether to hint that transitive dependencies are not being
++      shown and therefore the user should pass [--transitive] to the [dune pkg outdated]
++      command to see them.
++
++    - [lock_dir_path] is the path to the lock directory that will appear in the messages. *)
++val pp : t -> transitive:bool -> lock_dir_path:Path.Source.t -> User_message.Style.t Pp.t
++
++val packages_that_were_not_found : t -> Package_name.t list
++
++module For_tests : sig
++  (** Special module for internal testing only. *)
++
++  type result
++
++  val package_is_best_candidate : result
++
++  val better_candidate
++    :  is_immediate_dep_of_local_package:bool
++    -> name:string
++    -> newer_version:string
++    -> outdated_version:string
++    -> result
++
++  val explain_results
++    :  result list
++    -> transitive:bool
++    -> lock_dir_path:Path.Source.t
++    -> User_message.Style.t Pp.t list
++
++  val pp
++    :  result list
++    -> transitive:bool
++    -> lock_dir_path:Path.Source.t
++    -> User_message.Style.t Pp.t
++end
+diff --git a/src/dune_pkg_outdated/import.ml b/src/dune_pkg_outdated/import.ml
+new file mode 100644
+index 000000000..3bbbbbf0c
+--- /dev/null
++++ b/src/dune_pkg_outdated/import.ml
+@@ -0,0 +1,12 @@
++include Stdune
++
++include struct
++  open Dune_pkg
++  module Lock_dir = Lock_dir
++  module Opam_repo = Opam_repo
++end
++
++include struct
++  open Dune_lang
++  module Package_name = Package_name
++end
+diff --git a/bin/dune b/bin/dune
+index bef60fa7e..6e7edae75 100644
+--- a/bin/dune
++++ b/bin/dune
+@@ -29,6 +29,7 @@
+   dune_util
+   dune_upgrader
+   dune_pkg
++  dune_pkg_outdated
+   cmdliner
+   threads
+   ; Kept to keep implicit_transitive_deps false working in 4.x
+diff --git a/bin/import.ml b/bin/import.ml
+index de1134001..e1ed72f1d 100644
+--- a/bin/import.ml
++++ b/bin/import.ml
+@@ -63,6 +63,7 @@ include struct
+   module Stanza = Stanza
+   module Profile = Profile
+   module Lib_name = Lib_name
++  module Package_name = Package_name
+ end
+ 
+ module Log = Dune_util.Log
+diff --git a/bin/pkg.ml b/bin/pkg.ml
+index e7c846781..f2851da59 100644
+--- a/bin/pkg.ml
++++ b/bin/pkg.ml
+@@ -4,16 +4,8 @@ module Fetch = Dune_pkg.Fetch
+ module Opam_repo = Dune_pkg.Opam_repo
+ module Repository_id = Dune_pkg.Repository_id
+ 
+-let context_term =
+-  Arg.(
+-    value
+-    & opt (some Arg.context_name) None
+-    & info
+-        [ "context" ]
+-        ~docv:"CONTEXT"
+-        ~doc:
+-          "Generate the lockdir associated with this context (the default context will \
+-           be used if this is omitted)")
++let context_term ~doc =
++  Arg.(value & opt (some Arg.context_name) None & info [ "context" ] ~docv:"CONTEXT" ~doc)
+ ;;
+ 
+ module Version_preference = struct
+@@ -215,7 +207,11 @@ module Print_solver_env = struct
+ 
+   let term =
+     let+ (common : Common.t) = Common.term
+-    and+ context_name = context_term
++    and+ context_name =
++      context_term
++        ~doc:
++          "Generate the lockdir associated with this context (the default context will \
++           be used if this is omitted)"
+     and+ all_contexts =
+       Arg.(
+         value
+@@ -356,6 +352,25 @@ module Lock = struct
+                ]))
+   ;;
+ 
++  let find_local_packages =
++    let open Fiber.O in
++    let+ project =
++      let+ source_dir = Memo.run (Source_tree.root ()) in
++      Source_tree.Dir.project source_dir
++    in
++    Dune_project.packages project
++    |> Package.Name.Map.map ~f:(fun pkg ->
++      let opam_file = Package.to_opam_file pkg in
++      let file =
++        Path.source
++        @@
++        match pkg.has_opam_file with
++        | Generated | Exists false -> Dune_project.file project
++        | Exists true -> pkg.opam_file
++      in
++      { Opam_repo.With_file.opam_file; file })
++  ;;
++
+   let solve
+     per_context
+     ~opam_repository_path
+@@ -368,23 +383,7 @@ module Lock = struct
+     (* a list of thunks that will perform all the file IO side
+        effects after performing validation so that if materializing any
+        lockdir would fail then no side effect takes place. *)
+-    (let* local_packages =
+-       let+ project =
+-         let+ source_dir = Memo.run (Source_tree.root ()) in
+-         Source_tree.Dir.project source_dir
+-       in
+-       Dune_project.packages project
+-       |> Package.Name.Map.map ~f:(fun pkg ->
+-         let opam_file = Package.to_opam_file pkg in
+-         let file =
+-           Path.source
+-           @@
+-           match pkg.has_opam_file with
+-           | Generated | Exists false -> Dune_project.file project
+-           | Exists true -> pkg.opam_file
+-         in
+-         { Opam_repo.With_file.opam_file; file })
+-     in
++    (let* local_packages = find_local_packages in
+      let+ solutions =
+        Fiber.parallel_map
+          per_context
+@@ -476,7 +475,11 @@ module Lock = struct
+     let+ (common : Common.t) = Common.term
+     and+ opam_repository_path = Opam_repository_path.term
+     and+ opam_repository_url = Opam_repository_url.term
+-    and+ context_name = context_term
++    and+ context_name =
++      context_term
++        ~doc:
++          "Generate the lockdir associated with this context (the default context will \
++           be used if this is omitted)"
+     and+ all_contexts =
+       Arg.(
+         value
+@@ -529,6 +532,133 @@ module Lock = struct
+   let command = Cmd.v info term
+ end
+ 
++module Outdated = struct
++  let find_outdated_packages
++    ~context_name_arg
++    ~all_contexts_arg
++    ~opam_repository_path
++    ~opam_repository_url
++    ~transitive
++    ()
++    =
++    let open Fiber.O in
++    let+ pps, not_founds =
++      Per_context.choose ~context_name_arg ~all_contexts_arg ~version_preference_arg:None
++      >>= Fiber.parallel_map
++            ~f:
++              (fun
++                { Per_context.lock_dir_path
++                ; version_preference = _
++                ; repos
++                ; solver_env = solver_env_from_context
++                ; context_common = _
++                }
++              ->
++              let solver_env =
++                Print_solver_env.override_solver_env_variables
++                  ~solver_env_from_context
++                  ~sys_bindings_from_current_system:
++                    Dune_pkg.Solver_env.Variable.Sys.Bindings.empty
++              in
++              let+ repos =
++                Lock.get_repos repos solver_env ~opam_repository_path ~opam_repository_url
++              and+ local_packages = Lock.find_local_packages in
++              let lock_dir = Lock_dir.read_disk lock_dir_path in
++              let results =
++                Dune_pkg_outdated.find ~repos ~local_packages lock_dir.packages
++              in
++              ( Dune_pkg_outdated.pp ~transitive ~lock_dir_path results
++              , ( Dune_pkg_outdated.packages_that_were_not_found results
++                  |> Package_name.Set.of_list
++                  |> Package_name.Set.to_list
++                , lock_dir_path
++                , repos ) ))
++      >>| List.split
++    in
++    (match pps with
++     | [ _ ] -> Console.print pps
++     | _ -> Console.print [ Pp.enumerate ~f:Fun.id pps ]);
++    let error_messages =
++      List.filter_map not_founds ~f:(function
++        | [], _, _ -> None
++        | packages, lock_dir_path, repos ->
++          Some
++            [ Pp.textf
++                "When checking %s, the following packages:"
++                (Path.Source.to_string_maybe_quoted lock_dir_path)
++            ; Pp.enumerate packages ~f:(fun name ->
++                Dune_lang.Package_name.to_string name |> Pp.verbatim)
++            ; Pp.text "were not found in the following opam repositories:"
++            ; Pp.enumerate repos ~f:(fun repo ->
++                Opam_repo.serializable repo
++                |> Dyn.option Opam_repo.Serializable.to_dyn
++                |> Dyn.pp)
++            ])
++    in
++    match error_messages with
++    | [] -> ()
++    | [ error_message ] -> User_error.raise error_message
++    | error_messages ->
++      User_error.raise
++        [ Pp.text "Some packages could not be found."
++        ; Pp.enumerate ~f:(Pp.concat ~sep:Pp.newline) error_messages
++        ]
++  ;;
++
++  let term =
++    let+ (common : Common.t) = Common.term
++    and+ context_name_arg =
++      context_term ~doc:"Check for outdated packages in this context"
++    and+ all_contexts_arg =
++      Arg.(
++        value
++        & flag
++        & info [ "all-contexts" ] ~doc:"Check for outdated packages in all contexts")
++    and+ opam_repository_path = Lock.Opam_repository_path.term
++    and+ opam_repository_url = Lock.Opam_repository_url.term
++    and+ transitive =
++      Arg.(
++        value
++        & flag
++        & info
++            [ "transitive" ]
++            ~doc:"Check for outdated packages in transitive dependencies")
++    in
++    let common = Common.forbid_builds common in
++    let config = Common.init common in
++    Scheduler.go ~common ~config
++    @@ find_outdated_packages
++         ~context_name_arg
++         ~all_contexts_arg
++         ~opam_repository_path
++         ~opam_repository_url
++         ~transitive
++  ;;
++
++  let info =
++    let doc = "Check for outdated packages" in
++    let man =
++      [ `S "DESCRIPTION"
++      ; `P
++          "List packages in from lock directory that have newer versions available. By \
++           default, only direct dependencies are checked. The $(b,--transitive) flag can \
++           be used to check transitive dependencies as well."
++      ; `P "For example:"
++      ; `Pre "    \\$ dune pkg outdated"
++      ; `Noblank
++      ; `Pre "    1/2 packages in dune.lock are outdated."
++      ; `Noblank
++      ; `Pre "    - ocaml 4.14.1 < 5.1.0"
++      ; `Noblank
++      ; `Pre "    - dune 3.7.1 < 3.11.0"
++      ]
++    in
++    Cmd.info "outdated" ~doc ~man
++  ;;
++
++  let command = Cmd.v info term
++end
++
+ let info =
+   let doc = "Experimental package management" in
+   let man =
+@@ -540,4 +670,4 @@ let info =
+   Cmd.info "pkg" ~doc ~man
+ ;;
+ 
+-let group = Cmd.group info [ Lock.command; Print_solver_env.command ]
++let group = Cmd.group info [ Lock.command; Print_solver_env.command; Outdated.command ]
+diff --git a/test/blackbox-tests/test-cases/pkg/helpers.sh b/test/blackbox-tests/test-cases/pkg/helpers.sh
+index 28c89ebb3..f96214c9b 100644
+--- a/test/blackbox-tests/test-cases/pkg/helpers.sh
++++ b/test/blackbox-tests/test-cases/pkg/helpers.sh
+@@ -44,7 +44,7 @@ mkpkg() {
+ 
+ solve_project() {
+   cat >dune-project
+-  dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository
++  dune pkg lock --dont-poll-system-solver-variables --opam-repository-path=mock-opam-repository $@
+ }
+ 
+ solve_project_translate_opam_filters() {

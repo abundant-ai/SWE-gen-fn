@@ -1,0 +1,158 @@
+diff --git a/src/dune_rules/dep_conf_eval.ml b/src/dune_rules/dep_conf_eval.ml
+index 1c49e3fc2..a4e1c4be3 100644
+--- a/src/dune_rules/dep_conf_eval.ml
++++ b/src/dune_rules/dep_conf_eval.ml
+@@ -174,7 +174,6 @@ let rec dep expander : Dep_conf.t -> _ = function
+             let* package_db = Package_db.create (Context.name context) in
+             Package_db.find_package package_db pkg)
+          >>= function
+-         | Some (Build build) -> build
+          | Some (Local pkg) ->
+            Action_builder.alias
+              (package_install ~context:(Context.build_context context) ~pkg)
+diff --git a/src/dune_rules/package_db.ml b/src/dune_rules/package_db.ml
+index 81723b979..61f03e6be 100644
+--- a/src/dune_rules/package_db.ml
++++ b/src/dune_rules/package_db.ml
+@@ -6,7 +6,6 @@ type t = Context_name.t
+ type any_package =
+   | Local of Package.t
+   | Installed of Dune_package.t
+-  | Build of unit Action_builder.t
+ 
+ let find_package ctx pkg =
+   let* packages = Only_packages.get () in
+@@ -16,15 +15,11 @@ let find_package ctx pkg =
+     let open Memo.O in
+     let* findlib = Findlib.create ctx in
+     Findlib.find_root_package findlib pkg
+-    >>= (function
+-    | Ok p -> Memo.return @@ Some (Installed p)
++    >>| (function
++    | Ok p -> Some (Installed p)
++    | Error Not_found -> None
+     | Error (Invalid_dune_package user_message) ->
+-      User_error.raise [ User_message.pp user_message ]
+-    | Error Not_found ->
+-      Pkg_rules.find_package ctx pkg
+-      >>| (function
+-      | None -> None
+-      | Some b -> Some (Build b)))
++      User_error.raise [ User_message.pp user_message ])
+ ;;
+ 
+ let create ctx = Memo.return ctx
+@@ -33,7 +28,6 @@ let section_of_site t ~loc ~pkg ~site =
+   let+ sites =
+     let+ pkg = find_package t pkg in
+     Option.map pkg ~f:(function
+-      | Build _ -> Site.Map.empty
+       | Local p -> p.sites
+       | Installed p -> p.sites)
+   in
+diff --git a/src/dune_rules/package_db.mli b/src/dune_rules/package_db.mli
+index 7564b46ed..d75291edb 100644
+--- a/src/dune_rules/package_db.mli
++++ b/src/dune_rules/package_db.mli
+@@ -5,7 +5,6 @@ type t
+ type any_package =
+   | Local of Package.t
+   | Installed of Dune_package.t
+-  | Build of unit Action_builder.t
+ 
+ val create : Context_name.t -> t Memo.t
+ val find_package : t -> Package.Name.t -> any_package option Memo.t
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 13e97a29b..9fa9c8bda 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -1532,19 +1532,3 @@ let exported_env context =
+   let vars = Env.Map.map env ~f:Env_update.string_of_env_values in
+   Env.extend Env.empty ~vars
+ ;;
+-
+-let find_package ctx pkg =
+-  has_lock ctx
+-  >>= function
+-  | false -> Memo.return None
+-  | true ->
+-    let* db = DB.get ctx in
+-    Resolve.resolve db ctx (Loc.none, pkg)
+-    >>| (function
+-          | `System_provided -> Action_builder.return ()
+-          | `Inside_lock_dir pkg ->
+-            let open Action_builder.O in
+-            let+ _cookie = (Pkg_installed.of_paths pkg.paths).cookie in
+-            ())
+-    >>| Option.some
+-;;
+diff --git a/src/dune_rules/pkg_rules.mli b/src/dune_rules/pkg_rules.mli
+index b37a3c535..5315b769d 100644
+--- a/src/dune_rules/pkg_rules.mli
++++ b/src/dune_rules/pkg_rules.mli
+@@ -19,4 +19,3 @@ val has_lock : Context_name.t -> bool Memo.t
+ val ocaml_toolchain : Context_name.t -> Ocaml_toolchain.t Action_builder.t option Memo.t
+ val which : Context_name.t -> (Filename.t -> Path.t option Memo.t) Staged.t
+ val exported_env : Context_name.t -> Env.t Memo.t
+-val find_package : Context_name.t -> Package.Name.t -> unit Action_builder.t option Memo.t
+diff --git a/test/blackbox-tests/test-cases/pkg/dune b/test/blackbox-tests/test-cases/pkg/dune
+index e4f386d59..f576b17ea 100644
+--- a/test/blackbox-tests/test-cases/pkg/dune
++++ b/test/blackbox-tests/test-cases/pkg/dune
+@@ -13,7 +13,3 @@
+ (cram
+  (deps %{bin:make})
+  (applies_to make))
+-
+-(cram
+- (deps %{bin:which})
+- (applies_to pkg-deps))
+diff --git a/test/blackbox-tests/test-cases/pkg/pkg-deps.t b/test/blackbox-tests/test-cases/pkg/pkg-deps.t
+index ef06c9b0b..45931debf 100644
+--- a/test/blackbox-tests/test-cases/pkg/pkg-deps.t
++++ b/test/blackbox-tests/test-cases/pkg/pkg-deps.t
+@@ -8,7 +8,7 @@ We should be able to specify (package ..) deps on locally built packages.
+ 
+   $ make_lockdir
+   $ cat >dune.lock/foo.pkg <<EOF
+-  > (install
++  > (build
+   >  (progn
+   >   (run mkdir -p %{prefix}/bin)
+   >   (run touch %{prefix}/bin/foo)))
+@@ -18,19 +18,15 @@ We should be able to specify (package ..) deps on locally built packages.
+   > (dirs :standard \ external_sources)
+   > (rule
+   >  (alias foo)
+-  >  (action
+-  >   (progn
+-  >    (run which foo)
+-  >    (echo %{bin:foo})))
++  >  (action (system "command -v foo"))
+   >  (deps (package foo)))
+   > EOF
+ 
+   $ dune build @foo
+-  File "dune", line 7, characters 9-19:
+-  7 |    (echo %{bin:foo})))
+-               ^^^^^^^^^^
+-  Error: Program foo not found in the tree or in PATH
+-   (context: default)
++  File "dune", line 5, characters 16-19:
++  5 |  (deps (package foo)))
++                      ^^^
++  Error: Package foo does not exist
+   [1]
+ 
+ Now we define the external package using a dune project:
+@@ -53,9 +49,4 @@ Now we define the external package using a dune project:
+   > (build (run dune build @install --promote-install-files))
+   > EOF
+   $ dune build @foo
+-  File "dune", line 7, characters 9-19:
+-  7 |    (echo %{bin:foo})))
+-               ^^^^^^^^^^
+-  Error: Program foo not found in the tree or in PATH
+-   (context: default)
+-  [1]
++  $TESTCASE_ROOT/_build/_private/default/.pkg/foo/target/bin/foo

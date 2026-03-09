@@ -1,0 +1,457 @@
+diff --git a/src/dune_lang/package_constraint.mli b/src/dune_lang/package_constraint.mli
+index cbf07a980..5519eb95d 100644
+--- a/src/dune_lang/package_constraint.mli
++++ b/src/dune_lang/package_constraint.mli
+@@ -8,8 +8,6 @@ module Op : sig
+     | Gt
+     | Lt
+     | Neq
+-
+-  val to_dyn : t -> Dyn.t
+ end
+ 
+ module Variable : sig
+diff --git a/src/dune_pkg/opam_solver.ml b/src/dune_pkg/opam_solver.ml
+index d47d2dee4..eb3d4de4d 100644
+--- a/src/dune_pkg/opam_solver.ml
++++ b/src/dune_pkg/opam_solver.ml
+@@ -22,6 +22,7 @@ end
+ 
+ module Context_for_dune = struct
+   type 'a monad = 'a Monad.t
++  type filtered_formula = OpamTypes.filtered_formula
+   type filter = OpamTypes.filter
+   type rejection = Unavailable
+ 
+@@ -83,6 +84,24 @@ module Context_for_dune = struct
+     | Invalid_argument msg -> Error (`Not_a_bool msg)
+   ;;
+ 
++  (* Substitute variables with their values *)
++  let resolve_solver_env
++    (solver_env : Solver_env.t)
++    (stats_updater : Solver_stats.Updater.t)
++    : OpamTypes.filter -> OpamTypes.filter
++    =
++    OpamFilter.map_up (function
++      | FIdent ([], variable, None) as filter ->
++        (match Solver_env.Variable.of_string_opt (OpamVariable.to_string variable) with
++         | None -> filter
++         | Some variable ->
++           Solver_stats.Updater.expand_variable stats_updater variable;
++           (match Solver_env.get solver_env variable with
++            | Unset_sys -> filter
++            | String string -> FString string))
++      | other -> other)
++  ;;
++
+   let is_opam_available =
+     (* The solver can call this function several times on the same package. If
+        the package contains an invalid `available` filter we want to print a
+@@ -93,10 +112,7 @@ module Context_for_dune = struct
+       let available = OpamFile.OPAM.available opam in
+       match
+         let available_vars_resolved =
+-          Resolve_opam_formula.substitute_variables_in_filter
+-            ~stats_updater:(Some t.stats_updater)
+-            t.solver_env
+-            available
++          resolve_solver_env t.solver_env t.stats_updater available
+         in
+         eval_to_bool available_vars_resolved
+       with
+@@ -164,15 +180,25 @@ module Context_for_dune = struct
+       if OpamPackage.Name.equal dune pkg then Some (`Eq, t.dune_version) else None
+   ;;
+ 
++  let map_filters ~(f : filter -> filter) : filtered_formula -> filtered_formula =
++    OpamFilter.gen_filter_formula
++      (OpamFormula.partial_eval (function
++        | OpamTypes.Filter flt -> `Formula (Atom (OpamTypes.Filter (f flt)))
++        | Constraint _ as constraint_ -> `Formula (Atom constraint_)))
++  ;;
++
+   let filter_deps t package filtered_formula =
+     let package_is_local =
+       OpamPackage.Name.Map.mem (OpamPackage.name package) t.local_packages
+     in
+-    Resolve_opam_formula.apply_filter
+-      ~stats_updater:(Some t.stats_updater)
+-      ~with_test:package_is_local
+-      t.solver_env
+-      filtered_formula
++    map_filters filtered_formula ~f:(resolve_solver_env t.solver_env t.stats_updater)
++    |> OpamFilter.filter_deps
++         ~build:true
++         ~post:false
++         ~dev:false
++         ~default:false
++         ~test:package_is_local
++         ~doc:false
+   ;;
+ end
+ 
+@@ -428,8 +454,8 @@ let remove_filters_from_opam_file opam_file =
+ ;;
+ 
+ let opam_package_to_lock_file_pkg
+-  solver_env
+-  version_by_package_name
++  context_for_dune
++  ~all_package_names
+   ~repos
+   ~experimental_translate_opam_filters
+   opam_package
+@@ -492,23 +518,15 @@ let opam_package_to_lock_file_pkg
+     ; extra_sources
+     }
+   in
++  (* This will collect all the atoms from the package's dependency formula regardless of conditions *)
+   let deps =
+-    match
+-      Resolve_opam_formula.filtered_formula_to_package_names
+-        ~stats_updater:None
+-        ~with_test:false
+-        solver_env
+-        version_by_package_name
+-        opam_file.depends
+-    with
+-    | Ok dep_package_names ->
+-      List.map dep_package_names ~f:(fun package_name -> Loc.none, package_name)
+-    | Error (`Formula_could_not_be_satisfied hints) ->
+-      Code_error.raise
+-        "Dependencies of package can't be satisfied from packages in solution"
+-        [ "package", Dyn.string (OpamFile.OPAM.package opam_file |> OpamPackage.to_string)
+-        ; "hints", Dyn.list Resolve_opam_formula.Unsatisfied_formula_hint.to_dyn hints
+-        ]
++    Context_for_dune.filter_deps context_for_dune opam_package opam_file.depends
++    |> OpamFormula.fold_right
++         (fun acc (name, _condition) ->
++           if OpamPackage.Name.Set.mem name all_package_names then name :: acc else acc)
++         []
++    |> List.map ~f:(fun name ->
++      Loc.none, Package_name.of_string (OpamPackage.Name.to_string name))
+   in
+   let build_env action =
+     let env_update =
+@@ -633,13 +651,10 @@ let solve_lock_dir
+       context
+       ~local_package_names:(OpamPackage.Name.Map.keys local_packages)
+     >>| Result.map ~f:(fun solution ->
+-      let version_by_package_name =
+-        List.map solution ~f:(fun (package : OpamPackage.t) ->
+-          ( Package_name.of_string (OpamPackage.name_to_string package)
+-          , Package_version.of_string (OpamPackage.version_to_string package) ))
+-        |> Package_name.Map.of_list_exn
+-      in
+       (* don't include local packages in the lock dir *)
++      let all_package_names =
++        List.map solution ~f:OpamPackage.name |> OpamPackage.Name.Set.of_list
++      in
+       let opam_packages_to_lock =
+         let is_local_package package =
+           OpamPackage.Name.Map.mem (OpamPackage.name package) local_packages
+@@ -650,8 +665,8 @@ let solve_lock_dir
+         let+ pkgs =
+           Fiber.parallel_map opam_packages_to_lock ~f:(fun opam_package ->
+             opam_package_to_lock_file_pkg
+-              solver_env
+-              version_by_package_name
++              context
++              ~all_package_names
+               ~repos
+               ~experimental_translate_opam_filters
+               opam_package)
+diff --git a/src/dune_pkg/resolve_opam_formula.ml b/src/dune_pkg/resolve_opam_formula.ml
+deleted file mode 100644
+index 43e2993ad..000000000
+--- a/src/dune_pkg/resolve_opam_formula.ml
++++ /dev/null
+@@ -1,167 +0,0 @@
+-open! Import
+-module Op = Dune_lang.Package_constraint.Op
+-
+-let substitute_variables_in_filter
+-  ~stats_updater
+-  (solver_env : Solver_env.t)
+-  (opam_filter : OpamTypes.filter)
+-  : OpamTypes.filter
+-  =
+-  OpamFilter.map_up
+-    (function
+-     | FIdent ([], variable, None) as filter ->
+-       (match Solver_env.Variable.of_string_opt (OpamVariable.to_string variable) with
+-        | None -> filter
+-        | Some variable ->
+-          Option.iter stats_updater ~f:(fun stats_updater ->
+-            Solver_stats.Updater.expand_variable stats_updater variable);
+-          (match Solver_env.get solver_env variable with
+-           | Unset_sys -> filter
+-           | String string -> FString string))
+-     | other -> other)
+-    opam_filter
+-;;
+-
+-let apply_filter
+-  ~stats_updater
+-  ~with_test
+-  (solver_env : Solver_env.t)
+-  (opam_filtered_formula : OpamTypes.filtered_formula)
+-  : OpamTypes.formula
+-  =
+-  let map_filters ~f =
+-    OpamFilter.gen_filter_formula
+-      (OpamFormula.partial_eval (function
+-        | OpamTypes.Filter flt -> `Formula (Atom (OpamTypes.Filter (f flt)))
+-        | Constraint _ as constraint_ -> `Formula (Atom constraint_)))
+-  in
+-  map_filters
+-    opam_filtered_formula
+-    ~f:(substitute_variables_in_filter ~stats_updater solver_env)
+-  |> OpamFilter.filter_deps
+-       ~build:true
+-       ~post:false
+-       ~dev:false
+-       ~default:false
+-       ~test:with_test
+-       ~doc:false
+-;;
+-
+-module Version_constraint = struct
+-  type t = Op.t * Package_version.t
+-
+-  let of_opam ((relop, version) : OpamFormula.version_constraint) =
+-    let op =
+-      match relop with
+-      | `Eq -> Op.Eq
+-      | `Neq -> Neq
+-      | `Geq -> Gte
+-      | `Gt -> Gt
+-      | `Leq -> Lte
+-      | `Lt -> Lt
+-    in
+-    let package_version = Package_version.of_opam version in
+-    op, package_version
+-  ;;
+-
+-  let to_dyn (op, package_version) =
+-    Dyn.Tuple [ Op.to_dyn op; Package_version.to_dyn package_version ]
+-  ;;
+-end
+-
+-module Unsatisfied_formula_hint = struct
+-  type t =
+-    | Missing_package of Package_name.t
+-    | Unsatisfied_version_constraint of
+-        { package_name : Package_name.t
+-        ; found_version : Package_version.t
+-        ; version_constraint : Version_constraint.t
+-        }
+-
+-  let to_dyn = function
+-    | Missing_package package_name ->
+-      Dyn.variant "Missing_package" [ Package_name.to_dyn package_name ]
+-    | Unsatisfied_version_constraint { package_name; found_version; version_constraint }
+-      ->
+-      Dyn.variant
+-        "Unsatisfied_version_constraint"
+-        [ Dyn.record
+-            [ "package_name", Package_name.to_dyn package_name
+-            ; "found_version", Package_version.to_dyn found_version
+-            ; "version_constraint", Version_constraint.to_dyn version_constraint
+-            ]
+-        ]
+-  ;;
+-end
+-
+-type unsatisfied_formula =
+-  [ `Formula_could_not_be_satisfied of Unsatisfied_formula_hint.t list ]
+-
+-let formula_to_package_names version_by_package_name opam_formula =
+-  let dnf =
+-    (* a list of conjunctions where each conjunction represents on set of
+-       packages with version constrainst that completely satisfies the
+-       dependency formula *)
+-    OpamFormula.to_dnf opam_formula
+-  in
+-  if List.is_empty dnf
+-  then (* there are no dependencies so the formula is automatically satisfied *)
+-    Ok []
+-  else (
+-    let satisfied_or_error_hint_per_conjunction =
+-      (* check if each conjunction can be satisfied and if they can't, produce a hint indicating why it wasn't satisfied *)
+-      List.map dnf ~f:(fun conjunction ->
+-        List.map conjunction ~f:(fun (opam_package_name, version_constraint_opt) ->
+-          let package_name =
+-            Package_name.of_string (OpamPackage.Name.to_string opam_package_name)
+-          in
+-          match Package_name.Map.find version_by_package_name package_name with
+-          | None ->
+-            (* this package wasn't part of the solution so the current
+-               conjunction can't be satisfied *)
+-            Error (Unsatisfied_formula_hint.Missing_package package_name)
+-          | Some version ->
+-            (match version_constraint_opt with
+-             | None ->
+-               (* no constraint so any version will satisfy *)
+-               Ok ()
+-             | Some (constraint_ : OpamFormula.version_constraint) ->
+-               let opam_version = Package_version.to_opam version in
+-               let version_formula = OpamFormula.Atom constraint_ in
+-               if OpamFormula.check_version_formula version_formula opam_version
+-               then Ok ()
+-               else
+-                 Error
+-                   (Unsatisfied_formula_hint.Unsatisfied_version_constraint
+-                      { package_name
+-                      ; found_version = version
+-                      ; version_constraint = Version_constraint.of_opam constraint_
+-                      })))
+-        |> Result.List.all
+-        |> Result.map ~f:(fun (_ : unit list) -> conjunction))
+-    in
+-    match List.find_map satisfied_or_error_hint_per_conjunction ~f:Result.to_option with
+-    | None ->
+-      let hints =
+-        List.filter_map satisfied_or_error_hint_per_conjunction ~f:(function
+-          | Error hint -> Some hint
+-          | Ok _ -> None)
+-      in
+-      Error (`Formula_could_not_be_satisfied hints)
+-    | Some satisfied_conjunction ->
+-      Ok
+-        (List.map satisfied_conjunction ~f:(fun (opam_package_name, _) ->
+-           Package_name.of_string (OpamPackage.Name.to_string opam_package_name))))
+-;;
+-
+-let filtered_formula_to_package_names
+-  ~stats_updater
+-  ~with_test
+-  solver_env
+-  version_by_package_name
+-  formula
+-  =
+-  formula_to_package_names
+-    version_by_package_name
+-    (apply_filter ~stats_updater ~with_test solver_env formula)
+-;;
+diff --git a/src/dune_pkg/resolve_opam_formula.mli b/src/dune_pkg/resolve_opam_formula.mli
+deleted file mode 100644
+index 0da204db6..000000000
+--- a/src/dune_pkg/resolve_opam_formula.mli
++++ /dev/null
+@@ -1,63 +0,0 @@
+-open! Import
+-
+-(** Update a filter by substituting variables from a [Solver_env.t] *)
+-val substitute_variables_in_filter
+-  :  stats_updater:Solver_stats.Updater.t option
+-  -> Solver_env.t
+-  -> OpamTypes.filter
+-  -> OpamTypes.filter
+-
+-(** Evaluate the filters in a filtered formula returning the resulting formula. *)
+-val apply_filter
+-  :  stats_updater:Solver_stats.Updater.t option
+-  -> with_test:bool
+-  -> Solver_env.t
+-  -> OpamTypes.filtered_formula
+-  -> OpamTypes.formula
+-
+-module Version_constraint : sig
+-  type t = Dune_lang.Package_constraint.Op.t * Package_version.t
+-end
+-
+-module Unsatisfied_formula_hint : sig
+-  type t =
+-    | Missing_package of Package_name.t
+-    | Unsatisfied_version_constraint of
+-        { package_name : Package_name.t
+-        ; found_version : Package_version.t
+-        ; version_constraint : Version_constraint.t
+-        }
+-
+-  val to_dyn : t -> Dyn.t
+-end
+-
+-(** An unsatisfied formula is accompanied by a list of hints rather than a
+-    single hint as a formula may be unsatisfied for several reasons in the case
+-    of a formula containing a disjunction. In such a case, fixing one of the
+-    problems may cause the formula to become satisfiable. *)
+-type unsatisfied_formula =
+-  [ `Formula_could_not_be_satisfied of Unsatisfied_formula_hint.t list ]
+-
+-(** Given a map associating package names with the version of that package in a
+-    solution, this function evaluates an [OpamFormula.t] to a concrete list of
+-    package names all contained in the solution with versions which satisfy the
+-    formula, or an error if the the version constraints or packages in the
+-    formula can't be satisfied with the packages in the solution. If the
+-    formula contains disjunctions (the `|` operator in opam) then there may be
+-    multiple sets of packages that satisfy the formula. In this case the choice
+-    of which set to return is made arbitrarily. *)
+-val formula_to_package_names
+-  :  Package_version.t Package_name.Map.t
+-  -> OpamTypes.formula
+-  -> (Package_name.t list, unsatisfied_formula) result
+-
+-(** Like [formula_to_package_name] but takes an [OpamTypes.filtered_formula]
+-    and evaluates its filters to produce a formula which is then resolved to a
+-    list of package names. *)
+-val filtered_formula_to_package_names
+-  :  stats_updater:Solver_stats.Updater.t option
+-  -> with_test:bool
+-  -> Solver_env.t
+-  -> Package_version.t Package_name.Map.t
+-  -> OpamTypes.filtered_formula
+-  -> (Package_name.t list, unsatisfied_formula) result
+diff --git a/test/blackbox-tests/test-cases/pkg/lockfile-deps-respect-constraints.t b/test/blackbox-tests/test-cases/pkg/lockfile-deps-respect-constraints.t
+deleted file mode 100644
+index 797bdd16e..000000000
+--- a/test/blackbox-tests/test-cases/pkg/lockfile-deps-respect-constraints.t
++++ /dev/null
+@@ -1,45 +0,0 @@
+-When populating the "deps" field of a lockfile, only packages which have locked
+-versions compatible with the lockfile's package's dependency version
+-constraints should be included.
+-
+-  $ . ./helpers.sh
+-  $ mkrepo
+-
+-  $ mkpkg a 0.0.1
+-  $ mkpkg a 0.0.2
+-  $ mkpkg b
+-
+-The package "c" can be satisfied by b or by a.0.0.1.
+-  $ mkpkg c <<EOF
+-  > depends: [ "b" | "a" {= "0.0.1"} ]
+-  > EOF
+-
+-The package "d" can only be satisfied by "a.0.0.2" which will force the package
+-"c" to depend on "b" rather than "a" and ensure "a.0.0.2" is in the solution
+-rather than "a.0.0.1".
+-  $ mkpkg d <<EOF
+-  > depends: [ "a" {= "0.0.2"} ]
+-  > EOF
+-
+-  $ solve_project <<EOF
+-  > (lang dune 3.11)
+-  > (package
+-  >  (name foo)
+-  >  (depends c d))
+-  > EOF
+-  Solution for dune.lock:
+-  - a.0.0.2
+-  - b.0.0.1
+-  - c.0.0.1
+-  - d.0.0.1
+-
+-Confirm that we locked "a.0.0.2".
+-  $ cat dune.lock/a.pkg
+-  (version 0.0.2)
+-
+-The deps in the lockfile for "c" shouldn't contain "a" since the only version
+-of "a" that "c" could depend on is "a.0.0.1" which isn't part of the solution.
+-  $ cat dune.lock/c.pkg
+-  (version 0.0.1)
+-  
+-  (deps b)

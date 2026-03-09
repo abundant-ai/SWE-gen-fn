@@ -1,0 +1,242 @@
+diff --git a/src/dune_lang/action.ml b/src/dune_lang/action.ml
+index bf7b46c12..64cf84abb 100644
+--- a/src/dune_lang/action.ml
++++ b/src/dune_lang/action.ml
+@@ -175,7 +175,6 @@ type t =
+   | Patch of String_with_vars.t
+   | Substitute of String_with_vars.t * String_with_vars.t
+   | Withenv of String_with_vars.t Env_update.t list * t
+-  | When of Blang.t * t
+ 
+ let is_dev_null t = String_with_vars.is_pform t (Var Dev_null)
+ 
+@@ -376,11 +375,6 @@ let decode_pkg =
+         >>> let+ ops = enter (repeat Env_update.decode)
+             and+ t = t in
+             Withenv (ops, t) )
+-    ; ( "when"
+-      , Syntax.since Stanza.syntax (0, 1)
+-        >>> let+ condition = Blang.decode
+-            and+ action = t in
+-            When (condition, action) )
+     ]
+   in
+   Decoder.fix @@ fun t -> Decoder.sum (cstrs_dune_file t @ cstrs_pkg t)
+@@ -436,8 +430,6 @@ let rec encode =
+   | Substitute (i, o) -> List [ atom "substitute"; sw i; sw o ]
+   | Withenv (ops, t) ->
+     List [ atom "withenv"; List (List.map ~f:Env_update.encode ops); encode t ]
+-  | When (condition, action) ->
+-    List [ atom "when"; Blang.encode condition; encode action ]
+ ;;
+ 
+ (* In [Action_exec] we rely on one-to-one mapping between the cwd-relative paths
+@@ -460,7 +452,6 @@ let ensure_at_most_one_dynamic_run ~loc action =
+     | Ignore (_, t)
+     | With_accepted_exit_codes (_, t)
+     | Withenv (_, t)
+-    | When (_, t)
+     | No_infer t -> loop t
+     | Run _
+     | Echo _
+@@ -493,15 +484,6 @@ let ensure_at_most_one_dynamic_run ~loc action =
+ 
+ let validate ~loc t = ensure_at_most_one_dynamic_run ~loc t
+ 
+-let rec blang_map_string_with_vars ~f = function
+-  | Blang.Const _ as c -> c
+-  | Not blang -> Not (blang_map_string_with_vars ~f blang)
+-  | Expr sw -> Expr (f sw)
+-  | And blangs -> And (List.map blangs ~f:(blang_map_string_with_vars ~f))
+-  | Or blangs -> Or (List.map blangs ~f:(blang_map_string_with_vars ~f))
+-  | Compare (op, a, b) -> Compare (op, f a, f b)
+-;;
+-
+ let rec map_string_with_vars t ~f =
+   match t with
+   | Run (sw, xs) -> Run (f sw, List.map ~f xs)
+@@ -534,8 +516,6 @@ let rec map_string_with_vars t ~f =
+     Withenv
+       ( List.map ops ~f:(fun (op : _ Env_update.t) -> { op with value = f op.value })
+       , map_string_with_vars t ~f )
+-  | When (condition, t) ->
+-    When (blang_map_string_with_vars condition ~f, map_string_with_vars t ~f)
+ ;;
+ 
+ let remove_locs = map_string_with_vars ~f:String_with_vars.remove_locs
+diff --git a/src/dune_lang/action.mli b/src/dune_lang/action.mli
+index fbf2e3b2e..880def2b8 100644
+--- a/src/dune_lang/action.mli
++++ b/src/dune_lang/action.mli
+@@ -118,7 +118,6 @@ type t =
+   | Patch of String_with_vars.t
+   | Substitute of String_with_vars.t * String_with_vars.t
+   | Withenv of String_with_vars.t Env_update.t list * t
+-  | When of Blang.t * t
+ 
+ val encode : t Encoder.t
+ val decode_dune_file : t Decoder.t
+diff --git a/src/dune_lang/blang.ml b/src/dune_lang/blang.ml
+index aeea5fa94..ecb63edcd 100644
+--- a/src/dune_lang/blang.ml
++++ b/src/dune_lang/blang.ml
+@@ -26,25 +26,6 @@ module Op = struct
+     | Lt -> string "Lt"
+     | Neq -> string "Neq"
+   ;;
+-
+-  let equal a b =
+-    match a, b with
+-    | Eq, Eq -> true
+-    | Gt, Gt -> true
+-    | Gte, Gte -> true
+-    | Lte, Lte -> true
+-    | Lt, Lt -> true
+-    | Neq, Neq -> true
+-    | _ -> false
+-  ;;
+-
+-  let by_string = [ "=", Eq; ">=", Gte; "<=", Lte; ">", Gt; "<", Lt; "<>", Neq ]
+-  let to_string t = fst (List.find_exn by_string ~f:(fun (_, op) -> equal op t))
+-
+-  let encode t =
+-    let open Encoder in
+-    string (to_string t)
+-  ;;
+ end
+ 
+ type t =
+@@ -71,10 +52,12 @@ let rec to_dyn =
+       [ Op.to_dyn o; String_with_vars.to_dyn s1; String_with_vars.to_dyn s2 ]
+ ;;
+ 
++let ops = [ "=", Op.Eq; ">=", Gte; "<=", Lte; ">", Gt; "<", Lt; "<>", Neq ]
++
+ let decode_gen decode_string =
+   let open Decoder in
+   let ops =
+-    List.map Op.by_string ~f:(fun (name, op) ->
++    List.map ops ~f:(fun (name, op) ->
+       ( name
+       , let+ x = decode_string
+         and+ y = decode_string in
+@@ -98,16 +81,3 @@ let decode_gen decode_string =
+ 
+ let decode = decode_gen String_with_vars.decode
+ let decode_manually f = decode_gen (String_with_vars.decode_manually f)
+-
+-let rec encode t =
+-  let open Encoder in
+-  match t with
+-  | Const true -> string "true"
+-  | Const false -> string "false"
+-  | Not t -> List [ string "not"; encode t ]
+-  | Expr e -> String_with_vars.encode e
+-  | And ts -> List (string "and" :: List.map ts ~f:encode)
+-  | Or ts -> List (string "or" :: List.map ts ~f:encode)
+-  | Compare (o, s1, s2) ->
+-    List [ Op.encode o; String_with_vars.encode s1; String_with_vars.encode s2 ]
+-;;
+diff --git a/src/dune_lang/blang.mli b/src/dune_lang/blang.mli
+index a0b9c6b3d..da0d6bb72 100644
+--- a/src/dune_lang/blang.mli
++++ b/src/dune_lang/blang.mli
+@@ -24,7 +24,6 @@ type t =
+ val true_ : t
+ val to_dyn : t -> Dyn.t
+ val decode : t Decoder.t
+-val encode : t Encoder.t
+ 
+ (** Resolve variables manually. For complex cases such as [enabled_if] *)
+ val decode_manually : (Pform.Env.t -> Template.Pform.t -> Pform.t) -> t Decoder.t
+diff --git a/src/dune_rules/action_unexpanded.ml b/src/dune_rules/action_unexpanded.ml
+index e98aa4a86..3317f90b0 100644
+--- a/src/dune_rules/action_unexpanded.ml
++++ b/src/dune_rules/action_unexpanded.ml
+@@ -547,7 +547,7 @@ let rec expand (t : Dune_lang.Action.t) : Action.t Action_expander.t =
+   | Cram script ->
+     let+ script = E.dep script in
+     Cram_exec.action script
+-  | Withenv _ | Substitute _ | Patch _ | When _ ->
++  | Withenv _ | Substitute _ | Patch _ ->
+     (* these can only be provided by the package language which isn't expanded here *)
+     assert false
+ ;;
+diff --git a/src/dune_rules/pkg_rules.ml b/src/dune_rules/pkg_rules.ml
+index 7248afdec..6a08e2040 100644
+--- a/src/dune_rules/pkg_rules.ml
++++ b/src/dune_rules/pkg_rules.ml
+@@ -559,7 +559,7 @@ module Action_expander = struct
+       String_expander.Memo.expand ~f:(expand_pform t) ~dir:(Path.build t.paths.source_dir)
+     ;;
+ 
+-    let expand_sw = expand_pform_gen ~mode:Many
++    let expand_pform = expand_pform_gen ~mode:Many
+ 
+     let expand_exe t sw : ((Path.t, Action.Prog.Not_found.t) result * Value.t list) Memo.t
+       =
+@@ -601,10 +601,6 @@ module Action_expander = struct
+       let prog = Result.map prog ~f:(map_exe t) in
+       prog, args
+     ;;
+-
+-    let eval_blang t blang : bool Memo.t =
+-      Blang_expand.eval blang ~dir:(Path.build t.paths.source_dir) ~f:(expand_pform t)
+-    ;;
+   end
+ 
+   let substitute_env (expander : Expander.t) =
+@@ -660,7 +656,7 @@ module Action_expander = struct
+     match action with
+     | Run (exe, args) ->
+       let* exe, more_args = Expander.expand_exe expander exe in
+-      let+ args = Memo.parallel_map args ~f:(Expander.expand_sw expander) in
++      let+ args = Memo.parallel_map args ~f:(Expander.expand_pform expander) in
+       let args = more_args @ List.concat args |> Value.L.to_strings ~dir in
+       Action.Run (exe, Array.Immutable.of_list args)
+     | Progn t ->
+@@ -723,9 +719,6 @@ module Action_expander = struct
+       let+ action = expand action ~expander in
+       List.fold_left updates ~init:action ~f:(fun action (k, v) ->
+         Action.Setenv (k, v, action))
+-    | When (condition, action) ->
+-      let* condition_value = Expander.eval_blang expander condition in
+-      if condition_value then expand action ~expander else Memo.return (Action.progn [])
+     | _ ->
+       (* TODO *)
+       assert false
+diff --git a/test/blackbox-tests/test-cases/pkg/pkg-action-when.t b/test/blackbox-tests/test-cases/pkg/pkg-action-when.t
+deleted file mode 100644
+index 5d8a3f12f..000000000
+--- a/test/blackbox-tests/test-cases/pkg/pkg-action-when.t
++++ /dev/null
+@@ -1,29 +0,0 @@
+-Testing the when action in lockfiles
+-
+-  $ . ./helpers.sh
+-
+-  $ mkdir dune.lock
+-  $ cat >dune.lock/lock.dune <<EOF
+-  > (lang package 0.1)
+-  > EOF
+-
+-Case with a mix of uncoditional and conditional actions in a progn action
+-  $ cat >dune.lock/test.pkg <<'EOF'
+-  > (install
+-  >  (progn
+-  >   (when (= foo foo)
+-  >    (run echo a))
+-  >   (when (<> foo foo)
+-  >    (run echo b))
+-  >   (when (<> foo bar)
+-  >    (run echo c))
+-  >   (when (< 1 2)
+-  >    (run echo d))
+-  >   (when (< 2 1)
+-  >    (run echo e))))
+-  > EOF
+-
+-  $ build_pkg test
+-  a
+-  c
+-  d
