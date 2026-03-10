@@ -1,0 +1,562 @@
+diff --git a/Changes b/Changes
+index 6304f5d96e..10fe529a1d 100644
+--- a/Changes
++++ b/Changes
+@@ -205,6 +205,10 @@ Working version
+   to the Int, Int32, Int64 and Nativeint modules.
+   (Xavier Leroy, review by Ali Caglayan, Nicolás Ojeda Bär, Gabriel Scherer)
+ 
++- #14433: Add bit-counting functions `leading_zeros`, `leading_sign_bits`,
++  `trailing_zeros`, `bit_count`, `unsigned_bitsize`, `signed_bitsize`
++  to Int, Int32, Int64, and Nativeint
++  (Xavier Leroy, review by Ali Caglayan and David Allsopp)
+ 
+ ### Type system:
+ 
+diff --git a/stdlib/.depend b/stdlib/.depend
+index 3c641c22e4..ca5c9212bd 100644
+--- a/stdlib/.depend
++++ b/stdlib/.depend
+@@ -458,9 +458,11 @@ stdlib__In_channel.cmi : in_channel.mli \
+     stdlib.cmi \
+     stdlib__Bigarray.cmi
+ stdlib__Int.cmo : int.ml \
++    stdlib__Sys.cmi \
+     stdlib.cmi \
+     stdlib__Int.cmi
+ stdlib__Int.cmx : int.ml \
++    stdlib__Sys.cmx \
+     stdlib.cmx \
+     stdlib__Int.cmi
+ stdlib__Int.cmi : int.mli
+@@ -563,10 +565,14 @@ stdlib__Mutex.cmi : mutex.mli
+ stdlib__Nativeint.cmo : nativeint.ml \
+     stdlib__Sys.cmi \
+     stdlib.cmi \
++    stdlib__Int64.cmi \
++    stdlib__Int32.cmi \
+     stdlib__Nativeint.cmi
+ stdlib__Nativeint.cmx : nativeint.ml \
+     stdlib__Sys.cmx \
+     stdlib.cmx \
++    stdlib__Int64.cmx \
++    stdlib__Int32.cmx \
+     stdlib__Nativeint.cmi
+ stdlib__Nativeint.cmi : nativeint.mli
+ stdlib__Obj.cmo : obj.ml \
+diff --git a/stdlib/int.ml b/stdlib/int.ml
+index 50da61cc2f..d56f18a751 100644
+--- a/stdlib/int.ml
++++ b/stdlib/int.ml
+@@ -40,6 +40,78 @@ let equal : int -> int -> bool = ( = )
+ let compare : int -> int -> int = Stdlib.compare
+ let min x y : t = if x <= y then x else y
+ let max x y : t = if x >= y then x else y
++
++(* Number of leading zeros.  Hacker's Delight (2 ed.), algorithm 5.12 *)
++
++let leading_zeros x =
++  let x = ref x and n = ref Sys.int_size in
++  if Sys.int_size > 32 then begin
++    let y = shift_right_logical !x 32 in
++    if y <> 0 then (n := !n - 32; x := y)
++  end;
++  let y = shift_right_logical !x 16 in
++  if y <> 0 then (n := !n - 16; x := y);
++  let y = shift_right_logical !x  8 in
++  if y <> 0 then (n := !n -  8; x := y);
++  let y = shift_right_logical !x  4 in
++  if y <> 0 then (n := !n -  4; x := y);
++  let y = shift_right_logical !x 2 in
++  if y <> 0 then (n := !n -  2; x := y);
++  let y = shift_right_logical !x 1 in
++  if y <> 0 then !n - 2 else !n - !x
++
++let unsigned_bitsize x =
++  Sys.int_size - leading_zeros x
++
++(* Number of leading sign bits. *)
++
++let leading_sign_bits x =
++  if x >= 0 then leading_zeros x - 1 else leading_zeros (lognot x) - 1
++
++let signed_bitsize x =
++  Sys.int_size - leading_sign_bits x
++
++(* Number of trailing zeros.  Hacker's Delight (2 ed.), algorithm 5.21 *)
++
++let trailing_zeros x =
++  if x = 0 then Sys.int_size else begin
++    let x = ref x and n = ref (Sys.int_size - 1) in
++    if Sys.int_size > 32 then begin
++      let y = shift_left !x 32 in
++      if y <> 0 then (n := !n - 32; x := y)
++    end;
++    let y = shift_left !x 16 in
++    if y <> 0 then (n := !n - 16; x := y);
++    let y = shift_left !x  8 in
++    if y <> 0 then (n := !n -  8; x := y);
++    let y = shift_left !x  4 in
++    if y <> 0 then (n := !n -  4; x := y);
++    let y = shift_left !x  2 in
++    if y <> 0 then (n := !n -  2; x := y);
++    let y = shift_left !x  1 in
++    if y <> 0 then !n - 1 else !n
++  end
++
++(* Population count.  Hacker's Delight (2 ed.), algorithm 5.2 *)
++
++external int64_to_int : int64 -> int = "%int64_to_int"
++let cst1 = int64_to_int 0x5555_5555_5555_5555L
++let cst2 = int64_to_int 0x3333_3333_3333_3333L
++let cst3 = int64_to_int 0x0F0F_0F0F_0F0F_0F0FL
++
++let popcount x =
++  let x = sub x (logand (shift_right_logical x 1) cst1) in
++  let x = add (logand x cst2)
++              (logand (shift_right_logical x 2) cst2) in
++  let x = logand (add x (shift_right_logical x 4)) cst3 in
++  let x = add x (shift_right_logical x 8) in
++  let x = add x (shift_right_logical x 16) in
++  if Sys.int_size > 32 then begin
++    let x = add x (shift_right_logical x 32) in
++    x land 0x7F
++  end else
++    x land 0x3F
++
+ external to_float : int -> float = "%floatofint"
+ external of_float : float -> int = "%intoffloat"
+ 
+diff --git a/stdlib/int.mli b/stdlib/int.mli
+index 5038989325..a9b72997ef 100644
+--- a/stdlib/int.mli
++++ b/stdlib/int.mli
+@@ -167,6 +167,64 @@ val max : int -> int -> int
+     @since 4.13
+  *)
+ 
++(** {1:bitcounting Bit counting} *)
++
++val popcount: t -> int
++(** Population count, also known as Hamming weight.
++    [popcount n] is the number of 1 bits in the binary representation of [n].
++    Negative [n] are represented in two's complement.
++
++    @since 5.5 *)
++
++val unsigned_bitsize: t -> int
++(** [unsigned_bitsize n] is the minimal number of bits needed to represent
++    [n] as an unsigned binary number.  It is the smallest integer [i]
++    between 0 and {!Sys.int_size} inclusive such that
++    [0 <= n < 2{^i}] (unsigned).
++
++    @since 5.5 *)
++
++val signed_bitsize: t -> int
++(** [signed_bitsize n] is the minimal number of bits needed to represent
++    [n] as a signed, two's complement binary number.
++    It is the smallest integer [i] between 1 and {!Sys.int_size} inclusive
++    such that [-2{^i-1} <= n < 2{^i-1}] (signed).
++
++    @since 5.5 *)
++
++val leading_zeros: t -> int
++(** [leading_zeros n] is the number of leading (most significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and {!Sys.int_size} inclusive.
++    If [n] is negative, [leading_zeros n = 0] since the most significant
++    bit of [n] is 1.
++    [leading_zeros n = {!Sys.int_size}] if and only if [n = zero].
++    Note that [leading_zeros n + unsigned_bitsize n = {!Sys.int_size}].
++
++    @since 5.5 *)
++
++val leading_sign_bits: t -> int
++(** [leading_sign_bits n] is the number of leading (most significant)
++    sign bits in the binary representation of [n],
++    excluding the sign bit itself.
++    It is an integer between 0 and [{!Sys.int_size} - 1] inclusive.
++    For positive [n], it is the number of leading zero bits minus one.
++    For negative [n], it is the number of leading one bits minus one.
++    Note that [leading_sign_bits n + signed_bitsize n = {!Sys.int_size}].
++
++    @since 5.5 *)
++
++val trailing_zeros: t -> int
++(** [trailing_zeros n] is the number of trailing (least significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and {!Sys.int_size} inclusive.
++    It is the largest integer [i <= {!Sys.int_size}]
++    such that [2{^i}] divides [n] evenly.
++    For example, [trailing_zeros n = 0] if and only if [n] is odd,
++    and [trailing_zeros n = {!Sys.int_size}] if and only if [n = zero].
++
++    @since 5.5 *)
++
+ (** {1:convert Converting} *)
+ 
+ external to_float : int -> float = "%floatofint"
+diff --git a/stdlib/int32.ml b/stdlib/int32.ml
+index bbc0602c56..37ac437290 100644
+--- a/stdlib/int32.ml
++++ b/stdlib/int32.ml
+@@ -128,6 +128,60 @@ let ediv n d =
+   let r = sub n (mul q d) in
+   if r >= 0l then q else if d >= 0l then pred q else succ q
+ 
++(* Number of leading zeros.  Hacker's Delight (2 ed.), algorithm 5.12 *)
++
++let leading_zeros x =
++  let x = ref x and n = ref 32 in
++  let y = shift_right_logical !x 16 in
++  if y <> 0l then (n := !n - 16; x := y);
++  let y = shift_right_logical !x  8 in
++  if y <> 0l then (n := !n -  8; x := y);
++  let y = shift_right_logical !x  4 in
++  if y <> 0l then (n := !n -  4; x := y);
++  let y = shift_right_logical !x 2 in
++  if y <> 0l then (n := !n -  2; x := y);
++  let y = shift_right_logical !x 1 in
++  if y <> 0l then !n - 2 else !n - to_int !x
++
++let unsigned_bitsize x =
++  32 - leading_zeros x
++
++(* Number of leading sign bits. *)
++
++let leading_sign_bits x =
++  if x >= 0l then leading_zeros x - 1 else leading_zeros (lognot x) - 1
++
++let signed_bitsize x =
++  32 - leading_sign_bits x
++
++(* Number of trailing zeros.  Hacker's Delight (2 ed.), algorithm 5.21 *)
++
++let trailing_zeros x =
++  if x = 0l then 32 else begin
++    let x = ref x and n = ref 31 in
++    let y = shift_left !x 16 in
++    if y <> 0l then (n := !n - 16; x := y);
++    let y = shift_left !x  8 in
++    if y <> 0l then (n := !n -  8; x := y);
++    let y = shift_left !x  4 in
++    if y <> 0l then (n := !n -  4; x := y);
++    let y = shift_left !x  2 in
++    if y <> 0l then (n := !n -  2; x := y);
++    let y = shift_left !x  1 in
++    if y <> 0l then !n - 1 else !n
++  end
++
++(* Population count.  Hacker's Delight (2 ed.), algorithm 5.2 *)
++
++let popcount x =
++  let x = sub x (logand (shift_right_logical x 1) 0x5555_5555l) in
++  let x = add (logand x 0x3333_3333l)
++              (logand (shift_right_logical x 2) 0x3333_3333l) in
++  let x = logand (add x (shift_right_logical x 4)) 0x0F0F_0F0Fl in
++  let x = add x (shift_right_logical x 8) in
++  let x = add x (shift_right_logical x 16) in
++  to_int x land 0x3F
++
+ external seeded_hash_param :
+   int -> int -> int -> 'a -> int = "caml_hash" [@@noalloc]
+ let seeded_hash seed x = seeded_hash_param 10 100 seed x
+diff --git a/stdlib/int32.mli b/stdlib/int32.mli
+index 7dc0aac5ee..eb9989a12a 100644
+--- a/stdlib/int32.mli
++++ b/stdlib/int32.mli
+@@ -266,6 +266,59 @@ val max: t -> t -> t
+     @since 4.13
+  *)
+ 
++val popcount: t -> int
++(** Population count, also known as Hamming weight.
++    [popcount n] is the number of 1 bits in the binary representation of [n].
++    Negative [n] are represented in two's complement.
++
++    @since 5.5 *)
++
++val unsigned_bitsize: t -> int
++(** [unsigned_bitsize n] is the minimal number of bits needed to represent
++    [n] as an unsigned binary number.  It is the smallest integer [i]
++    between 0 and 32 inclusive such that [0 <= n < 2{^i}] (unsigned).
++
++    @since 5.5 *)
++
++val signed_bitsize: t -> int
++(** [signed_bitsize n] is the minimal number of bits needed to represent
++    [n] as a signed, two's complement binary number.
++    It is the smallest integer [i] between 1 and 32 inclusive such that
++    [-2{^i-1} <= n < 2{^i-1}] (signed).
++
++    @since 5.5 *)
++
++val leading_zeros: t -> int
++(** [leading_zeros n] is the number of leading (most significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and 32 inclusive.
++    If [n] is negative, [leading_zeros n = 0] since the most significant
++    bit of [n] is 1.  [leading_zeros n = 32] if and only if [n = zero].
++    Note that [leading_zeros n + unsigned_bitsize n = 32].
++
++    @since 5.5 *)
++
++val leading_sign_bits: t -> int
++(** [leading_sign_bits n] is the number of leading (most significant)
++    sign bits in the binary representation of [n],
++    excluding the sign bit itself.
++    It is an integer between 0 and 31 inclusive.
++    For positive [n], it is the number of leading zero bits minus one.
++    For negative [n], it is the number of leading one bits minus one.
++    Note that [leading_sign_bits n + signed_bitsize n = 32].
++
++    @since 5.5 *)
++
++val trailing_zeros: t -> int
++(** [trailing_zeros n] is the number of trailing (least significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and 32 inclusive.
++    It is the largest integer [i <= 32] such that [2{^i}] divides [n] evenly.
++    For example, [trailing_zeros n = 0] if and only if [n] is odd,
++    and [trailing_zeros n = 32] if and only if [n = zero].
++
++    @since 5.5 *)
++
+ val seeded_hash : int -> t -> int
+ (** A seeded hash function for 32-bit ints, with the same output value as
+     {!Hashtbl.seeded_hash}. This function allows this module to be passed as
+diff --git a/stdlib/int64.ml b/stdlib/int64.ml
+index c26a7084de..e945c015da 100644
+--- a/stdlib/int64.ml
++++ b/stdlib/int64.ml
+@@ -125,6 +125,65 @@ let ediv n d =
+   let r = sub n (mul q d) in
+   if r >= 0L then q else if d >= 0L then pred q else succ q
+ 
++(* Number of leading zeros.  Hacker's Delight (2 ed.), algorithm 5.12 *)
++
++let leading_zeros x =
++  let x = ref x and n = ref 64 in
++  let y = shift_right_logical !x 32 in
++  if y <> 0L then (n := !n - 32; x := y);
++  let y = shift_right_logical !x 16 in
++  if y <> 0L then (n := !n - 16; x := y);
++  let y = shift_right_logical !x  8 in
++  if y <> 0L then (n := !n -  8; x := y);
++  let y = shift_right_logical !x  4 in
++  if y <> 0L then (n := !n -  4; x := y);
++  let y = shift_right_logical !x 2 in
++  if y <> 0L then (n := !n -  2; x := y);
++  let y = shift_right_logical !x 1 in
++  if y <> 0L then !n - 2 else !n - to_int !x
++
++let unsigned_bitsize x =
++  64 - leading_zeros x
++
++(* Number of leading sign bits. *)
++
++let leading_sign_bits x =
++  if x >= 0L then leading_zeros x - 1 else leading_zeros (lognot x) - 1
++
++let signed_bitsize x =
++  64 - leading_sign_bits x
++
++(* Number of trailing zeros.  Hacker's Delight (2 ed.), algorithm 5.21 *)
++
++let trailing_zeros x =
++  if x = 0L then 64 else begin
++    let x = ref x and n = ref 63 in
++    let y = shift_left !x 32 in
++    if y <> 0L then (n := !n - 32; x := y);
++    let y = shift_left !x 16 in
++    if y <> 0L then (n := !n - 16; x := y);
++    let y = shift_left !x  8 in
++    if y <> 0L then (n := !n -  8; x := y);
++    let y = shift_left !x  4 in
++    if y <> 0L then (n := !n -  4; x := y);
++    let y = shift_left !x  2 in
++    if y <> 0L then (n := !n -  2; x := y);
++    let y = shift_left !x  1 in
++    if y <> 0L then !n - 1 else !n
++  end
++
++(* Population count.  Hacker's Delight (2 ed.), algorithm 5.2 *)
++
++let popcount x =
++  let x = sub x (logand (shift_right_logical x 1) 0x5555_5555_5555_5555L) in
++  let x = add (logand x 0x3333_3333_3333_3333L)
++              (logand (shift_right_logical x 2) 0x3333_3333_3333_3333L) in
++  let x = logand (add x (shift_right_logical x 4)) 0x0F0F_0F0F_0F0F_0F0FL in
++  let x = add x (shift_right_logical x 8) in
++  let x = add x (shift_right_logical x 16) in
++  let x = add x (shift_right_logical x 32) in
++  to_int x land 0x7F
++
+ external seeded_hash_param :
+   int -> int -> int -> 'a -> int = "caml_hash" [@@noalloc]
+ let seeded_hash seed x = seeded_hash_param 10 100 seed x
+diff --git a/stdlib/int64.mli b/stdlib/int64.mli
+index 9a1270a76f..1499e08934 100644
+--- a/stdlib/int64.mli
++++ b/stdlib/int64.mli
+@@ -285,6 +285,59 @@ val max: t -> t -> t
+     @since 4.13
+  *)
+ 
++val popcount: t -> int
++(** Population count, also known as Hamming weight.
++    [popcount n] is the number of 1 bits in the binary representation of [n].
++    Negative [n] are represented in two's complement.
++
++    @since 5.5 *)
++
++val unsigned_bitsize: t -> int
++(** [unsigned_bitsize n] is the minimal number of bits needed to represent
++    [n] as an unsigned binary number.  It is the smallest integer [i]
++    between 0 and 64 inclusive such that [0 <= n < 2{^i}] (unsigned).
++
++    @since 5.5 *)
++
++val signed_bitsize: t -> int
++(** [signed_bitsize n] is the minimal number of bits needed to represent
++    [n] as a signed, two's complement binary number.
++    It is the smallest integer [i] between 1 and 64 inclusive such that
++    [-2{^i-1} <= n < 2{^i-1}] (signed).
++
++    @since 5.5 *)
++
++val leading_zeros: t -> int
++(** [leading_zeros n] is the number of leading (most significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and 64 inclusive.
++    If [n] is negative, [leading_zeros n = 0] since the most significant
++    bit of [n] is 1.  [leading_zeros n = 64] if and only if [n = zero].
++    Note that [leading_zeros n + unsigned_bitsize n = 64].
++
++    @since 5.5 *)
++
++val leading_sign_bits: t -> int
++(** [leading_sign_bits n] is the number of leading (most significant)
++    sign bits in the binary representation of [n],
++    excluding the sign bit itself.
++    It is an integer between 0 and 63 inclusive.
++    For positive [n], it is the number of leading zero bits minus one.
++    For negative [n], it is the number of leading one bits minus one.
++    Note that [leading_sign_bits n + signed_bitsize n = 64].
++
++    @since 5.5 *)
++
++val trailing_zeros: t -> int
++(** [trailing_zeros n] is the number of trailing (least significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and 64 inclusive.
++    It is the largest integer [i <= 64] such that [2{^i}] divides [n] evenly.
++    For example, [trailing_zeros n = 0] if and only if [n] is odd,
++    and [trailing_zeros n = 64] if and only if [n = zero].
++
++    @since 5.5 *)
++
+ val seeded_hash : int -> t -> int
+ (** A seeded hash function for 64-bit ints, with the same output value as
+     {!Hashtbl.seeded_hash}. This function allows this module to be passed as
+diff --git a/stdlib/nativeint.ml b/stdlib/nativeint.ml
+index 746c20d70b..664803ad09 100644
+--- a/stdlib/nativeint.ml
++++ b/stdlib/nativeint.ml
+@@ -117,6 +117,32 @@ let ediv n d =
+   let r = sub n (mul q d) in
+   if r >= 0n then q else if d >= 0n then pred q else succ q
+ 
++(* Bit counting functions *)
++
++let leading_zeros =
++  if size = 64
++  then fun x -> Int64.(leading_zeros (of_nativeint x))
++  else fun x -> Int32.(leading_zeros (to_int32 x))
++
++let unsigned_bitsize x =
++  size - leading_zeros x
++
++let leading_sign_bits x =
++  if x >= 0n then leading_zeros x - 1 else leading_zeros (lognot x) - 1
++
++let signed_bitsize x =
++  size - leading_sign_bits x
++
++let trailing_zeros =
++  if size = 64
++  then fun x -> Int64.(trailing_zeros (of_nativeint x))
++  else fun x -> Int32.(trailing_zeros (to_int32 x))
++
++let popcount =
++  if size = 64
++  then fun x -> Int64.(popcount (of_nativeint x))
++  else fun x -> Int32.(popcount (to_int32 x))
++
+ external seeded_hash_param :
+   int -> int -> int -> 'a -> int = "caml_hash" [@@noalloc]
+ let seeded_hash seed x = seeded_hash_param 10 100 seed x
+diff --git a/stdlib/nativeint.mli b/stdlib/nativeint.mli
+index 508ce4a13e..63940716d6 100644
+--- a/stdlib/nativeint.mli
++++ b/stdlib/nativeint.mli
+@@ -275,6 +275,59 @@ val max: t -> t -> t
+     @since 4.13
+  *)
+ 
++val popcount: t -> int
++(** Population count, also known as Hamming weight.
++    [popcount n] is the number of 1 bits in the binary representation of [n].
++    Negative [n] are represented in two's complement.
++
++    @since 5.5 *)
++
++val unsigned_bitsize: t -> int
++(** [unsigned_bitsize n] is the minimal number of bits needed to represent
++    [n] as an unsigned binary number.  It is the smallest integer [i]
++    between 0 and [size] inclusive such that [0 <= n < 2{^i}] (unsigned).
++
++    @since 5.5 *)
++
++val signed_bitsize: t -> int
++(** [signed_bitsize n] is the minimal number of bits needed to represent
++    [n] as a signed, two's complement binary number.
++    It is the smallest integer [i] between 1 and [size] inclusive such that
++    [-2{^i-1} <= n < 2{^i-1}] (signed).
++
++    @since 5.5 *)
++
++val leading_zeros: t -> int
++(** [leading_zeros n] is the number of leading (most significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and 64 inclusive.
++    If [n] is negative, [leading_zeros n = 0] since the most significant
++    bit of [n] is 1.  [leading_zeros n = size] if and only if [n = zero].
++    Note that [leading_zeros n + unsigned_bitsize n = size].
++
++    @since 5.5 *)
++
++val leading_sign_bits: t -> int
++(** [leading_sign_bits n] is the number of leading (most significant)
++    sign bits in the binary representation of [n],
++    excluding the sign bit itself.
++    It is an integer between 0 and 63 inclusive.
++    For positive [n], it is the number of leading zero bits minus one.
++    For negative [n], it is the number of leading one bits minus one.
++    Note that [leading_sign_bits n + signed_bitsize n = size].
++
++    @since 5.5 *)
++
++val trailing_zeros: t -> int
++(** [trailing_zeros n] is the number of trailing (least significant) 0 bits in
++    the binary representation of [n].
++    It is an integer between 0 and [size] inclusive.
++    It is the largest integer [i <= size] such that [2{^i}] divides [n] evenly.
++    For example, [trailing_zeros n = 0] if and only if [n] is odd,
++    and [trailing_zeros n = size] if and only if [n = zero].
++
++    @since 5.5 *)
++
+ val seeded_hash : int -> t -> int
+ (** A seeded hash function for native ints, with the same output value as
+     {!Hashtbl.seeded_hash}. This function allows this module to be passed as

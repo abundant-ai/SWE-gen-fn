@@ -1,0 +1,274 @@
+diff --git a/runtime/caml/domain_state.tbl b/runtime/caml/domain_state.tbl
+index f6ddc0e6be..b18e0aacb8 100644
+--- a/runtime/caml/domain_state.tbl
++++ b/runtime/caml/domain_state.tbl
+@@ -170,9 +170,7 @@ DOMAIN_STATE(intnat, slice_target)
+ DOMAIN_STATE(intnat, slice_budget)
+ 
+ /* Accounting for sweeping work done while allocating. */
+-DOMAIN_STATE(uintnat, sweep_work_done_between_slices)
+-/* Accounting for marking work done in the write barrier. */
+-DOMAIN_STATE(uintnat, mark_work_done_between_slices)
++DOMAIN_STATE(intnat, major_work_done_between_slices)
+ 
+ DOMAIN_STATE(struct caml_extern_state*, extern_state)
+ DOMAIN_STATE(struct caml_intern_state*, intern_state)
+diff --git a/runtime/domain.c b/runtime/domain.c
+index 8aef0dcc15..58c8436f8e 100644
+--- a/runtime/domain.c
++++ b/runtime/domain.c
+@@ -903,8 +903,7 @@ static void domain_create(uintnat initial_minor_heap_wsize,
+   domain_state->dependent_size = 0;
+   domain_state->dependent_allocated = 0;
+ 
+-  domain_state->sweep_work_done_between_slices = 0;
+-  domain_state->mark_work_done_between_slices = 0;
++  domain_state->major_work_done_between_slices = 0;
+ 
+   /* the minor heap arena will be initialized by
+      [allocate_minor_heap_arena] below. */
+diff --git a/runtime/major_gc.c b/runtime/major_gc.c
+index 2813c8e1ec..67f7715dea 100644
+--- a/runtime/major_gc.c
++++ b/runtime/major_gc.c
+@@ -436,6 +436,7 @@ static intnat ephe_sweep (caml_domain_state* domain_state, intnat budget)
+ 
+     if (is_unmarked(v)) {
+       /* The whole array is dead, drop this ephemeron */
++      budget -= 1;
+     } else {
+       caml_ephe_clean(v);
+       Ephe_link(v) = domain_state->ephe_info->live;
+@@ -740,20 +741,6 @@ void caml_reset_major_pacing(void)
+   } while (!res);
+ }
+ 
+-static uintnat mark_work_done_between_slices(void)
+-{
+-  uintnat work = Caml_state->mark_work_done_between_slices;
+-  Caml_state->mark_work_done_between_slices = 0;
+-  return work;
+-}
+-
+-static uintnat sweep_work_done_between_slices(void)
+-{
+-  uintnat work = Caml_state->sweep_work_done_between_slices;
+-  Caml_state->sweep_work_done_between_slices = 0;
+-  return work;
+-}
+-
+ /* The [log_events] parameter is used to disable writing to the ring for two
+    reasons:
+    1. To prevent spamming the ring with numerous events generated during
+@@ -885,10 +872,8 @@ update_major_slice_work(intnat howmuch,
+   new_work = max3 (alloc_work, dependent_work, extra_work);
+   atomic_fetch_add (&alloc_counter, new_work);
+ 
+-  uintnat work_done_between_slices =
+-    mark_work_done_between_slices() +
+-    sweep_work_done_between_slices();
+-  atomic_fetch_add (&work_counter, work_done_between_slices);
++  atomic_fetch_add (&work_counter, dom_st->major_work_done_between_slices);
++  dom_st->major_work_done_between_slices = 0;
+ 
+   /* If the work_counter is falling far behind the alloc_counter,
+    * artificially catch up some of the difference. This is a band-aid
+@@ -1359,7 +1344,7 @@ Caml_noinline static intnat do_some_marking(struct mark_stack* stk,
+ 
+       if (Tag_hd(hd) == Cont_tag) {
+         caml_darken_cont(block);
+-        budget -= Whsize_hd(hd);
++        budget -= Wosize_hd(hd);
+         continue;
+       }
+ 
+@@ -1510,7 +1495,6 @@ void caml_darken_cont(value cont)
+                           Ptr_val(stk), 0);
+         atomic_store_release(Hp_atomic_val(cont),
+                              With_status_hd(hd, caml_global_heap_state.MARKED));
+-        Caml_state->mark_work_done_between_slices += Whsize_hd(hd);
+       }
+     }
+   }
+@@ -1540,9 +1524,6 @@ void caml_darken(void* state, value v, volatile value* ignored) {
+          With_status_hd(hd, caml_global_heap_state.MARKED));
+       if (Tag_hd(hd) < No_scan_tag) {
+         mark_stack_push_block(domain_state->mark_stack, v);
+-        Caml_state->mark_work_done_between_slices += 1; /* just the header */
+-      } else {
+-        Caml_state->mark_work_done_between_slices += Whsize_hd(hd);
+       }
+     }
+   }
+@@ -2001,11 +1982,6 @@ mark_again:
+            (budget = get_major_slice_work(mode)) > 0) {
+       intnat left = mark(budget);
+       intnat work_done = budget - left;
+-      /* It is possible to call caml_darken directly during marking,
+-         if we e.g. discover a continuation and mark its stack.
+-         This work should count towards this slice */
+-      work_done += mark_work_done_between_slices();
+-
+       mark_work += work_done;
+       commit_major_slice_work(work_done);
+     }
+@@ -2060,8 +2036,6 @@ mark_again:
+                (budget = get_major_slice_work(mode)) > 0) {
+           intnat left = ephe_mark(budget, saved_ephe_cycle, EPHE_MARK_DEFAULT);
+           intnat work_done = budget - left;
+-          /* caml_darken is called by ephe_mark, so count the work it does */
+-          work_done += mark_work_done_between_slices();
+           commit_major_slice_work (work_done);
+ 
+           // FIXME: Can we delete this?
+diff --git a/runtime/shared_heap.c b/runtime/shared_heap.c
+index be34eeef34..251b6c8128 100644
+--- a/runtime/shared_heap.c
++++ b/runtime/shared_heap.c
+@@ -390,7 +390,7 @@ static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
+   caml_plat_unlock(&pool_freelist.lock);
+ 
+   if( !r && adopted_pool ) {
+-    Caml_state->sweep_work_done_between_slices +=
++    Caml_state->major_work_done_between_slices +=
+       pool_sweep(local, &local->full_pools[sz], sz, 0);
+     r = local->avail_pools[sz];
+   }
+@@ -409,7 +409,7 @@ static pool* pool_find(struct caml_heap_state* local, sizeclass sz) {
+ 
+   /* Otherwise, try to sweep until we find one */
+   while (!local->avail_pools[sz] && local->unswept_avail_pools[sz]) {
+-    Caml_state->sweep_work_done_between_slices +=
++    Caml_state->major_work_done_between_slices +=
+       pool_sweep(local, &local->unswept_avail_pools[sz], sz, 0);
+   }
+ 
+@@ -536,7 +536,7 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
+ /* Sweeping of the major heap shared pools */
+ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+                          sizeclass sz, int release_to_global_pool) {
+-  uintnat work = 0;
++  intnat work;
+   pool* a = *plist;
+   if (!a) return 0;
+   *plist = a->next;
+@@ -553,7 +553,10 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+ 
+     a->next_obj = 0;
+ 
+-    while (p + wh <= end) {
++    /* note that the below will have to be changed for the new GC pacing
++      logic */
++    work = end - p;
++    do {
+       header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+ 
+       if( (char*)p + caml_plat_pagesize < (char*)end ) {
+@@ -637,10 +640,9 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+         /* there's still a live block, the pool can't be released to the global
+             freelist */
+         release_to_global_pool = 0;
+-        work += wh;
+       }
+       p += wh;
+-    }
++    } while (p + wh <= end);
+     CAMLassert(p == end);
+ 
+     if( !all_used ) {
+@@ -664,12 +666,9 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+     }
+   }
+ 
+-  /* Return the amount of GC budget consumed in units of words */
+   return work;
+ }
+ 
+-/* Sweep one large block. Returns the block's size. */
+-
+ static intnat large_alloc_sweep(struct caml_heap_state* local) {
+   value* p;
+   header_t hd;
+@@ -726,14 +725,20 @@ intnat caml_sweep(struct caml_heap_state* local, intnat work) {
+   /* Sweep local pools */
+   while (work > 0 && local->next_to_sweep < NUM_SIZECLASSES) {
+     sizeclass sz = local->next_to_sweep;
+-    work -= pool_sweep(local, &local->unswept_avail_pools[sz], sz, 1);
++    intnat full_sweep_work = 0;
++    intnat avail_sweep_work =
++      pool_sweep(local, &local->unswept_avail_pools[sz], sz, 1);
++    work -= avail_sweep_work;
+ 
+     if (work > 0) {
+-      work -= pool_sweep(local, &local->unswept_full_pools[sz], sz, 1);
++      full_sweep_work = pool_sweep(local,
++                                   &local->unswept_full_pools[sz],
++                                   sz, 1);
++
++      work -= full_sweep_work;
+     }
+ 
+-    if (local->unswept_avail_pools[sz] == NULL &&
+-        local->unswept_full_pools[sz] == NULL) {
++    if(full_sweep_work+avail_sweep_work == 0) {
+       local->next_to_sweep++;
+     }
+   }
+diff --git a/testsuite/tests/misc/darkening_work.ml b/testsuite/tests/misc/darkening_work.ml
+deleted file mode 100644
+index 8cc5b58a76..0000000000
+--- a/testsuite/tests/misc/darkening_work.ml
++++ /dev/null
+@@ -1,45 +0,0 @@
+-(* TEST
+- { native; }
+-*)
+-
+-(* This test checks that the extra marking work done by caml_modify is
+-   correctly accounted towards the current GC cycle, by checking that
+-   no-op writes do not cause GC cycles to complete more quickly than
+-   they should.
+-
+-   (This test is native-only because it's a bit slow, and it's not
+-   testing anything different in bytecode)
+-*)
+-
+-let table = Array.init 10_000 (fun _ -> Bytes.make 1_000 'a')
+-
+-let major_cycles () = (Gc.quick_stat ()).major_collections
+-
+-let[@inline never] f ~writes =
+-  List.init (Array.length table) (fun i ->
+-    let buf = table.(i) in
+-    if Sys.opaque_identity writes then table.(i) <- buf;
+-    Bytes.get buf 42)
+-
+-let count_cycles ~f =
+-  Gc.major ();
+-  let before = major_cycles () in
+-  for i = 1 to 10_000 do
+-    ignore (Sys.opaque_identity (f ()))
+-  done;
+-  let after = major_cycles () in
+-  after - before
+-
+-let () =
+-  (* wait until we do a few cycles to let the heap grow to a steady state *)
+-  let cyc_before = major_cycles () in
+-  while major_cycles () < cyc_before + 4 do
+-    ignore (Sys.opaque_identity (f ~writes:false))
+-  done;
+-  let wfalse = count_cycles ~f:(fun () -> f ~writes:false) in
+-  let wtrue = count_cycles ~f:(fun () -> f ~writes:true) in
+-  let wdiff = wtrue - wfalse in
+-  if abs wdiff > 2 then
+-    Printf.printf "error: writes caused %d more cycles\n" wdiff
+-  else
+-    Printf.printf "ok\n"
+diff --git a/testsuite/tests/misc/darkening_work.reference b/testsuite/tests/misc/darkening_work.reference
+deleted file mode 100644
+index 9766475a41..0000000000
+--- a/testsuite/tests/misc/darkening_work.reference
++++ /dev/null
+@@ -1 +0,0 @@
+-ok

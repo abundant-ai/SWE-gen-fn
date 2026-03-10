@@ -30,7 +30,7 @@ fi
 
 # Run the specific blackbox tests for PR #13712
 echo "Running tests for PR #13712 (bin-available tests)..."
-opam exec -- ./_boot/dune.exe runtest test/blackbox-tests/test-cases/bin-available-relative.t test/blackbox-tests/test-cases/bin-available.t --force 2>&1
+opam exec -- ./_boot/dune.exe test test/blackbox-tests/test-cases/bin-available-relative.t test/blackbox-tests/test-cases/bin-available.t 2>&1
 test_status=$?
 
 if [ $test_status -eq 0 ]; then

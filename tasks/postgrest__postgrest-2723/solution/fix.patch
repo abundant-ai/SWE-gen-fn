@@ -1,0 +1,149 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f68f8d2f..f9fc86d1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + When the client sends the request header specified in the config it will be included in the response headers.
+  - #2694, Make `db-root-spec` stable. - @steve-chavez
+    + This can be used to override the OpenAPI spec with a custom database function
+- - #1567, On bulk inserts with `?columns`, undefined json keys can get columns' DEFAULT values by using the `Prefer: undefined-keys=apply-defaults` header - @steve-chavez
++ - #1567, On bulk inserts, missing values can get the column DEFAULT by using the `Prefer: missing=default` header - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index c70fddfd..c21bdb55 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -9,7 +9,7 @@
+ module PostgREST.ApiRequest.Preferences
+   ( Preferences(..)
+   , PreferCount(..)
+-  , PreferUndefinedKeys(..)
++  , PreferMissing(..)
+   , PreferParameters(..)
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+@@ -34,7 +34,7 @@ import Protolude
+ -- >>> deriving instance Show PreferParameters
+ -- >>> deriving instance Show PreferCount
+ -- >>> deriving instance Show PreferTransaction
+--- >>> deriving instance Show PreferUndefinedKeys
++-- >>> deriving instance Show PreferMissing
+ -- >>> deriving instance Show Preferences
+ 
+ -- | Preferences recognized by the application.
+@@ -45,7 +45,7 @@ data Preferences
+     , preferParameters     :: Maybe PreferParameters
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+-    , preferUndefinedKeys  :: Maybe PreferUndefinedKeys
++    , preferMissing        :: Maybe PreferMissing
+     }
+ 
+ -- |
+@@ -60,19 +60,19 @@ data Preferences
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferUndefinedKeys = Nothing
++--     , preferMissing = Nothing
+ --     }
+ --
+ -- Multiple headers can also be used:
+ --
+--- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact")]
++-- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = None
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferUndefinedKeys = Nothing
++--     , preferMissing = Just ApplyNulls
+ --     }
+ --
+ -- If a preference is set more than once, only the first is used:
+@@ -97,14 +97,14 @@ data Preferences
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , undefined-keys=apply-defaults")]
++-- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Full
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+---     , preferUndefinedKeys = Just ApplyDefaults
++--     , preferMissing = Just ApplyDefaults
+ --     }
+ --
+ fromHeaders :: [HTTP.Header] -> Preferences
+@@ -115,7 +115,7 @@ fromHeaders headers =
+     , preferParameters = parsePrefs [SingleObject, MultipleObjects]
+     , preferCount = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction = parsePrefs [Commit, Rollback]
+-    , preferUndefinedKeys = parsePrefs [ApplyDefaults, IgnoreDefaults]
++    , preferMissing = parsePrefs [ApplyDefaults, ApplyNulls]
+     }
+   where
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+@@ -215,13 +215,13 @@ instance ToAppliedHeader PreferTransaction
+ -- |
+ -- How to handle the insertion/update when the keys specified in ?columns are not present
+ -- in the json body.
+-data PreferUndefinedKeys
+-  = ApplyDefaults  -- ^ Use the default column value for the unspecified keys.
+-  | IgnoreDefaults -- ^ Inserts: null values / Updates: the keys are not SET to any value
++data PreferMissing
++  = ApplyDefaults  -- ^ Use the default column value for missing values.
++  | ApplyNulls     -- ^ Use the null value for missing values.
+   deriving Eq
+ 
+-instance ToHeaderValue PreferUndefinedKeys where
+-  toHeaderValue ApplyDefaults  = "undefined-keys=apply-defaults"
+-  toHeaderValue IgnoreDefaults = "undefined-keys=ignore-defaults"
++instance ToHeaderValue PreferMissing where
++  toHeaderValue ApplyDefaults = "missing=default"
++  toHeaderValue ApplyNulls    = "missing=null"
+ 
+-instance ToAppliedHeader PreferUndefinedKeys
++instance ToAppliedHeader PreferMissing
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index e52fc72a..a1ae8753 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -533,7 +533,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+     tbl = HM.lookup qi $ dbTables sCache
+     typedColumnsOrError = resolveOrError tbl `traverse` S.toList iColumns
+-    applyDefaults = preferences.preferUndefinedKeys == Just ApplyDefaults
++    applyDefaults = preferences.preferMissing == Just ApplyDefaults
+ 
+ resolveOrError :: Maybe Table -> FieldName -> Either ApiRequestError TypedField
+ resolveOrError Nothing _ = Left NotFound
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 57f3ded0..398259bf 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -109,7 +109,7 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+               Nothing
+             else
+               toAppliedHeader <$> preferResolution
+-          , toAppliedHeader <$> preferUndefinedKeys
++          , toAppliedHeader <$> preferMissing
+           ]
+ 
+     if preferRepresentation == Full then
+@@ -128,7 +128,7 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferUndefinedKeys]
++      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferMissing]
+ 
+     if preferRepresentation == Full then
+         response HTTP.status200

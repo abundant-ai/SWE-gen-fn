@@ -1,0 +1,233 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3cbd8343..f437ac62 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -42,8 +42,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3404, Clarify the `PGRST121` (could not parse RAISE 'PGRST') error message - @laurenceisla
+  - #3267, Fix wrong `503 Service Unavailable` on pg error `53400` - @taimoorzaeem
+  - #2985, Fix not adding `application_name` on all connection strings - @steve-chavez
+- - #3424, Admin `/live` and `/ready` now differentiates a failure as 500 status - @steve-chavez
+-    + 503 status is still given when postgREST is in a recovering state
+ 
+ ### Deprecated
+ 
+diff --git a/docs/references/admin_server.rst b/docs/references/admin_server.rst
+index e06b7272..df9161f4 100644
+--- a/docs/references/admin_server.rst
++++ b/docs/references/admin_server.rst
+@@ -3,7 +3,7 @@
+ Admin Server
+ ############
+ 
+-PostgREST provides an admin server that can be enabled by setting :ref:`admin-server-port`.
++PostgREST provides an admin server that can be enabled by setting :ref:`admin-server-port` to the port number of your preference.
+ 
+ .. _health_check:
+ 
+@@ -23,7 +23,7 @@ Two endpoints ``live`` and ``ready`` will then be available.
+ Live
+ ----
+ 
+-The ``live`` endpoint verifies if PostgREST is running on its configured port. A request will return ``200 OK`` if PostgREST is alive or ``500`` otherwise.
++The ``live`` endpoint verifies if PostgREST is running on its configured port. A request will return ``200 OK`` if PostgREST is alive or ``503`` otherwise.
+ 
+ For instance, to verify if PostgREST is running while the ``admin-server-port`` is set to ``3001``:
+ 
+@@ -38,7 +38,7 @@ For instance, to verify if PostgREST is running while the ``admin-server-port``
+ Ready
+ -----
+ 
+-Additionally to the ``live`` check, the ``ready`` endpoint checks the state of the :ref:`connection_pool` and the :ref:`schema_cache`. A request will return ``200 OK`` if both are good or ``503`` if not.
++In addition, the ``ready`` endpoint checks the state of the :ref:`connection_pool` and the :ref:`schema_cache`. A request will return ``200 OK`` if both are good or ``503`` if not.
+ 
+ .. code-block:: bash
+ 
+@@ -48,8 +48,6 @@ Additionally to the ``live`` check, the ``ready`` endpoint checks the state of t
+ 
+   HTTP/1.1 200 OK
+ 
+-PostgREST will try to recover from the ``503`` state with :ref:`automatic_recovery`.
+-
+ Metrics
+ =======
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 95514e1c..8c347dad 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -161,7 +161,7 @@ admin-server-port
+   **In-Database** `n/a`
+   =============== =======================
+ 
+-  Specifies the port for the :ref:`admin_server`.
++  Specifies the port for the :ref:`health_check` endpoints.
+ 
+ .. _app.settings.*:
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 325e95c0..40b87243 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -42,19 +42,12 @@ admin :: AppState.AppState -> Wai.Application
+ admin appState req respond  = do
+   isMainAppReachable  <- isRight <$> reachMainApp (AppState.getSocketREST appState)
+   isLoaded <- AppState.isLoaded appState
+-  isPending <- AppState.isPending appState
+ 
+   case Wai.pathInfo req of
+-    ["live"] ->
+-      respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status500) [] mempty
+     ["ready"] ->
+-      let
+-        status | not isMainAppReachable = HTTP.status500
+-               | isPending              = HTTP.status503
+-               | isLoaded               = HTTP.status200
+-               | otherwise              = HTTP.status500
+-      in
+-      respond $ Wai.responseLBS status [] mempty
++      respond $ Wai.responseLBS (if isMainAppReachable && isLoaded then HTTP.status200 else HTTP.status503) [] mempty
++    ["live"] ->
++      respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
+     ["config"] -> do
+       config <- AppState.getConfig appState
+       respond $ Wai.responseLBS HTTP.status200 [] (LBS.fromStrict $ encodeUtf8 $ Config.toText config)
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index d5abd958..3fad53ed 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -27,7 +27,6 @@ module PostgREST.AppState
+   , runListener
+   , getObserver
+   , isLoaded
+-  , isPending
+   ) where
+ 
+ import qualified Data.Aeson                 as JSON
+@@ -316,12 +315,6 @@ isLoaded x = do
+   connEstablished <- isConnEstablished x
+   return $ scacheStatus == SCLoaded && connEstablished
+ 
+-isPending :: AppState -> IO Bool
+-isPending x = do
+-  scacheStatus <- readIORef $ stateSCacheStatus x
+-  connStatus <- readIORef $ stateConnStatus x
+-  return $ scacheStatus == SCPending || connStatus == ConnPending
+-
+ putSCacheStatus :: AppState -> SchemaCacheStatus -> IO ()
+ putSCacheStatus = atomicWriteIORef . stateSCacheStatus
+ 
+@@ -345,15 +338,12 @@ loadSchemaCache appState@AppState{stateObserver=observer} = do
+           observer $ SchemaCacheFatalErrorObs e hint
+           return SCFatalFail
+         Nothing -> do
+-          putSCacheStatus appState SCPending
+           putSchemaCache appState Nothing
+           observer $ SchemaCacheNormalErrorObs e
++          putSCacheStatus appState SCPending
+           return SCPending
+ 
+     Right sCache -> do
+-      -- IMPORTANT: While the pending schema cache state starts from running the above querySchemaCache, only at this stage we block API requests due to the usage of an
+-      -- IORef on putSchemaCache. This is why SCacheStatus is put at SCPending here to signal the Admin server (using isPending) that we're on a recovery state.
+-      putSCacheStatus appState SCPending
+       putSchemaCache appState $ Just sCache
+       observer $ SchemaCacheQueriedObs resultTime
+       (t, _) <- timeItT $ observer $ SchemaCacheSummaryObs $ showSummary sCache
+diff --git a/test/io/postgrest.py b/test/io/postgrest.py
+index a91c7775..43fe25ad 100644
+--- a/test/io/postgrest.py
++++ b/test/io/postgrest.py
+@@ -70,13 +70,6 @@ class PostgrestProcess:
+             time.sleep(0.1)
+         return output
+ 
+-    def wait_until_scache_starts_loading(self, max_seconds=1):
+-        "Wait for the admin /ready return a status of 503"
+-
+-        wait_until_status_code(
+-            self.admin.baseurl + "/ready", max_seconds=max_seconds, status_code=503
+-        )
+-
+ 
+ @contextlib.contextmanager
+ def run(
+@@ -127,7 +120,7 @@ def run(
+             process.stdin.close()
+ 
+             if wait_for_readiness:
+-                wait_until_status_code(adminurl + "/ready", wait_max_seconds, 200)
++                wait_until_ready(adminurl + "/ready", wait_max_seconds)
+ 
+             if no_startup_stdout:
+                 process.stdout.read()
+@@ -185,14 +178,14 @@ def wait_until_exit(postgrest):
+         raise PostgrestTimedOut()
+ 
+ 
+-def wait_until_status_code(url, max_seconds, status_code):
+-    "Wait for the given HTTP endpoint to return a status code"
++def wait_until_ready(url, max_seconds):
++    "Wait for the given HTTP endpoint to return a status of 200."
+     session = requests_unixsocket.Session()
+ 
+     for _ in range(max_seconds * 10):
+         try:
+             response = session.get(url, timeout=1)
+-            if response.status_code == status_code:
++            if response.status_code == 200:
+                 return
+         except (requests.ConnectionError, requests.ReadTimeout):
+             pass
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index 1e6ecf6c..3baa4a63 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -7,7 +7,7 @@ from util import *
+ from postgrest import *
+ 
+ 
+-def test_requests_wait_for_schema_cache_reload(defaultenv):
++def test_requests__wait_for_schema_cache_reload(defaultenv):
+     "requests that use the schema cache (e.g. resource embedding) wait for the schema cache to reload"
+ 
+     env = {
+@@ -23,14 +23,13 @@ def test_requests_wait_for_schema_cache_reload(defaultenv):
+         response = postgrest.session.get("/rpc/notify_pgrst")
+         assert response.status_code == 204
+ 
+-        postgrest.wait_until_scache_starts_loading()
++        time.sleep(1.5)  # wait for schema cache to start reloading
+ 
+         response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+         assert response.status_code == 200
+ 
+-        plan_dur = parse_server_timings_header(response.headers["Server-Timing"])[
+-            "plan"
+-        ]
++        server_timings = parse_server_timings_header(response.headers["Server-Timing"])
++        plan_dur = server_timings["plan"]
+         assert plan_dur > 10000.0
+ 
+ 
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index e36bb996..d9cad71d 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -739,7 +739,7 @@ def test_admin_ready_dependent_on_main_app(defaultenv):
+         # delete the unix socket to make the main app fail
+         os.remove(defaultenv["PGRST_SERVER_UNIX_SOCKET"])
+         response = postgrest.admin.get("/ready")
+-        assert response.status_code == 500
++        assert response.status_code == 503
+ 
+ 
+ def test_admin_live_good(defaultenv):
+@@ -757,7 +757,7 @@ def test_admin_live_dependent_on_main_app(defaultenv):
+         # delete the unix socket to make the main app fail
+         os.remove(defaultenv["PGRST_SERVER_UNIX_SOCKET"])
+         response = postgrest.admin.get("/live")
+-        assert response.status_code == 500
++        assert response.status_code == 503
+ 
+ 
+ @pytest.mark.parametrize("specialhostvalue", FIXTURES["specialhostvalues"])

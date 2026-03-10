@@ -1,0 +1,592 @@
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 15c40c1d..2e3313e1 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -15,6 +15,7 @@ module PostgREST.ApiRequest
+   , Action(..)
+   , Target(..)
+   , Payload(..)
++  , PathInfo(..)
+   , userApiRequest
+   ) where
+ 
+@@ -26,7 +27,6 @@ import qualified Data.ByteString.Lazy  as LBS
+ import qualified Data.CaseInsensitive  as CI
+ import qualified Data.Csv              as CSV
+ import qualified Data.HashMap.Strict   as HM
+-import qualified Data.List             as L
+ import qualified Data.List.NonEmpty    as NonEmptyList
+ import qualified Data.Map.Strict       as M
+ import qualified Data.Set              as S
+@@ -37,7 +37,7 @@ import Data.Either.Combinators (mapBoth)
+ 
+ import Control.Arrow             ((***))
+ import Data.Aeson.Types          (emptyArray, emptyObject)
+-import Data.List                 (lookup, union)
++import Data.List                 (lookup)
+ import Data.Ranged.Ranges        (emptyRange, rangeIntersection,
+                                   rangeIsEmpty)
+ import Network.HTTP.Types.Header (RequestHeaders, hCookie)
+@@ -51,8 +51,7 @@ import PostgREST.ApiRequest.Types        (ApiRequestError (..),
+                                           RangeError (..))
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+-import PostgREST.MediaType               (MTPlanFormat (..),
+-                                          MediaType (..))
++import PostgREST.MediaType               (MediaType (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           convertToLimitZeroRange,
+                                           hasLimitZero,
+@@ -128,10 +127,11 @@ data ApiRequest = ApiRequest {
+   , iHeaders             :: [(ByteString, ByteString)]       -- ^ HTTP request headers
+   , iCookies             :: [(ByteString, ByteString)]       -- ^ Request Cookies
+   , iPath                :: ByteString                       -- ^ Raw request path
++  , iPathInfo            :: PathInfo                         -- ^ Cached info about the path
+   , iMethod              :: ByteString                       -- ^ Raw request method
+   , iSchema              :: Schema                           -- ^ The request schema. Can vary depending on profile headers.
+   , iNegotiatedByProfile :: Bool                             -- ^ If schema was was chosen according to the profile spec https://www.w3.org/TR/dx-prof-conneg/
+-  , iAcceptMediaType     :: MediaType                        -- ^ The media type in the Accept header
++  , iAcceptMediaType     :: [MediaType]                      -- ^ The resolved media types in the Accept, considering quality(q) factors
+   , iContentMediaType    :: MediaType                        -- ^ The media type in the Content-Type header
+   }
+ 
+@@ -141,7 +141,6 @@ userApiRequest conf req reqBody = do
+   pInfo@PathInfo{..} <- getPathInfo conf $ pathInfo req
+   act <- getAction pInfo method
+   qPrms <- first QueryParamError $ QueryParams.parse (pathIsProc && act `elem` [ActionInvoke InvGet, ActionInvoke InvHead]) $ rawQueryString req
+-  (acceptMediaType, contentMediaType) <- getMediaTypes conf hdrs act pInfo
+   (schema, negotiatedByProfile) <- getSchema conf hdrs method
+   (topLevelRange, ranges) <- getRanges method qPrms hdrs
+   (payload, columns) <- getPayload reqBody contentMediaType qPrms act pInfo
+@@ -159,10 +158,11 @@ userApiRequest conf req reqBody = do
+   , iHeaders = iHdrs
+   , iCookies = iCkies
+   , iPath = rawPathInfo req
++  , iPathInfo = pInfo
+   , iMethod = method
+   , iSchema = schema
+   , iNegotiatedByProfile = negotiatedByProfile
+-  , iAcceptMediaType = acceptMediaType
++  , iAcceptMediaType = maybe [MTAny] (map MediaType.decodeMediaType . parseHttpAccept) $ lookupHeader "accept"
+   , iContentMediaType = contentMediaType
+   }
+   where
+@@ -171,6 +171,7 @@ userApiRequest conf req reqBody = do
+     lookupHeader    = flip lookup hdrs
+     iHdrs = [ (CI.foldedCase k, v) | (k,v) <- hdrs, k /= hCookie]
+     iCkies = maybe [] parseCookies $ lookupHeader "Cookie"
++    contentMediaType = maybe MTApplicationJSON MediaType.decodeMediaType $ lookupHeader "content-type"
+ 
+ getPathInfo :: AppConfig -> [Text] -> Either ApiRequestError PathInfo
+ getPathInfo AppConfig{configOpenApiMode, configDbRootSpec} path =
+@@ -204,15 +205,6 @@ getAction PathInfo{pathIsProc, pathIsDefSpec} method =
+       "OPTIONS"                  -> Right ActionInfo
+       _                          -> Left $ UnsupportedMethod method
+ 
+-getMediaTypes :: AppConfig -> RequestHeaders -> Action -> PathInfo -> Either ApiRequestError (MediaType, MediaType)
+-getMediaTypes conf hdrs action path = do
+-   acceptMediaType <- negotiateContent conf action path accepts
+-   pure (acceptMediaType, contentMediaType)
+-  where
+-    accepts = maybe [MTAny] (map MediaType.decodeMediaType . parseHttpAccept) $ lookupHeader "accept"
+-    contentMediaType = maybe MTApplicationJSON MediaType.decodeMediaType $ lookupHeader "content-type"
+-    lookupHeader    = flip lookup hdrs
+-
+ getSchema :: AppConfig -> RequestHeaders -> ByteString -> Either ApiRequestError (Schema, Bool)
+ getSchema AppConfig{configDbSchemas} hdrs method = do
+   case profile of
+@@ -346,34 +338,3 @@ payloadAttributes raw json =
+     _ -> Just emptyPJArray
+   where
+     emptyPJArray = ProcessedJSON (JSON.encode emptyArray) S.empty
+-
+-
+--- | Do content negotiation. i.e. choose a media type based on the intersection of accepted/produced media types.
+-negotiateContent :: AppConfig -> Action -> PathInfo -> [MediaType] -> Either ApiRequestError MediaType
+-negotiateContent conf action path accepts =
+-  case firstAcceptedPick of
+-    Just MTAny -> Right MTApplicationJSON -- by default(for */*) we respond with json
+-    Just mt    -> Right mt
+-    Nothing    -> Left . MediaTypeError $ map MediaType.toMime accepts
+-  where
+-    -- if there are multiple accepted media types, pick the first
+-    firstAcceptedPick = listToMaybe $ L.intersect accepts $ producedMediaTypes conf action path
+-
+-producedMediaTypes :: AppConfig -> Action -> PathInfo -> [MediaType]
+-producedMediaTypes conf action path =
+-  case action of
+-    ActionRead _    -> defaultMediaTypes ++ rawMediaTypes
+-    ActionInvoke _  -> invokeMediaTypes
+-    ActionInfo      -> defaultMediaTypes
+-    ActionMutate _  -> defaultMediaTypes
+-    ActionInspect _ -> inspectMediaTypes
+-  where
+-    inspectMediaTypes = [MTOpenAPI, MTApplicationJSON, MTArrayJSONStrip, MTAny]
+-    invokeMediaTypes =
+-      defaultMediaTypes
+-        ++ rawMediaTypes
+-        ++ [MTOpenAPI | pathIsRootSpec path]
+-    defaultMediaTypes =
+-      [MTApplicationJSON, MTArrayJSONStrip, MTSingularJSON True, MTSingularJSON False, MTGeoJSON, MTTextCSV] ++
+-      [MTPlan MTApplicationJSON PlanText mempty | configDbPlanEnabled conf] ++ [MTAny]
+-    rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 96d68a50..c08e02a1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -170,7 +170,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       wrPlan <- liftEither $ Plan.wrappedReadPlan identifier conf sCache apiReq
+       resultSet <- runQuery roleIsoLvl (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
+-      return $ Response.readResponse headersOnly identifier apiReq resultSet
++      return $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+@@ -180,25 +180,26 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+-      return $ Response.updateResponse apiReq resultSet
++      return $ Response.updateResponse mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+-      return $ Response.singleUpsertResponse apiReq resultSet
++      return $ Response.singleUpsertResponse mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+-      return $ Response.deleteResponse apiReq resultSet
++      return $ Response.deleteResponse mrPlan apiReq resultSet
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       cPlan <- liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+       resultSet <- runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan))(Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+-      return $ Response.invokeResponse invMethod (Plan.crProc cPlan) apiReq resultSet
++      return $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+-      oaiResult <- runQuery roleIsoLvl Plan.inspectPlanTxMode $ Query.openApiQuery sCache pgVer conf tSchema
++      iPlan <- liftEither $ Plan.inspectPlan conf apiReq
++      oaiResult <- runQuery roleIsoLvl (Plan.ipTxmode iPlan) $ Query.openApiQuery sCache pgVer conf tSchema
+       return $ Response.openApiResponse (T.decodeUtf8 prettyVersion, docsVersion) headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
+ 
+     (ActionInfo, TargetIdent identifier) ->
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 24594b99..5778ac09 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -19,10 +19,11 @@ module PostgREST.Plan
+   ( wrappedReadPlan
+   , mutateReadPlan
+   , callReadPlan
++  , inspectPlan
+   , WrappedReadPlan(..)
+   , MutateReadPlan(..)
+   , CallReadPlan(..)
+-  , inspectPlanTxMode
++  , InspectPlan(..)
+   ) where
+ 
+ import qualified Data.ByteString.Lazy          as LBS
+@@ -40,10 +41,12 @@ import PostgREST.ApiRequest                  (Action (..),
+                                               ApiRequest (..),
+                                               InvokeMethod (..),
+                                               Mutation (..),
++                                              PathInfo (..),
+                                               Payload (..))
+ import PostgREST.Config                      (AppConfig (..))
+ import PostgREST.Error                       (Error (..))
+-import PostgREST.MediaType                   (MediaType (..))
++import PostgREST.MediaType                   (MTPlanFormat (..),
++                                              MediaType (..))
+ import PostgREST.Query.SqlFragment           (sourceCTEName)
+ import PostgREST.RangeQuery                  (NonnegRange, allRange,
+                                               convertToLimitZeroRange,
+@@ -80,6 +83,7 @@ import PostgREST.Plan.Types
+ 
+ import qualified Hasql.Transaction.Sessions       as SQL
+ import qualified PostgREST.ApiRequest.QueryParams as QueryParams
++import qualified PostgREST.MediaType              as MediaType
+ 
+ import Protolude hiding (from)
+ 
+@@ -91,6 +95,7 @@ data WrappedReadPlan = WrappedReadPlan {
+   wrReadPlan :: ReadPlanTree
+ , wrTxMode   :: SQL.Mode
+ , wrResAgg   :: ResultAggregate
++, wrMedia    :: MediaType
+ }
+ 
+ data MutateReadPlan = MutateReadPlan {
+@@ -98,6 +103,7 @@ data MutateReadPlan = MutateReadPlan {
+ , mrMutatePlan :: MutatePlan
+ , mrTxMode     :: SQL.Mode
+ , mrResAgg     :: ResultAggregate
++, mrMedia      :: MediaType
+ }
+ 
+ data CallReadPlan = CallReadPlan {
+@@ -106,20 +112,28 @@ data CallReadPlan = CallReadPlan {
+ , crTxMode   :: SQL.Mode
+ , crProc     :: Routine
+ , crResAgg   :: ResultAggregate
++, crMedia    :: MediaType
++}
++
++data InspectPlan = InspectPlan {
++  ipMedia  :: MediaType
++, ipTxmode :: SQL.Mode
+ }
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Either Error WrappedReadPlan
+ wrappedReadPlan  identifier conf sCache apiRequest = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+-  binField <- mapLeft ApiRequestError $ binaryField conf (iAcceptMediaType apiRequest) Nothing rPlan
+-  return $ WrappedReadPlan rPlan SQL.Read $ mediaToAggregate (iAcceptMediaType apiRequest) binField apiRequest
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  binField <- mapLeft ApiRequestError $ binaryField conf mediaType Nothing rPlan
++  return $ WrappedReadPlan rPlan SQL.Read (mediaToAggregate mediaType binField apiRequest) mediaType
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error MutateReadPlan
+ mutateReadPlan  mutation apiRequest identifier conf sCache = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+-  binField <- mapLeft ApiRequestError $ binaryField conf (iAcceptMediaType apiRequest) Nothing rPlan
+   mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
+-  return $ MutateReadPlan rPlan mPlan SQL.Write $ mediaToAggregate (iAcceptMediaType apiRequest) binField apiRequest
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  binField <- mapLeft ApiRequestError $ binaryField conf mediaType Nothing rPlan
++  return $ MutateReadPlan rPlan mPlan SQL.Write (mediaToAggregate mediaType binField apiRequest) mediaType
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+ callReadPlan identifier conf sCache apiRequest invMethod = do
+@@ -143,12 +157,18 @@ callReadPlan identifier conf sCache apiRequest invMethod = do
+           (InvPost, Routine.Immutable) -> SQL.Read
+           (InvPost, Routine.Volatile)  -> SQL.Write
+       cPlan = callPlan proc apiRequest paramKeys args rPlan
+-  binField <- mapLeft ApiRequestError $ binaryField conf (iAcceptMediaType apiRequest) (Just proc) rPlan
+-  return $ CallReadPlan rPlan cPlan txMode proc $ mediaToAggregate (iAcceptMediaType apiRequest) binField apiRequest
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  binField <- mapLeft ApiRequestError $ binaryField conf mediaType (Just proc) rPlan
++  return $ CallReadPlan rPlan cPlan txMode proc (mediaToAggregate mediaType binField apiRequest) mediaType
+   where
+     Preferences{..} = iPreferences apiRequest
+     qsParams' = QueryParams.qsParams (iQueryParams apiRequest)
+ 
++inspectPlan :: AppConfig -> ApiRequest -> Either Error InspectPlan
++inspectPlan conf apiRequest = do
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  return $ InspectPlan mediaType SQL.Read
++
+ {-|
+   Search a pg proc by matching name and arguments keys to parameters. Since a function can be overloaded,
+   the name is not enough to find it. An overloaded function can have a different volatility or even a different return type.
+@@ -206,9 +226,6 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+       -- and can match any or none of the default parameters.
+         (reqParams, optParams) -> argumentsKeys `S.difference` S.fromList (ppName <$> optParams) == S.fromList (ppName <$> reqParams)
+ 
+-inspectPlanTxMode :: SQL.Mode
+-inspectPlanTxMode = SQL.Read
+-
+ -- | During planning we need to resolve Field -> CoercibleField (finding the context specific target type and map function).
+ -- | ResolverContext facilitates this without the need to pass around a laundry list of parameters.
+ data ResolverContext = ResolverContext
+@@ -873,3 +890,33 @@ mediaToAggregate mt binField apiReq@ApiRequest{iAction=act, iPreferences=Prefere
+       ActionRead _isHead     -> _isHead -- no need for an aggregate on HEAD https://github.com/PostgREST/postgrest/issues/2849
+       ActionInvoke invMethod -> invMethod == InvHead
+       _                      -> False
++
++-- | Do content negotiation. i.e. choose a media type based on the intersection of accepted/produced media types.
++negotiateContent :: AppConfig -> Action -> PathInfo -> [MediaType] -> Either ApiRequestError MediaType
++negotiateContent conf action path accepts =
++  case firstAcceptedPick of
++    Just MTAny -> Right MTApplicationJSON -- by default(for */*) we respond with json
++    Just mt    -> Right mt
++    Nothing    -> Left . MediaTypeError $ map MediaType.toMime accepts
++  where
++    -- if there are multiple accepted media types, pick the first
++    firstAcceptedPick = listToMaybe $ L.intersect accepts $ producedMediaTypes conf action path
++
++producedMediaTypes :: AppConfig -> Action -> PathInfo -> [MediaType]
++producedMediaTypes conf action path =
++  case action of
++    ActionRead _    -> defaultMediaTypes ++ rawMediaTypes
++    ActionInvoke _  -> invokeMediaTypes
++    ActionInfo      -> defaultMediaTypes
++    ActionMutate _  -> defaultMediaTypes
++    ActionInspect _ -> inspectMediaTypes
++  where
++    inspectMediaTypes = [MTOpenAPI, MTApplicationJSON, MTArrayJSONStrip, MTAny]
++    invokeMediaTypes =
++      defaultMediaTypes
++        ++ rawMediaTypes
++        ++ [MTOpenAPI | pathIsRootSpec path]
++    defaultMediaTypes =
++      [MTApplicationJSON, MTArrayJSONStrip, MTSingularJSON True, MTSingularJSON False, MTGeoJSON, MTTextCSV] ++
++      [MTPlan MTApplicationJSON PlanText mempty | configDbPlanEnabled conf] ++ [MTAny]
++    rawMediaTypes = configRawMediaTypes conf `L.union` [MTOctetStream, MTTextPlain, MTTextXML]
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 0323d75d..16cd7f73 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -65,7 +65,7 @@ import Protolude hiding (Handler)
+ type DbHandler = ExceptT Error SQL.Transaction
+ 
+ readQuery :: WrappedReadPlan -> AppConfig -> ApiRequest -> DbHandler ResultSet
+-readQuery WrappedReadPlan{wrReadPlan, wrResAgg} conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}, ..} = do
++readQuery WrappedReadPlan{wrReadPlan, wrMedia, wrResAgg} conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} = do
+   let countQuery = QueryBuilder.readPlanToCountQuery wrReadPlan
+   resultSet <-
+      lift . SQL.statement mempty $
+@@ -78,10 +78,10 @@ readQuery WrappedReadPlan{wrReadPlan, wrResAgg} conf@AppConfig{..} apiReq@ApiReq
+            countQuery
+         )
+         (shouldCount preferCount)
+-        iAcceptMediaType
++        wrMedia
+         wrResAgg
+         configDbPreparedStatements
+-  failNotSingular iAcceptMediaType resultSet
++  failNotSingular wrMedia resultSet
+   optionalRollback conf apiReq
+   resultSetWTotal conf apiReq resultSet countQuery
+ 
+@@ -108,16 +108,16 @@ resultSetWTotal AppConfig{..} ApiRequest{iPreferences=Preferences{..}} rs@RSStan
+         configDbPreparedStatements
+ 
+ createQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-createQuery mrPlan apiReq@ApiRequest{..} conf = do
++createQuery mrPlan@MutateReadPlan{mrMedia} apiReq conf = do
+   resultSet <- writeQuery mrPlan apiReq conf
+-  failNotSingular iAcceptMediaType resultSet
++  failNotSingular mrMedia resultSet
+   optionalRollback conf apiReq
+   pure resultSet
+ 
+ updateQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-updateQuery mrPlan apiReq@ApiRequest{..} conf = do
++updateQuery mrPlan@MutateReadPlan{mrMedia} apiReq@ApiRequest{..} conf = do
+   resultSet <- writeQuery mrPlan apiReq conf
+-  failNotSingular iAcceptMediaType resultSet
++  failNotSingular mrMedia resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
+   optionalRollback conf apiReq
+   pure resultSet
+@@ -142,15 +142,15 @@ failPut RSStandard{rsQueryTotal=queryTotal} =
+     throwError Error.PutMatchingPkError
+ 
+ deleteQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-deleteQuery mrPlan apiReq@ApiRequest{..} conf = do
++deleteQuery mrPlan@MutateReadPlan{mrMedia} apiReq@ApiRequest{..} conf = do
+   resultSet <- writeQuery mrPlan apiReq conf
+-  failNotSingular iAcceptMediaType resultSet
++  failNotSingular mrMedia resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
+   optionalRollback conf apiReq
+   pure resultSet
+ 
+ invokeQuery :: Routine -> CallReadPlan -> ApiRequest -> AppConfig -> PgVersion -> DbHandler ResultSet
+-invokeQuery rout CallReadPlan{crReadPlan, crCallPlan, crResAgg} apiReq@ApiRequest{iPreferences=Preferences{..}, ..} conf@AppConfig{..} pgVer = do
++invokeQuery rout CallReadPlan{crReadPlan, crCallPlan, crResAgg, crMedia} apiReq@ApiRequest{iPreferences=Preferences{..}} conf@AppConfig{..} pgVer = do
+   resultSet <-
+     lift . SQL.statement mempty $
+       Statements.prepareCall
+@@ -159,12 +159,12 @@ invokeQuery rout CallReadPlan{crReadPlan, crCallPlan, crResAgg} apiReq@ApiReques
+         (QueryBuilder.readPlanToQuery crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount preferCount)
+-        iAcceptMediaType
++        crMedia
+         crResAgg
+         configDbPreparedStatements
+ 
+   optionalRollback conf apiReq
+-  failNotSingular iAcceptMediaType resultSet
++  failNotSingular crMedia resultSet
+   pure resultSet
+ 
+ openApiQuery :: SchemaCache -> PgVersion -> AppConfig -> Schema -> DbHandler (Maybe (TablesMap, RoutineMap, Maybe Text))
+@@ -185,7 +185,7 @@ openApiQuery sCache pgVer AppConfig{..} tSchema =
+       pure Nothing
+ 
+ writeQuery :: MutateReadPlan -> ApiRequest -> AppConfig  -> DbHandler ResultSet
+-writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan, mrResAgg} apiReq@ApiRequest{iPreferences=Preferences{..}} conf =
++writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan, mrResAgg, mrMedia} ApiRequest{iPreferences=Preferences{..}} conf =
+   let
+     (isInsert, pkCols) = case mrMutatePlan of {Insert{insPkCols} -> (True, insPkCols); _ -> (False, mempty);}
+   in
+@@ -194,7 +194,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan, mrResAgg} apiReq@ApiRequest{
+       (QueryBuilder.readPlanToQuery mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+-      (iAcceptMediaType apiReq)
++      mrMedia
+       mrResAgg
+       preferRepresentation
+       pkCols
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 13e57e76..dcf618c8 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -45,7 +45,9 @@ import PostgREST.ApiRequest.Preferences  (PreferRepresentation (..),
+ import PostgREST.ApiRequest.QueryParams  (QueryParams (..))
+ import PostgREST.Config                  (AppConfig (..))
+ import PostgREST.MediaType               (MediaType (..))
+-import PostgREST.Plan                    (MutateReadPlan (..))
++import PostgREST.Plan                    (CallReadPlan (..),
++                                          MutateReadPlan (..),
++                                          WrappedReadPlan (..))
+ import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Query.Statements        (ResultSet (..))
+ import PostgREST.Response.GucHeader      (GucHeader, unwrapGucHeader)
+@@ -62,9 +64,8 @@ import qualified PostgREST.SchemaCache.Routine as Routine
+ import Protolude      hiding (Handler, toS)
+ import Protolude.Conv (toS)
+ 
+-
+-readResponse :: Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
+-readResponse headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
++readResponse :: WrappedReadPlan -> Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
++readResponse WrappedReadPlan{wrMedia} headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+@@ -78,7 +79,7 @@ readResponse headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Prefer
+               <> if BS.null (qsCanonical iQueryParams) then mempty else "?" <> qsCanonical iQueryParams
+           )
+         ]
+-        ++ contentTypeHeaders ctxApiRequest
++        ++ contentTypeHeaders wrMedia ctxApiRequest
+         ++ prefHeader
+       rsOrErrBody = if status == HTTP.status416
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+@@ -88,10 +89,10 @@ readResponse headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Prefer
+     response status headers $ if headersOnly then mempty else rsOrErrBody
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders wrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ createResponse :: QualifiedIdentifier -> MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
+-createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet = case resultSet of
++createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+@@ -116,17 +117,16 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+           ]
+ 
+     case preferRepresentation of
+-      Just Full -> response HTTP.status201 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
++      Just Full -> response HTTP.status201 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+       Just None -> response HTTP.status201 headers mempty
+       Just HeadersOnly -> response HTTP.status201 headers mempty
+       Nothing -> response HTTP.status201 headers mempty
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+-
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-updateResponse :: ApiRequest -> ResultSet -> Wai.Response
+-updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
++updateResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -137,30 +137,30 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       headers = catMaybes [contentRangeHeader, prefHeader]
+ 
+     case preferRepresentation of
+-        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
++        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+         Just None -> response HTTP.status204 headers mempty
+         _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-singleUpsertResponse :: ApiRequest -> ResultSet -> Wai.Response
+-singleUpsertResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
++singleUpsertResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
+ 
+     case preferRepresentation of
+-      Just Full -> response HTTP.status200 (contentTypeHeaders ctxApiRequest ++ prefHeader) (LBS.fromStrict rsBody)
++      Just Full -> response HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest ++ prefHeader) (LBS.fromStrict rsBody)
+       Just None -> response HTTP.status204 prefHeader mempty
+       _ -> response HTTP.status204 prefHeader mempty
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-deleteResponse :: ApiRequest -> ResultSet -> Wai.Response
+-deleteResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
++deleteResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -171,12 +171,12 @@ deleteResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       headers = contentRangeHeader : prefHeader
+ 
+     case preferRepresentation of
+-        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
++        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+         Just None -> response HTTP.status204 headers mempty
+         _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ infoIdentResponse :: QualifiedIdentifier -> SchemaCache -> Wai.Response
+ infoIdentResponse identifier sCache =
+@@ -205,8 +205,8 @@ respondInfo allowHeader =
+   let allOrigins = ("Access-Control-Allow-Origin", "*") in
+   Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
+ 
+-invokeResponse :: InvokeMethod -> Routine -> ApiRequest -> ResultSet -> Wai.Response
+-invokeResponse invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet = case resultSet of
++invokeResponse :: CallReadPlan -> InvokeMethod -> Routine -> ApiRequest -> ResultSet -> Wai.Response
++invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -223,11 +223,11 @@ invokeResponse invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{
+         response HTTP.status204 headers mempty
+       else
+         response status
+-          (headers ++ contentTypeHeaders ctxApiRequest)
++          (headers ++ contentTypeHeaders crMedia ctxApiRequest)
+           (if invMethod == InvHead then mempty else rsOrErrBody)
+ 
+   RSPlan plan ->
+-    Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders crMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+ openApiResponse :: (Text, Text) -> Bool -> Maybe (TablesMap, RoutineMap, Maybe Text) -> AppConfig -> SchemaCache -> Schema -> Bool -> Wai.Response
+ openApiResponse versions headersOnly body conf sCache schema negotiatedByProfile =
+@@ -257,9 +257,9 @@ decodeGucStatus :: Maybe Text -> Either Error.Error (Maybe HTTP.Status)
+ decodeGucStatus =
+   maybe (Right Nothing) $ first (const Error.GucStatusError) . fmap (Just . toEnum . fst) . decimal
+ 
+-contentTypeHeaders :: ApiRequest -> [HTTP.Header]
+-contentTypeHeaders ApiRequest{..} =
+-  MediaType.toContentType iAcceptMediaType : maybeToList (profileHeader iSchema iNegotiatedByProfile)
++contentTypeHeaders :: MediaType -> ApiRequest -> [HTTP.Header]
++contentTypeHeaders mediaType ApiRequest{..} =
++  MediaType.toContentType mediaType : maybeToList (profileHeader iSchema iNegotiatedByProfile)
+ 
+ profileHeader :: Schema -> Bool -> Maybe HTTP.Header
+ profileHeader schema negotiatedByProfile =

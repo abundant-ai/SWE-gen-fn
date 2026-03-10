@@ -1,0 +1,127 @@
+diff --git a/Changes b/Changes
+index a7ec9137e9..5e0d5fdd57 100644
+--- a/Changes
++++ b/Changes
+@@ -88,6 +88,12 @@ Working version
+ 
+ ### Standard library:
+ 
++- #14363: Preserve the backtrace at exceptional domain termination. Domain.join
++  on an exceptionally terminated domain re-raises the exception with the
++  backtrace.
++  (KC Sivaramakrishnan, report by Nathan Taylor, review by Gabriel Scherer,
++  David Allsopp)
++
+ - #13372: New Format and Printf printf-like functions that accept a
+    heterogeneous list as arguments.
+   (Leonardo Santos, review by Florian Angeletti and Gabriel Scherer)
+diff --git a/runtime/caml/backtrace.h b/runtime/caml/backtrace.h
+index 40bbb637d6..7f8b3fae47 100644
+--- a/runtime/caml/backtrace.h
++++ b/runtime/caml/backtrace.h
+@@ -150,6 +150,8 @@ CAMLextern void caml_print_exception_backtrace(void);
+ void caml_init_backtrace(void);
+ CAMLextern void caml_init_debug_info(void);
+ 
++value caml_get_exception_raw_backtrace(value unit);
++
+ #endif /* CAML_INTERNALS */
+ 
+ #endif /* CAML_BACKTRACE_H */
+diff --git a/runtime/domain.c b/runtime/domain.c
+index 8aef0dcc15..5a8b6ea43a 100644
+--- a/runtime/domain.c
++++ b/runtime/domain.c
+@@ -1294,14 +1294,24 @@ CAMLexport _Atomic caml_timing_hook caml_domain_terminated_hook =
+ static value make_finished(caml_result result)
+ {
+   CAMLparam0();
+-  CAMLlocal1(res);
+-  res = caml_alloc_1(
+-    (caml_result_is_exception(result) ?
+-     1 /* Error */ :
+-     0 /* Ok */),
+-    result.data);
+-  /* [Finished res] */
+-  res = caml_alloc_1(0, res);
++  CAMLlocal2(res, bt);
++  if (caml_result_is_exception(result)) {
++    res = result.data; /* Ensure that [result.data] is rooted before
++                          subsequent allocations */
++    /* res = exn */
++    bt = caml_get_exception_raw_backtrace(Val_unit);
++    res = caml_alloc_2(0, res, bt);
++    /* res = (exn, bt) */
++    res = caml_alloc_1(1 /* Error */, res);
++    /* res = Error (exn, bt) */
++    res = caml_alloc_1(0 /* Finished */, res);
++    /* res = Finished(Error(exn, bt)) */
++  } else {
++    res = caml_alloc_1(0 /* Ok */,result.data);
++    /* res = Ok v */
++    res = caml_alloc_1(0, res);
++    /* res = Finished(Ok v) */
++  }
+   CAMLreturn(res);
+ }
+ 
+diff --git a/stdlib/.depend b/stdlib/.depend
+index 1420b0094c..d6c5987c0a 100644
+--- a/stdlib/.depend
++++ b/stdlib/.depend
+@@ -216,6 +216,7 @@ stdlib__Digest.cmi : digest.mli
+ stdlib__Domain.cmo : domain.ml \
+     stdlib__Sys.cmi \
+     stdlib.cmi \
++    stdlib__Printexc.cmi \
+     stdlib__Obj.cmi \
+     stdlib__Mutex.cmi \
+     stdlib__List.cmi \
+@@ -226,6 +227,7 @@ stdlib__Domain.cmo : domain.ml \
+ stdlib__Domain.cmx : domain.ml \
+     stdlib__Sys.cmx \
+     stdlib.cmx \
++    stdlib__Printexc.cmx \
+     stdlib__Obj.cmx \
+     stdlib__Mutex.cmx \
+     stdlib__List.cmx \
+diff --git a/stdlib/StdlibModules b/stdlib/StdlibModules
+index 14a61afe4e..3bbe1f1568 100644
+--- a/stdlib/StdlibModules
++++ b/stdlib/StdlibModules
+@@ -73,11 +73,11 @@ STDLIB_MODULE_BASENAMES = \
+   mutex \
+   condition \
+   semaphore \
+-  domain \
+   camlinternalFormat \
+   printf \
+   arg \
+   printexc \
++  domain \
+   fun \
+   gc \
+   in_channel \
+diff --git a/stdlib/domain.ml b/stdlib/domain.ml
+index 2e9605cee9..157335c1c8 100644
+--- a/stdlib/domain.ml
++++ b/stdlib/domain.ml
+@@ -25,7 +25,8 @@ module Raw = struct
+ 
+   type 'a state =
+     | Running
+-    | Finished of ('a, exn) result [@warning "-unused-constructor"]
++    | Finished of ('a, exn * Printexc.raw_backtrace) result
++    [@warning "-unused-constructor"]
+ 
+   type 'a term_sync = {
+     (* protected by [mut] *)
+@@ -299,7 +300,7 @@ let join { term_sync ; _ } =
+   in
+   match Mutex.protect term_sync.mut loop with
+   | Ok x -> x
+-  | Error ex -> raise ex
++  | Error (ex, bt) -> Printexc.raise_with_backtrace ex bt
+ 
+ let count = Raw.get_domain_count
+ let recommended_domain_count = Raw.get_recommended_domain_count

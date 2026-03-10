@@ -1,0 +1,295 @@
+diff --git a/src/Stack/Config.hs b/src/Stack/Config.hs
+index 199d206b0..a19e9c55a 100644
+--- a/src/Stack/Config.hs
++++ b/src/Stack/Config.hs
+@@ -226,7 +226,7 @@ makeConcreteResolver ar = do
+         let fp = implicitGlobalDir </> stackDotYaml
+         iopc <- loadConfigYaml (parseProjectAndConfigMonoid (parent fp)) fp
+         ProjectAndConfigMonoid project _ <- liftIO iopc
+-        pure project.resolver
++        pure project.projectResolver
+       ARLatestNightly ->
+         RSLSynonym . Nightly . (.snapshotsNightly) <$> getSnapshots
+       ARLatestLTSMajor x -> do
+@@ -727,7 +727,7 @@ withBuildConfig inner = do
+ 
+   (project', stackYamlFP) <- case config.project of
+     PCProject (project, fp) -> do
+-      forM_ project.userMsg prettyWarnS
++      forM_ project.projectUserMsg prettyWarnS
+       pure (project, fp)
+     PCNoProject extraDeps -> do
+       p <-
+@@ -753,7 +753,7 @@ withBuildConfig inner = do
+               Nothing ->
+                 logDebug $
+                      "Using resolver: "
+-                  <> display project.resolver
++                  <> display project.projectResolver
+                   <> " from implicit global project's config file: "
+                   <> fromString dest'
+               Just _ -> pure ()
+@@ -786,12 +786,12 @@ withBuildConfig inner = do
+           pure (p, dest)
+   mcompiler <- view $ globalOptsL . to (.globalCompiler)
+   let project = project'
+-        { compiler = mcompiler <|> project'.compiler
+-        , resolver = fromMaybe project'.resolver mresolver
++        { projectCompiler = mcompiler <|> project'.projectCompiler
++        , projectResolver = fromMaybe project'.projectResolver mresolver
+         }
+-  extraPackageDBs <- mapM resolveDir' project.extraPackageDBs
++  extraPackageDBs <- mapM resolveDir' project.projectExtraPackageDBs
+ 
+-  wanted <- lockCachedWanted stackYamlFP project.resolver $
++  wanted <- lockCachedWanted stackYamlFP project.projectResolver $
+     fillProjectWanted stackYamlFP config project
+ 
+   -- Unfortunately redoes getProjectWorkDir, since we don't have a BuildConfig
+@@ -805,7 +805,7 @@ withBuildConfig inner = do
+           , smWanted = wanted
+           , extraPackageDBs = extraPackageDBs
+           , stackYaml = stackYamlFP
+-          , curator = project.curator
++          , curator = project.projectCurator
+           , projectStorage = projectStorage
+           }
+     runRIO bc inner
+@@ -831,16 +831,16 @@ withBuildConfig inner = do
+           ]
+         pure r''
+     pure Project
+-      { userMsg = Nothing
+-      , packages = []
+-      , dependencies =
++      { projectUserMsg = Nothing
++      , projectPackages = []
++      , projectDependencies =
+           map (RPLImmutable . flip RPLIHackage Nothing) extraDeps
+-      , flags = mempty
+-      , resolver = r
+-      , compiler = Nothing
+-      , extraPackageDBs = []
+-      , curator = Nothing
+-      , dropPackages = mempty
++      , projectFlags = mempty
++      , projectResolver = r
++      , projectCompiler = Nothing
++      , projectExtraPackageDBs = []
++      , projectCurator = Nothing
++      , projectDropPackages = mempty
+       }
+ 
+ fillProjectWanted ::
+@@ -855,7 +855,7 @@ fillProjectWanted ::
+ fillProjectWanted stackYamlFP config project locCache snapCompiler snapPackages = do
+   let bopts = config.build
+ 
+-  packages0 <- for project.packages $ \fp@(RelFilePath t) -> do
++  packages0 <- for project.projectPackages $ \fp@(RelFilePath t) -> do
+     abs' <- resolveDir (parent stackYamlFP) (T.unpack t)
+     let resolved = ResolvedPath fp abs'
+     pp <- mkProjectPackage YesPrintWarnings resolved bopts.haddock
+@@ -868,11 +868,11 @@ fillProjectWanted stackYamlFP config project locCache snapCompiler snapPackages
+             (RPLImmutable (RPLIRepo repo rpm)) -> Just (repo, rpm)
+             _ -> Nothing
+         )
+-        project.dependencies
++        project.projectDependencies
+   logDebug ("Prefetching git repos: " <> display (T.pack (show gitRepos)))
+   fetchReposRaw gitRepos
+ 
+-  (deps0, mcompleted) <- fmap unzip . forM project.dependencies $ \rpl -> do
++  (deps0, mcompleted) <- fmap unzip . forM project.projectDependencies $ \rpl -> do
+     (pl, mCompleted) <- case rpl of
+        RPLImmutable rpli -> do
+          (compl, mcompl) <-
+@@ -899,7 +899,7 @@ fillProjectWanted stackYamlFP config project locCache snapCompiler snapPackages
+       snPackages = snapPackages
+         `Map.difference` packages1
+         `Map.difference` Map.fromList deps0
+-        `Map.withoutKeys` project.dropPackages
++        `Map.withoutKeys` project.projectDropPackages
+ 
+   snDeps <- for snPackages $ \getDep -> getDep (shouldHaddockDeps bopts)
+ 
+@@ -907,7 +907,7 @@ fillProjectWanted stackYamlFP config project locCache snapCompiler snapPackages
+ 
+   let mergeApply m1 m2 f =
+         MS.merge MS.preserveMissing MS.dropMissing (MS.zipWithMatched f) m1 m2
+-      pFlags = project.flags
++      pFlags = project.projectFlags
+       packages2 = mergeApply packages1 pFlags $
+         \_ p flags -> p{ppCommon = p.ppCommon {cpFlags=flags}}
+       deps2 = mergeApply deps1 pFlags $
+@@ -928,10 +928,10 @@ fillProjectWanted stackYamlFP config project locCache snapCompiler snapPackages
+     throwM $ InvalidGhcOptionsSpecification (Map.keys unusedPkgGhcOptions)
+ 
+   let wanted = SMWanted
+-        { smwCompiler = fromMaybe snapCompiler project.compiler
++        { smwCompiler = fromMaybe snapCompiler project.projectCompiler
+         , smwProject = packages
+         , smwDeps = deps
+-        , smwSnapshotLocation = project.resolver
++        , smwSnapshotLocation = project.projectResolver
+         }
+ 
+   pure (wanted, catMaybes mcompleted)
+diff --git a/src/Stack/Config/Docker.hs b/src/Stack/Config/Docker.hs
+index 189aa1cd1..21237aebf 100644
+--- a/src/Stack/Config/Docker.hs
++++ b/src/Stack/Config/Docker.hs
+@@ -38,7 +38,7 @@ instance Exception ConfigDockerException where
+           (_, Just aresolver) ->
+             T.unpack $ utf8BuilderToText $ display aresolver
+           (Just project, Nothing) ->
+-            T.unpack $ utf8BuilderToText $ display project.resolver
++            T.unpack $ utf8BuilderToText $ display project.projectResolver
+       , "\nUse an LTS resolver, or set the '"
+       , T.unpack dockerImageArgName
+       , "' explicitly, in your configuration file."]
+@@ -56,7 +56,7 @@ addDefaultTag base mproject maresolver = do
+     Just (ARResolver (RSLSynonym lts@(LTS _ _))) -> pure lts
+     Just _aresolver -> exc
+     Nothing ->
+-      case (.resolver) <$> mproject of
++      case (.projectResolver) <$> mproject of
+         Just (RSLSynonym lts@(LTS _ _)) -> pure lts
+         _ -> exc
+   pure $ base ++ ":" ++ show lts
+diff --git a/src/Stack/Init.hs b/src/Stack/Init.hs
+index 13b739f83..6c3ce9d38 100644
+--- a/src/Stack/Init.hs
++++ b/src/Stack/Init.hs
+@@ -281,15 +281,15 @@ initProject currDir initOpts mresolver = do
+       completePackageLocation
+         (RPLIHackage (PackageIdentifierRevision n v CFILatest) Nothing)
+   let p = Project
+-        { userMsg = if userMsg == "" then Nothing else Just userMsg
+-        , packages = resolvedRelative <$> Map.elems rbundle
+-        , dependencies = map toRawPL deps
+-        , flags = removeSrcPkgDefaultFlags gpds flags
+-        , resolver = snapshotLoc
+-        , compiler = Nothing
+-        , extraPackageDBs = []
+-        , curator = Nothing
+-        , dropPackages = mempty
++        { projectUserMsg = if userMsg == "" then Nothing else Just userMsg
++        , projectPackages = resolvedRelative <$> Map.elems rbundle
++        , projectDependencies = map toRawPL deps
++        , projectFlags = removeSrcPkgDefaultFlags gpds flags
++        , projectResolver = snapshotLoc
++        , projectCompiler = Nothing
++        , projectExtraPackageDBs = []
++        , projectCurator = Nothing
++        , projectDropPackages = mempty
+         }
+       makeRel = fmap toFilePath . makeRelativeToCurrentDir
+   prettyInfoL
+diff --git a/src/Stack/Options/Completion.hs b/src/Stack/Options/Completion.hs
+index 56ff09626..8d3b02e5c 100644
+--- a/src/Stack/Options/Completion.hs
++++ b/src/Stack/Options/Completion.hs
+@@ -92,7 +92,7 @@ flagCompleter = buildConfigCompleter $ \input -> do
+         in  (if flagEnabled name fl then "-" else "") ++ flname
+       prjFlags =
+         case bconfig.config.project of
+-          PCProject (p, _) -> p.flags
++          PCProject (p, _) -> p.projectFlags
+           PCGlobalProject -> mempty
+           PCNoProject _ -> mempty
+       flagEnabled name fl =
+diff --git a/src/Stack/Types/Project.hs b/src/Stack/Types/Project.hs
+index 966b06092..abcc4d139 100644
+--- a/src/Stack/Types/Project.hs
++++ b/src/Stack/Types/Project.hs
+@@ -1,5 +1,4 @@
+ {-# LANGUAGE NoImplicitPrelude #-}
+-{-# LANGUAGE NoFieldSelectors  #-}
+ {-# LANGUAGE OverloadedStrings #-}
+ 
+ module Stack.Types.Project
+@@ -15,27 +14,27 @@ import           Stack.Types.Curator ( Curator )
+ -- | A project is a collection of packages. We can have multiple stack.yaml
+ -- files, but only one of them may contain project information.
+ data Project = Project
+-  { userMsg :: !(Maybe String)
++  { projectUserMsg :: !(Maybe String)
+     -- ^ A warning message to display to the user when the auto generated
+     -- config may have issues.
+-  , packages :: ![RelFilePath]
++  , projectPackages :: ![RelFilePath]
+     -- ^ Packages which are actually part of the project (as opposed
+     -- to dependencies).
+-  , dependencies :: ![RawPackageLocation]
++  , projectDependencies :: ![RawPackageLocation]
+     -- ^ Dependencies defined within the stack.yaml file, to be applied on top
+     -- of the snapshot.
+-  , flags :: !(Map PackageName (Map FlagName Bool))
++  , projectFlags :: !(Map PackageName (Map FlagName Bool))
+     -- ^ Flags to be applied on top of the snapshot flags.
+-  , resolver :: !RawSnapshotLocation
++  , projectResolver :: !RawSnapshotLocation
+     -- ^ How we resolve which @Snapshot@ to use
+-  , compiler :: !(Maybe WantedCompiler)
++  , projectCompiler :: !(Maybe WantedCompiler)
+     -- ^ Override the compiler in 'projectResolver'
+-  , extraPackageDBs :: ![FilePath]
+-  , curator :: !(Maybe Curator)
++  , projectExtraPackageDBs :: ![FilePath]
++  , projectCurator :: !(Maybe Curator)
+     -- ^ Extra configuration intended exclusively for usage by the curator tool.
+     -- In other words, this is /not/ part of the documented and exposed Stack
+     -- API. SUBJECT TO CHANGE.
+-  , dropPackages :: !(Set PackageName)
++  , projectDropPackages :: !(Set PackageName)
+     -- ^ Packages to drop from the 'projectResolver'.
+   }
+   deriving Show
+diff --git a/src/Stack/Types/ProjectAndConfigMonoid.hs b/src/Stack/Types/ProjectAndConfigMonoid.hs
+index df461470f..c16d1b5ae 100644
+--- a/src/Stack/Types/ProjectAndConfigMonoid.hs
++++ b/src/Stack/Types/ProjectAndConfigMonoid.hs
+@@ -44,15 +44,15 @@ parseProjectAndConfigMonoid rootDir =
+       deps' <- mapM (resolvePaths (Just rootDir)) deps
+       resolver' <- resolvePaths (Just rootDir) resolver
+       let project = Project
+-            { userMsg = msg
+-            , resolver = resolver'
+-            , compiler = mcompiler -- FIXME make sure resolver' isn't SLCompiler
+-            , extraPackageDBs = extraPackageDBs
+-            , packages = packages
+-            , dependencies =
++            { projectUserMsg = msg
++            , projectResolver = resolver'
++            , projectCompiler = mcompiler -- FIXME make sure resolver' isn't SLCompiler
++            , projectExtraPackageDBs = extraPackageDBs
++            , projectPackages = packages
++            , projectDependencies =
+                 concatMap toList (deps' :: [NonEmpty RawPackageLocation])
+-            , flags = flags
+-            , curator = mcurator
+-            , dropPackages = Set.map unCabalString drops
++            , projectFlags = flags
++            , projectCurator = mcurator
++            , projectDropPackages = Set.map unCabalString drops
+             }
+       pure $ ProjectAndConfigMonoid project config
+diff --git a/tests/unit/Stack/ConfigSpec.hs b/tests/unit/Stack/ConfigSpec.hs
+index 4bc61b23a..effbb6793 100644
+--- a/tests/unit/Stack/ConfigSpec.hs
++++ b/tests/unit/Stack/ConfigSpec.hs
+@@ -150,11 +150,11 @@ spec = beforeAll setup $ do
+ 
+     it "parses snapshot using 'resolver'" $ inTempDir $ do
+       loadProject resolverConfig $ \project ->
+-        project.resolver `shouldBe` RSLSynonym (LTS 19 22)
++        project.projectResolver `shouldBe` RSLSynonym (LTS 19 22)
+ 
+     it "parses snapshot using 'snapshot'" $ inTempDir $ do
+       loadProject snapshotConfig $ \project ->
+-        project.resolver `shouldBe` RSLSynonym (LTS 19 22)
++        project.projectResolver `shouldBe` RSLSynonym (LTS 19 22)
+ 
+     it "throws if both 'resolver' and 'snapshot' are present" $ inTempDir $ do
+       loadProject resolverSnapshotConfig (const (pure ()))

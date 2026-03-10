@@ -1,0 +1,12 @@
+PostgREST should build and run correctly after upgrading to hasql-1.6 and hasql-pool-0.8, but the upgrade introduces breaking API and behavioral changes that currently prevent successful compilation and/or correct runtime behavior.
+
+1) hasql-1.6 changes the shape of server errors: the ServerError type now includes a position parameter. Code that pattern-matches on Hasql errors (directly or indirectly) must be updated so it still extracts and reports relevant fields (message, detail, hint, SQLSTATE, etc.) without failing to compile. Any places that construct, deconstruct, or display ServerError values must accept the additional position field and continue to behave the same from a user perspective (error responses/log output should not lose information or crash).
+
+2) hasql-pool-0.8 changes pool release semantics and removes an error type: calling release now flushes the pool rather than destroying it, and PoolIsReleasedUsageError no longer exists. PostgREST code that previously relied on the old release/destroy behavior or referenced PoolIsReleasedUsageError must be updated. After the change:
+
+- Creating a pool with P.acquire and using it via P.use must work normally.
+- Releasing the pool should not make subsequent pool usage fail with a “pool is released” style error (since that error no longer exists). If PostgREST had any logic for detecting/handling PoolIsReleasedUsageError, it must be removed or replaced so the system still cleans up and restarts connections as intended.
+
+3) Compatibility with hasql-notifications is required: hasql-notifications has an upper bound on hasql-pool that may need to be overridden/relaxed for builds to succeed. The resulting dependency set should compile without requiring ad-hoc local overrides, and runtime behavior that depends on notifications should remain functional.
+
+A minimal reproduction of the expectations is: create a pool with `P.acquire`, run sessions/transactions through `P.use` (e.g., executing `queryPgVersion`), initialize the application state with the pool (`AppState.initWithPool`), and ensure errors returned from database failures are still handled and rendered correctly under the new hasql error types. The final result should compile cleanly and the application should be able to start, query PostgreSQL version/structure, and execute queries without pool-release related failures or mismatched error pattern matches.

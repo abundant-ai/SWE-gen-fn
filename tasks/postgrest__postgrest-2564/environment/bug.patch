@@ -1,0 +1,515 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 357fcc9e..cf30d6b6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,9 +8,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Added
+ 
+  - #1414, Add related orders - @steve-chavez
+-   + On a many-to-one or one-to-one relationship, you can order a parent by a child column `/projects?select=*,clients(*)&order=clients(name).desc.nullsfirst`
+- - #1233, Allow spreading embedded resources - @steve-chavez
+-   + On a many-to-one or one-to-one relationship, you can unnest a json object with `/projects?select=*,..clients(client_name:name)`
++  + On a many-to-one or one-to-one relationship, you can order a parent by a child column `/projects?select=*,clients(*)&order=clients(name).desc.nullsfirst`
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 7a884f09..06c99a7d 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -212,7 +212,6 @@ test-suite spec
+                       Feature.Query.RelatedQueriesSpec
+                       Feature.Query.RpcSpec
+                       Feature.Query.SingularSpec
+-                      Feature.Query.SpreadQueriesSpec
+                       Feature.Query.UnicodeSpec
+                       Feature.Query.UpdateSpec
+                       Feature.Query.UpsertSpec
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 07513c57..54cdcb2b 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -46,8 +46,7 @@ import PostgREST.SchemaCache.Identifiers (FieldName)
+ 
+ import PostgREST.ApiRequest.Types (EmbedParam (..), EmbedPath, Field,
+                                    Filter (..), FtsOperator (..),
+-                                   Hint, JoinType (..),
+-                                   JsonOperand (..),
++                                   JoinType (..), JsonOperand (..),
+                                    JsonOperation (..), JsonPath,
+                                    ListVal, LogicOperator (..),
+                                    LogicTree (..), OpExpr (..),
+@@ -318,9 +317,6 @@ pTreePath = do
+ -- >>> P.parse pFieldForest "" "*,client(*,nested(*))"
+ -- Right [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectRelation {selRelation = "client", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectRelation {selRelation = "nested", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]}]
+ --
+--- >>> P.parse pFieldForest "" "*,..client(*),other(*)"
+--- Right [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SpreadRelation {selRelation = "client", selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]},Node {rootLabel = SelectRelation {selRelation = "other", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]
+---
+ -- >>> P.parse pFieldForest "" "id,clients(name[])"
+ -- Left (line 1, column 16):
+ -- unexpected '['
+@@ -329,8 +325,7 @@ pFieldForest :: Parser [Tree SelectItem]
+ pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
+   where
+     pFieldTree :: Parser (Tree SelectItem)
+-    pFieldTree =  try (Node <$> pSpreadRelationSelect <*> between (char '(') (char ')') pFieldForest) <|>
+-                  try (Node <$> pRelationSelect       <*> between (char '(') (char ')') pFieldForest) <|>
++    pFieldTree =  try (Node <$> pRelationSelect <*> between (char '(') (char ')') pFieldForest) <|>
+                   Node <$> pFieldSelect <*> pure []
+ 
+ pStar :: Parser Text
+@@ -459,10 +454,24 @@ pRelationSelect :: Parser SelectItem
+ pRelationSelect = lexeme $ try ( do
+     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+     name <- pFieldName
+-    (hint, jType) <- pEmbedParams
++    prm1 <- optionMaybe pEmbedParam
++    prm2 <- optionMaybe pEmbedParam
+     try (void $ lookAhead (string "("))
+-    return $ SelectRelation name alias hint jType
++    return $ SelectRelation name alias (embedParamHint prm1 <|> embedParamHint prm2) (embedParamJoin prm1 <|> embedParamJoin prm2)
+   )
++  where
++    pEmbedParam :: Parser EmbedParam
++    pEmbedParam =
++      char '!' *> (
++        try (string "left"  $> EPJoinType JTLeft)  <|>
++        try (string "inner" $> EPJoinType JTInner) <|>
++        try (EPHint <$> pFieldName))
++    embedParamHint prm = case prm of
++      Just (EPHint hint) -> Just hint
++      _                  -> Nothing
++    embedParamJoin prm = case prm of
++      Just (EPJoinType jt) -> Just jt
++      _                    -> Nothing
+ 
+ -- |
+ -- Parse regular fields in select
+@@ -518,55 +527,6 @@ pFieldSelect = lexeme $
+            try (void $ lookAhead (string ",")) <|>
+            try eof
+ 
+--- |
+--- Parse spread relations in select
+---
+--- >>> P.parse pSpreadRelationSelect "" "..rel(*)"
+--- Right (SpreadRelation {selRelation = "rel", selHint = Nothing, selJoinType = Nothing})
+---
+--- >>> P.parse pSpreadRelationSelect "" "..rel!hint!inner(*)"
+--- Right (SpreadRelation {selRelation = "rel", selHint = Just "hint", selJoinType = Just JTInner})
+---
+--- >>> P.parse pSpreadRelationSelect "" "rel(*)"
+--- Left (line 1, column 1):
+--- unexpected "r"
+--- expecting "..."
+---
+--- >>> P.parse pSpreadRelationSelect "" "alias:..rel(*)"
+--- Left (line 1, column 1):
+--- unexpected "a"
+--- expecting ".."
+---
+--- >>> P.parse pSpreadRelationSelect "" "..rel->jsonpath(*)"
+--- Left (line 1, column 8):
+--- unexpected '>'
+-pSpreadRelationSelect :: Parser SelectItem
+-pSpreadRelationSelect = lexeme $ try ( do
+-    name <- string ".." >> pFieldName
+-    (hint, jType) <- pEmbedParams
+-    try (void $ lookAhead (string "("))
+-    return $ SpreadRelation name hint jType
+-  )
+-
+-pEmbedParams :: Parser (Maybe Hint, Maybe JoinType)
+-pEmbedParams = do
+-  prm1 <- optionMaybe pEmbedParam
+-  prm2 <- optionMaybe pEmbedParam
+-  return (embedParamHint prm1 <|> embedParamHint prm2, embedParamJoin prm1 <|> embedParamJoin prm2)
+-  where
+-    pEmbedParam :: Parser EmbedParam
+-    pEmbedParam =
+-      char '!' *> (
+-        try (string "left"  $> EPJoinType JTLeft)  <|>
+-        try (string "inner" $> EPJoinType JTInner) <|>
+-        try (EPHint <$> pFieldName))
+-    embedParamHint prm = case prm of
+-      Just (EPHint hint) -> Just hint
+-      _                  -> Nothing
+-    embedParamJoin prm = case prm of
+-      Just (EPJoinType jt) -> Just jt
+-      _                    -> Nothing
+-
+ -- |
+ -- Parse operator expression used in horizontal filtering
+ --
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e419dae4..cc1a17ac 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -38,26 +38,19 @@ import PostgREST.SchemaCache.Relationship (Relationship)
+ 
+ import Protolude
+ 
+--- | The value in `/tbl?select=alias:field::cast`
++-- | The select value in `/tbl?select=alias:field::cast`
+ data SelectItem
+   = SelectField
+     { selField :: Field
+     , selCast  :: Maybe Cast
+     , selAlias :: Maybe Alias
+     }
+--- | The value in `/tbl?select=alias:another_tbl(*)`
+   | SelectRelation
+     { selRelation :: FieldName
+     , selAlias    :: Maybe Alias
+     , selHint     :: Maybe Hint
+     , selJoinType :: Maybe JoinType
+     }
+--- | The value in `/tbl?select=...another_tbl(*)`
+-  | SpreadRelation
+-    { selRelation :: FieldName
+-    , selHint     :: Maybe Hint
+-    , selJoinType :: Maybe JoinType
+-    }
+   deriving (Eq)
+ 
+ data ApiRequestError
+@@ -71,14 +64,13 @@ data ApiRequestError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
++  | NotToOne Text Text
+   | NoRelBetween Text Text Text
+   | NoRpc Text Text [Text] Bool MediaType Bool
+   | NotEmbedded Text
+   | ParseRequestError Text Text
+   | PutRangeNotAllowedError
+   | QueryParamError QPError
+-  | RelatedOrderNotToOne Text Text
+-  | SpreadNotToOne Text Text
+   | UnacceptableSchema [Text]
+   | UnsupportedMethod ByteString
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 07accc74..d7aaeb00 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -64,6 +64,7 @@ instance PgrstError ApiRequestError where
+   status InvalidRpcMethod{}      = HTTP.status405
+   status InvalidRange{}          = HTTP.status416
+   status NotFound                = HTTP.status404
++  status NotToOne{}              = HTTP.status400
+ 
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+@@ -71,8 +72,6 @@ instance PgrstError ApiRequestError where
+   status ParseRequestError{}     = HTTP.status400
+   status PutRangeNotAllowedError = HTTP.status400
+   status QueryParamError{}       = HTTP.status400
+-  status RelatedOrderNotToOne{}  = HTTP.status400
+-  status SpreadNotToOne{}        = HTTP.status400
+   status UnacceptableSchema{}    = HTTP.status406
+   status UnsupportedMethod{}     = HTTP.status405
+   status LimitNoOrderError       = HTTP.status400
+@@ -154,16 +153,10 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (RelatedOrderNotToOne origin target) = JSON.object [
++  toJSON (NotToOne origin target) = JSON.object [
+     "code"    .= ApiRequestErrorCode18,
+-    "message" .= ("A related order on '" <> target <> "' is not possible" :: Text),
+-    "details" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
+-    "hint"    .= JSON.Null]
+-
+-  toJSON (SpreadNotToOne origin target) = JSON.object [
+-    "code"    .= ApiRequestErrorCode19,
+-    "message" .= ("A spread operation on '" <> target <> "' is not possible" :: Text),
+-    "details" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
++    "message" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
++    "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+@@ -478,7 +471,6 @@ data ErrorCode
+   | ApiRequestErrorCode16
+   | ApiRequestErrorCode17
+   | ApiRequestErrorCode18
+-  | ApiRequestErrorCode19
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -521,7 +513,6 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode16  -> "116"
+   ApiRequestErrorCode17  -> "117"
+   ApiRequestErrorCode18  -> "118"
+-  ApiRequestErrorCode19  -> "119"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 54c69f10..99c906d3 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -97,7 +97,6 @@ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Eit
+ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-  validateSpreadEmbeds =<<
+   addRelatedOrders =<<
+   addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+   addLogicTrees apiRequest =<<
+@@ -111,23 +110,15 @@ initReadRequest qi@QualifiedIdentifier{..} =
+   foldr (treeEntry rootDepth) $ Node defReadPlan{from=qi, relName=qiName, depth=rootDepth} []
+   where
+     rootDepth = 0
+-    defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing mempty Nothing Nothing False rootDepth
++    defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing mempty Nothing Nothing rootDepth
+     treeEntry :: Depth -> Tree SelectItem -> ReadPlanTree -> ReadPlanTree
+-    treeEntry depth (Node si fldForest) (Node q rForest) =
++    treeEntry depth (Node SelectRelation{..} fldForest) (Node q rForest) =
+       let nxtDepth = succ depth in
+-      case si of
+-        SelectRelation{..} ->
+-          Node q $
+-            foldr (treeEntry nxtDepth)
+-            (Node defReadPlan{from=QualifiedIdentifier qiSchema selRelation, relName=selRelation, relAlias=selAlias, relHint=selHint, relJoinType=selJoinType, depth=nxtDepth} [])
+-            fldForest:rForest
+-        SpreadRelation{..} ->
+-          Node q $
+-            foldr (treeEntry nxtDepth)
+-            (Node defReadPlan{from=QualifiedIdentifier qiSchema selRelation, relName=selRelation, relHint=selHint, relJoinType=selJoinType, depth=nxtDepth, relIsSpread=True} [])
+-            fldForest:rForest
+-        SelectField{..} ->
+-          Node q{select=(selField, selCast, selAlias):select q} rForest
++        Node q $
++          foldr (treeEntry nxtDepth)
++          (Node defReadPlan{from=QualifiedIdentifier qiSchema selRelation, relName=selRelation, relAlias=selAlias, relHint=selHint, relJoinType=selJoinType, depth=nxtDepth} [])
++          fldForest:rForest
++    treeEntry _ (Node SelectField{..} _) (Node q rForest) = Node q{select=(selField, selCast, selAlias):select q} rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+ treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -328,7 +319,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+               name    = fromMaybe relName relAlias in
+           if isToOne == Just True
+             then Right $ ot{otRelation=relAggAlias}
+-            else Left $ RelatedOrderNotToOne (qiName from) name
++            else Left $ NotToOne (qiName from) name
+         Nothing ->
+           Left $ NotEmbedded otRelation
+ 
+@@ -353,15 +344,6 @@ addLogicTrees ApiRequest{..} rReq =
+     addLogicTreeToNode :: (EmbedPath, LogicTree) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+     addLogicTreeToNode = updateNode (\t (Node q@ReadPlan{where_=lf} f) -> Node q{ReadPlan.where_=t:lf} f)
+ 
+--- Validates that spread embeds are only done on to-one relationships
+-validateSpreadEmbeds :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-validateSpreadEmbeds (Node rp@ReadPlan{relToParent=Nothing} forest) = Node rp <$> validateSpreadEmbeds `traverse` forest
+-validateSpreadEmbeds (Node rp@ReadPlan{relIsSpread,relToParent=Just rel,relName} forest) = do
+-  validRP <- if relIsSpread && not (relIsToOne rel)
+-    then Left $ SpreadNotToOne (qiName $ relTable rel) relName -- TODO using relTable is not entirely right because ReadPlan might have an alias, need to store the parent alias on ReadPlan
+-    else Right rp
+-  Node validRP <$> validateSpreadEmbeds `traverse` forest
+-
+ -- Find a Node of the Tree and apply a function to it
+ updateNode :: (a -> ReadPlanTree -> ReadPlanTree) -> (EmbedPath, a) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ updateNode f ([], a) rr = f a <$> rr
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index e51170cd..95566576 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -41,7 +41,6 @@ data ReadPlan = ReadPlan
+   , relAggAlias  :: Alias
+   , relHint      :: Maybe Hint
+   , relJoinType  :: Maybe JoinType
+-  , relIsSpread  :: Bool
+   , depth        :: Depth
+   -- ^ used for aliasing
+   }
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index fa8d624a..c72ad451 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -57,25 +57,23 @@ readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,o
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+ getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} _) (selects,joins) =
++getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType=joinType} _) (selects,joins) =
+   let
+     subquery = readPlanToQuery rr
+     aliasOrName = pgFmtIdent $ fromMaybe relName relAlias
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+-      (if relJoinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
++      (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+     (sel, joi) = if relIsToOne rel
+       then
+-        ( if relIsSpread
+-            then SQL.sql aggAlias <> ".*"
+-            else SQL.sql ("row_to_json(" <> aggAlias <> ".*) AS " <> aliasOrName)
++        ( SQL.sql ("row_to_json(" <> aggAlias <> ".*) AS " <> aliasOrName)
+         , correlatedSubquery subquery aggAlias "TRUE")
+       else
+         ( SQL.sql $ "COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> aliasOrName
+         , correlatedSubquery (
+             "SELECT json_agg(" <> SQL.sql aggAlias <> ") AS " <> SQL.sql aggAlias <>
+             "FROM (" <> subquery <> " ) AS " <> SQL.sql aggAlias
+-          ) aggAlias $ if relJoinType == Just JTInner then SQL.sql aggAlias <> " IS NOT NULL" else "TRUE")
++          ) aggAlias $ if joinType == Just JTInner then SQL.sql aggAlias <> " IS NOT NULL" else "TRUE")
+   in
+   (sel:selects, joi:joins)
+ 
+diff --git a/test/spec/Feature/Query/RelatedQueriesSpec.hs b/test/spec/Feature/Query/RelatedQueriesSpec.hs
+index 0d316741..ddb35c37 100644
+--- a/test/spec/Feature/Query/RelatedQueriesSpec.hs
++++ b/test/spec/Feature/Query/RelatedQueriesSpec.hs
+@@ -107,32 +107,17 @@ spec =
+ 
+     it "fails when is not a to-one relationship" $ do
+       get "/clients?select=*,projects(*)&order=projects(id)" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST118",
+-          "details":"'clients' and 'projects' do not form a many-to-one or one-to-one relationship",
+-          "hint":null,
+-          "message":"A related order on 'projects' is not possible"
+-        }|]
++        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'clients' and 'projects' do not form a many-to-one or one-to-one relationship"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+       get "/clients?select=*,pros:projects(*)&order=pros(id)" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST118",
+-          "details":"'clients' and 'pros' do not form a many-to-one or one-to-one relationship",
+-          "hint":null,
+-          "message":"A related order on 'pros' is not possible"
+-        }|]
++        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'clients' and 'pros' do not form a many-to-one or one-to-one relationship"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+       get "/designers?select=id,computed_videogames(id)&order=computed_videogames(id).desc" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST118",
+-          "details":"'designers' and 'computed_videogames' do not form a many-to-one or one-to-one relationship",
+-          "hint":null,
+-          "message":"A related order on 'computed_videogames' is not possible"
+-        }|]
++        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'designers' and 'computed_videogames' do not form a many-to-one or one-to-one relationship"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+diff --git a/test/spec/Feature/Query/SpreadQueriesSpec.hs b/test/spec/Feature/Query/SpreadQueriesSpec.hs
+deleted file mode 100644
+index ea519c1f..00000000
+--- a/test/spec/Feature/Query/SpreadQueriesSpec.hs
++++ /dev/null
+@@ -1,86 +0,0 @@
+-module Feature.Query.SpreadQueriesSpec where
+-
+-import Network.Wai (Application)
+-
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "spread embeds" $ do
+-    it "works on a many-to-one relationship" $ do
+-      get "/projects?select=id,..clients(client_name:name)" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"client_name":"Microsoft"},
+-          {"id":2,"client_name":"Microsoft"},
+-          {"id":3,"client_name":"Apple"},
+-          {"id":4,"client_name":"Apple"},
+-          {"id":5,"client_name":null}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/grandchild_entities?select=name,..child_entities(parent_name:name,..entities(grandparent_name:name))&limit=3" `shouldRespondWith`
+-        [json|[
+-          {"name":"grandchild entity 1","parent_name":"child entity 1","grandparent_name":"entity 1"},
+-          {"name":"grandchild entity 2","parent_name":"child entity 1","grandparent_name":"entity 1"},
+-          {"name":"grandchild entity 3","parent_name":"child entity 2","grandparent_name":"entity 1"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/videogames?select=name,..computed_designers(designer_name:name)" `shouldRespondWith`
+-        [json|[
+-          {"name":"Civilization I","designer_name":"Sid Meier"},
+-          {"name":"Civilization II","designer_name":"Sid Meier"},
+-          {"name":"Final Fantasy I","designer_name":"Hironobu Sakaguchi"},
+-          {"name":"Final Fantasy II","designer_name":"Hironobu Sakaguchi"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works inside a normal embed" $
+-      get "/grandchild_entities?select=name,child_entity:child_entities(name,..entities(parent_name:name))&limit=1" `shouldRespondWith`
+-        [json|[
+-          {"name":"grandchild entity 1","child_entity":{"name":"child entity 1","parent_name":"entity 1"}}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on a one-to-one relationship" $
+-      get "/country?select=name,..capital(capital:name)" `shouldRespondWith`
+-        [json|[
+-          {"name":"Afghanistan","capital":"Kabul"},
+-          {"name":"Algeria","capital":"Algiers"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "fails when is not a to-one relationship" $ do
+-      get "/clients?select=*,..projects(*)" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST119",
+-          "details":"'clients' and 'projects' do not form a many-to-one or one-to-one relationship",
+-          "hint":null,
+-          "message":"A spread operation on 'projects' is not possible"
+-        }|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/designers?select=*,..computed_videogames(*)" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST119",
+-          "details":"'designers' and 'computed_videogames' do not form a many-to-one or one-to-one relationship",
+-          "hint":null,
+-          "message":"A spread operation on 'computed_videogames' is not possible"
+-        }|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index aa443b82..72306bf5 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -56,7 +56,6 @@ import qualified Feature.Query.RawOutputTypesSpec
+ import qualified Feature.Query.RelatedQueriesSpec
+ import qualified Feature.Query.RpcSpec
+ import qualified Feature.Query.SingularSpec
+-import qualified Feature.Query.SpreadQueriesSpec
+ import qualified Feature.Query.UnicodeSpec
+ import qualified Feature.Query.UpdateSpec
+ import qualified Feature.Query.UpsertSpec
+@@ -152,7 +151,6 @@ main = do
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+         , ("Feature.Query.RelatedQueriesSpec"            , Feature.Query.RelatedQueriesSpec.spec)
+-        , ("Feature.Query.SpreadQueriesSpec"             , Feature.Query.SpreadQueriesSpec.spec)
+         ]
+ 
+   hspec $ do

@@ -1,0 +1,318 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 17bf4a16..d0270bb5 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -291,13 +291,9 @@ handleRead headersOnly identifier context@RequestContext{..} = do
+             )
+           ]
+           ++ contentTypeHeaders context
+-        rsOrErrBody = if status == HTTP.status416
+-          then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+-            $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show total)
+-          else LBS.fromStrict rsBody
+ 
+       failNotSingular iAcceptMediaType rsQueryTotal . response status headers $
+-        if headersOnly then mempty else rsOrErrBody
++        if headersOnly then mempty else LBS.fromStrict rsBody
+ 
+     RSPlan plan ->
+       pure $ Wai.responseLBS HTTP.status200 (contentTypeHeaders context) $ LBS.fromStrict plan
+@@ -505,10 +501,6 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       let
+         (status, contentRange) =
+           RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        rsOrErrBody = if status == HTTP.status416
+-          then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+-            $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+-          else LBS.fromStrict rsBody
+ 
+       failNotSingular iAcceptMediaType rsQueryTotal $
+         if Proc.procReturnsVoid proc then
+@@ -516,7 +508,7 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+         else
+           response status
+             (contentTypeHeaders context ++ [contentRange])
+-            (if invMethod == InvHead then mempty else rsOrErrBody)
++            (if invMethod == InvHead then mempty else LBS.fromStrict rsBody)
+ 
+     RSPlan plan ->
+       pure $ Wai.responseLBS HTTP.status200 (contentTypeHeaders context) $ LBS.fromStrict plan
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 985b7b3a..27930ad2 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -32,8 +32,7 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.MediaType     (MediaType (..))
+ import qualified PostgREST.MediaType     as MediaType
+ import           PostgREST.Request.Types (ApiRequestError (..),
+-                                          QPError (..),
+-                                          RangeError (..))
++                                          QPError (..))
+ 
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+@@ -61,7 +60,7 @@ instance PgrstError ApiRequestError where
+   status InvalidBody{}           = HTTP.status400
+   status InvalidFilters          = HTTP.status405
+   status InvalidRpcMethod{}      = HTTP.status405
+-  status InvalidRange{}          = HTTP.status416
++  status InvalidRange            = HTTP.status416
+   status NotFound                = HTTP.status404
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+@@ -91,13 +90,10 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= T.decodeUtf8 errorMessage,
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+-  toJSON (InvalidRange rangeError) = JSON.object [
++  toJSON InvalidRange = JSON.object [
+     "code"    .= ApiRequestErrorCode03,
+-    "message" .= ("Requested range not satisfiable" :: Text),
+-    "details" .= (case rangeError of
+-                   NegativeLimit           -> "Limit should be greater than or equal to zero."
+-                   LowerGTUpper            -> "The lower boundary must be lower than or equal to the upper boundary in the Range header."
+-                   OutOfBounds lower total -> "An offset of " <> lower <> " was requested, but there are only " <> total <> " rows."),
++    "message" .= ("HTTP Range error" :: Text),
++    "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+   toJSON (ParseRequestError message details) = JSON.object [
+     "code"    .= ApiRequestErrorCode04,
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index cea2625c..f067cf74 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -36,8 +36,7 @@ import Control.Arrow             ((***))
+ import Data.Aeson.Types          (emptyArray, emptyObject)
+ import Data.List                 (lookup, union)
+ import Data.Maybe                (fromJust)
+-import Data.Ranged.Ranges        (emptyRange, rangeIntersection,
+-                                  rangeIsEmpty)
++import Data.Ranged.Ranges        (emptyRange, rangeIntersection)
+ import Network.HTTP.Types.Header (hCookie)
+ import Network.HTTP.Types.URI    (parseSimpleQuery)
+ import Network.Wai               (Request (..))
+@@ -65,8 +64,7 @@ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferResolution (..),
+                                           PreferTransaction (..))
+ import PostgREST.Request.QueryParams     (QueryParams (..))
+-import PostgREST.Request.Types           (ApiRequestError (..),
+-                                          RangeError (..))
++import PostgREST.Request.Types           (ApiRequestError (..))
+ 
+ import qualified PostgREST.MediaType           as MediaType
+ import qualified PostgREST.Request.Preferences as Preferences
+@@ -219,7 +217,7 @@ getAction PathInfo{pathIsProc, pathIsDefSpec} method =
+ apiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> QueryParams.QueryParams -> PathInfo -> Action -> Either ApiRequestError ApiRequest
+ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..} path@PathInfo{pathName, pathIsProc, pathIsRootSpec, pathIsDefSpec} action
+   | isJust profile && fromJust profile `notElem` configDbSchemas = Left $ UnacceptableSchema $ toList configDbSchemas
+-  | isInvalidRange = Left $ InvalidRange (if rangeIsEmpty headerRange then LowerGTUpper else NegativeLimit)
++  | isInvalidRange = Left InvalidRange
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
+   | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+   | method `elem` ["PATCH", "DELETE"] && not (null qsRanges) && null qsOrder = Left LimitNoOrderError
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 0dd1d893..cf828793 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -27,7 +27,6 @@ module PostgREST.Request.Types
+   , OrderNulls(..)
+   , OrderTerm(..)
+   , QPError(..)
+-  , RangeError(..)
+   , SingleVal
+   , TrileanVal(..)
+   , SimpleOperator(..)
+@@ -53,7 +52,7 @@ data ApiRequestError
+   | MediaTypeError [ByteString]
+   | InvalidBody ByteString
+   | InvalidFilters
+-  | InvalidRange RangeError
++  | InvalidRange
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
+@@ -67,10 +66,6 @@ data ApiRequestError
+   | UnsupportedMethod ByteString
+ 
+ data QPError = QPError Text Text
+-data RangeError
+-  = NegativeLimit
+-  | LowerGTUpper
+-  | OutOfBounds Text Text
+ 
+ type CallRequest = CallQuery
+ 
+diff --git a/test/spec/Feature/Query/RangeSpec.hs b/test/spec/Feature/Query/RangeSpec.hs
+index c2481b15..22cb704f 100644
+--- a/test/spec/Feature/Query/RangeSpec.hs
++++ b/test/spec/Feature/Query/RangeSpec.hs
+@@ -39,35 +39,6 @@ spec = do
+               [json| [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}] |]
+               { matchHeaders = ["Content-Range" <:> "0-14/*"] }
+ 
+-      context "of invalid range" $ do
+-        it "refuses a range with nonzero start when there are no items" $
+-          request methodPost "/rpc/getitemrange?offset=1"
+-                  [("Prefer", "count=exact")] emptyRange
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 1 was requested, but there are only 0 rows.",
+-                "hint":null
+-              }|]
+-            { matchStatus  = 416
+-            , matchHeaders = ["Content-Range" <:> "*/0"]
+-            }
+-
+-        it "refuses a range requesting start past last item" $
+-          request methodPost "/rpc/getitemrange?offset=100"
+-                  [("Prefer", "count=exact")] defaultRange
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 100 was requested, but there are only 15 rows.",
+-                "hint":null
+-              }|]
+-            { matchStatus  = 416
+-            , matchHeaders = ["Content-Range" <:> "*/15"]
+-            }
+-
+     context "with range headers" $ do
+       context "of acceptable range" $ do
+         it "succeeds with partial content" $ do
+@@ -111,25 +82,12 @@ spec = do
+         it "fails with 416 for offside range" $
+           request methodPost  "/rpc/getitemrange"
+                   (rangeHdrs $ ByteRangeFromTo 1 0) emptyRange
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"The lower boundary must be lower than or equal to the upper boundary in the Range header.",
+-                "hint":null
+-              }|]
+-            { matchStatus = 416 }
++            `shouldRespondWith` 416
+ 
+         it "refuses a range with nonzero start when there are no items" $
+           request methodPost "/rpc/getitemrange"
+                   (rangeHdrsWithCount $ ByteRangeFromTo 1 2) emptyRange
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 1 was requested, but there are only 0 rows.",
+-                "hint":null
+-              }|]
++            `shouldRespondWith` "[]"
+             { matchStatus  = 416
+             , matchHeaders = ["Content-Range" <:> "*/0"]
+             }
+@@ -137,13 +95,7 @@ spec = do
+         it "refuses a range requesting start past last item" $
+           request methodPost "/rpc/getitemrange"
+                   (rangeHdrsWithCount $ ByteRangeFromTo 100 199) defaultRange
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 100 was requested, but there are only 15 rows.",
+-                "hint":null
+-              }|]
++            `shouldRespondWith` "[]"
+             { matchStatus  = 416
+             , matchHeaders = ["Content-Range" <:> "*/15"]
+             }
+@@ -241,46 +193,11 @@ spec = do
+ 
+       it "fails if limit is negative" $
+         get "/items?select=id&limit=-1"
+-          `shouldRespondWith`
+-            [json| {
+-              "message":"Requested range not satisfiable",
+-              "code":"PGRST103",
+-              "details":"Limit should be greater than or equal to zero.",
+-              "hint":null
+-            }|]
++          `shouldRespondWith` [json|{"message":"HTTP Range error","code":"PGRST103","details":null,"hint":null}|]
+           { matchStatus  = 416
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+-      context "of invalid range" $ do
+-        it "refuses a range with nonzero start when there are no items" $
+-          request methodGet "/menagerie?offset=1"
+-                  [("Prefer", "count=exact")] ""
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 1 was requested, but there are only 0 rows.",
+-                "hint":null
+-              }|]
+-            { matchStatus  = 416
+-            , matchHeaders = ["Content-Range" <:> "*/0"]
+-            }
+-
+-        it "refuses a range requesting start past last item" $
+-          request methodGet "/items?offset=100"
+-                  [("Prefer", "count=exact")] ""
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 100 was requested, but there are only 15 rows.",
+-                "hint":null
+-              }|]
+-            { matchStatus  = 416
+-            , matchHeaders = ["Content-Range" <:> "*/15"]
+-            }
+-
+     context "when count=planned" $ do
+       it "obtains a filtered range" $ do
+         request methodGet "/items?select=id&id=gt.8"
+@@ -426,25 +343,12 @@ spec = do
+         it "fails with 416 for offside range" $
+           request methodGet  "/items"
+                   (rangeHdrs $ ByteRangeFromTo 1 0) ""
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"The lower boundary must be lower than or equal to the upper boundary in the Range header.",
+-                "hint":null
+-              }|]
+-            { matchStatus = 416 }
++            `shouldRespondWith` 416
+ 
+         it "refuses a range with nonzero start when there are no items" $
+           request methodGet "/menagerie"
+                   (rangeHdrsWithCount $ ByteRangeFromTo 1 2) ""
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 1 was requested, but there are only 0 rows.",
+-                "hint":null
+-              }|]
++            `shouldRespondWith` "[]"
+             { matchStatus  = 416
+             , matchHeaders = ["Content-Range" <:> "*/0"]
+             }
+@@ -452,13 +356,7 @@ spec = do
+         it "refuses a range requesting start past last item" $
+           request methodGet "/items"
+                   (rangeHdrsWithCount $ ByteRangeFromTo 100 199) ""
+-            `shouldRespondWith`
+-              [json| {
+-                "message":"Requested range not satisfiable",
+-                "code":"PGRST103",
+-                "details":"An offset of 100 was requested, but there are only 15 rows.",
+-                "hint":null
+-              }|]
++            `shouldRespondWith` "[]"
+             { matchStatus  = 416
+             , matchHeaders = ["Content-Range" <:> "*/15"]
+             }

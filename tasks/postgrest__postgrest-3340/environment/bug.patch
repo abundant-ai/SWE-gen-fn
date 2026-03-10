@@ -1,0 +1,171 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ec757c4e..26f1d7eb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,7 +25,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3323, #3324, Don't hide error on LISTEN channel failure - @steve-chavez
+  - #3330, Incorrect admin server `/ready` response on slow schema cache loads - @steve-chavez
+  - #3327, Fix slow responses on schema cache reloads - @steve-chavez
+- - #3340, Log when the LISTEN channel gets a notification - @steve-chavez
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 29059c07..4ec78f69 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -1,5 +1,4 @@
+ {-# LANGUAGE LambdaCase      #-}
+-{-# LANGUAGE MultiWayIf      #-}
+ {-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ 
+@@ -502,7 +501,6 @@ listener appState observer = do
+         putIsListenerOn appState True
+         SQL.listen db $ SQL.toPgIdentifier dbChannel
+         SQL.waitForNotifications handleNotification db
+-
+       Left err -> do
+         observer $ DBListenerFail dbChannel err
+         exitFailure
+@@ -519,11 +517,11 @@ listener appState observer = do
+       -- retry the listener
+       listener appState observer
+ 
+-    handleNotification channel msg =
+-      if | BS.null msg            -> observer (DBListenerGotSCacheMsg channel) >> cacheReloader
+-         | msg == "reload schema" -> observer (DBListenerGotSCacheMsg channel) >> cacheReloader
+-         | msg == "reload config" -> observer (DBListenerGotConfigMsg channel) >> reReadConfig False appState observer
+-         | otherwise              -> pure () -- Do nothing if anything else than an empty message is sent
++    handleNotification _ msg
++      | BS.null msg            = cacheReloader
++      | msg == "reload schema" = cacheReloader
++      | msg == "reload config" = reReadConfig False appState observer
++      | otherwise              = pure () -- Do nothing if anything else than an empty message is sent
+ 
+     cacheReloader =
+       -- reloads the schema cache + restarts pool connections
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index de039653..98370ef9 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -40,8 +40,6 @@ data Observation
+   | DBListenerStart Text
+   | DBListenerFail Text SQL.ConnectionError
+   | DBListenerFailRecoverObs Bool Text (Either SomeException ())
+-  | DBListenerGotSCacheMsg ByteString
+-  | DBListenerGotConfigMsg ByteString
+   | ConfigReadErrorObs
+   | ConfigReadErrorFatalObs SQL.UsageError Text
+   | ConfigReadErrorNotFatalObs SQL.UsageError
+@@ -84,15 +82,11 @@ observationMessage = \case
+   ConnectionPgVersionErrorObs usageErr ->
+     jsonMessage usageErr
+   DBListenerStart channel -> do
+-    "Listening for notifications on the " <> show channel <> " channel"
++    "Listening for notifications on the " <> channel <> " channel"
+   DBListenerFail channel err -> do
+     "Could not listen for notifications on the " <> channel <> " channel. " <> show err
+   DBListenerFailRecoverObs recover channel err ->
+     "Could not listen for notifications on the " <> channel <> " channel. " <> showListenerError err <> (if recover then " Retrying listening for notifications.." else mempty)
+-  DBListenerGotSCacheMsg channel ->
+-    "Received a schema cache reload message on the " <> show channel <> " channel"
+-  DBListenerGotConfigMsg channel ->
+-    "Received a config reload message on the " <> show channel <> " channel"
+   ConfigReadErrorObs ->
+     "An error ocurred when trying to query database settings for the config parameters"
+   ConfigReadErrorFatalObs usageErr hint ->
+diff --git a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+index ead912a9..cc12ccd7 100644
+--- a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
++++ b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+@@ -393,23 +393,6 @@
+       pdSchema: public
+       pdVolatility: Volatile
+ 
+-- - qiName: notify_do_nothing
+-    qiSchema: public
+-  - - pdDescription: null
+-      pdFuncSettings: []
+-      pdHasVariadic: false
+-      pdName: notify_do_nothing
+-      pdParams: []
+-      pdReturnType:
+-        contents:
+-          contents:
+-            qiName: void
+-            qiSchema: pg_catalog
+-          tag: Scalar
+-        tag: Single
+-      pdSchema: public
+-      pdVolatility: Volatile
+-
+ - - qiName: sleep
+     qiSchema: public
+   - - pdDescription: null
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index 63650566..f6df2171 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -89,10 +89,6 @@ begin
+   perform pg_notify('pgrst', 'reload config');
+ end $_$ volatile security definer language plpgsql ;
+ 
+-create function notify_do_nothing() returns void as $_$
+-  notify pgrst, 'nothing';
+-$_$ language sql;
+-
+ create function reset_invalid_role_claim_key() returns void as $_$
+ begin
+   alter role postgrest_test_authenticator reset pgrst.jwt_role_claim_key;
+diff --git a/test/io/test_cli.py b/test/io/test_cli.py
+index a85a0111..498f10ec 100644
+--- a/test/io/test_cli.py
++++ b/test/io/test_cli.py
+@@ -246,7 +246,7 @@ def test_invalid_openapi_mode(invalidopenapimodes, defaultenv):
+                 print(line)
+ 
+ 
+-# If this test is failing, run postgrest-test-io --snapshot-update -k test_schema_cache_snapshot
++# If this test is failing, run pytest with --snapshot-update.
+ @pytest.mark.parametrize(
+     "key",
+     [
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index bf48ddb1..ca421150 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -421,8 +421,6 @@ def test_invalid_role_claim_key_notify_reload(defaultenv):
+     with run(env=env) as postgrest:
+         postgrest.session.post("/rpc/invalid_role_claim_key_reload")
+ 
+-        output = postgrest.read_stdout()
+-        assert 'Received a config reload message on the "pgrst" channel' in output[0]
+         output = postgrest.read_stdout()
+         assert "failed to parse role-claim-key value" in output[0]
+ 
+@@ -430,24 +428,6 @@ def test_invalid_role_claim_key_notify_reload(defaultenv):
+         assert response.status_code == 204
+ 
+ 
+-def test_notify_do_nothing(defaultenv):
+-    "NOTIFY with unknown message should do nothing"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_CONFIG": "true",
+-        "PGRST_DB_CHANNEL_ENABLED": "true",
+-        "PGRST_LOG_LEVEL": "crit",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.post("/rpc/notify_do_nothing")
+-        assert response.status_code == 204
+-
+-        output = postgrest.read_stdout()
+-        assert output == []
+-
+-
+ def test_db_prepared_statements_enable(defaultenv):
+     "Should use prepared statements when the setting is enabled."
+ 

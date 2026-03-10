@@ -1,0 +1,345 @@
+diff --git a/src/dune_engine/action_exec.ml b/src/dune_engine/action_exec.ml
+index b5bf32914..c8cca9964 100644
+--- a/src/dune_engine/action_exec.ml
++++ b/src/dune_engine/action_exec.ml
+@@ -264,7 +264,7 @@ let rec exec t ~ectx ~eenv : Done_or_more_deps.t Produce.t =
+     Done
+   | Pipe (outputs, l) -> exec_pipe ~ectx ~eenv outputs l
+   | Diff diff ->
+-    let+ () = Produce.of_fiber (Diff_action.exec ectx.rule_loc diff) in
++    let+ () = Produce.of_fiber (Diff_action.exec ~patch_back:None ectx.rule_loc diff) in
+     Done
+   | Extension (module A) -> Produce.of_fiber @@ A.Spec.action A.v ~ectx ~eenv
+ 
+diff --git a/src/dune_engine/diff_action.ml b/src/dune_engine/diff_action.ml
+index bead610ae..42b7204da 100644
+--- a/src/dune_engine/diff_action.ml
++++ b/src/dune_engine/diff_action.ml
+@@ -21,7 +21,7 @@ let compare_files { Diff.optional; mode; file1; file2 } =
+     | false, true -> `Eq false)
+ ;;
+ 
+-let exec loc ({ Diff.optional; file1; file2; mode } as diff) =
++let exec loc ~patch_back ({ Diff.optional; file1; file2; mode } as diff) =
+   let remove_intermediate_file () =
+     if optional
+     then (
+@@ -66,6 +66,7 @@ let exec loc ({ Diff.optional; file1; file2; mode } as diff) =
+              ]
+          else
+            Print_diff.print
++             ~patch_back
+              promotion
+              file1
+              (Path.build file2)
+diff --git a/src/dune_engine/diff_action.mli b/src/dune_engine/diff_action.mli
+index 048f2137f..8ed7ce748 100644
+--- a/src/dune_engine/diff_action.mli
++++ b/src/dune_engine/diff_action.mli
+@@ -1,3 +1,7 @@
+ open Import
+ 
+-val exec : Loc.t -> (Path.t, Path.Build.t) Dune_util.Action.Diff.t -> unit Fiber.t
++val exec
++  :  Loc.t
++  -> patch_back:Path.t option
++  -> (Path.t, Path.Build.t) Dune_util.Action.Diff.t
++  -> unit Fiber.t
+diff --git a/src/dune_engine/print_diff.ml b/src/dune_engine/print_diff.ml
+index 219521460..0e7274c5e 100644
+--- a/src/dune_engine/print_diff.ml
++++ b/src/dune_engine/print_diff.ml
+@@ -102,7 +102,7 @@ module External = struct
+     |> Option.map ~f:(fun prog ->
+       let relative = Path.reach ~from:dir in
+       let args =
+-        [ "-u"; "--label"; relative label1; "--label"; relative label2 ]
++        [ "-u"; "--label"; label1; "--label"; label2 ]
+         @ (if skip_trailing_cr then [ "--strip-trailing-cr" ] else [])
+         @ [ relative file1; relative file2 ]
+       in
+@@ -158,22 +158,14 @@ end
+ 
+ let noent_to_dev_null f = if Fpath.exists (Path.to_string f) then f else Dev_null.path
+ 
+-let prepare ~skip_trailing_cr promotion path1 path2 =
+-  let dir, loc =
+-    let dir, file1 =
+-      match
+-        ( Path.extract_build_context_dir_maybe_sandboxed path1
+-        , Path.extract_build_context_dir_maybe_sandboxed path2 )
+-      with
+-      | Some (dir1, f1), Some (dir2, _) when Path.equal dir1 dir2 -> dir1, Path.source f1
+-      | _ -> Path.root, path1
+-    in
+-    dir, Loc.in_file file1
+-  in
+-  let label1 = path1 in
+-  let label2 = path2 in
+-  let path1 = noent_to_dev_null path1 in
+-  let path2 = noent_to_dev_null path2 in
++let prepare_with_labels
++      ~skip_trailing_cr
++      ~dir
++      loc
++      promotion
++      (label1, path1)
++      (label2, path2)
++  =
+   let fallback =
+     With_fallback.fail
+       (User_error.make
+@@ -181,10 +173,12 @@ let prepare ~skip_trailing_cr promotion path1 path2 =
+          ?promotion
+          [ Pp.textf
+              "Files %s and %s differ."
+-             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root label1))
+-             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root label2))
++             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root path1))
++             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root path2))
+          ])
+   in
++  let path1 = noent_to_dev_null path1 in
++  let path2 = noent_to_dev_null path2 in
+   match !Clflags.diff_command with
+   | Some "-" -> fallback
+   | Some cmd ->
+@@ -232,8 +226,40 @@ let prepare ~skip_trailing_cr promotion path1 path2 =
+       External.patdiff ~dir promotion loc path1 path2 |> or_fallback ~fallback)
+ ;;
+ 
+-let print ~skip_trailing_cr promotion path1 path2 =
+-  let p = prepare ~skip_trailing_cr (Some promotion) path1 path2 in
++let prepare ~skip_trailing_cr promotion path1 path2 =
++  let dir, loc =
++    let dir, file1 =
++      match
++        ( Path.extract_build_context_dir_maybe_sandboxed path1
++        , Path.extract_build_context_dir_maybe_sandboxed path2 )
++      with
++      | Some (dir1, f1), Some (dir2, _) when Path.equal dir1 dir2 -> dir1, Path.source f1
++      | _ -> Path.root, path1
++    in
++    dir, Loc.in_file file1
++  in
++  let label1 = Path.reach ~from:dir path1 in
++  let label2 = Path.reach ~from:dir path2 in
++  prepare_with_labels ~skip_trailing_cr ~dir loc promotion (label1, path1) (label2, path2)
++;;
++
++let print ~skip_trailing_cr ~patch_back promotion path1 path2 =
++  let p =
++    match patch_back with
++    | None -> prepare ~skip_trailing_cr (Some promotion) path1 path2
++    | Some dir ->
++      let path1 = Path.source (Path.drop_optional_build_context_src_exn path1) in
++      let loc = Loc.in_file path1 in
++      let label1 = Path.to_string path1 in
++      let label2 = Path.to_string (Path.drop_optional_sandbox_root path2) in
++      prepare_with_labels
++        ~skip_trailing_cr
++        ~dir
++        loc
++        (Some promotion)
++        (label1, path1)
++        (label2, path2)
++  in
+   With_fallback.exec p
+ ;;
+ 
+diff --git a/src/dune_engine/print_diff.mli b/src/dune_engine/print_diff.mli
+index 373cedb6f..249eda271 100644
+--- a/src/dune_engine/print_diff.mli
++++ b/src/dune_engine/print_diff.mli
+@@ -3,6 +3,7 @@ open Import
+ (** Diff two files that are expected not to match. *)
+ val print
+   :  skip_trailing_cr:bool
++  -> patch_back:Path.t option
+   -> User_message.Diff_annot.t
+   -> Path.t
+   -> Path.t
+diff --git a/src/dune_engine/sandbox.ml b/src/dune_engine/sandbox.ml
+index 921e675eb..155c06ec2 100644
+--- a/src/dune_engine/sandbox.ml
++++ b/src/dune_engine/sandbox.ml
+@@ -225,41 +225,68 @@ let register_snapshot_promotion t (targets : Targets.Validated.t) ~old_snapshot
+   let in_source_tree p =
+     Path.extract_build_context_dir_maybe_sandboxed p |> Option.value_exn |> snd
+   in
+-  let copy_file p =
+-    let source_file = in_source_tree p in
+-    let correction_file = Path.as_in_build_dir_exn p in
+-    Diff_promotion.register_intermediate `Move ~source_file ~correction_file
+-  in
+-  let delete what file = in_source_tree file |> Diff_promotion.register_delete what in
++  let diffs = ref [] in
++  let add_copy_file p = diffs := p :: !diffs in
++  let deletes = ref [] in
++  let add_delete what file = deletes := (what, in_source_tree file) :: !deletes in
+   let target_root_in_sandbox = map_path t targets.root in
+-  Path.Map.iter2 old_snapshot new_snapshot ~f:(fun p before after ->
+-    if
+-      not
+-        (let dir = Path.as_in_build_dir_exn (Path.parent_exn p) in
+-         Path.Build.equal dir target_root_in_sandbox
+-         &&
+-         let basename = Path.basename p in
+-         Filename.Set.mem targets.files basename || Filename.Set.mem targets.dirs basename)
+-    then (
+-      match before, after with
+-      | None, None -> assert false
+-      | None, Some (`File _) -> copy_file p
+-      | Some (`File _), None -> delete `File p
+-      | Some `Dir, None -> delete `Directory p
+-      | Some `Dir, Some `Dir -> ()
+-      | None, Some `Dir ->
+-        (* We don't create empty dirs and rely on the traversal of this dir to
++  let () =
++    Path.Map.iter2 old_snapshot new_snapshot ~f:(fun p before after ->
++      if
++        not
++          (let dir = Path.as_in_build_dir_exn (Path.parent_exn p) in
++           Path.Build.equal dir target_root_in_sandbox
++           &&
++           let basename = Path.basename p in
++           Filename.Set.mem targets.files basename
++           || Filename.Set.mem targets.dirs basename)
++      then (
++        match before, after with
++        | None, None -> assert false
++        | None, Some (`File _) -> add_copy_file p
++        | Some (`File _), None -> add_delete `File p
++        | Some `Dir, None -> add_delete `Directory p
++        | Some `Dir, Some `Dir -> ()
++        | None, Some `Dir ->
++          (* We don't create empty dirs and rely on the traversal of this dir to
+            create the underlying files. Mayb e we should try harder *)
+-        ()
+-      | Some (`File _), Some `Dir ->
+-        (* We are going to traverse the target directory here, but we should
++          ()
++        | Some (`File _), Some `Dir ->
++          (* We are going to traverse the target directory here, but we should
+            really treat this as a deletion *)
+-        ()
+-      | Some `Dir, Some (`File _) -> copy_file p
+-      | Some (`File before), Some (`File after) ->
+-        (match Cached_digest.Reduced_stats.compare before after with
+-         | Eq -> ()
+-         | Lt | Gt -> copy_file p)))
++          ()
++        | Some `Dir, Some (`File _) -> add_copy_file p
++        | Some (`File before), Some (`File after) ->
++          (match Cached_digest.Reduced_stats.compare before after with
++           | Eq -> ()
++           | Lt | Gt -> add_copy_file p)))
++  in
++  Fiber.fork_and_join_unit
++    (fun () ->
++       Fiber.parallel_iter !diffs ~f:(fun path ->
++         let source = Path.drop_optional_sandbox_root path in
++         Diff_action.exec
++           ~patch_back:(Some (Path.build t.dir))
++           t.loc
++           { Dune_util.Action.Diff.file1 = source
++           ; file2 = Path.as_in_build_dir_exn path
++           ; optional = true
++           ; mode = Text
++           }))
++    (fun () ->
++       Fiber.parallel_iter !deletes ~f:(fun (what, path) ->
++         Diff_promotion.register_delete what path;
++         let what =
++           match what with
++           | `File -> "File"
++           | `Directory -> "Directory"
++         in
++         User_error.raise
++           [ Pp.textf
++               "%s %s should be deleted"
++               what
++               (Path.Source.to_string_maybe_quoted path)
++           ]))
+ ;;
+ 
+ let hint_delete_dir =
+@@ -273,42 +300,46 @@ let move_targets_to_build_dir t ~should_be_skipped ~(targets : Targets.Validated
+   : unit Fiber.t
+   =
+   let open Fiber.O in
+-  let+ start, stop, queued =
+-    maybe_async (fun () ->
+-      Option.iter t.snapshot ~f:(fun old_snapshot ->
+-        register_snapshot_promotion t targets ~old_snapshot);
+-      Targets.Validated.iter
+-        targets
+-        ~file:(fun target ->
+-          if not (should_be_skipped target)
+-          then rename_optional_file ~src:(map_path t target) ~dst:target)
+-        ~dir:(fun target ->
+-          let src_dir = map_path t target in
+-          (match Path.Untracked.stat (Path.build target) with
+-           | Error (Unix.ENOENT, _, _) -> ()
+-           | Error e ->
+-             User_error.raise
+-               ~hints:hint_delete_dir
+-               [ Pp.textf "unable to stat %s" (Path.Build.to_string_maybe_quoted target)
+-               ; Pp.text "reason:"
+-               ; Pp.text (Unix_error.Detailed.to_string_hum e)
+-               ]
+-           | Ok { Unix.st_kind; _ } ->
+-             (* We clean up all targets (including directory targets) before
++  let start = Time.now () in
++  let+ () =
++    match t.snapshot with
++    | None -> Fiber.return ()
++    | Some old_snapshot -> register_snapshot_promotion t targets ~old_snapshot
++  in
++  let () =
++    Targets.Validated.iter
++      targets
++      ~file:(fun target ->
++        if not (should_be_skipped target)
++        then rename_optional_file ~src:(map_path t target) ~dst:target)
++      ~dir:(fun target ->
++        let src_dir = map_path t target in
++        (match Path.Untracked.stat (Path.build target) with
++         | Error (Unix.ENOENT, _, _) -> ()
++         | Error e ->
++           User_error.raise
++             ~hints:hint_delete_dir
++             [ Pp.textf "unable to stat %s" (Path.Build.to_string_maybe_quoted target)
++             ; Pp.text "reason:"
++             ; Pp.text (Unix_error.Detailed.to_string_hum e)
++             ]
++         | Ok { Unix.st_kind; _ } ->
++           (* We clean up all targets (including directory targets) before
+               running an action, so this branch should be unreachable unless
+               the rule somehow escaped the sandbox *)
+-             User_error.raise
+-               ~hints:hint_delete_dir
+-               [ Pp.textf
+-                   "Target %s of kind %S already exists in the build directory"
+-                   (Path.Build.to_string_maybe_quoted target)
+-                   (File_kind.to_string_hum st_kind)
+-               ]);
+-          if Fpath.exists (Path.Build.to_string src_dir)
+-          then Unix.rename (Path.Build.to_string src_dir) (Path.Build.to_string target)))
++           User_error.raise
++             ~hints:hint_delete_dir
++             [ Pp.textf
++                 "Target %s of kind %S already exists in the build directory"
++                 (Path.Build.to_string_maybe_quoted target)
++                 (File_kind.to_string_hum st_kind)
++             ]);
++        if Fpath.exists (Path.Build.to_string src_dir)
++        then Unix.rename (Path.Build.to_string src_dir) (Path.Build.to_string target))
+   in
++  let stop = Time.now () in
+   Dune_trace.emit ~buffered:true Sandbox (fun () ->
+-    Dune_trace.Event.sandbox `Extract ~start ~stop ~queued t.loc ~dir:t.dir)
++    Dune_trace.Event.sandbox `Extract ~start ~stop ~queued:None t.loc ~dir:t.dir)
+ ;;
+ 
+ let failed_to_delete_sandbox dir reason =

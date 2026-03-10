@@ -1,0 +1,292 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index f16c9ba6..eb47231f 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -149,7 +149,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache jsonDbS pgVer aut
+       ApiRequest.userApiRequest conf sCache req body
+ 
+   Response.optionalRollback conf apiRequest $
+-    handleRequest authResult conf appState (Query.txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements jsonDbS pgVer apiRequest sCache
++    handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements jsonDbS pgVer apiRequest sCache
+ 
+ runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState mode authenticated prepared handler = do
+@@ -163,52 +163,58 @@ runDbHandler appState mode authenticated prepared handler = do
+ 
+   liftEither resp
+ 
+-handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> SQL.Mode -> Bool -> Bool -> ByteString -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
+-handleRequest AuthResult{..} conf appState mode authenticated prepared jsonDbS pgVer apiReq@ApiRequest{..} sCache =
++handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> ByteString -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
++handleRequest AuthResult{..} conf appState authenticated prepared jsonDbS pgVer apiReq@ApiRequest{..} sCache =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       rPlan <- liftEither $ Plan.readPlan identifier conf sCache apiReq
+-      resultSet <- runQuery $ Query.readQuery rPlan conf apiReq
++      resultSet <- runQuery Plan.readPlanTxMode $ Query.readQuery rPlan conf apiReq
+       return $ Response.readResponse headersOnly identifier apiReq resultSet
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+-      resultSet <- runQuery $ Query.createQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
+       return $ Response.createResponse identifier mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+-      resultSet <- runQuery $ Query.updateQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+       return $ Response.updateResponse apiReq resultSet
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+-      resultSet <- runQuery $ Query.singleUpsertQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+       return $ Response.singleUpsertResponse apiReq resultSet
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+-      resultSet <- runQuery $ Query.deleteQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+       return $ Response.deleteResponse apiReq resultSet
+ 
+     (ActionInvoke invMethod, TargetProc proc _) -> do
+-      cPlan <- liftEither $ Plan.callReadPlan proc conf sCache apiReq
+-      resultSet <- runQuery $ Query.invokeQuery proc cPlan apiReq conf
++      cPlan <- liftEither $ Plan.callReadPlan proc conf sCache apiReq invMethod
++      resultSet <- runQuery (Plan.crTxMode cPlan) $ Query.invokeQuery proc cPlan apiReq conf
+       return $ Response.invokeResponse invMethod proc apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+-      oaiResult <- runQuery $ Query.openApiQuery sCache pgVer conf tSchema
++      oaiResult <- runQuery Plan.inspectPlanTxMode $ Query.openApiQuery sCache pgVer conf tSchema
+       return $ Response.openApiResponse headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
+ 
+-    (ActionInfo, _) ->
+-      return $ Response.infoResponse iTarget sCache
++    (ActionInfo, TargetIdent identifier) ->
++      return $ Response.infoIdentResponse identifier sCache
++
++    (ActionInfo, TargetProc proc _) ->
++      return $ Response.infoProcResponse proc
++
++    (ActionInfo, TargetDefaultSpec _) ->
++      return Response.infoRootResponse
+ 
+     _ ->
+       -- This is unreachable as the ApiRequest.hs rejects it before
+       -- TODO Refactor the Action/Target types to remove this line
+       throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+-    runQuery query =
++    runQuery mode query =
+       runDbHandler appState mode authenticated prepared $ do
+         Query.setPgLocals conf authClaims authRole apiReq jsonDbS pgVer
+         query
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 55c2afd8..8f800df0 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -21,6 +21,8 @@ module PostgREST.Plan
+   , callReadPlan
+   , MutateReadPlan(..)
+   , CallReadPlan(..)
++  , readPlanTxMode
++  , inspectPlanTxMode
+   ) where
+ 
+ import qualified Data.HashMap.Strict        as HM
+@@ -33,6 +35,7 @@ import Data.Tree               (Tree (..))
+ 
+ import PostgREST.ApiRequest               (Action (..),
+                                            ApiRequest (..),
++                                           InvokeMethod (..),
+                                            Mutation (..),
+                                            Payload (..))
+ import PostgREST.Config                   (AppConfig (..))
+@@ -63,6 +66,7 @@ import PostgREST.Plan.MutatePlan
+ import PostgREST.Plan.ReadPlan          as ReadPlan
+ import PostgREST.Plan.Types
+ 
++import qualified Hasql.Transaction.Sessions       as SQL
+ import qualified PostgREST.ApiRequest.QueryParams as QueryParams
+ 
+ import Protolude hiding (from)
+@@ -70,25 +74,39 @@ import Protolude hiding (from)
+ data MutateReadPlan = MutateReadPlan {
+   mrReadPlan   :: ReadPlanTree
+ , mrMutatePlan :: MutatePlan
++, mrTxMode     :: SQL.Mode
+ }
+ 
+ data CallReadPlan = CallReadPlan {
+   crReadPlan :: ReadPlanTree
+ , crCallPlan :: CallPlan
++, crTxMode   :: SQL.Mode
+ }
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error MutateReadPlan
+ mutateReadPlan  mutation apiRequest identifier conf sCache = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+   mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
+-  return $ MutateReadPlan rPlan mPlan
++  return $ MutateReadPlan rPlan mPlan SQL.Write
+ 
+-callReadPlan :: ProcDescription -> AppConfig -> SchemaCache -> ApiRequest -> Either Error CallReadPlan
+-callReadPlan proc conf sCache apiRequest = do
++callReadPlan :: ProcDescription -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
++callReadPlan proc conf sCache apiRequest invMethod = do
+   let identifier = QualifiedIdentifier (pdSchema proc) (fromMaybe (pdName proc) $ Proc.procTableName proc)
+   rPlan <- readPlan identifier conf sCache apiRequest
+   let cPlan = callPlan proc apiRequest rPlan
+-  return $ CallReadPlan rPlan cPlan
++      txMode = case (invMethod, Proc.pdVolatility proc) of
++          (InvGet,  _)              -> SQL.Read
++          (InvHead, _)              -> SQL.Read
++          (InvPost, Proc.Stable)    -> SQL.Read
++          (InvPost, Proc.Immutable) -> SQL.Read
++          (InvPost, Proc.Volatile)  -> SQL.Write
++  return $ CallReadPlan rPlan cPlan txMode
++
++readPlanTxMode :: SQL.Mode
++readPlanTxMode = SQL.Read
++
++inspectPlanTxMode :: SQL.Mode
++inspectPlanTxMode = SQL.Read
+ 
+ -- | Builds the ReadPlan tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 022a3af3..35fbddfc 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -7,7 +7,6 @@ module PostgREST.Query
+   , openApiQuery
+   , readQuery
+   , singleUpsertQuery
+-  , txMode
+   , updateQuery
+   , setPgLocals
+   , DbHandler
+@@ -24,7 +23,6 @@ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL (Snippet)
+ import qualified Hasql.DynamicStatements.Statement as SQL
+ import qualified Hasql.Transaction                 as SQL
+-import qualified Hasql.Transaction.Sessions        as SQL
+ 
+ import qualified PostgREST.Error              as Error
+ import qualified PostgREST.Query.QueryBuilder as QueryBuilder
+@@ -35,9 +33,7 @@ import qualified PostgREST.SchemaCache.Proc   as Proc
+ 
+ import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+ 
+-import PostgREST.ApiRequest              (Action (..),
+-                                          ApiRequest (..),
+-                                          InvokeMethod (..),
++import PostgREST.ApiRequest              (ApiRequest (..),
+                                           Target (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferParameters (..),
+@@ -62,7 +58,6 @@ import PostgREST.SchemaCache             (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..),
+                                           Schema)
+ import PostgREST.SchemaCache.Proc        (ProcDescription (..),
+-                                          ProcVolatility (..),
+                                           ProcsMap)
+ import PostgREST.SchemaCache.Table       (TablesMap)
+ 
+@@ -192,24 +187,6 @@ openApiQuery sCache pgVer AppConfig{..} tSchema =
+     OADisabled ->
+       pure Nothing
+ 
+-txMode :: ApiRequest -> SQL.Mode
+-txMode ApiRequest{..} =
+-  case (iAction, iTarget) of
+-    (ActionRead _, _) ->
+-      SQL.Read
+-    (ActionInspect _, _) ->
+-      SQL.Read
+-    (ActionInvoke InvGet, _) ->
+-      SQL.Read
+-    (ActionInvoke InvHead, _) ->
+-      SQL.Read
+-    (ActionInvoke InvPost, TargetProc ProcDescription{pdVolatility=Stable} _) ->
+-      SQL.Read
+-    (ActionInvoke InvPost, TargetProc ProcDescription{pdVolatility=Immutable} _) ->
+-      SQL.Read
+-    _ ->
+-      SQL.Write
+-
+ writeQuery :: MutateReadPlan -> ApiRequest -> AppConfig  -> DbHandler ResultSet
+ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq conf =
+   let
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 9f710b66..ae72cfcf 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -3,7 +3,9 @@
+ module PostgREST.Response
+   ( createResponse
+   , deleteResponse
+-  , infoResponse
++  , infoIdentResponse
++  , infoProcResponse
++  , infoRootResponse
+   , invokeResponse
+   , openApiResponse
+   , readResponse
+@@ -30,8 +32,7 @@ import qualified PostgREST.RangeQuery       as RangeQuery
+ import qualified PostgREST.Response.OpenAPI as OpenAPI
+ 
+ import PostgREST.ApiRequest              (ApiRequest (..),
+-                                          InvokeMethod (..),
+-                                          Target (..))
++                                          InvokeMethod (..))
+ import PostgREST.ApiRequest.Preferences  (PreferRepresentation (..),
+                                           PreferTransaction (..),
+                                           shouldCount,
+@@ -169,20 +170,12 @@ deleteResponse ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+ 
+-infoResponse :: Target -> SchemaCache -> Wai.Response
+-infoResponse target sCache =
+-  case target of
+-    TargetIdent identifier ->
+-      case HM.lookup identifier (dbTables sCache) of
+-        Just tbl -> respondInfo $ allowH tbl
+-        Nothing  -> Error.errorResponseFor $ Error.ApiRequestError ApiRequestTypes.NotFound
+-    TargetProc pd _
+-      | pdVolatility pd == Volatile -> respondInfo "OPTIONS,POST"
+-      | otherwise                   -> respondInfo "OPTIONS,GET,HEAD,POST"
+-    TargetDefaultSpec _             -> respondInfo "OPTIONS,GET,HEAD"
++infoIdentResponse :: QualifiedIdentifier -> SchemaCache -> Wai.Response
++infoIdentResponse identifier sCache =
++  case HM.lookup identifier (dbTables sCache) of
++    Just tbl -> respondInfo $ allowH tbl
++    Nothing  -> Error.errorResponseFor $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+-    respondInfo allowHeader = Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
+-    allOrigins = ("Access-Control-Allow-Origin", "*")
+     allowH table =
+       let hasPK = not . null $ tablePKCols table in
+       BS.intercalate "," $
+@@ -192,6 +185,18 @@ infoResponse target sCache =
+           ["PATCH" | tableUpdatable table] ++
+           ["DELETE" | tableDeletable table]
+ 
++infoProcResponse :: ProcDescription -> Wai.Response
++infoProcResponse proc | pdVolatility proc == Volatile = respondInfo "OPTIONS,POST"
++                      | otherwise                     = respondInfo "OPTIONS,GET,HEAD,POST"
++
++infoRootResponse :: Wai.Response
++infoRootResponse = respondInfo "OPTIONS,GET,HEAD"
++
++respondInfo :: ByteString -> Wai.Response
++respondInfo allowHeader =
++  let allOrigins = ("Access-Control-Allow-Origin", "*") in
++  Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
++
+ invokeResponse :: InvokeMethod -> ProcDescription -> ApiRequest -> ResultSet -> Wai.Response
+ invokeResponse invMethod proc ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard {..} -> do

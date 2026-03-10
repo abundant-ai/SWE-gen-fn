@@ -1,0 +1,291 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b1f5643e..1790da7e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,10 +5,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Added
+- 
+- - #1614, Add `db-pool-automatic-recovery` configuration to disable connection retrying - @taimoorzaeem
+-
+ ### Fixed
+ 
+  - #2899, Fix `application/vnd.pgrst.array` not accepted as a valid mediatype - @taimoorzaeem
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 89e3cb69..7f4ac565 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -281,9 +281,8 @@ internalConnectionWorker appState = work
+           -- Fatal error when connecting
+           logWithZTime appState reason >> killThread (getMainThreadId appState)
+         NotConnected ->
+-          -- Unreachable because establishConnection will keep trying to connect, unless disable-recovery is turned on
+-          unless configDbPoolAutomaticRecovery
+-              $ logWithZTime appState "Automatic recovery disabled, exiting." >> killThread (getMainThreadId appState)
++          -- Unreachable because establishConnection will keep trying to connect
++          return ()
+         Connected actualPgVersion -> do
+           -- Procede with initialization
+           putPgVersion appState actualPgVersion
+@@ -345,10 +344,9 @@ establishConnection appState =
+ 
+     shouldRetry :: RetryStatus -> ConnectionStatus -> IO Bool
+     shouldRetry rs isConnSucc = do
+-      AppConfig{..} <- getConfig appState
+       let
+         delay = fromMaybe 0 (rsPreviousDelay rs) `div` backoffMicroseconds
+-        itShould = NotConnected == isConnSucc && configDbPoolAutomaticRecovery
++        itShould = NotConnected == isConnSucc
+       when itShould . logWithZTime appState $
+         "Attempting to reconnect to the database in "
+         <> (show delay::Text)
+@@ -422,7 +420,7 @@ listener appState = do
+   waitListener appState
+ 
+   -- forkFinally allows to detect if the thread dies
+-  void . flip forkFinally (handleFinally dbChannel configDbPoolAutomaticRecovery) $ do
++  void . flip forkFinally (handleFinally dbChannel) $ do
+     dbOrError <- acquire $ toUtf8 (addFallbackAppName prettyVersion configDbUri)
+     case dbOrError of
+       Right db -> do
+@@ -433,9 +431,7 @@ listener appState = do
+       _ ->
+         die $ "Could not listen for notifications on the " <> dbChannel <> " channel"
+   where
+-    handleFinally _ False _ =
+-      logWithZTime appState "Automatic recovery disabled, exiting." >> killThread (getMainThreadId appState)
+-    handleFinally dbChannel True _ = do
++    handleFinally dbChannel _ = do
+       -- if the thread dies, we try to recover
+       logWithZTime appState $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
+       putIsListenerOn appState False
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 7f39d212..8f4626ad 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -162,9 +162,6 @@ exampleConfigFile =
+       |## Time in seconds after which to recycle unused pool connections
+       |# db-pool-max-idletime = 30
+       |
+-      |## Allow autmatic database connection retrying
+-      |# db-pool-automatic-recovery = true
+-      |
+       |## Stored proc to exec immediately after auth
+       |# db-pre-request = "stored_proc_name"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 4221ff59..de0ed82e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -80,7 +80,6 @@ data AppConfig = AppConfig
+   , configDbPoolAcquisitionTimeout :: Int
+   , configDbPoolMaxLifetime        :: Int
+   , configDbPoolMaxIdletime        :: Int
+-  , configDbPoolAutomaticRecovery  :: Bool
+   , configDbPreRequest             :: Maybe QualifiedIdentifier
+   , configDbPreparedStatements     :: Bool
+   , configDbRootSpec               :: Maybe QualifiedIdentifier
+@@ -148,7 +147,6 @@ toText conf =
+       ,("db-pool-acquisition-timeout",   show . configDbPoolAcquisitionTimeout)
+       ,("db-pool-max-lifetime",          show . configDbPoolMaxLifetime)
+       ,("db-pool-max-idletime",          show . configDbPoolMaxIdletime)
+-      ,("db-pool-automatic-recovery",    T.toLower . show . configDbPoolAutomaticRecovery)
+       ,("db-pre-request",            q . maybe mempty dumpQi . configDbPreRequest)
+       ,("db-prepared-statements",        T.toLower . show . configDbPreparedStatements)
+       ,("db-root-spec",              q . maybe mempty dumpQi . configDbRootSpec)
+@@ -243,7 +241,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe 1800 <$> optInt "db-pool-max-lifetime")
+     <*> (fromMaybe 30 <$> optWithAlias (optInt "db-pool-timeout")
+                                        (optInt "db-pool-max-idletime"))
+-    <*> (fromMaybe True <$> optBool "db-pool-automatic-recovery")
+     <*> (fmap toQi <$> optWithAlias (optString "db-pre-request")
+                                     (optString "pre-request"))
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index 96e74e2a..fedbac8b 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -8,7 +8,6 @@ db-pool = 10
+ db-pool-acquisition-timeout = 10
+ db-pool-max-lifetime = 1800
+ db-pool-max-idletime = 5
+-db-pool-automatic-recovery = true
+ db-pre-request = "check_alias"
+ db-prepared-statements = true
+ db-root-spec = "open_alias"
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index 438cd358..37abeb03 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -8,7 +8,6 @@ db-pool = 10
+ db-pool-acquisition-timeout = 10
+ db-pool-max-lifetime = 1800
+ db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+ db-pre-request = ""
+ db-prepared-statements = false
+ db-root-spec = ""
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index 438cd358..37abeb03 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -8,7 +8,6 @@ db-pool = 10
+ db-pool-acquisition-timeout = 10
+ db-pool-max-lifetime = 1800
+ db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+ db-pre-request = ""
+ db-prepared-statements = false
+ db-root-spec = ""
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index 3561d742..ab914aea 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -8,7 +8,6 @@ db-pool = 10
+ db-pool-acquisition-timeout = 10
+ db-pool-max-lifetime = 1800
+ db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+ db-pre-request = ""
+ db-prepared-statements = true
+ db-root-spec = ""
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index 226b1a73..dceefd8a 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -8,7 +8,6 @@ db-pool = 1
+ db-pool-acquisition-timeout = 30
+ db-pool-max-lifetime = 3600
+ db-pool-max-idletime = 60
+-db-pool-automatic-recovery = false
+ db-pre-request = "test.other_custom_headers"
+ db-prepared-statements = false
+ db-root-spec = "other_root"
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index d434cf77..0676308c 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -8,7 +8,6 @@ db-pool = 1
+ db-pool-acquisition-timeout = 30
+ db-pool-max-lifetime = 3600
+ db-pool-max-idletime = 60
+-db-pool-automatic-recovery = false
+ db-pre-request = "test.custom_headers"
+ db-prepared-statements = false
+ db-root-spec = "root"
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index a657ef85..2be86049 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -8,7 +8,6 @@ db-pool = 1
+ db-pool-acquisition-timeout = 30
+ db-pool-max-lifetime = 3600
+ db-pool-max-idletime = 60
+-db-pool-automatic-recovery = false
+ db-pre-request = "please_run_fast"
+ db-prepared-statements = false
+ db-root-spec = "openapi_v3"
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index bd0d91f4..7259e4a4 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -8,7 +8,6 @@ db-pool = 10
+ db-pool-acquisition-timeout = 10
+ db-pool-max-lifetime = 1800
+ db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+ db-pre-request = ""
+ db-prepared-statements = true
+ db-root-spec = ""
+diff --git a/test/io/configs/no-defaults-env.yaml b/test/io/configs/no-defaults-env.yaml
+index 158cd0e8..126075e4 100644
+--- a/test/io/configs/no-defaults-env.yaml
++++ b/test/io/configs/no-defaults-env.yaml
+@@ -10,7 +10,6 @@ PGRST_DB_POOL: 1
+ PGRST_DB_POOL_ACQUISITION_TIMEOUT: 30
+ PGRST_DB_POOL_MAX_LIFETIME: 3600
+ PGRST_DB_POOL_MAX_IDLETIME: 60
+-PGRST_DB_POOL_AUTOMATIC_RECOVERY: false
+ PGRST_DB_PREPARED_STATEMENTS: false
+ PGRST_DB_PRE_REQUEST: please_run_fast
+ PGRST_DB_ROOT_SPEC: openapi_v3
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index 9c7419b1..2a9f7361 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -8,7 +8,6 @@ db-pool = 1
+ db-pool-acquisition-timeout = 30
+ db-pool-max-lifetime = 3600
+ db-pool-max-idletime = 60
+-db-pool-automatic-recovery = false
+ db-pre-request = "please_run_fast"
+ db-prepared-statements = false
+ db-root-spec = "openapi_v3"
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index bc1dd967..7315ee5e 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -173,8 +173,4 @@ select application_name
+ from pg_stat_activity
+ where application_name ilike 'postgrest%'
+ limit 1;
+-$$;
+-
+-create function terminate_pgrst() returns setof record as $$
+-select pg_terminate_backend(pid) from pg_stat_activity where application_name iLIKE '%postgrest%';
+-$$ language sql security definer;
++$$
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 55a0712a..036e074f 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1063,35 +1063,3 @@ def test_succeed_w_role_having_superuser_settings(defaultenv):
+         response = postgrest.session.get("/projects", headers=headers)
+         print(response.text)
+         assert response.status_code == 200
+-
+-
+-def test_fail_with_invalid_dbname_and_automatic_recovery_disabled(defaultenv):
+-    "Should fail without retries when automatic recovery is disabled and dbname is invalid"
+-    dbname = "INVALID"
+-    uri = f'postgresql://?dbname={dbname}&host={defaultenv["PGHOST"]}&user={defaultenv["PGUSER"]}'
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_URI": uri,
+-        "PGRST_DB_POOL_AUTOMATIC_RECOVERY": "false",
+-    }
+-
+-    with run(env=env, wait_for_readiness=False) as postgrest:
+-        exitCode = wait_until_exit(postgrest)
+-        assert exitCode == 1
+-
+-
+-def test_fail_with_automatic_recovery_disabled_and_terminated_using_query(defaultenv):
+-    "Should fail without retries when automatic recovery is disabled and pg_terminate_backend(pid) is called"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_POOL_AUTOMATIC_RECOVERY": "false",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        os.system(
+-            f'psql -d {defaultenv["PGDATABASE"]} -U {defaultenv["PGUSER"]} -h {defaultenv["PGHOST"]} --set ON_ERROR_STOP=1 -a -c "SELECT terminate_pgrst()"'
+-        )
+-
+-        exitCode = wait_until_exit(postgrest)
+-        assert exitCode == 1
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 5ef0cd6d..cc96ad5a 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -91,7 +91,6 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbPoolAcquisitionTimeout = 10
+   , configDbPoolMaxLifetime     = 1800
+   , configDbPoolMaxIdletime     = 600
+-  , configDbPoolAutomaticRecovery = True
+   , configDbPreRequest          = Just $ QualifiedIdentifier "test" "switch_role"
+   , configDbPreparedStatements  = True
+   , configDbRootSpec            = Nothing

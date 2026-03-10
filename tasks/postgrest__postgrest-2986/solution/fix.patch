@@ -1,0 +1,108 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1d472992..8ed7c15f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2698, Add config `jwt-cache-max-lifetime` and implement JWT caching - @taimoorzaeem
+  - #2943, Add `handling=strict/lenient` for Prefer header - @taimoorzaeem
+  - #2983, Add more data to `Server-Timing` header - @develop7
++ - #2441, Add config `server-cors-allowed-origins` to specify CORS origins - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index ba1e5895..c8239db0 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -110,7 +110,7 @@ serverSettings AppConfig{..} =
+ postgrest :: AppConfig -> AppState.AppState -> IO () -> Wai.Application
+ postgrest conf appState connWorker =
+   traceHeaderMiddleware conf .
+-  Cors.middleware .
++  Cors.middleware (configServerCorsAllowedOrigins conf) .
+   Auth.middleware appState .
+   Logger.middleware (configLogLevel conf) $
+     -- fromJust can be used, because the auth middleware will **always** add
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 2bbd9072..510d5e9d 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -221,6 +221,9 @@ exampleConfigFile =
+       |## Content types to produce raw output
+       |# raw-media-types="image/png, image/jpg"
+       |
++      |## Configurable CORS origins
++      |# server-cors-allowed-origins = ""
++      |
+       |server-host = "!4"
+       |server-port = 3000
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 73f28481..4cfc059a 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -103,6 +103,7 @@ data AppConfig = AppConfig
+   , configOpenApiSecurityActive    :: Bool
+   , configOpenApiServerProxyUri    :: Maybe Text
+   , configRawMediaTypes            :: [MediaType]
++  , configServerCorsAllowedOrigins :: Maybe [Text]
+   , configServerHost               :: Text
+   , configServerPort               :: Int
+   , configServerTraceHeader        :: Maybe (CI.CI BS.ByteString)
+@@ -169,6 +170,7 @@ toText conf =
+       ,("openapi-security-active",       T.toLower . show . configOpenApiSecurityActive)
+       ,("openapi-server-proxy-uri",  q . fromMaybe mempty . configOpenApiServerProxyUri)
+       ,("raw-media-types",           q . T.decodeUtf8 . BS.intercalate "," . fmap toMime . configRawMediaTypes)
++      ,("server-cors-allowed-origins",      q . maybe "" (T.intercalate ",") . configServerCorsAllowedOrigins)
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
+       ,("server-trace-header",       q . T.decodeUtf8 . maybe mempty CI.original . configServerTraceHeader)
+@@ -273,6 +275,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe False <$> optBool "openapi-security-active")
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+     <*> (maybe [] (fmap (MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
++    <*> (fmap splitOnCommas <$> optValue "server-cors-allowed-origins")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
+diff --git a/src/PostgREST/Cors.hs b/src/PostgREST/Cors.hs
+index df38f1d9..fea3733d 100644
+--- a/src/PostgREST/Cors.hs
++++ b/src/PostgREST/Cors.hs
+@@ -2,10 +2,14 @@
+ Module      : PostgREST.Cors
+ Description : Wai Middleware to set cors policy.
+ -}
++
++{-# LANGUAGE TupleSections #-}
++
+ module PostgREST.Cors (middleware) where
+ 
+ import qualified Data.ByteString.Char8       as BS
+ import qualified Data.CaseInsensitive        as CI
++import qualified Data.Text.Encoding          as T
+ import qualified Network.Wai                 as Wai
+ import qualified Network.Wai.Middleware.Cors as Wai
+ 
+@@ -13,15 +17,15 @@ import Data.List (lookup)
+ 
+ import Protolude
+ 
+-middleware :: Wai.Middleware
+-middleware = Wai.cors corsPolicy
++middleware :: Maybe [Text] -> Wai.Middleware
++middleware corsAllowedOrigins = Wai.cors $ corsPolicy corsAllowedOrigins
+ 
+ -- | CORS policy to be used in by Wai Cors middleware
+-corsPolicy :: Wai.Request -> Maybe Wai.CorsResourcePolicy
+-corsPolicy req = case lookup "origin" headers of
+-  Just origin ->
++corsPolicy :: Maybe [Text] -> Wai.Request -> Maybe Wai.CorsResourcePolicy
++corsPolicy corsAllowedOrigins req = case lookup "origin" headers of
++  Just _ ->
+     Just Wai.CorsResourcePolicy
+-    { Wai.corsOrigins = Just ([origin], True)
++    { Wai.corsOrigins = (, True) . map T.encodeUtf8 <$> corsAllowedOrigins
+     , Wai.corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
+     , Wai.corsRequestHeaders = "Authorization" : accHeaders
+     , Wai.corsExposedHeaders = Just

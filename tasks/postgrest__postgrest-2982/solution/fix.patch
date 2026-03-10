@@ -1,0 +1,66 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c5e05855..60b9e7aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,6 +25,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2846, Fix error when requesting `Prefer: count=<type>` and doing null filtering on embedded resources - @laurenceisla
+  - #2959, Fix setting `default_transaction_isolation` unnecessarily - @steve-chavez
+  - #2929, Fix arrow filtering on RPC returning dynamic TABLE with composite type - @steve-chavez
++ - #2963, Fix RPCs not embedding correctly when using overloaded functions for computed relationships - @laurenceisla
+ 
+ ## [11.2.0] - 2023-08-10
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index fc5cdc0f..a30114be 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -399,7 +399,7 @@ addRels schema action allRels parentNode (Node rPlan@ReadPlan{relName,relHint,re
+             Relationship{relCardinality=M2M _} -> -- m2m does internal implicit joins that don't need aliasing
+               rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, relJoinConds=getJoinConditions Nothing parentAlias r}
+             ComputedRelationship{} ->
+-              rPlan{from=relForeignTable r, relToParent=Just r{relTable=maybe (relTable r) (QualifiedIdentifier mempty) parentAlias}, relAggAlias=aggAlias, fromAlias=newAlias}
++              rPlan{from=relForeignTable r, relToParent=Just r{relTableAlias=maybe (relTable r) (QualifiedIdentifier mempty) parentAlias}, relAggAlias=aggAlias, fromAlias=newAlias}
+             _ ->
+               rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, fromAlias=newAlias, relJoinConds=getJoinConditions newAlias parentAlias r}
+           ) <$> rel
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 02a4a892..06e4ad1f 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -242,8 +242,10 @@ getQualifiedIdentifier rel mainQi tblAlias = case rel of
+ fromF :: Maybe Relationship -> QualifiedIdentifier -> Maybe Alias -> SQL.Snippet
+ fromF rel mainQi tblAlias = "FROM " <>
+   (case rel of
+-    Just ComputedRelationship{relFunction,relTable} -> fromQi relFunction <> "(" <> pgFmtIdent (qiName relTable) <> ")"
+-    _                                               -> fromQi mainQi) <>
++    -- Due to the use of CTEs on RPC, we need to cast the parameter to the table name in case of function overloading.
++    -- See https://github.com/PostgREST/postgrest/issues/2963#issuecomment-1736557386
++    Just ComputedRelationship{relFunction,relTableAlias,relTable} -> fromQi relFunction <> "(" <> pgFmtIdent (qiName relTableAlias) <> "::" <> fromQi relTable <> ")"
++    _                                                             -> fromQi mainQi) <>
+   maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias <>
+   (case rel of
+     Just Relationship{relCardinality=M2M Junction{junTable=jt}} -> ", " <> fromQi jt
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 214fa7f0..5358a051 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -882,6 +882,7 @@ allComputedRels =
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
++    pure (QualifiedIdentifier mempty mempty) <*>
+     column HD.bool <*>
+     column HD.bool
+ 
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index e9eed8c3..8b7c7c60 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -31,6 +31,7 @@ data Relationship = Relationship
+   { relFunction     :: QualifiedIdentifier
+   , relTable        :: QualifiedIdentifier
+   , relForeignTable :: QualifiedIdentifier
++  , relTableAlias   :: QualifiedIdentifier
+   , relToOne        :: Bool
+   , relIsSelf       :: Bool
+   }

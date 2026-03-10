@@ -1,0 +1,207 @@
+diff --git a/hledger-lib/Hledger/Data/Balancing.hs b/hledger-lib/Hledger/Data/Balancing.hs
+index 6e24d5de4..ec998ddc6 100644
+--- a/hledger-lib/Hledger/Data/Balancing.hs
++++ b/hledger-lib/Hledger/Data/Balancing.hs
+@@ -18,6 +18,8 @@ module Hledger.Data.Balancing
+ , isTransactionBalanced
+ , balanceTransaction
+ , balanceTransactionHelper
++  -- * assertion validation
++, transactionCheckAssertions
+   -- * journal balancing
+ , journalBalanceTransactions
+   -- * tests
+@@ -146,6 +148,17 @@ transactionCheckBalanced BalancingOpts{commodity_styles_} t = errs
+ isTransactionBalanced :: BalancingOpts -> Transaction -> Bool
+ isTransactionBalanced bopts = null . transactionCheckBalanced bopts
+ 
++-- | Verify that any assertions in this transaction hold 
++-- when included in the larger journal.
++transactionCheckAssertions :: BalancingOpts -> Journal -> Transaction -> Either String Transaction
++transactionCheckAssertions bopts j t =
++  if (ignore_assertions_ bopts) then Right t else do
++    j' <- journalStyleAmounts j 
++    let newtxns = sortOn tdate (jtxns j' ++ [ t ])
++    case journalBalanceTransactions bopts j'{jtxns = newtxns} of
++      Right _ -> Right t
++      Left e -> Left e
++
+ -- | Balance this transaction, ensuring that its postings
+ -- (and its balanced virtual postings) sum to 0,
+ -- by inferring a missing amount or conversion price(s) if needed.
+@@ -1072,6 +1085,32 @@ tests_Balancing =
+ 
+     ]
+ 
++    ,testGroup "transactionCheckAssertions" $ [
++      testCase "simple assertion on same day" $ do 
++        assertRight $ 
++          transactionCheckAssertions defbalancingopts nulljournal{ jtxns = [
++            transaction (fromGregorian 2025 01 01) [ vpost' "a" (usd 1) Nothing ]
++            ] } (transaction (fromGregorian 2025 01 01) [ vpost' "a" (usd 1) (balassert (usd 2)) ])
++
++      ,testCase "inclusive assertions" $ do 
++        assertRight $ 
++          transactionCheckAssertions defbalancingopts nulljournal{ jtxns = [
++            transaction (fromGregorian 2025 01 01) [ vpost' "a:a" (usd 1) Nothing ] 
++            ,transaction (fromGregorian 2025 01 02) [ vpost' "a:b" (usd 2) Nothing]
++            ,transaction (fromGregorian 2025 01 02) [ vpost' "a:c" (usd 5) Nothing]
++            ,transaction (fromGregorian 2025 01 03) [ vpost' "a:d" (eur 10) Nothing]
++            ] } (transaction (fromGregorian 2025 01 04) [ vpost' "a" (usd 2) (balassertParInc (usd 10))])
++
++      ,testCase "multicommodity assertion" $ do 
++        assertRight $ 
++          transactionCheckAssertions defbalancingopts nulljournal{ jtxns = [
++            transaction (fromGregorian 2025 01 01) [ vpost' "a" (usd 1) Nothing ] 
++            ,transaction (fromGregorian 2025 01 02) [ vpost' "a:b" (eur 2) Nothing ]
++            ,transaction (fromGregorian 2025 01 02) [ vpost' "a:c" (usd 5) Nothing ]
++            ,transaction (fromGregorian 2025 01 03) [ vpost' "a:b" (eur (-2)) Nothing ]
++            ] } (transaction (fromGregorian 2025 01 03) [ vpost' "a" (usd 2) (balassertTotInc (usd 8)) ])
++    ]
++
+     ,testGroup "commodityStylesFromAmounts" $ [
+ 
+       -- Journal similar to the one on #1091:
+diff --git a/hledger/Hledger/Cli/Commands/Add.hs b/hledger/Hledger/Cli/Commands/Add.hs
+index 61dd3f727..b4a3efab2 100644
+--- a/hledger/Hledger/Cli/Commands/Add.hs
++++ b/hledger/Hledger/Cli/Commands/Add.hs
+@@ -29,14 +29,14 @@ import qualified Data.Text as T
+ import qualified Data.Text.IO as T
+ import qualified Data.Text.Lazy as TL
+ import qualified Data.Text.Lazy.IO as TL
+-import Data.Time.Calendar (Day)
++import Data.Time.Calendar (Day, toGregorian)
+ import Data.Time.Format (formatTime, defaultTimeLocale)
+ import Lens.Micro ((^.))
+ import Safe (headDef, headMay, atMay)
+ import System.Console.CmdArgs.Explicit (flagNone)
+ import System.Console.Haskeline (runInputT, defaultSettings, setComplete)
+ import System.Console.Haskeline.Completion (CompletionFunc, completeWord, isFinished, noCompletion, simpleCompletion)
+-import System.Console.Wizard (Wizard, defaultTo, line, output, retryMsg, linePrewritten, nonEmpty, parser, run)
++import System.Console.Wizard (Wizard, defaultTo, line, output, outputLn, retryMsg, linePrewritten, nonEmpty, parser, run)
+ import System.Console.Wizard.Haskeline
+ import System.IO ( stderr, hPutStr, hPutStrLn )
+ import Text.Megaparsec
+@@ -231,16 +231,31 @@ confirmedTransactionWizard prevInput es@EntryState{..} stack@(currentStage : _)
+       confirmedTransactionWizard prevInput es{esPostings=init esPostings} (dropWhile notPrevAmountAndNotEnterDesc stack)
+ 
+   EnterAmountAndComment txnParams account -> amountAndCommentWizard prevInput es >>= \case
+-    Just (amt, comment) -> do
++    Just (amt, assertion, (comment, tags, pdate1, pdate2)) -> do
+       let p = nullposting{paccount=T.pack $ stripbrackets account
+                           ,pamount=mixedAmount amt
+-                          ,pcomment=comment
++                          ,pcomment=T.dropAround isNewline comment
+                           ,ptype=accountNamePostingType $ T.pack account
++                          ,pbalanceassertion = assertion
++                          ,pdate=pdate1
++                          ,pdate2=pdate2
++                          ,ptags=tags
+                           }
+           amountAndCommentString = showAmount amt ++ T.unpack (if T.null comment then "" else "  ;" <> comment)
+           prevAmountAndCmnt' = replaceNthOrAppend (length esPostings) amountAndCommentString (prevAmountAndCmnt prevInput)
+           es' = es{esPostings=esPostings++[p], esArgs=drop 1 esArgs}
+-      confirmedTransactionWizard prevInput{prevAmountAndCmnt=prevAmountAndCmnt'} es' (EnterNewPosting txnParams (Just posting) : stack)
++          -- Include a dummy posting to balance the unfinished transation in assertion checking
++          dummytxn = nulltransaction{tpostings = esPostings ++ [p, post "" missingamt]
++                                     ,tdate = txnDate txnParams
++                                     ,tdescription = txnDesc txnParams }
++          bopts = balancingopts_ (inputopts_ esOpts)
++          validated = balanceTransaction bopts dummytxn >>= transactionCheckAssertions bopts esJournal
++      case validated of
++        Left err -> do
++          liftIO (hPutStrLn stderr err)
++          confirmedTransactionWizard prevInput es (EnterAmountAndComment txnParams account : stack)
++        Right _ -> 
++          confirmedTransactionWizard prevInput{prevAmountAndCmnt=prevAmountAndCmnt'} es' (EnterNewPosting txnParams (Just posting) : stack)
+     Nothing -> confirmedTransactionWizard prevInput es (drop 1 stack)
+ 
+   EndStage t -> do
+@@ -324,7 +339,10 @@ accountWizard PrevInput{..} EntryState{..} = do
+                             | otherwise = Just t
+       dbg' = id -- strace
+ 
+-amountAndCommentWizard PrevInput{..} EntryState{..} = do
++type Comment = (Text, [Tag], Maybe Day, Maybe Day)
++
++amountAndCommentWizard :: PrevInput -> EntryState -> Wizard Haskeline (Maybe (Amount, Maybe BalanceAssertion, Comment))
++amountAndCommentWizard previnput@PrevInput{..} entrystate@EntryState{..} = do
+   let pnum = length esPostings + 1
+       (mhistoricalp,followedhistoricalsofar) =
+           case esSimilarTransaction of
+@@ -339,26 +357,37 @@ amountAndCommentWizard PrevInput{..} EntryState{..} = do
+           | Just hp <- mhistoricalp, followedhistoricalsofar    = showamt $ pamount hp
+           | pnum > 1 && not (mixedAmountLooksZero balancingamt) = showamt balancingamtfirstcommodity
+           | otherwise                                           = ""
+-  retryMsg "A valid hledger amount is required. Eg: 1, $2, 3 EUR, \"4 red apples\"." $
+-   parser parseAmountAndComment $
++  retryMsg "A valid hledger amount is required. Eg: 1, $2, 3 EUR, \"4 red apples\"." $ 
++   parser' parseAmountAndComment $
+    withCompletion (amountCompleter def) $
+    defaultTo' def $
+    nonEmpty $
+    linePrewritten (green' $ printf "Amount  %d%s: " pnum (showDefault def)) (fromMaybe "" $ prevAmountAndCmnt `atMay` length esPostings) ""
+     where
+-      parseAmountAndComment s = if s == "<" then return Nothing else either (const Nothing) (return . Just) $
+-                                runParser
+-                                  (evalStateT (amountandcommentp <* eof) nodefcommodityj)
+-                                  ""
+-                                  (T.pack s)
++      -- Custom parser that combines with Wizard to use IO via outputLn
++      parser' f a = a >>= \input ->
++        case f input of
++          Left err -> do
++            outputLn (customErrorBundlePretty err)
++            amountAndCommentWizard previnput entrystate
++          Right res -> pure res
++      parseAmountAndComment s = 
++        if s == "<" then Right Nothing else 
++         Just <$> runParser 
++            (evalStateT (amountandcommentp <* eof) nodefcommodityj)
++            ""
++            (T.pack s)
+       nodefcommodityj = esJournal{jparsedefaultcommodity=Nothing}
+-      amountandcommentp :: JournalParser Identity (Amount, Text)
++      amountandcommentp :: JournalParser Identity (Amount, Maybe BalanceAssertion, Comment)
+       amountandcommentp = do
+         a <- amountp
+         lift skipNonNewlineSpaces
+-        c <- T.pack <$> fromMaybe "" `fmap` optional (char ';' >> many anySingle)
+-        -- eof
+-        return (a,c)
++        assertion <- optional balanceassertionp
++        com <- T.pack <$> fromMaybe "" `fmap` optional (char ';' >> many anySingle)
++        case rtp (postingcommentp (let (y,_,_) = toGregorian esDefDate in Just y)) (T.cons ';' com) of
++          Left err -> fail $ customErrorBundlePretty err
++          -- Keep our original comment string from the user to add to the journal
++          Right (_, tags, date1', date2') -> return $ (a, assertion, (com, tags, date1', date2'))
+       balancingamt = maNegate . sumPostings $ filter isReal esPostings
+       balancingamtfirstcommodity = mixed . take 1 $ amounts balancingamt
+       showamt = wbUnpack . showMixedAmountB defaultFmt . mixedAmountSetPrecision
+diff --git a/hledger/hledger.m4.md b/hledger/hledger.m4.md
+index e88ca7257..c9c9a70f1 100644
+--- a/hledger/hledger.m4.md
++++ b/hledger/hledger.m4.md
+@@ -1803,6 +1803,21 @@ Eg a [commodity directive](#commodity-directive)
+ may limit the display precision, but this will not affect balance assertions.
+ Balance assertion failure messages show exact amounts.
+ 
++### Assertions and hledger add
++
++Balance assertions can be included in the amounts given in `add`. 
++All types of assertions are supported, and assertions can be used as 
++in a normal journal file. 
++
++All transactions, not just those that have an explicit assertion, 
++are validated against the existing assertions in the journal. 
++This means it is possible for an added transaction to fail even if its
++assertions are correct as of the transaction date.
++
++If this assertion checking is not desired, then it can be disabled with `-I`.
++
++However, [balance assignments](#balance-assignments) are currently not supported.
++
+ ## Posting comments
+ 
+ Text following `;`, at the end of a posting line, 

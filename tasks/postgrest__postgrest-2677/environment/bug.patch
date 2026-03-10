@@ -1,0 +1,444 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 92ec196c..a26410c9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,7 +28,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + `PGRST204`: Column is not found
+    + `PGRST003`: Timed out when acquiring connection to db
+  - #2667, Fix `db-pool-acquisition-timeout` not logging to stderr when the timeout is reached - @steve-chavez
+- - #1652, Fix function call with arguments not inlining - @steve-chavez
+ 
+ ## [10.1.2] - 2023-02-01
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index b6ec51d9..c23f2061 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -82,12 +82,13 @@ getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggA
+ 
+ mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _) =
++  "WITH " <> normalizedBody body <> " " <>
+   "INSERT INTO " <> SQL.sql (fromQi mainQi) <> SQL.sql (if null iCols then " " else "(" <> cols <> ") ") <>
+-  fromJsonBodyF body iCols True False <>
++  pgFmtSelectFromJson iCols <>
+   -- Only used for PUT
+-  (if null putConditions then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree (QualifiedIdentifier mempty "pgrst_body") <$> putConditions)) <>
++  (if null putConditions then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree (QualifiedIdentifier mempty "_") <$> putConditions)) <>
+   SQL.sql (BS.unwords [
+-    maybe mempty (\(oncDo, oncCols) ->
++    maybe "" (\(oncDo, oncCols) ->
+       if null oncCols then
+         mempty
+       else
+@@ -113,14 +114,15 @@ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings)
+     SQL.sql $ "SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false"
+ 
+   | range == allRange =
++    "WITH " <> normalizedBody body <> " " <>
+     "UPDATE " <> mainTbl <> " SET " <> SQL.sql nonRangeCols <> " " <>
+-    fromJsonBodyF body uCols False False <>
++    "FROM (" <> pgFmtSelectFromJson uCols <> ") AS _ " <>
+     whereLogic <> " " <>
+     SQL.sql (returningF mainQi returnings)
+ 
+   | otherwise =
+-    "WITH " <>
+-    "pgrst_update_body AS (" <> fromJsonBodyF body uCols True True <> "), " <>
++    "WITH " <> normalizedBody body <> ", " <>
++    "pgrst_update_body AS (" <> pgFmtSelectFromJson uCols <> " LIMIT 1), " <>
+     "pgrst_affected_rows AS (" <>
+       "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
+       whereLogic <> " " <>
+@@ -136,7 +138,7 @@ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings)
+     whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+     mainTbl = SQL.sql (fromQi mainQi)
+     emptyBodyReturnedColumns = if null returnings then "NULL" else BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+-    nonRangeCols = BS.intercalate ", " (pgFmtIdent . tfName <> const " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_body") . tfName <$> uCols)
++    nonRangeCols = BS.intercalate ", " (pgFmtIdent . tfName <> const " = _." <> pgFmtIdent . tfName <$> uCols)
+     rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent (tfName col) <> " = (SELECT " <> pgFmtIdent (tfName col) <> " FROM pgrst_update_body) ") <$> uCols)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+@@ -165,26 +167,50 @@ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+ 
+ callPlanToQuery :: CallPlan -> SQL.Snippet
+ callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
+-  "SELECT " <> (if returnsScalar then "pgrst_call AS pgrst_scalar " else returnedColumns) <> " " <>
+-  fromCall
++  prmsCTE <> argsBody
+   where
+-    fromCall = case params of
+-      OnePosParam prm -> "FROM " <> callIt (singleParameter args $ encodeUtf8 $ ppType prm)
+-      KeyParams []    -> "FROM " <> callIt mempty
+-      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p)) <$> prms) False (not multipleCall) <> ", " <>
+-                         "LATERAL " <> callIt (fmtParams prms)
++    (prmsCTE, argFrag) = case params of
++      OnePosParam prm -> ("WITH pgrst_args AS (SELECT NULL)", singleParameter args (encodeUtf8 $ ppType prm))
++      KeyParams []    -> (mempty, mempty)
++      KeyParams prms  -> (
++          "WITH " <> normalizedBody args <> ", " <>
++          SQL.sql (
++            BS.unwords [
++            "pgrst_args AS (",
++              "SELECT * FROM json_to_recordset(" <> selectBody <> ") AS _(" <> fmtParams prms (const mempty) (\a -> " " <> encodeUtf8 (ppType a)) <> ")",
++            ")"])
++         , SQL.sql $ if multipleCall
++             then fmtParams prms varadicPrefix (\a -> " := pgrst_args." <> pgFmtIdent (ppName a))
++             else fmtParams prms varadicPrefix (\a -> " := (SELECT " <> pgFmtIdent (ppName a) <> " FROM pgrst_args LIMIT 1)")
++        )
++
++    fmtParams :: [ProcParam] -> (ProcParam -> SqlFragment) -> (ProcParam -> SqlFragment) -> SqlFragment
++    fmtParams prms prmFragPre prmFragSuf = BS.intercalate ", "
++      ((\a -> prmFragPre a <> pgFmtIdent (ppName a) <> prmFragSuf a) <$> prms)
+ 
+-    callIt :: SQL.Snippet -> SQL.Snippet
+-    callIt argument = SQL.sql (fromQi qi) <> "(" <> argument <> ") pgrst_call"
++    varadicPrefix :: ProcParam -> SqlFragment
++    varadicPrefix a = if ppVar a then "VARIADIC " else mempty
+ 
+-    fmtParams :: [ProcParam] -> SQL.Snippet
+-    fmtParams prms = SQL.sql $ BS.intercalate ", "
+-      ((\a -> (if ppVar a then "VARIADIC " else mempty) <> pgFmtIdent (ppName a) <> " := pgrst_body." <> pgFmtIdent (ppName a)) <$> prms)
++    argsBody :: SQL.Snippet
++    argsBody
++      | multipleCall =
++          if returnsScalar
++            then "SELECT " <> callIt <> " AS pgrst_scalar FROM pgrst_args"
++            else "SELECT pgrst_lat_args.* FROM pgrst_args, " <>
++                 "LATERAL ( SELECT " <> returnedColumns <> " FROM " <> callIt <> " ) pgrst_lat_args"
++      | otherwise =
++          if returnsScalar
++            then "SELECT " <> callIt <> " AS pgrst_scalar"
++            else "SELECT " <> returnedColumns <> " FROM " <> callIt
++
++    callIt :: SQL.Snippet
++    callIt = SQL.sql (fromQi qi) <> "(" <> argFrag <> ")"
+ 
+     returnedColumns :: SQL.Snippet
+     returnedColumns
+       | null returnings = "*"
+-      | otherwise       = SQL.sql $ BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty "pgrst_call") <$> returnings)
++      | otherwise       = SQL.sql $ BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName qi) <$> returnings)
++
+ 
+ -- | SQL query meant for COUNTing the root node of the Tree.
+ -- It only takes WHERE into account and doesn't include LIMIT/OFFSET because it would reduce the COUNT.
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 704350be..4548911a 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -21,6 +21,7 @@ module PostgREST.Query.SqlFragment
+   , limitOffsetF
+   , locationF
+   , mutRangeF
++  , normalizedBody
+   , orderF
+   , pgFmtColumn
+   , pgFmtIdent
+@@ -29,10 +30,11 @@ module PostgREST.Query.SqlFragment
+   , pgFmtLogicTree
+   , pgFmtOrderTerm
+   , pgFmtSelectItem
+-  , fromJsonBodyF
++  , pgFmtSelectFromJson
+   , responseHeadersF
+   , responseStatusF
+   , returningF
++  , selectBody
+   , singleParameter
+   , sourceCTEName
+   , unknownEncoder
+@@ -119,6 +121,25 @@ ftsOperator = \case
+   FilterFtsPhrase    -> "@@ phraseto_tsquery"
+   FilterFtsWebsearch -> "@@ websearch_to_tsquery"
+ 
++-- |
++-- These CTEs convert a json object into a json array, this way we can use json_to_recordset for all json payloads
++-- Otherwise we'd have to use json_to_record for json objects and json_to_recordset for json arrays
++-- We do this in SQL to avoid processing the JSON in application code
++-- TODO: At this stage there shouldn't be a Maybe since ApiRequest should ensure that an INSERT/UPDATE has a body
++normalizedBody :: Maybe LBS.ByteString -> SQL.Snippet
++normalizedBody body =
++  "pgrst_payload AS (SELECT " <> jsonPlaceHolder <> " AS json_data), " <>
++  SQL.sql (BS.unwords [
++    "pgrst_body AS (",
++      "SELECT",
++        "CASE WHEN json_typeof(json_data) = 'array'",
++          "THEN json_data",
++          "ELSE json_build_array(json_data)",
++        "END AS val",
++      "FROM pgrst_payload)"])
++  where
++    jsonPlaceHolder = SQL.encoderAndParam (HE.nullable HE.jsonLazyBytes) body
++
+ singleParameter :: Maybe LBS.ByteString -> ByteString -> SQL.Snippet
+ singleParameter body typ =
+   if typ == "bytea"
+@@ -126,6 +147,9 @@ singleParameter body typ =
+     then SQL.encoderAndParam (HE.nullable HE.bytea) (LBS.toStrict <$> body)
+     else SQL.encoderAndParam (HE.nullable HE.unknown) (LBS.toStrict <$> body) <> "::" <> SQL.sql typ
+ 
++selectBody :: SqlFragment
++selectBody = "(SELECT val FROM pgrst_body)"
++
+ -- Here we build the pg array literal, e.g '{"Hebdon, John","Other","Another"}', manually.
+ -- This is necessary to pass an "unknown" array and let pg infer the type.
+ -- There are backslashes here, but since this value is parametrized and is not a string constant
+@@ -220,29 +244,19 @@ pgFmtSelectItem table (f@(fName, jp), Nothing, alias) = pgFmtField table f <> SQ
+ -- Not quoting should be fine, we validate the input on Parsers.
+ pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField table f <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> SQL.sql (pgFmtAs fName jp alias)
+ 
+--- TODO: At this stage there shouldn't be a Maybe since ApiRequest should ensure that an INSERT/UPDATE has a body
+-fromJsonBodyF :: Maybe LBS.ByteString -> [TypedField] -> Bool -> Bool -> SQL.Snippet
+-fromJsonBodyF body fields includeSelect includeLimitOne =
+-  SQL.sql
+-  (if includeSelect then "SELECT " <> parsedCols <> " " else mempty) <>
+-  "FROM (SELECT " <> jsonPlaceHolder <> " AS json_data) pgrst_payload, " <>
+-  -- convert a json object into a json array, this way we can use json_to_recordset for all json payloads
+-  -- Otherwise we'd have to use json_to_record for json objects and json_to_recordset for json arrays
+-  -- We do this in SQL to avoid processing the JSON in application code
+-  "LATERAL (SELECT CASE WHEN json_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE json_build_array(pgrst_payload.json_data) END AS val) pgrst_uniform_json, " <>
+-  "LATERAL (SELECT * FROM " <>
+-    (if null fields
+-      -- When we are inserting no columns (e.g. using default values), we can't use our ordinary `json_to_recordset`
+-      -- because it can't extract records with no columns (there's no valid syntax for the `AS (colName colType,...)`
+-      -- part). But we still need to ensure as many rows are created as there are array elements.
+-      then SQL.sql "json_array_elements(pgrst_uniform_json.val) _ "
+-      else SQL.sql ("json_to_recordset(pgrst_uniform_json.val) AS _(" <> typedCols <> ") " <> if includeLimitOne then "LIMIT 1" else mempty)
+-    ) <>
+-  ") pgrst_body "
++pgFmtSelectFromJson :: [TypedField] -> SQL.Snippet
++pgFmtSelectFromJson fields =
++  SQL.sql "SELECT " <> parsedCols <> " " <>
++  (if null fields
++    -- When we are inserting no columns (e.g. using default values), we can't use our ordinary `json_to_recordset`
++    -- because it can't extract records with no columns (there's no valid syntax for the `AS (colName colType,...)`
++    -- part). But we still need to ensure as many rows are created as there are array elements.
++    then SQL.sql ("FROM json_array_elements (" <> selectBody <> ") _ ")
++    else SQL.sql ("FROM json_to_recordset (" <> selectBody <> ") AS _ " <> "(" <> typedCols <> ") ")
++  )
+   where
+-    parsedCols = BS.intercalate ", " $ fromQi  . QualifiedIdentifier "pgrst_body" . tfName <$> fields
++    parsedCols = SQL.sql $ BS.intercalate ", " $ pgFmtIdent . tfName <$> fields
+     typedCols = BS.intercalate ", " $ pgFmtIdent . tfName <> const " " <> encodeUtf8 . tfIRType <$> fields
+-    jsonPlaceHolder = SQL.encoderAndParam (HE.nullable HE.jsonLazyBytes) body
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+diff --git a/test/pgbench/1652/new.sql b/test/pgbench/1652/new.sql
+deleted file mode 100644
+index 2cd7a161..00000000
+--- a/test/pgbench/1652/new.sql
++++ /dev/null
+@@ -1,20 +0,0 @@
+-WITH pgrst_source AS (
+-  SELECT pgrst_call.*
+-  FROM (
+-    SELECT '{"id": 4}'::json as json_data
+-  ) pgrst_payload,
+-  LATERAL (
+-    SELECT CASE WHEN json_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE json_build_array(pgrst_payload.json_data) END AS val
+-  ) pgrst_uniform_json,
+-  LATERAL (
+-    SELECT * FROM json_to_recordset(pgrst_uniform_json.val) AS _("id" integer) LIMIT 1
+-  ) pgrst_body,
+-  LATERAL "test"."get_projects_below"("id" := pgrst_body.id) pgrst_call
+-)
+-SELECT
+-  null::bigint AS total_result_set,
+-  pg_catalog.count(_postgrest_t) AS page_total,
+-  coalesce(json_agg(_postgrest_t), '[]')::character varying AS body,
+-  nullif(current_setting('response.headers', true), '') AS response_headers,
+-  nullif(current_setting('response.status', true), '') AS response_status
+-FROM (SELECT "projects".* FROM "pgrst_source" AS "projects") _postgrest_t;
+diff --git a/test/pgbench/1652/old.sql b/test/pgbench/1652/old.sql
+deleted file mode 100644
+index 07965a1c..00000000
+--- a/test/pgbench/1652/old.sql
++++ /dev/null
+@@ -1,15 +0,0 @@
+-WITH pgrst_source AS (
+-  WITH
+-  pgrst_payload AS (SELECT '{"id": 4}'::json AS json_data),
+-  pgrst_body AS ( SELECT CASE WHEN json_typeof(json_data) = 'array' THEN json_data ELSE json_build_array(json_data) END AS val FROM pgrst_payload),
+-  pgrst_args AS ( SELECT * FROM json_to_recordset((SELECT val FROM pgrst_body)) AS _("id" integer) )
+-  SELECT "get_projects_below".*
+-  FROM "test"."get_projects_below"("id" := (SELECT "id" FROM pgrst_args LIMIT 1))
+-)
+-SELECT
+-  null::bigint AS total_result_set,
+-  pg_catalog.count(_postgrest_t) AS page_total,
+-  coalesce(json_agg(_postgrest_t), '[]')::character varying AS body,
+-  nullif(current_setting('response.headers', true), '') AS response_headers,
+-  nullif(current_setting('response.status', true), '') AS response_status
+-FROM (SELECT "projects".* FROM "pgrst_source" AS "projects") _postgrest_t;
+diff --git a/test/pgbench/2677/new.sql b/test/pgbench/2677/new.sql
+deleted file mode 100644
+index f4b70b4f..00000000
+--- a/test/pgbench/2677/new.sql
++++ /dev/null
+@@ -1,12 +0,0 @@
+-INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-SELECT pgrst_body."arr_data", pgrst_body."field-with_sep", pgrst_body."id", pgrst_body."name"
+-FROM (
+-  SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::json as json_data
+-) pgrst_payload,
+-LATERAL (
+-  SELECT CASE WHEN json_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE json_build_array(pgrst_payload.json_data) END AS val
+-) pgrst_uniform_json,
+-LATERAL (
+-  SELECT * FROM json_to_recordset (pgrst_uniform_json.val) AS _ ("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text)
+-) pgrst_body
+-RETURNING "test"."complex_items".*
+diff --git a/test/pgbench/2677/old.sql b/test/pgbench/2677/old.sql
+deleted file mode 100644
+index 9c85151c..00000000
+--- a/test/pgbench/2677/old.sql
++++ /dev/null
+@@ -1,7 +0,0 @@
+-WITH
+-pgrst_payload AS (SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::json AS json_data),
+-pgrst_body AS ( SELECT CASE WHEN json_typeof(json_data) = 'array' THEN json_data ELSE json_build_array(json_data) END AS val FROM pgrst_payload)
+-INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-SELECT "arr_data", "field-with_sep", "id", "name"
+-FROM json_to_recordset ((SELECT val FROM pgrst_body)) AS _ ("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text)
+-RETURNING "test"."complex_items".*
+diff --git a/test/pgbench/README.md b/test/pgbench/README.md
+deleted file mode 100644
+index da8fa974..00000000
+--- a/test/pgbench/README.md
++++ /dev/null
+@@ -1,8 +0,0 @@
+-## pgbench tests
+-
+-Can be used as:
+-
+-```
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/2677/old.sql
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/2677/new.sql
+-```
+diff --git a/test/pgbench/fixtures.sql b/test/pgbench/fixtures.sql
+deleted file mode 100644
+index f176d5d6..00000000
+--- a/test/pgbench/fixtures.sql
++++ /dev/null
+@@ -1,7 +0,0 @@
+-\ir ../spec/fixtures/load.sql
+-
+-ALTER TABLE test.complex_items
+-    DROP CONSTRAINT complex_items_pkey;
+-
+-ALTER TABLE test.complex_items
+-    ALTER COLUMN "field-with_sep" DROP NOT NULL;
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index ec18996a..b896efb8 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -8,9 +8,7 @@ import Network.Wai.Test (SResponse (..))
+ 
+ import           Data.Aeson.Lens
+ import           Data.Aeson.QQ
+-import qualified Data.ByteString      as BS
+ import qualified Data.ByteString.Lazy as LBS
+-import qualified Data.Text            as T
+ import           Network.HTTP.Types
+ import           Test.Hspec           hiding (pendingWith)
+ import           Test.Hspec.Wai
+@@ -168,7 +166,10 @@ spec actualPgVersion = do
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        totalCost `shouldBe` 3.27
++        totalCost `shouldBe`
++          if actualPgVersion > pgVersion120
++            then 3.28
++            else 3.33
+ 
+     it "outputs the total cost for an update" $ do
+       r <- request methodPatch "/projects?id=eq.3"
+@@ -181,7 +182,10 @@ spec actualPgVersion = do
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        totalCost `shouldBe` 12.45
++        totalCost `shouldBe`
++          if actualPgVersion > pgVersion120
++            then 12.45
++            else 12.5
+ 
+     it "outputs the total cost for a delete" $ do
+       r <- request methodDelete "/projects?id=in.(1,2,3)"
+@@ -208,7 +212,10 @@ spec actualPgVersion = do
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        totalCost `shouldBe` 1.29
++        totalCost `shouldBe`
++          if actualPgVersion >= pgVersion120
++            then 1.3
++            else 1.35
+ 
+     it "outputs the plan for application/vnd.pgrst.object" $ do
+       r <- request methodDelete "/projects?id=eq.6"
+@@ -331,7 +338,7 @@ spec actualPgVersion = do
+       r <- request methodGet "/rpc/get_projects_below?id=3"
+              [planHdr] ""
+ 
+-      liftIO $ planCost r `shouldSatisfy` (< 45.4)
++      liftIO $ planCost r `shouldSatisfy` (< 36.4)
+ 
+     it "should not exceed cost when calling setof composite proc with empty params" $ do
+       r <- request methodGet "/rpc/getallprojects"
+@@ -360,29 +367,6 @@ spec actualPgVersion = do
+ 
+         liftIO $ planCost r `shouldSatisfy` (< 5.85)
+ 
+-    context "function inlining" $ do
+-      it "should inline a zero argument function" $ do
+-        r <- request methodGet "/rpc/getallusers?id=eq.1"
+-               [(hAccept, "application/vnd.pgrst.plan")] ""
+-
+-        let resBody = simpleBody r
+-
+-        liftIO $ do
+-          resBody `shouldSatisfy` (
+-            if actualPgVersion >= pgVersion120
+-              then (\t -> T.isInfixOf "Index Scan using users_pkey on users" (decodeUtf8 $ BS.toStrict t))
+-              else (\t -> T.isInfixOf "Seq Scan on users" (decodeUtf8 $ BS.toStrict t)))
+-
+-      it "should inline a function with arguments" $ do
+-        r <- request methodGet "/rpc/getitemrange?min=10&max=15"
+-               [(hAccept, "application/vnd.pgrst.plan")] ""
+-
+-        let resBody = simpleBody r
+-
+-        liftIO $ do
+-          -- a Seq Scan ensures the function is inlined as the plan uses the underlying table
+-          resBody `shouldSatisfy` (\t -> T.isInfixOf "Seq Scan on items" (decodeUtf8 $ BS.toStrict t))
+-
+ disabledSpec :: SpecWith ((), Application)
+ disabledSpec =
+   it "doesn't work if db-plan-enabled=false(the default)" $ do
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 3b95e5db..f9275f66 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -15,7 +15,7 @@ import Text.Heredoc
+ import PostgREST.Config.PgVersion (PgVersion, pgVersion100,
+                                    pgVersion109, pgVersion110,
+                                    pgVersion112, pgVersion114,
+-                                   pgVersion130, pgVersion140)
++                                   pgVersion140)
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
+@@ -309,8 +309,7 @@ spec actualPgVersion =
+           ]|]
+           { matchHeaders = [matchContentTypeJson] }
+ 
+-      -- https://github.com/PostgREST/postgrest/pull/2677#issuecomment-1444976849
+-      when (actualPgVersion >= pgVersion130) $
++      when (actualPgVersion >= pgVersion110) $
+         it "can embed if rpc returns domain of table type" $ do
+           post "/rpc/getproject_domain?select=id,name,client:clients(id),tasks(id)"
+               [json| { "id": 1} |]

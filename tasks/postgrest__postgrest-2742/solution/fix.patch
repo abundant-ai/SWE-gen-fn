@@ -1,0 +1,294 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1fb40bcf..75396c85 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Fixes postgresql resource leak with long-lived connections (#2638)
+  - #1569, Allow `any/all` modifiers on the `eq,like,ilike,gt,gte,lt,lte,match,imatch` operators, e.g. `/tbl?id=eq(any).{1,2,3}` - @steve-chavez
+    - This converts the input into an array type
++ - #2561, Configurable role settings - @steve-chavez
++   - Database roles that are members of the connection role get their settings applied, e.g. doing
++     `ALTER ROLE anon SET statement_timeout TO '5s'` will result in that `statement_timeout` getting applied for that role.
++   - Works when switching roles when a JWT is sent
++   - Settings can be reloaded with `NOTIFY pgrst, 'reload config'`.
+ 
+ ### Fixed
+ 
+@@ -44,6 +49,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2705, Fix bug when using the `Range` header on `PATCH/DELETE` - @laurenceisla
+    + Fix the`"message": "syntax error at or near \"RETURNING\""` error
+    + Fix doing a limited update/delete when an `order` query parameter was present
++ - #2742, Fix db settings and pg version queries not getting prepared  - @steve-chavez
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 30f59ea3..3443cd3a 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -33,7 +33,7 @@ import Protolude hiding (hPutStrLn)
+ main :: App.SignalHandlerInstaller -> Maybe App.SocketRunner -> CLI -> IO ()
+ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+   conf@AppConfig{..} <-
+-    either panic identity <$> Config.readAppConfig mempty cliPath Nothing
++    either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty
+ 
+   -- Per https://github.com/PostgREST/postgrest/issues/268, we want to
+   -- explicitly close the connections to PostgreSQL on shutdown.
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 773745d9..5bbffb30 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -51,6 +51,7 @@ import Numeric                 (readOct, showOct)
+ import System.Environment      (getEnvironment)
+ import System.Posix.Types      (FileMode)
+ 
++import PostgREST.Config.Database         (RoleSettings)
+ import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
+                                           dumpJSPath, pRoleClaimKey)
+ import PostgREST.Config.Proxy            (Proxy (..),
+@@ -99,6 +100,7 @@ data AppConfig = AppConfig
+   , configServerUnixSocket         :: Maybe FilePath
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
++  , configRoleSettings             :: RoleSettings
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo
+@@ -191,13 +193,13 @@ instance JustIfMaybe a (Maybe a) where
+ 
+ -- | Reads and parses the config and overrides its parameters from env vars,
+ -- files or db settings.
+-readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> IO (Either Text AppConfig)
+-readAppConfig dbSettings optPath prevDbUri = do
++readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> IO (Either Text AppConfig)
++readAppConfig dbSettings optPath prevDbUri roleSettings = do
+   env <- readPGRSTEnvironment
+   -- if no filename provided, start with an empty map to read config from environment
+   conf <- maybe (return $ Right M.empty) loadConfig optPath
+ 
+-  case C.runParser (parser optPath env dbSettings) =<< mapLeft show conf of
++  case C.runParser (parser optPath env dbSettings roleSettings) =<< mapLeft show conf of
+     Left err ->
+       return . Left $ "Error in config " <> err
+     Right parsedConfig ->
+@@ -212,8 +214,8 @@ readAppConfig dbSettings optPath prevDbUri = do
+       decodeJWKS <$>
+         (decodeSecret =<< readSecretFile =<< readDbUriFile prevDbUri parsedConfig)
+ 
+-parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> C.Parser C.Config AppConfig
+-parser optPath env dbSettings =
++parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> C.Parser C.Config AppConfig
++parser optPath env dbSettings roleSettings =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+     <*> optString "db-anon-role"
+@@ -257,6 +259,7 @@ parser optPath env dbSettings =
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
++    <*> pure roleSettings
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 28d191dc..8a85c574 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -3,11 +3,17 @@
+ module PostgREST.Config.Database
+   ( pgVersionStatement
+   , queryDbSettings
++  , queryRoleSettings
+   , queryPgVersion
++  , RoleSettings
+   ) where
+ 
++import Control.Arrow ((***))
++
+ import PostgREST.Config.PgVersion (PgVersion (..))
+ 
++import qualified Data.HashMap.Strict as HM
++
+ import qualified Hasql.Decoders             as HD
+ import qualified Hasql.Encoders             as HE
+ import           Hasql.Session              (Session, statement)
+@@ -19,11 +25,13 @@ import Text.InterpolatedString.Perl6 (q)
+ 
+ import Protolude
+ 
+-queryPgVersion :: Session PgVersion
+-queryPgVersion = statement mempty pgVersionStatement
++type RoleSettings = (HM.HashMap ByteString [(ByteString, ByteString)])
+ 
+-pgVersionStatement :: SQL.Statement () PgVersion
+-pgVersionStatement = SQL.Statement sql HE.noParams versionRow False
++queryPgVersion :: Bool -> Session PgVersion
++queryPgVersion prepared = statement mempty $ pgVersionStatement prepared
++
++pgVersionStatement :: Bool -> SQL.Statement () PgVersion
++pgVersionStatement = SQL.Statement sql HE.noParams versionRow
+   where
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+@@ -31,11 +39,11 @@ pgVersionStatement = SQL.Statement sql HE.noParams versionRow False
+ queryDbSettings :: Bool -> Session [(Text, Text)]
+ queryDbSettings prepared =
+   let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty dbSettingsStatement
++  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ dbSettingsStatement prepared
+ 
+ -- | Get db settings from the connection role. Global settings will be overridden by database specific settings.
+-dbSettingsStatement :: SQL.Statement () [(Text, Text)]
+-dbSettingsStatement = SQL.Statement sql HE.noParams decodeSettings False
++dbSettingsStatement :: Bool -> SQL.Statement () [(Text, Text)]
++dbSettingsStatement = SQL.Statement sql HE.noParams decodeSettings
+   where
+     sql = [q|
+       WITH
+@@ -61,5 +69,45 @@ dbSettingsStatement = SQL.Statement sql HE.noParams decodeSettings False
+     |]
+     decodeSettings = HD.rowList $ (,) <$> column HD.text <*> column HD.text
+ 
++queryRoleSettings :: Bool -> Session RoleSettings
++queryRoleSettings prepared =
++  let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
++  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ roleSettingsStatement prepared
++
++roleSettingsStatement :: Bool -> SQL.Statement () RoleSettings
++roleSettingsStatement = SQL.Statement sql HE.noParams decodeSettings
++  where
++    sql = [q|
++      with
++      role_setting as (
++        select r.rolname, unnest(r.rolconfig) as setting
++        from pg_auth_members m
++        join pg_roles r on r.oid = m.roleid
++        where member = current_user::regrole::oid
++      ),
++      kv_settings AS (
++        SELECT
++          rolname,
++          substr(setting, 1, strpos(setting, '=') - 1) as key,
++          substr(setting, strpos(setting, '=') + 1) as value
++        FROM role_setting
++      )
++      select rolname, array_agg(row(key, value))
++      from kv_settings
++      group by rolname;
++    |]
++    decodeSettings = HM.fromList . map (bimap encodeUtf8 ((encodeUtf8 *** encodeUtf8) <$>)) <$> HD.rowList aRow
++    aRow :: HD.Row (Text, [(Text, Text)])
++    aRow = (,) <$> column HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text)
++
+ column :: HD.Value a -> HD.Row a
+ column = HD.column . HD.nonNullable
++
++compositeField :: HD.Value a -> HD.Composite a
++compositeField = HD.field . HD.nonNullable
++
++compositeArrayColumn :: HD.Composite a -> HD.Row [a]
++compositeArrayColumn = arrayColumn . HD.composite
++
++arrayColumn :: HD.Value a -> HD.Row [a]
++arrayColumn = column . HD.listArray . HD.nonNullable
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 76e4e940..23bbf729 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -237,10 +237,10 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> Text ->
+                ApiRequest -> PgVersion -> DbHandler ()
+-setPgLocals conf claims role req actualPgVersion = lift $
++setPgLocals AppConfig{..} claims role req actualPgVersion = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+-    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
+-    HD.noResult (configDbPreparedStatements conf)
++    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
++    HD.noResult configDbPreparedStatements
+   where
+     methodSql = setConfigLocal mempty ("request.method", iMethod req)
+     pathSql = setConfigLocal mempty ("request.path", iPath req)
+@@ -253,12 +253,16 @@ setPgLocals conf claims role req actualPgVersion = lift $
+     claimsSql = if usesLegacyGucs
+                   then setConfigLocal "request.jwt.claim." <$> [(toUtf8 $ K.toText c, toUtf8 $ unquoted v) | (c,v) <- KM.toList claims]
+                   else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+-    roleSql = [setConfigLocal mempty ("role", toUtf8 role)]
+-    appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings conf)
++    roleBs = toUtf8 role
++    roleSql = [setConfigLocal mempty ("role", roleBs)]
++    roleSettingsSql = if null configRoleSettings
++      then mempty
++      else setConfigLocal mempty <$> fromMaybe mempty (HM.lookup roleBs configRoleSettings)
++    appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings)
+     searchPathSql =
+-      let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath conf) in
++      let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath) in
+       setConfigLocal mempty ("search_path", schemas)
+-    usesLegacyGucs = configDbUseLegacyGucs conf && actualPgVersion < pgVersion140
++    usesLegacyGucs = configDbUseLegacyGucs && actualPgVersion < pgVersion140
+ 
+     unquoted :: JSON.Value -> Text
+     unquoted (JSON.String t) = t
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index e970756a..859d8395 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -107,7 +107,7 @@ type SqlQuery = ByteString
+ querySchemaCache :: [Schema] -> [Schema] -> Bool -> SQL.Transaction SchemaCache
+ querySchemaCache schemas extraSearchPath prepared = do
+   SQL.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+-  pgVer   <- SQL.statement mempty pgVersionStatement
++  pgVer   <- SQL.statement mempty $ pgVersionStatement prepared
+   tabs    <- SQL.statement schemas $ allTables pgVer prepared
+   keyDeps <- SQL.statement (schemas, extraSearchPath) $ allViewsKeyDependencies prepared
+   m2oRels <- SQL.statement mempty $ allM2OandO2ORels pgVer prepared
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 11fcf464..28c1cf50 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -27,7 +27,8 @@ import Network.Socket.ByteString
+ 
+ import PostgREST.AppState         (AppState)
+ import PostgREST.Config           (AppConfig (..), readAppConfig)
+-import PostgREST.Config.Database  (queryDbSettings, queryPgVersion)
++import PostgREST.Config.Database  (queryDbSettings, queryPgVersion,
++                                   queryRoleSettings)
+ import PostgREST.Config.PgVersion (PgVersion (..), minimumPgVersion)
+ import PostgREST.Error            (checkIsFatal)
+ import PostgREST.SchemaCache      (querySchemaCache)
+@@ -124,7 +125,7 @@ establishConnection appState =
+ 
+     getConnectionStatus :: IO ConnectionStatus
+     getConnectionStatus = do
+-      pgVersion <- AppState.usePool appState queryPgVersion
++      pgVersion <- AppState.usePool appState $ queryPgVersion False -- No need to prepare the query here, as the connection might not be established
+       case pgVersion of
+         Left e -> do
+           AppState.logPgrstError appState e
+@@ -248,11 +249,22 @@ reReadConfig startingUp appState = do
+               killThread (AppState.getMainThreadId appState)
+             Nothing -> do
+               AppState.logPgrstError appState e
+-          pure []
++          pure mempty
+         Right x -> pure x
+     else
+       pure mempty
+-  readAppConfig dbSettings configFilePath (Just configDbUri) >>= \case
++  roleSettings <-
++    if configDbConfig then do
++      rSettings <- AppState.usePool appState $ queryRoleSettings configDbPreparedStatements
++      case rSettings of
++        Left e -> do
++          AppState.logWithZTime appState "An error ocurred when trying to query the role settings"
++          AppState.logPgrstError appState e
++          pure mempty
++        Right x -> pure x
++    else
++      pure mempty
++  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings >>= \case
+     Left err   ->
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up

@@ -1,0 +1,162 @@
+diff --git a/doc/changes/added/13541.md b/doc/changes/added/13541.md
+deleted file mode 100644
+index e6b273685..000000000
+--- a/doc/changes/added/13541.md
++++ /dev/null
+@@ -1 +0,0 @@
+-- Add a trace event for snapshotting the asndbox (#13541, @rgrinberg)
+diff --git a/src/dune_engine/sandbox.ml b/src/dune_engine/sandbox.ml
+index c1f5386f9..b08750214 100644
+--- a/src/dune_engine/sandbox.ml
++++ b/src/dune_engine/sandbox.ml
+@@ -147,26 +147,19 @@ let link_deps t ~mode ~deps =
+ 
+ let snapshot t =
+   let root = Path.build t.dir in
+-  let start = Time.now () in
+-  let snapshot =
+-    Fpath.traverse
+-      ~dir:(Path.to_string root)
+-      ~init:Path.Map.empty
+-      ~on_dir:(fun ~dir fname acc ->
+-        let path = Path.relative root (Filename.concat dir fname) in
+-        Path.Map.add_exn acc path `Dir)
+-      ~on_file:(fun ~dir fname acc ->
+-        let p = Path.relative root (Filename.concat dir fname) in
+-        let stats = Unix.stat (Path.to_string p) in
+-        Path.Map.add_exn acc p (`File (Cached_digest.Reduced_stats.of_unix_stats stats)))
+-      ~on_other:`Ignore
+-      ~on_symlink:`Ignore
+-      ()
+-  in
+-  let stop = Time.now () in
+-  Dune_trace.emit ~buffered:true Sandbox (fun () ->
+-    Dune_trace.Event.sandbox `Snapshot ~start ~stop ~queued:None t.loc ~dir:t.dir);
+-  snapshot
++  Fpath.traverse
++    ~dir:(Path.to_string root)
++    ~init:Path.Map.empty
++    ~on_dir:(fun ~dir fname acc ->
++      let path = Path.relative root (Filename.concat dir fname) in
++      Path.Map.add_exn acc path `Dir)
++    ~on_file:(fun ~dir fname acc ->
++      let p = Path.relative root (Filename.concat dir fname) in
++      let stats = Unix.stat (Path.to_string p) in
++      Path.Map.add_exn acc p (`File (Cached_digest.Reduced_stats.of_unix_stats stats)))
++    ~on_other:`Ignore
++    ~on_symlink:`Ignore
++    ()
+ ;;
+ 
+ let create ~mode ~rule_loc ~dirs ~deps ~rule_dir ~rule_digest =
+@@ -323,5 +316,5 @@ let destroy t =
+   in
+   Dune_trace.emit ~buffered:true Sandbox (fun () ->
+     let queued = Time.diff start queue_start in
+-    Dune_trace.Event.sandbox `Destroy ~start ~stop ~queued:(Some queued) t.loc ~dir:t.dir)
++    Dune_trace.Event.sandbox_destroy ~start ~stop ~queued t.loc ~dir:t.dir)
+ ;;
+diff --git a/src/dune_trace/dune_trace.mli b/src/dune_trace/dune_trace.mli
+index 6620cdbc2..764d847fd 100644
+--- a/src/dune_trace/dune_trace.mli
++++ b/src/dune_trace/dune_trace.mli
+@@ -37,11 +37,10 @@ module Event : sig
+ 
+   type t
+ 
+-  val sandbox
+-    :  [ `Snapshot | `Destroy ]
+-    -> start:Time.t
++  val sandbox_destroy
++    :  start:Time.t
+     -> stop:Time.t
+-    -> queued:Time.Span.t option
++    -> queued:Time.Span.t
+     -> Loc.t
+     -> dir:Path.Build.t
+     -> t
+diff --git a/src/dune_trace/event.ml b/src/dune_trace/event.ml
+index f8f8fe89f..1f8b0610a 100644
+--- a/src/dune_trace/event.ml
++++ b/src/dune_trace/event.ml
+@@ -746,20 +746,13 @@ let spawn_thread ~name =
+   Event.instant ~args ~name:"spawn_thread" now Thread
+ ;;
+ 
+-let sandbox name ~start ~stop ~queued loc ~dir =
++let sandbox_destroy ~start ~stop ~queued loc ~dir =
+   let args =
+-    [ "loc", Arg.string (Loc.to_file_colon_line loc); "dir", Arg.build_path dir ]
+-  in
+-  let args =
+-    match queued with
+-    | None -> args
+-    | Some queued -> ("queued", Arg.span queued) :: args
++    [ "queued", Arg.span queued
++    ; "loc", Arg.string (Loc.to_file_colon_line loc)
++    ; "dir", Arg.build_path dir
++    ]
+   in
+   let dur = Time.diff stop start in
+-  let name =
+-    match name with
+-    | `Destroy -> "destroy"
+-    | `Snapshot -> "snapshot"
+-  in
+-  Event.complete ~args ~name ~start ~dur Sandbox
++  Event.complete ~args ~name:"destroy" ~start ~dur Sandbox
+ ;;
+diff --git a/test/blackbox-tests/dune.jq b/test/blackbox-tests/dune.jq
+index fc9ecbde1..110dc9354 100644
+--- a/test/blackbox-tests/dune.jq
++++ b/test/blackbox-tests/dune.jq
+@@ -75,6 +75,3 @@ def fsUpdateWithPath($path):
+     select(.name == "fs_update")
+   | .args
+   | select(.path == $path);
+-
+-def censorDigestDir:
+-  .args.dir |= (if . then sub("[0-9a-f]{32}"; "$DIGEST") else . end);
+diff --git a/test/blackbox-tests/test-cases/sandbox/patch-back-source-tree.t b/test/blackbox-tests/test-cases/sandbox/patch-back-source-tree.t
+index f90c10d50..e09cb9ffd 100644
+--- a/test/blackbox-tests/test-cases/sandbox/patch-back-source-tree.t
++++ b/test/blackbox-tests/test-cases/sandbox/patch-back-source-tree.t
+@@ -34,22 +34,6 @@ All modified dependencies are promoted
+ 
+   $ echo blah > x
+   $ dune build
+-
+-  $ dune trace cat | jq '
+-  > include "dune";
+-  >   select(.cat == "sandbox" and .name == "snapshot")
+-  > | censorDigestDir
+-  > | .args
+-  > '
+-  {
+-    "loc": "dune:1",
+-    "dir": "_build/.sandbox/$DIGEST"
+-  }
+-  {
+-    "loc": "dune:1",
+-    "dir": "_build/.sandbox/$DIGEST"
+-  }
+-
+   $ dune promote x
+   Promoting _build/default/x to x.
+   $ cat x
+diff --git a/test/blackbox-tests/test-cases/sandbox/sandbox-events.t b/test/blackbox-tests/test-cases/sandbox/sandbox-events.t
+index d34d355c4..0f1613442 100644
+--- a/test/blackbox-tests/test-cases/sandbox/sandbox-events.t
++++ b/test/blackbox-tests/test-cases/sandbox/sandbox-events.t
+@@ -12,10 +12,9 @@ Demonstrate sandbox events:
+   $ dune build @foo
+ 
+   $ dune trace cat | jq '
+-  >  include "dune";
+   >   select(.cat == "sandbox")
+   > | del(.ts,.dur, .args.queued)
+-  > | censorDigestDir
++  > | .args.dir |= (if . then sub("[0-9a-f]{32}"; "$DIGEST") else . end)
+   > '
+   {
+     "cat": "sandbox",

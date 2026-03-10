@@ -1,0 +1,357 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b08bab27..3347dc76 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,10 +15,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Allows disambiguating a recursive m2m embed
+    + Allows disambiguating an embed that has a many-to-many relationship using two foreign keys on a junction
+  - #2340, Allow embedding without selecting any column - @steve-chavez
+- - #2563, Allow `is.null` or `not.is.null` on an embedded resource - @steve-chavez
+-   + Offers a more flexible replacement for `!inner`, e.g. `/projects?select=*,clients(*)&clients=not.is.null`
+-   + Allows doing an anti join, e.g. `/projects?select=*,clients(*)&clients=is.null`
+-   + Allows using or across related tables conditions
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e7985405..f471298e 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -80,7 +80,6 @@ data ApiRequestError
+   | QueryParamError QPError
+   | RelatedOrderNotToOne Text Text
+   | SpreadNotToOne Text Text
+-  | UnacceptableFilter Text
+   | UnacceptableSchema [Text]
+   | UnsupportedMethod ByteString
+ 
+@@ -173,12 +172,10 @@ data LogicOperator
+   | Or
+   deriving Eq
+ 
+-data Filter
+-  = Filter
++data Filter = Filter
+   { field  :: Field
+   , opExpr :: OpExpr
+   }
+-  | FilterNullEmbed Bool FieldName
+   deriving (Eq)
+ 
+ data OpExpr =
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 7e45df48..ebb8a7ca 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -74,7 +74,6 @@ instance PgrstError ApiRequestError where
+   status QueryParamError{}       = HTTP.status400
+   status RelatedOrderNotToOne{}  = HTTP.status400
+   status SpreadNotToOne{}        = HTTP.status400
+-  status UnacceptableFilter{}    = HTTP.status400
+   status UnacceptableSchema{}    = HTTP.status406
+   status UnsupportedMethod{}     = HTTP.status405
+   status LimitNoOrderError       = HTTP.status400
+@@ -168,12 +167,6 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (UnacceptableFilter target) = JSON.object [
+-    "code"    .= ApiRequestErrorCode20,
+-    "message" .= ("Bad operator on the '" <> target <> "' embedded resource":: Text),
+-    "details" .= ("Only is null or not is null filters are allowed on embedded resources":: Text),
+-    "hint"    .= JSON.Null]
+-
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+@@ -547,7 +540,6 @@ data ErrorCode
+   | ApiRequestErrorCode17
+   | ApiRequestErrorCode18
+   | ApiRequestErrorCode19
+-  | ApiRequestErrorCode20
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -591,7 +583,6 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode17  -> "117"
+   ApiRequestErrorCode18  -> "118"
+   ApiRequestErrorCode19  -> "119"
+-  ApiRequestErrorCode20  -> "120"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 3d5b4259..86e61bbf 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -97,7 +97,6 @@ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Eit
+ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-  addNullEmbedFilters =<<
+   validateSpreadEmbeds =<<
+   addRelatedOrders =<<
+   addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+@@ -333,25 +332,6 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+         Nothing ->
+           Left $ NotEmbedded otRelation
+ 
+--- Searches for null filters on embeds, e.g. `clients` on /projects?select=*,clients()&clients=not.is.null.
+--- If these are found, it changes the filter to use the internal aggregate name(`projects_clients_1`) so the filter can succeed.
+--- It fails if operators other than is.null or not.is.null are used.
+-addNullEmbedFilters :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addNullEmbedFilters (Node rp@ReadPlan{where_=oldLogic} forest) = do
+-  let readPlans = rootLabel <$> forest
+-  newLogic <- getFilters readPlans `traverse` oldLogic
+-  Node rp{ReadPlan.where_= newLogic} <$> (addNullEmbedFilters `traverse` forest)
+-  where
+-    getFilters :: [ReadPlan] -> LogicTree -> Either ApiRequestError LogicTree
+-    getFilters rPlans (Expr b lOp trees) = Expr b lOp <$> (getFilters rPlans `traverse` trees)
+-    getFilters rPlans flt@(Stmnt (Filter (fld, []) opExpr)) =
+-      let foundRP = find (\ReadPlan{relName, relAlias} -> Just fld `elem` [Just relName, relAlias]) rPlans in
+-      case (foundRP, opExpr) of
+-        (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ Stmnt $ FilterNullEmbed b relAggAlias
+-        (Just ReadPlan{relName}, _)                         -> Left $ UnacceptableFilter relName
+-        _                                                   -> Right flt
+-    getFilters _ flt@(Stmnt _)        = Right flt
+-
+ addRanges :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addRanges ApiRequest{..} rReq =
+   case iAction of
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 022a3af3..edb98f63 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -76,7 +76,7 @@ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+   resultSet <-
+      lift . SQL.statement mempty $
+       Statements.prepareRead
+-        (QueryBuilder.readPlanToQuery req)
++        (QueryBuilder.readPlanToQuery True req)
+         (if iPreferCount == Just EstimatedCount then
+            -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+            QueryBuilder.limitedQuery countQuery ((+ 1) <$> configDbMaxRows)
+@@ -163,7 +163,7 @@ invokeQuery proc CallReadPlan{crReadPlan, crCallPlan} apiReq@ApiRequest{..} conf
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingle proc)
+         (QueryBuilder.callPlanToQuery crCallPlan)
+-        (QueryBuilder.readPlanToQuery crReadPlan)
++        (QueryBuilder.readPlanToQuery True crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount iPreferCount)
+         iAcceptMediaType
+@@ -217,7 +217,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq conf =
+   in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+-      (QueryBuilder.readPlanToQuery mrReadPlan)
++      (QueryBuilder.readPlanToQuery True mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+       (iAcceptMediaType apiReq)
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 71c591de..4fb689de 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -39,10 +39,10 @@ import PostgREST.RangeQuery        (allRange)
+ 
+ import Protolude
+ 
+-readPlanToQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
++readPlanToQuery :: Bool -> ReadPlanTree -> SQL.Snippet
++readPlanToQuery isRoot (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
+   "SELECT " <>
+-  intercalateSnippet ", " ((pgFmtSelectItem qi <$> (if null select && null forest then defSelect else select)) ++ selects) <> " " <>
++  intercalateSnippet ", " ((pgFmtSelectItem qi <$> (if isRoot && null select && null forest then defRootSelect else select)) ++ selects) <> " " <>
+   fromFrag <> " " <>
+   intercalateSnippet " " joins <> " " <>
+   (if null logicForest && null relJoinConds
+@@ -53,14 +53,14 @@ readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,o
+   where
+     fromFrag = fromF relToParent mainQi fromAlias
+     qi = getQualifiedIdentifier relToParent mainQi fromAlias
+-    defSelect = [(("*", []), Nothing, Nothing)] -- gets all the columns in case of an empty select, ignoring/obtaining these columns is done at the aggregation stage
++    defRootSelect = [(("*", []), Nothing, Nothing)] -- gets all columns in case an empty select, e.g. `/tbl?select=`, is done.
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+ getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
+ getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} forest) (selects,joins) =
+   let
+-    subquery = readPlanToQuery rr
++    subquery = readPlanToQuery False rr
+     aliasOrName = pgFmtIdent $ fromMaybe relName relAlias
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 3dbee227..77ea8fb4 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -261,7 +261,6 @@ pgFmtOrderTerm qi ot =
+ 
+ 
+ pgFmtFilter :: QualifiedIdentifier -> Filter -> SQL.Snippet
+-pgFmtFilter _ (FilterNullEmbed hasNot fld) = SQL.sql (pgFmtIdent fld) <> " IS " <> (if hasNot then "NOT" else mempty) <> " NULL"
+ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper of
+    Op op val  -> pgFmtFieldOp op <> " " <> case op of
+      OpLike  -> unknownLiteral (T.map star val)
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index b896efb8..0d7c2583 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -299,39 +299,6 @@ spec actualPgVersion = do
+ 
+       liftIO $ planCost r `shouldSatisfy` (< 70.9)
+ 
+-    context "!inner vs embed not null" $ do
+-      it "on an o2m, an !inner has a similar cost to not.null" $ do
+-        r1 <- request methodGet "/clients?select=*,projects!inner(*)&id=eq.1"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r1 `shouldSatisfy` (< 33.3)
+-
+-        r2 <- request methodGet "/clients?select=*,projects(*)&projects=not.is.null&id=eq.1"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r2 `shouldSatisfy` (< 33.3)
+-
+-      it "on an m2o, an !inner has a similar cost to not.null" $ do
+-        r1 <- request methodGet "/projects?select=*,clients!inner(*)&id=eq.1"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r1 `shouldSatisfy` (< 16.42)
+-
+-        r2 <- request methodGet "/projects?select=*,clients(*)&clients=not.is.null&id=eq.1"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r2 `shouldSatisfy` (< 16.42)
+-
+-      it "on an m2m, an !inner has a similar cost to not.null" $ do
+-        r1 <- request methodGet "/users?select=*,tasks!inner(*)&tasks.id=eq.1"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r1 `shouldSatisfy` (< 20876.14)
+-
+-        r2 <- request methodGet "/users?select=*,tasks(*)&tasks.id=eq.1&tasks=not.is.null"
+-               [planHdr] ""
+-
+-        liftIO $ planCost r2 `shouldSatisfy` (< 20876.14)
+ 
+   describe "function call costs" $ do
+     it "should not exceed cost when calling setof composite proc" $ do
+diff --git a/test/spec/Feature/Query/RelatedQueriesSpec.hs b/test/spec/Feature/Query/RelatedQueriesSpec.hs
+index 7e0f013a..0d316741 100644
+--- a/test/spec/Feature/Query/RelatedQueriesSpec.hs
++++ b/test/spec/Feature/Query/RelatedQueriesSpec.hs
+@@ -10,8 +10,8 @@ import Protolude  hiding (get)
+ import SpecHelper
+ 
+ spec :: SpecWith ((), Application)
+-spec = describe "related queries" $ do
+-  context "related orders" $ do
++spec =
++  describe "related orders" $ do
+     it "works on a many-to-one relationship" $ do
+       get "/projects?select=id,clients(name)&order=clients(name).nullsfirst" `shouldRespondWith`
+         [json|[
+@@ -148,99 +148,3 @@ spec = describe "related queries" $ do
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+-
+-  context "related conditions through null operator on embed" $ do
+-    it "works on a many-to-one relationship" $ do
+-      get "/projects?select=name,clients()&clients=not.is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"Windows 7"},
+-          {"name":"Windows 10"},
+-          {"name":"IOS"},
+-          {"name":"OSX"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/projects?select=name,clients()&clients=is.null" `shouldRespondWith`
+-        [json|[{"name":"Orphan"}]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/projects?select=name,computed_clients()&computed_clients=is.null" `shouldRespondWith`
+-        [json|[{"name":"Orphan"}]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on a one-to-many relationship" $ do
+-      get "/entities?select=name,child_entities()&child_entities=not.is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"entity 1"},
+-          {"name":"entity 2"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/entities?select=name,child_entities()&child_entities=is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"entity 3"},
+-          {"name":null}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/entities?select=name,childs:child_entities()&childs=is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"entity 3"},
+-          {"name":null}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on a many-to-many relationship" $ do
+-      get "/users?select=name,tasks()&tasks.id=eq.1&tasks=not.is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"Angela Martin"},
+-          {"name":"Dwight Schrute"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/users?select=name,tasks()&tasks.id=eq.1&tasks=is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"Michael Scott"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on nested embeds" $ do
+-      get "/entities?select=name,child_entities(name,grandchild_entities())&child_entities.grandchild_entities=not.is.null&child_entities=not.is.null" `shouldRespondWith`
+-        [json|[
+-          {"name":"entity 1","child_entities":[{"name":"child entity 1"}, {"name":"child entity 2"}]}]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "can do an or across embeds" $
+-      get "/client?select=*,clientinfo(),contact()&clientinfo.other=ilike.*main*&contact.name=ilike.*tabby*&or=(clientinfo.not.is.null,contact.not.is.null)" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"name":"Walmart"},
+-          {"id":2,"name":"Target"}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "only works with is null or is not null operators" $
+-      get "/projects?select=name,clients(*)&clients=eq.3" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST120",
+-          "details":"Only is null or not is null filters are allowed on embedded resources",
+-          "hint":null,
+-          "message":"Bad operator on the 'clients' embedded resource"
+-        }|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }

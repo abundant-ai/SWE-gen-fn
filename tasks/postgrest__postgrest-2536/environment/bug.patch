@@ -1,0 +1,158 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c8363c46..9b826416 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,7 +21,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2283, Fix infinite recursion when loading schema cache with self-referencing view - @wolfgangwalther
+  - #2343, Return status code 200 for PATCH requests which don't affect any rows - @wolfgangwalther
+  - #2481, Treat computed relationships not marked SETOF as M2O/O2O relationship - @wolfgangwalther
+- - #2534, Fix embedding a computed relationship with a normal relationship - @steve-chavez
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index fd598299..62a07253 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -107,7 +107,7 @@ initReadRequest qi@QualifiedIdentifier{..} =
+   foldr (treeEntry rootDepth) $ Node defReadPlan{from=qi, relName=qiName, depth=rootDepth} []
+   where
+     rootDepth = 0
+-    defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing mempty Nothing Nothing rootDepth
++    defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing Nothing Nothing rootDepth
+     treeEntry :: Depth -> Tree SelectItem -> ReadPlanTree -> ReadPlanTree
+     treeEntry depth (Node fld@((fldName, _),_,alias, hint, joinType) fldForest) (Node q rForest) =
+       let nxtDepth = succ depth in
+@@ -126,26 +126,22 @@ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> reque
+     nodeRestrictRange :: Maybe Integer -> ReadPlan -> ReadPlan
+     nodeRestrictRange m q@ReadPlan{range_=r} = q{range_=restrictRange m r }
+ 
+--- add relationships to the nodes of the tree by traversing the forest while keeping track of the parentNode(https://stackoverflow.com/questions/22721064/get-the-parent-of-a-node-in-data-tree-haskell#comment34627048_22721064)
+--- also adds aliasing
++-- add relationships to the nodes of the tree by traversing the forest while keeping track of the parentNode, also adds aliasing
+ addRels :: Schema -> Action -> RelationshipsMap -> Maybe ReadPlanTree -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addRels schema action allRels parentNode (Node rPlan@ReadPlan{relName,relHint,relAlias,depth} forest) =
++addRels schema action allRels parentNode (Node rPlan@ReadPlan{relName,relHint,depth} forest) =
+   case parentNode of
+-    Just (Node ReadPlan{from=parentNodeQi, fromAlias=parentAlias} _) ->
++    Just (Node ReadPlan{from=parentNodeQi, fromAlias} _) ->
+       let
+         newReadPlan = (\r ->
+-          let newAlias = Just (qiName (relForeignTable r) <> "_" <> show depth)
+-              aggAlias = qiName (relTable r) <> "_" <> fromMaybe relName relAlias <> "_" <> show depth in
++          let newAlias = Just (qiName (relForeignTable r) <> "_" <> show depth) in
+           case r of
+-            Relationship{relCardinality=M2M _} -> -- m2m does internal implicit joins that don't need aliasing
+-              rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, relJoinConds=getJoinConditions Nothing parentAlias r}
+-            ComputedRelationship{} ->
+-              rPlan{from=relForeignTable r, relToParent=Just r{relTable=maybe (relTable r) (QualifiedIdentifier mempty) parentAlias}, relAggAlias=aggAlias, fromAlias=newAlias}
++            Relationship{relCardinality=M2M _} ->
++              rPlan{from=relForeignTable r, relToParent=Just r, relJoinConds=getJoinConditions Nothing fromAlias r}
+             _ ->
+-              rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, fromAlias=newAlias, relJoinConds=getJoinConditions newAlias parentAlias r}
++              rPlan{from=relForeignTable r, relToParent=Just r, fromAlias=newAlias, relJoinConds=getJoinConditions newAlias fromAlias r}
+           ) <$> rel
+         origin = if depth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
+-          then fromMaybe (qiName parentNodeQi) parentAlias
++          then fromMaybe (qiName parentNodeQi) fromAlias
+           else qiName parentNodeQi
+         rel = findRel schema allRels origin relName relHint
+       in
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index 05082328..cc23f7a6 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -39,11 +39,12 @@ data ReadPlan = ReadPlan
+   , relToParent  :: Maybe Relationship
+   , relJoinConds :: [JoinCondition]
+   , relAlias     :: Maybe Alias
+-  , relAggAlias  :: Alias
+   , relHint      :: Maybe Hint
+   , relJoinType  :: Maybe JoinType
+   , depth        :: Depth
+-  -- ^ used for aliasing
++  -- depth is used bc when a self join occurs we
++  -- need to differentiate the parent from the child tables by having an alias like
++  -- "table_depth". See http://github.com/PostgREST/postgrest/issues/987.
+   }
+   deriving (Eq)
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 91e54cef..38884057 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -56,11 +56,11 @@ readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,o
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+ getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType=joinType} _) (selects,joins) =
++getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAlias, relJoinType=joinType, depth} _) (selects,joins) =
+   let
+     subquery = readPlanToQuery rr
+-    aliasOrName = pgFmtIdent $ fromMaybe relName relAlias
+-    aggAlias = pgFmtIdent relAggAlias
++    aliasOrName = fromMaybe relName relAlias
++    localTableName = pgFmtIdent $ qiName (relTable rel) <> "_" <> aliasOrName <> "_" <> show depth
+     correlatedSubquery sub al cond =
+       (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+     isToOne = case rel of
+@@ -70,14 +70,14 @@ getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, re
+       _                                    -> False
+     (sel, joi) = if isToOne
+       then
+-        ( SQL.sql ("row_to_json(" <> aggAlias <> ".*) AS " <> aliasOrName)
+-        , correlatedSubquery subquery aggAlias "TRUE")
++        ( SQL.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
++        , correlatedSubquery subquery localTableName "TRUE")
+       else
+-        ( SQL.sql $ "COALESCE( " <> aggAlias <> "." <> aggAlias <> ", '[]') AS " <> aliasOrName
++        ( SQL.sql $ "COALESCE( " <> localTableName <> "." <> localTableName <> ", '[]') AS " <> pgFmtIdent aliasOrName
+         , correlatedSubquery (
+-            "SELECT json_agg(" <> SQL.sql aggAlias <> ") AS " <> SQL.sql aggAlias <>
+-            "FROM (" <> subquery <> " ) AS " <> SQL.sql aggAlias
+-          ) aggAlias $ if joinType == Just JTInner then SQL.sql aggAlias <> " IS NOT NULL" else "TRUE")
++            "SELECT json_agg(" <> SQL.sql localTableName <> ") AS " <> SQL.sql localTableName <>
++            "FROM (" <> subquery <> " ) AS " <> SQL.sql localTableName
++          ) localTableName $ if joinType == Just JTInner then SQL.sql localTableName <> " IS NOT NULL" else "TRUE")
+   in
+   (sel:selects, joi:joins)
+ 
+diff --git a/test/spec/Feature/Query/ComputedRelsSpec.hs b/test/spec/Feature/Query/ComputedRelsSpec.hs
+index ea66ad43..612453d0 100644
+--- a/test/spec/Feature/Query/ComputedRelsSpec.hs
++++ b/test/spec/Feature/Query/ComputedRelsSpec.hs
+@@ -136,18 +136,3 @@ spec = describe "computed relationships" $ do
+     get "/fee?select=*,jsbaz(*,johnsmith(*, fee(*)))"
+       `shouldRespondWith`
+       [json|[]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  it "creates queries with the right aliasing when following a normal embed" $ do
+-    get "/projects?select=name,clients(name,computed_projects(name))&limit=1"
+-      `shouldRespondWith`
+-      [json|
+-        [{"name":"Windows 7","clients":{"name":"Microsoft","computed_projects":{"name":"Windows 7"}}}]
+-      |] { matchHeaders = [matchContentTypeJson] }
+-    get "/clients?select=name,projects(name,computed_clients(name))&limit=1"
+-      `shouldRespondWith`
+-      [json|[
+-        {"name":"Microsoft","projects":[
+-          {"name":"Windows 7","computed_clients":{"name":"Microsoft"}},
+-          {"name":"Windows 10","computed_clients":{"name":"Microsoft"}}
+-        ]}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index c528bbf1..5cb2e22f 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2910,11 +2910,3 @@ create trigger ins instead of insert on with_multiple_pks
+ -- issue https://github.com/PostgREST/postgrest/issues/2283
+ create view self_recursive_view as table projects;
+ create or replace view self_recursive_view as table self_recursive_view;
+-
+-CREATE FUNCTION test.computed_clients(test.projects) RETURNS SETOF test.clients ROWS 1 AS $$
+-  SELECT * FROM test.clients WHERE id = $1.client_id;
+-$$ LANGUAGE sql STABLE;
+-
+-CREATE FUNCTION test.computed_projects(test.clients) RETURNS SETOF test.projects ROWS 1 AS $$
+-  SELECT * FROM test.projects WHERE client_id = $1.id;
+-$$ LANGUAGE sql STABLE;

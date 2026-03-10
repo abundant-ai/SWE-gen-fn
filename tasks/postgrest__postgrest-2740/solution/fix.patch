@@ -1,0 +1,114 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 780317cc..1eb5d861 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Completely optional, define the functions in the database and they will be used automatically everywhere
+    + Data representations preserve the ability to write to the original column and require no extra storage or complex triggers (compared to using `GENERATED ALWAYS` columns)
+    + Note: data representations require Postgres 10 (Postgres 11 if using `IN` predicates); data representations are not implemented for RPC
++ - #2647, Allow to verify the PostgREST version in SQL: `select distinct application_name from pg_stat_activity`. - @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 6245f164..50c8b006 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -34,6 +34,7 @@ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Session              as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified PostgREST.Error            as Error
++import           PostgREST.Version          (prettyVersion)
+ 
+ import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                            updateAction)
+@@ -47,6 +48,7 @@ import Data.Time          (ZonedTime, defaultTimeLocale, formatTime,
+ import Data.Time.Clock    (UTCTime, getCurrentTime)
+ 
+ import PostgREST.Config                  (AppConfig (..),
++                                          addFallbackAppName,
+                                           readAppConfig)
+ import PostgREST.Config.Database         (queryDbSettings,
+                                           queryPgVersion,
+@@ -136,7 +138,7 @@ initPool AppConfig{..} =
+     (fromIntegral configDbPoolAcquisitionTimeout)
+     (fromIntegral configDbPoolMaxLifetime)
+     (fromIntegral configDbPoolMaxIdletime)
+-    (toUtf8 configDbUri)
++    (toUtf8 $ addFallbackAppName prettyVersion configDbUri)
+ 
+ -- | Run an action with a database connection.
+ usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+@@ -418,7 +420,7 @@ listener appState = do
+ 
+   -- forkFinally allows to detect if the thread dies
+   void . flip forkFinally (handleFinally dbChannel) $ do
+-    dbOrError <- acquire $ toUtf8 configDbUri
++    dbOrError <- acquire $ toUtf8 (addFallbackAppName prettyVersion configDbUri)
+     case dbOrError of
+       Right db -> do
+         logWithZTime appState $ "Listening for notifications on the " <> dbChannel <> " channel"
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 1b79d0ff..de0ed82e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -24,6 +24,7 @@ module PostgREST.Config
+   , readPGRSTEnvironment
+   , toURI
+   , parseSecret
++  , addFallbackAppName
+   ) where
+ 
+ import qualified Crypto.JOSE.Types      as JOSE
+@@ -47,6 +48,9 @@ import Data.List               (lookup)
+ import Data.List.NonEmpty      (fromList, toList)
+ import Data.Maybe              (fromJust)
+ import Data.Scientific         (floatingOrInteger)
++import Network.URI             (escapeURIString,
++                                isUnescapedInURIComponent, parseURI,
++                                uriQuery)
+ import Numeric                 (readOct, showOct)
+ import System.Environment      (getEnvironment)
+ import System.Posix.Types      (FileMode)
+@@ -460,3 +464,41 @@ type Environment = M.Map [Char] Text
+ readPGRSTEnvironment :: IO Environment
+ readPGRSTEnvironment =
+   M.map T.pack . M.fromList . filter (isPrefixOf "PGRST_" . fst) <$> getEnvironment
++
++-- | Adds a `fallback_application_name` value to the connection string. This allows querying the PostgREST version on pg_stat_activity.
++--
++-- >>> let ver = "11.1.0 (5a04ec7)"::ByteString
++-- >>> let strangeVer = "11'1&0@#$%,.:\"[]{}?+^()=asdfqwer"::ByteString
++--
++-- >>> addFallbackAppName ver "postgres://user:pass@host:5432/postgres"
++-- "postgres://user:pass@host:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
++--
++-- >>> addFallbackAppName ver "postgres://user:pass@host:5432/postgres?"
++-- "postgres://user:pass@host:5432/postgres?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
++--
++-- >>> addFallbackAppName ver "postgres:///postgres?host=server&port=5432"
++-- "postgres:///postgres?host=server&port=5432&fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
++--
++-- >>> addFallbackAppName ver "host=localhost port=5432 dbname=postgres"
++-- "host=localhost port=5432 dbname=postgres fallback_application_name='PostgREST 11.1.0 (5a04ec7)'"
++--
++-- >>> addFallbackAppName ver "postgresql://"
++-- "postgresql://?fallback_application_name=PostgREST%2011.1.0%20%285a04ec7%29"
++--
++-- >>> addFallbackAppName strangeVer "host=localhost port=5432 dbname=postgres"
++-- "host=localhost port=5432 dbname=postgres fallback_application_name='PostgREST 11\\'1&0@#$%,.:\"[]{}?+^()=asdfqwer'"
++--
++-- >>> addFallbackAppName strangeVer "postgres:///postgres?host=server&port=5432"
++-- "postgres:///postgres?host=server&port=5432&fallback_application_name=PostgREST%2011%271%260%40%23%24%25%2C.%3A%22%5B%5D%7B%7D%3F%2B%5E%28%29%3Dasdfqwer"
++addFallbackAppName :: ByteString -> Text -> Text
++addFallbackAppName version dbUri = dbUri <>
++  case uriQuery <$> parseURI (toS dbUri) of
++    Nothing  -> " " <> keyValFmt -- Assume key/value connection string if the uri is not valid
++    Just ""  -> "?" <> uriFmt
++    Just "?" -> uriFmt
++    _        -> "&" <> uriFmt
++  where
++    uriFmt = pKeyWord <> toS (escapeURIString isUnescapedInURIComponent $ toS pgrstVer)
++    keyValFmt = pKeyWord <> "'" <> T.replace "'" "\\'" pgrstVer <> "'"
++    pKeyWord = "fallback_application_name="
++    pgrstVer = "PostgREST " <> T.decodeUtf8 version

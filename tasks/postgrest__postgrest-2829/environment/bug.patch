@@ -1,0 +1,699 @@
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 3bc0231e..add9c951 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -51,7 +51,10 @@ import PostgREST.ApiRequest.Types        (ApiRequestError (..),
+                                           RangeError (..))
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+-import PostgREST.MediaType               (MediaType (..))
++import PostgREST.MediaType               (MTPlanAttrs (..),
++                                          MTPlanFormat (..),
++                                          MediaType (..),
++                                          NormalMedia (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           convertToLimitZeroRange,
+                                           hasLimitZero,
+@@ -208,8 +211,8 @@ getMediaTypes conf hdrs action path = do
+    acceptMediaType <- negotiateContent conf action path accepts
+    pure (acceptMediaType, contentMediaType)
+   where
+-    accepts = maybe [MTAny] (map MediaType.decodeMediaType . parseHttpAccept) $ lookupHeader "accept"
+-    contentMediaType = maybe MTApplicationJSON MediaType.decodeMediaType $ lookupHeader "content-type"
++    accepts = maybe [MTNormal MTAny] (map MediaType.decodeMediaType . parseHttpAccept) $ lookupHeader "accept"
++    contentMediaType = maybe (MTNormal MTApplicationJSON) MediaType.decodeMediaType $ lookupHeader "content-type"
+     lookupHeader    = flip lookup hdrs
+ 
+ getSchema :: AppConfig -> RequestHeaders -> ByteString -> Either ApiRequestError (Schema, Bool)
+@@ -262,26 +265,26 @@ getPayload reqBody contentMediaType QueryParams{qsColumns} action PathInfo{pathI
+   where
+     payload :: Either ApiRequestError (Maybe Payload)
+     payload = mapBoth InvalidBody Just $ case (contentMediaType, pathIsProc) of
+-      (MTApplicationJSON, _) ->
++      (MTNormal MTApplicationJSON, _) ->
+         if isJust columns
+           then Right $ RawJSON reqBody
+           else note "All object keys must match" . payloadAttributes reqBody
+                  =<< if LBS.null reqBody && pathIsProc
+                        then Right emptyObject
+                        else first BS.pack $ JSON.eitherDecode reqBody
+-      (MTTextCSV, _) -> do
++      (MTNormal MTTextCSV, _) -> do
+         json <- csvToJson <$> first BS.pack (CSV.decodeByName reqBody)
+         note "All lines must have same number of fields" $ payloadAttributes (JSON.encode json) json
+-      (MTUrlEncoded, isProc) -> do
++      (MTNormal MTUrlEncoded, isProc) -> do
+         let params = (T.decodeUtf8 *** T.decodeUtf8) <$> parseSimpleQuery (LBS.toStrict reqBody)
+         if isProc
+           then Right $ ProcessedUrlEncoded params (S.fromList $ fst <$> params)
+           else
+             let paramsMap = HM.fromList $ (identity *** JSON.String) <$> params in
+             Right $ ProcessedJSON (JSON.encode paramsMap) $ S.fromList (HM.keys paramsMap)
+-      (MTTextPlain, True) -> Right $ RawPay reqBody
+-      (MTTextXML, True) -> Right $ RawPay reqBody
+-      (MTOctetStream, True) -> Right $ RawPay reqBody
++      (MTNormal MTTextPlain, True) -> Right $ RawPay reqBody
++      (MTNormal MTTextXML, True) -> Right $ RawPay reqBody
++      (MTNormal MTOctetStream, True) -> Right $ RawPay reqBody
+       (ct, _) -> Left $ "Content-Type not acceptable: " <> MediaType.toMime ct
+ 
+     shouldParsePayload = case (action, contentMediaType) of
+@@ -351,9 +354,9 @@ payloadAttributes raw json =
+ negotiateContent :: AppConfig -> Action -> PathInfo -> [MediaType] -> Either ApiRequestError MediaType
+ negotiateContent conf action path accepts =
+   case firstAcceptedPick of
+-    Just MTAny -> Right MTApplicationJSON -- by default(for */*) we respond with json
+-    Just mt    -> Right mt
+-    Nothing    -> Left . MediaTypeError $ map MediaType.toMime accepts
++    Just (MTNormal MTAny) -> Right (MTNormal MTApplicationJSON) -- by default(for */*) we respond with json
++    Just mt               -> Right mt
++    Nothing               -> Left . MediaTypeError $ map MediaType.toMime accepts
+   where
+     -- if there are multiple accepted media types, pick the first
+     firstAcceptedPick = listToMaybe $ L.intersect accepts $ producedMediaTypes conf action path
+@@ -363,15 +366,15 @@ producedMediaTypes conf action path =
+   case action of
+     ActionRead _    -> defaultMediaTypes ++ rawMediaTypes
+     ActionInvoke _  -> invokeMediaTypes
+-    ActionInspect _ -> [MTOpenAPI, MTApplicationJSON, MTAny]
++    ActionInspect _ -> [MTNormal MTOpenAPI, MTNormal MTApplicationJSON, MTNormal MTAny]
+     ActionInfo      -> defaultMediaTypes
+     ActionMutate _  -> defaultMediaTypes
+   where
+     invokeMediaTypes =
+       defaultMediaTypes
+         ++ rawMediaTypes
+-        ++ [MTOpenAPI | pathIsRootSpec path]
++        ++ [MTNormal MTOpenAPI | pathIsRootSpec path]
+     defaultMediaTypes =
+-      [MTApplicationJSON, MTSingularJSON, MTGeoJSON, MTTextCSV] ++
+-      [MTPlan Nothing Nothing mempty | configDbPlanEnabled conf] ++ [MTAny]
+-    rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
++      [MTNormal MTApplicationJSON, MTNormal MTSingularJSON, MTNormal MTGeoJSON, MTNormal MTTextCSV] ++
++      [MTPlan $ MTPlanAttrs Nothing PlanJSON mempty | configDbPlanEnabled conf] ++ [MTNormal MTAny]
++    rawMediaTypes = configRawMediaTypes conf `union` [MTNormal MTOctetStream, MTNormal MTTextPlain, MTNormal MTTextXML]
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 1b79d0ff..7176d3e4 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -57,7 +57,8 @@ import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
+                                           dumpJSPath, pRoleClaimKey)
+ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+-import PostgREST.MediaType               (MediaType (..), toMime)
++import PostgREST.MediaType               (MediaType (..),
++                                          NormalMedia (..), toMime)
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier, dumpQi,
+                                           toQi)
+ 
+@@ -262,7 +263,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> parseOpenAPIMode "openapi-mode"
+     <*> (fromMaybe False <$> optBool "openapi-security-active")
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+-    <*> (maybe [] (fmap (MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
++    <*> (maybe [] (fmap (MTNormal . MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 6e0d72d6..a39d2fba 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -33,7 +33,8 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.ApiRequest.Types (ApiRequestError (..),
+                                              QPError (..),
+                                              RangeError (..))
+-import           PostgREST.MediaType        (MediaType (..))
++import           PostgREST.MediaType        (MediaType (..),
++                                             NormalMedia (..))
+ import qualified PostgREST.MediaType        as MediaType
+ 
+ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..),
+@@ -81,7 +82,7 @@ instance PgrstError ApiRequestError where
+   status LimitNoOrderError       = HTTP.status400
+   status ColumnNotFound{}        = HTTP.status400
+ 
+-  headers _ = [MediaType.toContentType MTApplicationJSON]
++  headers _ = [MediaType.toContentType $ MTNormal MTApplicationJSON]
+ 
+ instance JSON.ToJSON ApiRequestError where
+   toJSON (QueryParamError (QPError message details)) = JSON.object [
+@@ -188,18 +189,18 @@ instance JSON.ToJSON ApiRequestError where
+         prmsMsg = "(" <> prms <> ")"
+         prmsDet = " with parameter" <> (if length argumentKeys > 1 then "s " else " ") <> prms
+         fmtPrms p = if null argumentKeys then " without parameters" else p
+-        onlySingleParams = hasPreferSingleObject || (isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream])
++        onlySingleParams = hasPreferSingleObject || (isInvPost && contentType `elem` [MTNormal MTTextPlain, MTNormal MTTextXML, MTNormal MTOctetStream])
+     in JSON.object [
+     "code"    .= SchemaCacheErrorCode02,
+     "message" .= ("Could not find the function " <> func <> (if onlySingleParams then "" else fmtPrms prmsMsg) <> " in the schema cache"),
+     "details" .= ("Searched for the function " <> func <>
+       (case (hasPreferSingleObject, isInvPost, contentType) of
+-        (True, _, _)                 -> " with a single json/jsonb parameter"
+-        (_, True, MTTextPlain)       -> " with a single unnamed text parameter"
+-        (_, True, MTTextXML)         -> " with a single unnamed xml parameter"
+-        (_, True, MTOctetStream)     -> " with a single unnamed bytea parameter"
+-        (_, True, MTApplicationJSON) -> fmtPrms prmsDet <> " or with a single unnamed json/jsonb parameter"
+-        _                            -> fmtPrms prmsDet) <>
++        (True, _, _)                          -> " with a single json/jsonb parameter"
++        (_, True, MTNormal MTTextPlain)       -> " with a single unnamed text parameter"
++        (_, True, MTNormal MTTextXML)         -> " with a single unnamed xml parameter"
++        (_, True, MTNormal MTOctetStream)     -> " with a single unnamed bytea parameter"
++        (_, True, MTNormal MTApplicationJSON) -> fmtPrms prmsDet <> " or with a single unnamed json/jsonb parameter"
++        _                                     -> fmtPrms prmsDet) <>
+       ", but no matches were found in the schema cache."),
+     -- The hint will be null in the case of single unnamed parameter functions
+     "hint"    .= if onlySingleParams
+@@ -361,8 +362,8 @@ instance PgrstError PgError where
+ 
+   headers err =
+     if status err == HTTP.status401
+-       then [MediaType.toContentType MTApplicationJSON, ("WWW-Authenticate", "Bearer") :: Header]
+-       else [MediaType.toContentType MTApplicationJSON]
++       then [MediaType.toContentType $ MTNormal MTApplicationJSON, ("WWW-Authenticate", "Bearer") :: Header]
++       else [MediaType.toContentType $ MTNormal MTApplicationJSON]
+ 
+ instance JSON.ToJSON PgError where
+   toJSON (PgError _ usageError) = JSON.toJSON usageError
+@@ -475,11 +476,11 @@ instance PgrstError Error where
+   status SingularityError{}      = HTTP.status406
+ 
+   headers (ApiRequestError err)  = headers err
+-  headers (JwtTokenInvalid m)    = [MediaType.toContentType MTApplicationJSON, invalidTokenHeader m]
+-  headers JwtTokenRequired       = [MediaType.toContentType MTApplicationJSON, requiredTokenHeader]
++  headers (JwtTokenInvalid m)    = [MediaType.toContentType $ MTNormal MTApplicationJSON, invalidTokenHeader m]
++  headers JwtTokenRequired       = [MediaType.toContentType $ MTNormal MTApplicationJSON, requiredTokenHeader]
+   headers (PgErr err)            = headers err
+-  headers SingularityError{}     = [MediaType.toContentType MTSingularJSON]
+-  headers _                      = [MediaType.toContentType MTApplicationJSON]
++  headers SingularityError{}     = [MediaType.toContentType $ MTNormal MTSingularJSON]
++  headers _                      = [MediaType.toContentType $ MTNormal MTApplicationJSON]
+ 
+ instance JSON.ToJSON Error where
+   toJSON NoSchemaCacheError = JSON.object [
+@@ -530,7 +531,7 @@ instance JSON.ToJSON Error where
+   toJSON (SingularityError n) = JSON.object [
+     "code"    .= ApiRequestErrorCode16,
+     "message" .= ("JSON object requested, multiple (or no) rows returned" :: Text),
+-    "details" .= T.unwords ["Results contain", show n, "rows,", T.decodeUtf8 (MediaType.toMime MTSingularJSON), "requires 1 row"],
++    "details" .= T.unwords ["Results contain", show n, "rows,", T.decodeUtf8 (MediaType.toMime $ MTNormal MTSingularJSON), "requires 1 row"],
+     "hint"    .= JSON.Null]
+ 
+   toJSON (PgErr err) = JSON.toJSON err
+diff --git a/src/PostgREST/MediaType.hs b/src/PostgREST/MediaType.hs
+index 1704b758..69f4cad4 100644
+--- a/src/PostgREST/MediaType.hs
++++ b/src/PostgREST/MediaType.hs
+@@ -1,9 +1,12 @@
+ {-# LANGUAGE DuplicateRecordFields #-}
++{-# LANGUAGE LambdaCase            #-}
+ 
+ module PostgREST.MediaType
+   ( MediaType(..)
++  , NormalMedia(..)
+   , MTPlanOption (..)
+   , MTPlanFormat (..)
++  , MTPlanAttrs(..)
+   , toContentType
+   , toMime
+   , decodeMediaType
+@@ -12,22 +15,29 @@ module PostgREST.MediaType
+ 
+ import qualified Data.ByteString          as BS
+ import qualified Data.ByteString.Internal as BS (c2w)
++import qualified Data.List                as L
+ import           Data.Maybe               (fromJust)
+ 
+ import Network.HTTP.Types.Header (Header, hContentType)
+ 
+ import Protolude
+-
+ --
+ -- $setup
+ -- Setup for doctests
+ -- >>> import Text.Pretty.Simple (pPrint)
++-- >>> deriving instance Show NormalMedia
+ -- >>> deriving instance Show MTPlanFormat
+ -- >>> deriving instance Show MTPlanOption
++-- >>> deriving instance Show MTPlanAttrs
+ -- >>> deriving instance Show MediaType
+ 
+ -- | Enumeration of currently supported media types
+ data MediaType
++  = MTNormal NormalMedia
++  | MTPlan   MTPlanAttrs
++  deriving Eq
++
++data NormalMedia
+   = MTApplicationJSON
+   | MTSingularJSON
+   | MTGeoJSON
+@@ -39,61 +49,59 @@ data MediaType
+   | MTOctetStream
+   | MTAny
+   | MTOther ByteString
+-  | MTPlan (Maybe MediaType) (Maybe MTPlanFormat) [MTPlanOption]
+-instance Eq MediaType where
+-  MTApplicationJSON == MTApplicationJSON = True
+-  MTSingularJSON    == MTSingularJSON    = True
+-  MTGeoJSON         == MTGeoJSON         = True
+-  MTTextCSV         == MTTextCSV         = True
+-  MTTextPlain       == MTTextPlain       = True
+-  MTTextXML         == MTTextXML         = True
+-  MTOpenAPI         == MTOpenAPI         = True
+-  MTUrlEncoded      == MTUrlEncoded      = True
+-  MTOctetStream     == MTOctetStream     = True
+-  MTAny             == MTAny             = True
+-  MTOther x         == MTOther y         = x == y
+-  MTPlan{}          == MTPlan{}          = True
+-  _                 == _                 = False
++  deriving Eq
++
++
++data MTPlanAttrs = MTPlanAttrs (Maybe NormalMedia) MTPlanFormat [MTPlanOption]
++instance Eq MTPlanAttrs where
++  MTPlanAttrs {} == MTPlanAttrs {} = True -- we don't care about the attributes when comparing two MTPlan media types
+ 
+ data MTPlanOption
+   = PlanAnalyze | PlanVerbose | PlanSettings | PlanBuffers | PlanWAL
++  deriving Eq
+ 
+ data MTPlanFormat
+   = PlanJSON | PlanText
++  deriving Eq
+ 
+ -- | Convert MediaType to a Content-Type HTTP Header
+ toContentType :: MediaType -> Header
+ toContentType ct = (hContentType, toMime ct <> charset)
+   where
+     charset = case ct of
+-      MTOctetStream -> mempty
+-      MTOther _     -> mempty
+-      _             -> "; charset=utf-8"
++      MTNormal MTOctetStream -> mempty
++      MTNormal (MTOther _)   -> mempty
++      _                      -> "; charset=utf-8"
+ 
+ -- | Convert from MediaType to a ByteString representing the mime type
+ toMime :: MediaType -> ByteString
+-toMime MTApplicationJSON = "application/json"
+-toMime MTGeoJSON         = "application/geo+json"
+-toMime MTTextCSV         = "text/csv"
+-toMime MTTextPlain       = "text/plain"
+-toMime MTTextXML         = "text/xml"
+-toMime MTOpenAPI         = "application/openapi+json"
+-toMime MTSingularJSON    = "application/vnd.pgrst.object+json"
+-toMime MTUrlEncoded      = "application/x-www-form-urlencoded"
+-toMime MTOctetStream     = "application/octet-stream"
+-toMime MTAny             = "*/*"
+-toMime (MTOther ct)      = ct
+-toMime (MTPlan mt fmt opts) =
+-  "application/vnd.pgrst.plan" <> maybe mempty (\x -> "+" <> toMimePlanFormat x) fmt <>
+-  (if isNothing mt then mempty else "; for=\"" <> toMime (fromJust mt) <> "\"") <>
++toMime (MTNormal x) = toMimeNormal x
++toMime (MTPlan (MTPlanAttrs mt fmt opts)) =
++  "application/vnd.pgrst.plan+" <> toMimePlanFormat fmt <>
++  (if isNothing mt then mempty else "; for=\"" <> toMimeNormal (fromJust mt) <> "\"") <>
+   (if null opts then mempty else "; options=" <> BS.intercalate "|" (toMimePlanOption <$> opts))
+ 
++toMimeNormal :: NormalMedia -> ByteString
++toMimeNormal = \case
++  MTApplicationJSON -> "application/json"
++  MTGeoJSON         -> "application/geo+json"
++  MTTextCSV         -> "text/csv"
++  MTTextPlain       -> "text/plain"
++  MTTextXML         -> "text/xml"
++  MTOpenAPI         -> "application/openapi+json"
++  MTSingularJSON    -> "application/vnd.pgrst.object+json"
++  MTUrlEncoded      -> "application/x-www-form-urlencoded"
++  MTOctetStream     -> "application/octet-stream"
++  MTAny             -> "*/*"
++  (MTOther ct)      -> ct
++
+ toMimePlanOption :: MTPlanOption -> ByteString
+-toMimePlanOption PlanAnalyze  = "analyze"
+-toMimePlanOption PlanVerbose  = "verbose"
+-toMimePlanOption PlanSettings = "settings"
+-toMimePlanOption PlanBuffers  = "buffers"
+-toMimePlanOption PlanWAL      = "wal"
++toMimePlanOption = \case
++  PlanAnalyze  -> "analyze"
++  PlanVerbose  -> "verbose"
++  PlanSettings -> "settings"
++  PlanBuffers  -> "buffers"
++  PlanWAL      -> "wal"
+ 
+ toMimePlanFormat :: MTPlanFormat -> ByteString
+ toMimePlanFormat PlanJSON = "json"
+@@ -102,51 +110,62 @@ toMimePlanFormat PlanText = "text"
+ -- | Convert from ByteString to MediaType.
+ --
+ -- >>> decodeMediaType "application/json"
+--- MTApplicationJSON
++-- MTNormal MTApplicationJSON
+ --
+ -- >>> decodeMediaType "application/vnd.pgrst.plan;"
+--- MTPlan Nothing Nothing []
++-- MTPlan (MTPlanAttrs Nothing PlanText [])
+ --
+ -- >>> decodeMediaType "application/vnd.pgrst.plan;for=\"application/json\""
+--- MTPlan (Just MTApplicationJSON) Nothing []
++-- MTPlan (MTPlanAttrs (Just MTApplicationJSON) PlanText [])
++--
++-- >>> decodeMediaType "application/vnd.pgrst.plan;for=\"text/csv\""
++-- MTPlan (MTPlanAttrs (Just MTTextCSV) PlanText [])
+ --
+--- >>> decodeMediaType "application/vnd.pgrst.plan+text;for=\"text/csv\""
+--- MTPlan (Just MTTextCSV) (Just PlanText) []
++-- A plan media type inside "for" shouldn't recurse
++--
++-- >>> decodeMediaType "application/vnd.pgrst.plan;for=\"application/vnd.pgrst.plan\""
++-- MTPlan (MTPlanAttrs (Just (MTOther "application/vnd.pgrst.plan")) PlanText [])
+ decodeMediaType :: BS.ByteString -> MediaType
+-decodeMediaType mt =
+-  case BS.split (BS.c2w ';') mt of
+-    "application/json":_                   -> MTApplicationJSON
+-    "application/geo+json":_               -> MTGeoJSON
+-    "text/csv":_                           -> MTTextCSV
+-    "text/plain":_                         -> MTTextPlain
+-    "text/xml":_                           -> MTTextXML
+-    "application/openapi+json":_           -> MTOpenAPI
+-    "application/vnd.pgrst.object+json":_  -> MTSingularJSON
+-    "application/vnd.pgrst.object":_       -> MTSingularJSON
+-    "application/x-www-form-urlencoded":_  -> MTUrlEncoded
+-    "application/octet-stream":_           -> MTOctetStream
+-    "application/vnd.pgrst.plan":rest      -> getPlan Nothing rest
+-    "application/vnd.pgrst.plan+text":rest -> getPlan (Just PlanText) rest
+-    "application/vnd.pgrst.plan+json":rest -> getPlan (Just PlanJSON) rest
+-    "*/*":_                                -> MTAny
+-    other:_                                -> MTOther other
+-    _                                      -> MTAny
++decodeMediaType bs =
++  case BS.split (BS.c2w ';') bs of
++    "application/vnd.pgrst.plan":rest      -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+text":rest -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+json":rest -> getPlan PlanJSON rest
++    mt                                     -> MTNormal $ decodeNormalMediaType mt
+   where
+     getPlan fmt rest =
+      let
+        opts         = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
+        inOpts str   = str `elem` opts
+-       mtFor        = decodeMediaType . dropAround (== BS.c2w '"') <$> (BS.stripPrefix "for=" =<< find (BS.isPrefixOf "for=") rest)
++       mtFor        = decodeNormalMediaType . L.singleton . dropAround (== BS.c2w '"') <$> (BS.stripPrefix "for=" =<< find (BS.isPrefixOf "for=") rest)
+        dropAround p = BS.dropWhile p . BS.dropWhileEnd p in
+-     MTPlan mtFor fmt $
++     MTPlan $ MTPlanAttrs mtFor fmt $
+       [PlanAnalyze  | inOpts "analyze" ] ++
+       [PlanVerbose  | inOpts "verbose" ] ++
+       [PlanSettings | inOpts "settings"] ++
+       [PlanBuffers  | inOpts "buffers" ] ++
+       [PlanWAL      | inOpts "wal"     ]
+ 
+-getMediaType :: MediaType -> MediaType
++-- | Convert from ByteString to MediaType. Warning: discards MIME parameters
++decodeNormalMediaType :: [BS.ByteString] -> NormalMedia
++decodeNormalMediaType bs =
++  case bs of
++    "application/json":_                  -> MTApplicationJSON
++    "application/geo+json":_              -> MTGeoJSON
++    "text/csv":_                          -> MTTextCSV
++    "text/plain":_                        -> MTTextPlain
++    "text/xml":_                          -> MTTextXML
++    "application/openapi+json":_          -> MTOpenAPI
++    "application/vnd.pgrst.object+json":_ -> MTSingularJSON
++    "application/vnd.pgrst.object":_      -> MTSingularJSON
++    "application/x-www-form-urlencoded":_ -> MTUrlEncoded
++    "application/octet-stream":_          -> MTOctetStream
++    "*/*":_                               -> MTAny
++    other:_                               -> MTOther other
++    _                                     -> MTAny
++
++getMediaType :: MediaType -> NormalMedia
+ getMediaType mt = case mt of
+-  MTPlan (Just mType) _ _ -> mType
+-  MTPlan Nothing _ _      -> MTApplicationJSON
+-  other                   -> other
++  MTPlan (MTPlanAttrs (Just mType) _ _) -> mType
++  MTPlan (MTPlanAttrs Nothing _ _)      -> MTApplicationJSON
++  MTNormal x                            -> x
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index b6d9abe0..512ff53e 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -44,7 +44,9 @@ import PostgREST.ApiRequest               (Action (..),
+                                            Payload (..))
+ import PostgREST.Config                   (AppConfig (..))
+ import PostgREST.Error                    (Error (..))
+-import PostgREST.MediaType                (MediaType (..))
++import PostgREST.MediaType                (MTPlanAttrs (..),
++                                           MediaType (..),
++                                           NormalMedia (..))
+ import PostgREST.Query.SqlFragment        (sourceCTEName)
+ import PostgREST.RangeQuery               (NonnegRange, allRange,
+                                            convertToLimitZeroRange,
+@@ -121,10 +123,10 @@ callReadPlan identifier conf sCache apiRequest invMethod = do
+   let relIdentifier = QualifiedIdentifier pdSchema (fromMaybe pdName $ Routine.funcTableName proc) -- done so a set returning function can embed other relations
+   rPlan <- readPlan relIdentifier conf sCache apiRequest
+   let args = case (invMethod, iContentMediaType apiRequest) of
+-        (InvGet, _)             -> jsonRpcParams proc qsParams'
+-        (InvHead, _)            -> jsonRpcParams proc qsParams'
+-        (InvPost, MTUrlEncoded) -> maybe mempty (jsonRpcParams proc . payArray) $ iPayload apiRequest
+-        (InvPost, _)            -> maybe mempty payRaw $ iPayload apiRequest
++        (InvGet, _)                      -> jsonRpcParams proc qsParams'
++        (InvHead, _)                     -> jsonRpcParams proc qsParams'
++        (InvPost, MTNormal MTUrlEncoded) -> maybe mempty (jsonRpcParams proc . payArray) $ iPayload apiRequest
++        (InvPost, _)                     -> maybe mempty payRaw $ iPayload apiRequest
+       txMode = case (invMethod, pdVolatility) of
+           (InvGet,  _)                 -> SQL.Read
+           (InvHead, _)                 -> SQL.Read
+@@ -166,12 +168,12 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+     -- If the function is called with post and has a single unnamed parameter
+     -- it can be called depending on content type and the parameter type
+     hasSingleUnnamedParam Function{pdParams=[RoutineParam{ppType}]} = isInvPost && case (contentMediaType, ppType) of
+-      (MTApplicationJSON, "json")  -> True
+-      (MTApplicationJSON, "jsonb") -> True
+-      (MTTextPlain, "text")        -> True
+-      (MTTextXML, "xml")           -> True
+-      (MTOctetStream, "bytea")     -> True
+-      _                            -> False
++      (MTNormal MTApplicationJSON, "json")  -> True
++      (MTNormal MTApplicationJSON, "jsonb") -> True
++      (MTNormal MTTextPlain, "text")        -> True
++      (MTNormal MTTextXML, "xml")           -> True
++      (MTNormal MTOctetStream, "bytea")     -> True
++      _                                     -> False
+     hasSingleUnnamedParam _ = False
+     matchesParams proc =
+       let
+@@ -183,7 +185,7 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+         then length params == 1 && (firstType == Just "json" || firstType == Just "jsonb")
+       -- If the function has no parameters, the arguments keys must be empty as well
+       else if null params
+-        then null argumentsKeys && not (isInvPost && contentMediaType `elem` [MTOctetStream, MTTextPlain, MTTextXML])
++        then null argumentsKeys && not (isInvPost && contentMediaType `elem` [MTNormal MTOctetStream, MTNormal MTTextPlain, MTNormal MTTextXML])
+       -- A function has optional and required parameters. Optional parameters have a default value and
+       -- don't require arguments for the function to be executed, required parameters must have an argument present.
+       else case L.partition ppReq params of
+@@ -631,12 +633,12 @@ binaryField AppConfig{configRawMediaTypes} acceptMediaType proc rpTree
+   | otherwise =
+       Right Nothing
+   where
+-    isRawMediaType = acceptMediaType `elem` configRawMediaTypes `L.union` [MTOctetStream, MTTextPlain, MTTextXML] || isRawPlan acceptMediaType
++    isRawMediaType = acceptMediaType `elem` configRawMediaTypes `L.union` [MTNormal MTOctetStream, MTNormal MTTextPlain, MTNormal MTTextXML] || isRawPlan acceptMediaType
+     isRawPlan mt = case mt of
+-      MTPlan (Just MTOctetStream) _ _ -> True
+-      MTPlan (Just MTTextPlain) _ _   -> True
+-      MTPlan (Just MTTextXML) _ _     -> True
+-      _                               -> False
++      MTPlan (MTPlanAttrs (Just MTOctetStream) _ _) -> True
++      MTPlan (MTPlanAttrs (Just MTTextPlain) _ _)   -> True
++      MTPlan (MTPlanAttrs (Just MTTextXML) _ _)     -> True
++      _                                             -> False
+ 
+     fstFieldName :: ReadPlanTree -> Maybe FieldName
+     fstFieldName (Node ReadPlan{select=(("*", []), _, _):_} [])  = Nothing
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index c0f2097b..524da373 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -46,7 +46,8 @@ import PostgREST.Config                  (AppConfig (..),
+ import PostgREST.Config.PgVersion        (PgVersion (..),
+                                           pgVersion140)
+ import PostgREST.Error                   (Error)
+-import PostgREST.MediaType               (MediaType (..))
++import PostgREST.MediaType               (MediaType (..),
++                                          NormalMedia (..))
+ import PostgREST.Plan                    (CallReadPlan (..),
+                                           MutateReadPlan (..),
+                                           WrappedReadPlan (..))
+@@ -207,7 +208,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq@ApiRequest{iPreferenc
+ failNotSingular :: MediaType -> ResultSet -> DbHandler ()
+ failNotSingular _ RSPlan{} = pure ()
+ failNotSingular mediaType RSStandard{rsQueryTotal=queryTotal} =
+-  when (mediaType == MTSingularJSON && queryTotal /= 1) $ do
++  when (mediaType == MTNormal MTSingularJSON && queryTotal /= 1) $ do
+     lift SQL.condemn
+     throwError $ Error.singularityError queryTotal
+ 
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index ea150ec4..9e735e94 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -431,7 +431,7 @@ intercalateSnippet :: ByteString -> [SQL.Snippet] -> SQL.Snippet
+ intercalateSnippet _ [] = mempty
+ intercalateSnippet frag snippets = foldr1 (\a b -> a <> SQL.sql frag <> b) snippets
+ 
+-explainF :: Maybe MTPlanFormat -> [MTPlanOption] -> SQL.Snippet -> SQL.Snippet
++explainF :: MTPlanFormat -> [MTPlanOption] -> SQL.Snippet -> SQL.Snippet
+ explainF fmt opts snip =
+   "EXPLAIN (" <>
+     SQL.sql (BS.intercalate ", " (fmtPlanFmt fmt : (fmtPlanOpt <$> opts))) <>
+@@ -444,9 +444,8 @@ explainF fmt opts snip =
+     fmtPlanOpt PlanBuffers  = "BUFFERS"
+     fmtPlanOpt PlanWAL      = "WAL"
+ 
+-    fmtPlanFmt Nothing         = "FORMAT TEXT"
+-    fmtPlanFmt (Just PlanJSON) = "FORMAT JSON"
+-    fmtPlanFmt (Just PlanText) = "FORMAT TEXT"
++    fmtPlanFmt PlanJSON = "FORMAT JSON"
++    fmtPlanFmt PlanText = "FORMAT TEXT"
+ 
+ -- | Do a pg set_config(setting, value, true) call. This is equivalent to a SET LOCAL.
+ setConfigLocal :: ByteString -> (ByteString, ByteString) -> SQL.Snippet
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 03fff7fe..4bb7ecda 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -26,8 +26,10 @@ import Control.Lens ((^?))
+ import Data.Maybe   (fromJust)
+ 
+ import PostgREST.ApiRequest.Preferences
+-import PostgREST.MediaType               (MTPlanFormat (..),
++import PostgREST.MediaType               (MTPlanAttrs (..),
++                                          MTPlanFormat (..),
+                                           MediaType (..),
++                                          NormalMedia (..),
+                                           getMediaType)
+ import PostgREST.Query.SqlFragment
+ import PostgREST.SchemaCache.Identifiers (FieldName)
+@@ -167,7 +169,7 @@ preparePlanRows :: SQL.Snippet -> Bool -> SQL.Statement () (Maybe Int64)
+ preparePlanRows countQuery =
+   SQL.dynamicallyParameterized snippet decodeIt
+   where
+-    snippet = explainF (Just PlanJSON) mempty countQuery
++    snippet = explainF PlanJSON mempty countQuery
+     decodeIt :: HD.Result (Maybe Int64)
+     decodeIt =
+       let row = HD.singleRow $ column HD.bytea in
+@@ -187,8 +189,8 @@ standardRow noLocation =
+ 
+ mtSnippet :: MediaType -> SQL.Snippet -> SQL.Snippet
+ mtSnippet mediaType snippet = case mediaType of
+-  MTPlan _ fmt opts -> explainF fmt opts snippet
+-  _                 -> snippet
++  MTPlan (MTPlanAttrs _ fmt opts) -> explainF fmt opts snippet
++  MTNormal _                      -> snippet
+ 
+ -- | We use rowList because when doing EXPLAIN (FORMAT TEXT), the result comes as many rows. FORMAT JSON comes as one.
+ planRow :: HD.Result ResultSet
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 6d2b96f1..0a949940 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -42,7 +42,8 @@ import PostgREST.ApiRequest.Preferences  (PreferRepresentation (..),
+                                           toAppliedHeader)
+ import PostgREST.ApiRequest.QueryParams  (QueryParams (..))
+ import PostgREST.Config                  (AppConfig (..))
+-import PostgREST.MediaType               (MediaType (..))
++import PostgREST.MediaType               (MediaType (..),
++                                          NormalMedia (..))
+ import PostgREST.Plan                    (MutateReadPlan (..))
+ import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Query.Statements        (ResultSet (..))
+@@ -226,7 +227,7 @@ invokeResponse invMethod proc ctxApiRequest@ApiRequest{..} resultSet = case resu
+ openApiResponse :: Bool -> Maybe (TablesMap, RoutineMap, Maybe Text) -> AppConfig -> SchemaCache -> Schema -> Bool -> Wai.Response
+ openApiResponse headersOnly body conf sCache schema negotiatedByProfile =
+   Wai.responseLBS HTTP.status200
+-    (MediaType.toContentType MTOpenAPI : maybeToList (profileHeader schema negotiatedByProfile))
++    (MediaType.toContentType (MTNormal MTOpenAPI) : maybeToList (profileHeader schema negotiatedByProfile))
+     (maybe mempty (\(x, y, z) -> if headersOnly then mempty else OpenAPI.encode conf sCache x y z) body)
+ 
+ -- | Response with headers and status overridden from GUCs.
+diff --git a/src/PostgREST/Response/OpenAPI.hs b/src/PostgREST/Response/OpenAPI.hs
+index db855f9f..1968b958 100644
+--- a/src/PostgREST/Response/OpenAPI.hs
++++ b/src/PostgREST/Response/OpenAPI.hs
+@@ -351,7 +351,7 @@ makeProcPathItem pd = ("/rpc/" ++ toS (pdName pd), pe)
+       & summary .~ pSum
+       & description .~ mfilter (/="") pDesc
+       & tags .~ Set.fromList ["(rpc) " <> pdName pd]
+-      & produces ?~ makeMimeList [MTApplicationJSON, MTSingularJSON]
++      & produces ?~ makeMimeList [MTNormal MTApplicationJSON, MTNormal MTSingularJSON]
+       & at 200 ?~ "OK"
+     getOp = procOp
+       & parameters .~ makeProcGetParams (pdParams pd)
+@@ -367,7 +367,7 @@ makeRootPathItem = ("/", p)
+     getOp = (mempty :: Operation)
+       & tags .~ Set.fromList ["Introspection"]
+       & summary ?~ "OpenAPI description (this document)"
+-      & produces ?~ makeMimeList [MTOpenAPI, MTApplicationJSON]
++      & produces ?~ makeMimeList [MTNormal MTOpenAPI, MTNormal MTApplicationJSON]
+       & at 200 ?~ "OK"
+     pr = (mempty :: PathItem) & get ?~ getOp
+     p = pr
+@@ -407,8 +407,8 @@ postgrestSpec rels pds ti (s, h, p, b) sd allowSecurityDef = (mempty :: Swagger)
+   & definitions .~ fromList (makeTableDef rels <$> ti)
+   & parameters .~ fromList (makeParamDefs ti)
+   & paths .~ makePathItems pds ti
+-  & produces .~ makeMimeList [MTApplicationJSON, MTSingularJSON, MTTextCSV]
+-  & consumes .~ makeMimeList [MTApplicationJSON, MTSingularJSON, MTTextCSV]
++  & produces .~ makeMimeList mediaTypes
++  & consumes .~ makeMimeList mediaTypes
+   & securityDefinitions .~ makeSecurityDefinitions securityDefName allowSecurityDef
+   & security .~ [SecurityRequirement (fromList [(securityDefName, [])]) | allowSecurityDef]
+     where
+@@ -417,6 +417,7 @@ postgrestSpec rels pds ti (s, h, p, b) sd allowSecurityDef = (mempty :: Swagger)
+       securityDefName = "JWT"
+       (dTitle, dDesc) = fmap fst &&& fmap (T.dropWhile (=='\n') . snd) $
+                     T.breakOn "\n" <$> sd
++      mediaTypes = [MTNormal MTApplicationJSON, MTNormal MTSingularJSON, MTNormal MTTextCSV]
+ 
+ pickProxy :: Maybe Text -> Maybe Proxy
+ pickProxy proxy
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index e88dec51..eb21d95c 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -254,7 +254,7 @@ spec actualPgVersion = do
+           resStatus  = simpleStatus r
+ 
+       liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan; charset=utf-8")
++        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+text; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         resBody `shouldSatisfy` (\t -> LBS.take 9 t == "Aggregate")
+ 
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index c5b1a383..e7963c3a 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -29,7 +29,8 @@ import PostgREST.Config                  (AppConfig (..),
+                                           LogLevel (..),
+                                           OpenAPIMode (..),
+                                           parseSecret)
+-import PostgREST.MediaType               (MediaType (..))
++import PostgREST.MediaType               (MediaType (..),
++                                          NormalMedia (..))
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..))
+ import Protolude                         hiding (get, toS)
+ import Protolude.Conv                    (toS)
+@@ -196,7 +197,7 @@ testCfgRootSpec :: AppConfig
+ testCfgRootSpec = baseCfg { configDbRootSpec = Just $ QualifiedIdentifier mempty "root"}
+ 
+ testCfgHtmlRawOutput :: AppConfig
+-testCfgHtmlRawOutput = baseCfg { configRawMediaTypes = [MTOther "text/html"] }
++testCfgHtmlRawOutput = baseCfg { configRawMediaTypes = [MTNormal $ MTOther "text/html"] }
+ 
+ testCfgResponseHeaders :: AppConfig
+ testCfgResponseHeaders = baseCfg { configDbPreRequest = Just $ QualifiedIdentifier mempty "custom_headers" }

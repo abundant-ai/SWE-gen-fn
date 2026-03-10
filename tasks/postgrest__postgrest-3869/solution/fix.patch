@@ -1,0 +1,176 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d3711238..581fdd74 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Fixed `"column <json_aggregate>.<alias> does not exist"` error when selecting `?select=...table(aias:count())`
+  - #3727, Clarify "listening" logs - @steve-chavez
+  - #3795, Clarify `Accept: vnd.pgrst.object` error message - @steve-chavez
++ - #3697, #3602, Handle queries on non-existing table gracefully - @taimoorzaeem
+ 
+ ### Changed
+ 
+@@ -40,6 +41,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + This preference was deprecated in favor of Functions with an array of JSON objects
+  - #3013, Drop support for Limited updates/deletes
+    + The feature was complicated and largely unused.
++ - #3697, #3602, Querying non-existent table now returns `PGRST205` error instead of empty json - @taimoorzaeem
+ 
+ ## [12.2.8] - 2025-02-10
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 8977f847..20091a7c 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -286,6 +286,10 @@ Related to a :ref:`schema_cache`. Most of the time, these errors are solved by :
+ |               |             | in the ``columns`` query parameter is not found.            |
+ | PGRST204      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
++| .. _pgrst205: | 404         | Caused when the :ref:`table specified <tables_views>` in    |
++|               |             | the URI is not found.                                       |
++| PGRST205      |             |                                                             |
+++---------------+-------------+-------------------------------------------------------------+
+ 
+ .. _pgrst3**:
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index f9093b6d..59e40253 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -45,6 +45,7 @@ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            RelationshipsMap)
+ import PostgREST.SchemaCache.Routine      (Routine (..),
+                                            RoutineParam (..))
++import PostgREST.SchemaCache.Table        (Table (..))
+ import Protolude
+ 
+ 
+@@ -82,6 +83,7 @@ data ApiRequestError
+   | UnacceptableSchema [Text]
+   | UnsupportedMethod ByteString
+   | ColumnNotFound Text Text
++  | TableNotFound Text Text [Table]
+   | GucHeadersError
+   | GucStatusError
+   | PutMatchingPkError
+@@ -128,6 +130,7 @@ instance PgrstError ApiRequestError where
+   status UnacceptableSchema{}        = HTTP.status406
+   status UnsupportedMethod{}         = HTTP.status405
+   status ColumnNotFound{}            = HTTP.status400
++  status TableNotFound{}             = HTTP.status404
+   status GucHeadersError             = HTTP.status500
+   status GucStatusError              = HTTP.status500
+   status PutMatchingPkError          = HTTP.status400
+@@ -285,6 +288,12 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON (ColumnNotFound relName colName) = toJsonPgrstError
+     SchemaCacheErrorCode04 ("Could not find the '" <> colName <> "' column of '" <> relName <> "' in the schema cache") Nothing Nothing
+ 
++  toJSON (TableNotFound schemaName relName tbls) = toJsonPgrstError
++    SchemaCacheErrorCode05
++    ("Could not find the table '" <> schemaName <> "." <> relName <> "' in the schema cache")
++    Nothing
++    (JSON.String <$> tableNotFoundHint schemaName relName tbls)
++
+ -- |
+ -- If no relationship is found then:
+ --
+@@ -382,6 +391,16 @@ noRpcHint schema procName params allProcs overloadedProcs =
+       | null overloadedProcs = Fuzzy.getOne fuzzySetOfProcs procName
+       | otherwise            = (procName <>) <$> Fuzzy.getOne fuzzySetOfParams (listToText params)
+ 
++-- |
++-- Do a fuzzy search in all tables in the same schema and return closest result
++tableNotFoundHint :: Text -> Text -> [Table] -> Maybe Text
++tableNotFoundHint schema tblName tblList
++  = fmap (\tbl -> "Perhaps you meant the table '" <> schema <> "." <> tbl <> "'") perhapsTable
++    where
++      perhapsTable = Fuzzy.getOne fuzzyTableSet tblName
++      fuzzyTableSet = Fuzzy.fromList [ tableName tbl | tbl <- tblList, tableSchema tbl == schema]
++
++
+ compressedRel :: Relationship -> JSON.Value
+ -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+ compressedRel ComputedRelationship{} = JSON.object mempty
+@@ -672,6 +691,7 @@ data ErrorCode
+   | SchemaCacheErrorCode02
+   | SchemaCacheErrorCode03
+   | SchemaCacheErrorCode04
++  | SchemaCacheErrorCode05
+   -- JWT authentication errors
+   | JWTErrorCode00
+   | JWTErrorCode01
+@@ -719,6 +739,7 @@ buildErrorCode code = case code of
+   SchemaCacheErrorCode02 -> "PGRST202"
+   SchemaCacheErrorCode03 -> "PGRST203"
+   SchemaCacheErrorCode04 -> "PGRST204"
++  SchemaCacheErrorCode05 -> "PGRST205"
+ 
+   JWTErrorCode00         -> "PGRST300"
+   JWTErrorCode01         -> "PGRST301"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 1d067aea..17ba08ab 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -153,18 +153,20 @@ dbActionPlan dbAct conf apiReq sCache = case dbAct of
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Bool -> Either Error CrudPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} headersOnly = do
+-  rPlan <- readPlan identifier conf sCache apiRequest
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  qi <- mapLeft ApiRequestError $ findTable identifier (dbTables sCache)
++  rPlan <- readPlan qi conf sCache apiRequest
++  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  return $ WrappedReadPlan rPlan SQL.Read handler mediaType headersOnly identifier
++  return $ WrappedReadPlan rPlan SQL.Read handler mediaType headersOnly qi
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error CrudPlan
+ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+-  rPlan <- readPlan identifier conf sCache apiRequest
+-  mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
++  qi <- mapLeft ApiRequestError $ findTable identifier (dbTables sCache)
++  rPlan <- readPlan qi conf sCache apiRequest
++  mPlan <- mutatePlan mutation qi apiRequest sCache rPlan
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+-  return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation identifier
++  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation qi
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs},..} invMethod = do
+@@ -745,6 +747,13 @@ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+   | not aggFunctionsAllowed && any (isJust . csAggFunction) select = Left AggregatesNotAllowed
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
++-- | Lookup table in the schema cache before creating read plan
++findTable :: QualifiedIdentifier -> TablesMap -> Either ApiRequestError QualifiedIdentifier
++findTable qi@QualifiedIdentifier{..} tableMap =
++  case HM.lookup qi tableMap of
++    Nothing -> Left (TableNotFound qiSchema qiName (HM.elems tableMap))
++    Just _ -> Right qi
++
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addFilters ctx ApiRequest{..} rReq =
+   foldr addFilterToNode (Right rReq) flts
+@@ -967,7 +976,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+     typedColumnsOrError = resolveOrError ctx tbl `traverse` S.toList iColumns
+ 
+ resolveOrError :: ResolverContext -> Maybe Table -> FieldName -> Either ApiRequestError CoercibleField
+-resolveOrError _ Nothing _ = Left NotFound
++resolveOrError _ Nothing _ = Left NotFound -- TODO: control never reaches here since #3869, should be fixed when fixing #3906
+ resolveOrError ctx (Just table) field =
+   case resolveTableFieldName table field Nothing of
+     CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+diff --git a/src/PostgREST/SchemaCache/Identifiers.hs b/src/PostgREST/SchemaCache/Identifiers.hs
+index 2cc01f2e..6d2a4cff 100644
+--- a/src/PostgREST/SchemaCache/Identifiers.hs
++++ b/src/PostgREST/SchemaCache/Identifiers.hs
+@@ -25,6 +25,7 @@ instance Hashable RelIdentifier
+ 
+ -- | Represents a pg identifier with a prepended schema name "schema.table".
+ -- When qiSchema is "", the schema is defined by the pg search_path.
++-- TODO: Refactor this, we also use QI for procedure names
+ data QualifiedIdentifier = QualifiedIdentifier
+   { qiSchema :: Schema
+   , qiName   :: TableName

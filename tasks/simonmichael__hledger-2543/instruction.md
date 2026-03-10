@@ -1,0 +1,9 @@
+The `hledger aregister` (aka `areg`) command needs to support a new `--drop` flag that changes what account name is displayed in the register output.
+
+Currently, `aregister` shows postings in the matched account (and its subaccounts) and displays the “other account” involved in each matching transaction (eg showing `in:salary` or `ex:food` when registering `assets:checking`). Users need the same `--drop N` behavior that exists in other register-style commands: when rendering account names in the output, drop the first `N` components of the displayed account name.
+
+For example, when running a register on `assets:checking` that would normally display `income:salary` as the other account, using `--drop 1` should display `salary` (dropping the leading `income`). Similarly `expenses:food` should display `food`. Dropping should apply consistently anywhere `aregister` renders account names in its report lines (including abbreviated forms like `in:salary`/`ex:food`, if those are still produced), without changing which transactions/postings are included—only the rendered account name should change.
+
+`--drop` should accept a non-negative integer argument. With `--drop 0` it should behave exactly as today. With values larger than the account depth, the displayed name should become empty or minimal in a sensible way (eg nothing beyond what remains), but it must not crash.
+
+The option should integrate with existing `aregister` behavior: it must still always include subaccounts regardless of a depth limit, it must still operate in historical mode (running balance includes prior transactions when a begin date is used), and any additional non-account arguments must continue to act as an extra query filter. The presence of `--drop` must not affect sorting, filtering, or running-balance calculations—only the displayed account names.

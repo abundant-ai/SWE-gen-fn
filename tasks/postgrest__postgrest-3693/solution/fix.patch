@@ -1,0 +1,239 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 532c2374..91c73428 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,14 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
+  - #3560, Log resolved host in "Listening on ..." messages - @develop7
+ 
++### Fixed
++
++ - #3693, Prevent spread embedding to allow aggregates when they are disabled - @laurenceisla
++ - #3693, A nested spread embedding now correctly groups by the fields of its top parent relationship - @laurenceisla
++ - #3693, Fix spread embedding errors when using the `count()` aggregate without a field - @laurenceisla
++   + Fixed `"column reference <col> is ambiguous"` error when selecting `?select=...table(col,count())`
++   + Fixed `"column <json_aggregate>.<alias> does not exist"` error when selecting `?select=...table(aias:count())`
++
+ ### Changed
+ 
+  - #2052, Dropped support for PostgreSQL 9.6 - @wolfgangwalther
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 4718b05e..926ab3f9 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -270,7 +270,7 @@ data ResolverContext = ResolverContext
+   }
+ 
+ resolveColumnField :: Column -> CoercibleField
+-resolveColumnField col = CoercibleField (colName col) mempty False (colNominalType col) Nothing (colDefault col)
++resolveColumnField col = CoercibleField (colName col) mempty False (colNominalType col) Nothing (colDefault col) False
+ 
+ resolveTableFieldName :: Table -> FieldName -> CoercibleField
+ resolveTableFieldName table fieldName =
+@@ -332,8 +332,8 @@ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows, configDbAggregate
+   in
+     mapLeft ApiRequestError $
+     treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-    validateAggFunctions configDbAggregates =<<
+     hoistSpreadAggFunctions =<<
++    validateAggFunctions configDbAggregates =<<
+     addRelSelects =<<
+     addNullEmbedFilters =<<
+     validateSpreadEmbeds =<<
+@@ -380,11 +380,19 @@ addAliases = Right . fmap addAliasToPlan
+ 
+     aliasSelectField :: CoercibleSelectField -> CoercibleSelectField
+     aliasSelectField field@CoercibleSelectField{csField=fieldDetails, csAggFunction=aggFun, csAlias=alias}
+-      | isJust alias || isJust aggFun = field
++      | isJust alias = field
++      | isJust aggFun = fieldAliasForSpreadAgg field
+       | isJsonKeyPath fieldDetails, Just key <- lastJsonKey fieldDetails = field { csAlias = Just key }
+       | isTransformPath fieldDetails = field { csAlias = Just (cfName fieldDetails) }
+       | otherwise = field
+ 
++    -- A request like: `/top_table?select=...middle_table(...nested_table(count()))` will `SELECT` the full row instead of `*`,
++    -- because doing a `COUNT(*)` in `top_table` would not return the desired results.
++    -- So we use the "count" alias if none is present since the field name won't be selected.
++    fieldAliasForSpreadAgg field
++      | cfFullRow (csField field) = field { csAlias = Just "count" }
++      | otherwise                 = field
++
+     isJsonKeyPath CoercibleField{cfJsonPath=(_: _)} = True
+     isJsonKeyPath _                                 = False
+ 
+@@ -428,26 +436,30 @@ expandStars ctx rPlanTree = Right $ expandStarsForReadPlan False rPlanTree
+     adjustContext context fromQI _ = context{qi=fromQI}
+ 
+ expandStarsForTable :: ResolverContext -> Bool -> ReadPlan -> ReadPlan
+-expandStarsForTable ctx@ResolverContext{representations, outputType} hasAgg rp@ReadPlan{select=selectFields}
++expandStarsForTable ctx@ResolverContext{representations, outputType} hasAgg rp@ReadPlan{select=selectFields, relIsSpread=isSpread}
+   -- We expand if either of the below are true:
+   -- * We have a '*' select AND there is an aggregate function in this ReadPlan's sub-tree.
+   -- * We have a '*' select AND the target table has at least one data representation.
+-  -- We ignore any '*' selects that have an aggregate function attached (i.e for COUNT(*)).
+-  | hasStarSelect && (hasAgg || hasDataRepresentation) = rp{select = concatMap (expandStarSelectField knownColumns) selectFields}
++  -- We ignore '*' selects that have an aggregate function attached, unless it's a `COUNT(*)` for a Spread Embed,
++  -- we tag it as "full row" in that case.
++  | hasStarSelect && (hasAgg || hasDataRepresentation) = rp{select = concatMap (expandStarSelectField isSpread knownColumns) selectFields}
+   | otherwise = rp
+   where
+     hasStarSelect = "*" `elem` map (cfName . csField) filteredSelectFields
+-    filteredSelectFields = filter (isNothing . csAggFunction) selectFields
++    filteredSelectFields = filter (shouldExpandOrTag . csAggFunction) selectFields
++    shouldExpandOrTag aggFunc = isNothing aggFunc || (isSpread && aggFunc == Just Count)
+     hasDataRepresentation = any hasOutputRep knownColumns
+     knownColumns = knownColumnsInContext ctx
+ 
+     hasOutputRep :: Column -> Bool
+     hasOutputRep col = HM.member (colNominalType col, outputType) representations
+ 
+-    expandStarSelectField :: [Column] -> CoercibleSelectField -> [CoercibleSelectField]
+-    expandStarSelectField columns sel@CoercibleSelectField{csField=CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Nothing} =
++    expandStarSelectField :: Bool -> [Column] -> CoercibleSelectField -> [CoercibleSelectField]
++    expandStarSelectField _ columns sel@CoercibleSelectField{csField=CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Nothing} =
+       map (\col -> sel { csField = withOutputFormat ctx $ resolveColumnField col }) columns
+-    expandStarSelectField _ selectField = [selectField]
++    expandStarSelectField True _ sel@CoercibleSelectField{csField=fld@CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Just Count} =
++      [sel { csField = fld { cfFullRow = True } }]
++    expandStarSelectField _ _ selectField = [selectField]
+ 
+ -- | Enforces the `max-rows` config on the result
+ treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -679,15 +691,23 @@ applySpreadAggHoistingToNode (Node rp@ReadPlan{relAggAlias, relToParent, relIsSp
+                                 then (select rp, [])
+                                 else hoistFromSelectFields relAggAlias (select rp)
+ 
+-      newRelSelects = if null children
++      -- If the current `ReadPlan` is a spread rel and it has aggregates hoisted from
++      -- child relationships, then it must hoist those aggregates to its parent rel.
++      -- So we update them with the current `relAggAlias`.
++      hoistAgg ((_, fieldName), hoistFunc) = ((relAggAlias, fieldName), hoistFunc)
++      hoistedAggList = if relIsSpread
++                       then aggList ++ map hoistAgg allChildAggLists
++                       else aggList
++
++      newRelSelects = if null children || relIsSpread
+                       then relSelect rp
+                       else map (hoistIntoRelSelectFields allChildAggLists) $ relSelect rp
+-  in  (Node rp { select = newSelects, relSelect = newRelSelects } newChildren, aggList)
++  in  (Node rp { select = newSelects, relSelect = newRelSelects } newChildren, hoistedAggList)
+ 
+ -- Hoist aggregate functions from the select list of a ReadPlan, and return the
+ -- updated select list and the list of hoisted aggregates.
+ hoistFromSelectFields :: Alias -> [CoercibleSelectField] -> ([CoercibleSelectField], [HoistedAgg])
+-hoistFromSelectFields aggAlias fields =
++hoistFromSelectFields relAggAlias fields =
+     let (newFields, maybeAggs) = foldr processField ([], []) fields
+     in (newFields, catMaybes maybeAggs)
+   where
+@@ -695,23 +715,21 @@ hoistFromSelectFields aggAlias fields =
+       let (modifiedField, maybeAgg) = modifyField field
+       in (modifiedField : newFields, maybeAgg : aggList)
+ 
+-    modifyField field =
+-      case csAggFunction field of
+-        Just aggFunc ->
+-          ( field { csAggFunction = Nothing, csAggCast = Nothing },
+-            Just ((aggAlias, determineFieldName field), (aggFunc, csAggCast field, csAlias field)))
+-        Nothing -> (field, Nothing)
+-
+-    determineFieldName field = fromMaybe (cfName $ csField field) (csAlias field)
++    modifyField field@CoercibleSelectField{csAggFunction=Just aggFunc, csField, csAggCast, csAlias} =
++      let determineFieldName = fromMaybe (cfName csField) csAlias
++          updatedField = field {csAggFunction = Nothing, csAggCast = Nothing}
++          hoistedField = Just ((relAggAlias, determineFieldName), (aggFunc, csAggCast, csAlias))
++      in (updatedField, hoistedField)
++    modifyField field = (field, Nothing)
+ 
+ -- Taking the hoisted aggregates, modify the rel selects to apply the aggregates,
+ -- and any applicable casts or aliases.
+ hoistIntoRelSelectFields :: [HoistedAgg] -> RelSelectField -> RelSelectField
+-hoistIntoRelSelectFields aggList r@(Spread {rsSpreadSel = spreadSelects, rsAggAlias = aggAlias}) =
++hoistIntoRelSelectFields aggList r@(Spread {rsSpreadSel = spreadSelects, rsAggAlias = relAggAlias}) =
+     r { rsSpreadSel = map updateSelect spreadSelects }
+   where
+     updateSelect s =
+-        case lookup (aggAlias, ssSelName s) aggList of
++        case lookup (relAggAlias, ssSelName s) aggList of
+             Just (aggFunc, aggCast, fldAlias) ->
+                 s { ssSelAggFunction = Just aggFunc,
+                     ssSelAggCast     = aggCast,
+@@ -721,8 +739,7 @@ hoistIntoRelSelectFields _ r = r
+ 
+ validateAggFunctions :: Bool -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+-  | aggFunctionsAllowed = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+-  | any (isJust . csAggFunction) select = Left AggregatesNotAllowed
++  | not aggFunctionsAllowed && any (isJust . csAggFunction) select = Left AggregatesNotAllowed
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -818,7 +835,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --       where_ = [
+ --         CoercibleStmnt (
+ --           CoercibleFilter {
+---            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing},
++--            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
+ --            opExpr = op
+ --           }
+ --         )
+@@ -834,7 +851,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing}, opExpr = OpExpr True (Is TriNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is TriNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -853,7 +870,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+     newNullFilters rPlans = \case
+       (CoercibleExpr b lOp trees) ->
+         CoercibleExpr b lOp <$> (newNullFilters rPlans `traverse` trees)
+-      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _) opExpr)) ->
++      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _) opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+           (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index 97de4699..2d72c054 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -39,10 +39,11 @@ data CoercibleField = CoercibleField
+   , cfIRType    :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
+   , cfTransform :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+   , cfDefault   :: Maybe Text
++  , cfFullRow   :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
+   } deriving (Eq, Show)
+ 
+ unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path False "" Nothing Nothing
++unknownField name path = CoercibleField name path False "" Nothing Nothing False
+ 
+ -- | Like an API request LogicTree, but with coercible field information.
+ data CoercibleLogicTree
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 96701be2..602ae27e 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -206,7 +206,7 @@ callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScal
+       KeyParams []    -> "FROM " <> callIt mempty
+       KeyParams prms  -> case arguments of
+         DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
+-        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing) <$> prms) False True False <> ", " <>
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 39b869d5..b2e58841 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -252,6 +252,7 @@ pgFmtCallUnary :: Text -> SQL.Snippet -> SQL.Snippet
+ pgFmtCallUnary f x = SQL.sql (encodeUtf8 f) <> "(" <> x <> ")"
+ 
+ pgFmtField :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
++pgFmtField table CoercibleField{cfFullRow=True}                                          = fromQi table
+ pgFmtField table CoercibleField{cfName=fn, cfJsonPath=[]}                                = pgFmtColumn table fn
+ pgFmtField table CoercibleField{cfName=fn, cfToJson=doToJson, cfJsonPath=jp} | doToJson  = "to_jsonb(" <> pgFmtColumn table fn <> ")" <> pgFmtJsonPath jp
+                                                                              | otherwise = pgFmtColumn table fn <> pgFmtJsonPath jp

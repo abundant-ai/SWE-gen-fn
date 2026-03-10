@@ -1,0 +1,105 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1790da7e..b1f5643e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Added
++ 
++ - #1614, Add `db-pool-automatic-recovery` configuration to disable connection retrying - @taimoorzaeem
++
+ ### Fixed
+ 
+  - #2899, Fix `application/vnd.pgrst.array` not accepted as a valid mediatype - @taimoorzaeem
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 7f4ac565..89e3cb69 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -281,8 +281,9 @@ internalConnectionWorker appState = work
+           -- Fatal error when connecting
+           logWithZTime appState reason >> killThread (getMainThreadId appState)
+         NotConnected ->
+-          -- Unreachable because establishConnection will keep trying to connect
+-          return ()
++          -- Unreachable because establishConnection will keep trying to connect, unless disable-recovery is turned on
++          unless configDbPoolAutomaticRecovery
++              $ logWithZTime appState "Automatic recovery disabled, exiting." >> killThread (getMainThreadId appState)
+         Connected actualPgVersion -> do
+           -- Procede with initialization
+           putPgVersion appState actualPgVersion
+@@ -344,9 +345,10 @@ establishConnection appState =
+ 
+     shouldRetry :: RetryStatus -> ConnectionStatus -> IO Bool
+     shouldRetry rs isConnSucc = do
++      AppConfig{..} <- getConfig appState
+       let
+         delay = fromMaybe 0 (rsPreviousDelay rs) `div` backoffMicroseconds
+-        itShould = NotConnected == isConnSucc
++        itShould = NotConnected == isConnSucc && configDbPoolAutomaticRecovery
+       when itShould . logWithZTime appState $
+         "Attempting to reconnect to the database in "
+         <> (show delay::Text)
+@@ -420,7 +422,7 @@ listener appState = do
+   waitListener appState
+ 
+   -- forkFinally allows to detect if the thread dies
+-  void . flip forkFinally (handleFinally dbChannel) $ do
++  void . flip forkFinally (handleFinally dbChannel configDbPoolAutomaticRecovery) $ do
+     dbOrError <- acquire $ toUtf8 (addFallbackAppName prettyVersion configDbUri)
+     case dbOrError of
+       Right db -> do
+@@ -431,7 +433,9 @@ listener appState = do
+       _ ->
+         die $ "Could not listen for notifications on the " <> dbChannel <> " channel"
+   where
+-    handleFinally dbChannel _ = do
++    handleFinally _ False _ =
++      logWithZTime appState "Automatic recovery disabled, exiting." >> killThread (getMainThreadId appState)
++    handleFinally dbChannel True _ = do
+       -- if the thread dies, we try to recover
+       logWithZTime appState $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
+       putIsListenerOn appState False
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 8f4626ad..7f39d212 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -162,6 +162,9 @@ exampleConfigFile =
+       |## Time in seconds after which to recycle unused pool connections
+       |# db-pool-max-idletime = 30
+       |
++      |## Allow autmatic database connection retrying
++      |# db-pool-automatic-recovery = true
++      |
+       |## Stored proc to exec immediately after auth
+       |# db-pre-request = "stored_proc_name"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index de0ed82e..4221ff59 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -80,6 +80,7 @@ data AppConfig = AppConfig
+   , configDbPoolAcquisitionTimeout :: Int
+   , configDbPoolMaxLifetime        :: Int
+   , configDbPoolMaxIdletime        :: Int
++  , configDbPoolAutomaticRecovery  :: Bool
+   , configDbPreRequest             :: Maybe QualifiedIdentifier
+   , configDbPreparedStatements     :: Bool
+   , configDbRootSpec               :: Maybe QualifiedIdentifier
+@@ -147,6 +148,7 @@ toText conf =
+       ,("db-pool-acquisition-timeout",   show . configDbPoolAcquisitionTimeout)
+       ,("db-pool-max-lifetime",          show . configDbPoolMaxLifetime)
+       ,("db-pool-max-idletime",          show . configDbPoolMaxIdletime)
++      ,("db-pool-automatic-recovery",    T.toLower . show . configDbPoolAutomaticRecovery)
+       ,("db-pre-request",            q . maybe mempty dumpQi . configDbPreRequest)
+       ,("db-prepared-statements",        T.toLower . show . configDbPreparedStatements)
+       ,("db-root-spec",              q . maybe mempty dumpQi . configDbRootSpec)
+@@ -241,6 +243,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe 1800 <$> optInt "db-pool-max-lifetime")
+     <*> (fromMaybe 30 <$> optWithAlias (optInt "db-pool-timeout")
+                                        (optInt "db-pool-max-idletime"))
++    <*> (fromMaybe True <$> optBool "db-pool-automatic-recovery")
+     <*> (fmap toQi <$> optWithAlias (optString "db-pre-request")
+                                     (optString "pre-request"))
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")

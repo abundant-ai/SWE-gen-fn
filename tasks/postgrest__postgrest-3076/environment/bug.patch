@@ -1,0 +1,238 @@
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 09361bc9..68cadeda 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -62,7 +62,6 @@ import PostgREST.SchemaCache.Relationship    (Cardinality (..),
+ import PostgREST.SchemaCache.Representations (DataRepresentation (..),
+                                               RepresentationsMap)
+ import PostgREST.SchemaCache.Routine         (MediaHandler (..),
+-                                              MediaHandlerMap,
+                                               Routine (..),
+                                               RoutineMap,
+                                               RoutineParam (..),
+@@ -992,9 +991,10 @@ addFilterToLogicForest :: CoercibleFilter -> [CoercibleLogicTree] -> [CoercibleL
+ addFilterToLogicForest flt lf = CoercibleStmnt flt : lf
+ 
+ -- | Do content negotiation. i.e. choose a media type based on the intersection of accepted/produced media types.
+-negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] -> MediaHandlerMap -> Either ApiRequestError (MediaHandler, MediaType)
++negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] ->
++                    HM.HashMap (RelIdentifier, MediaType) MediaHandler -> Either ApiRequestError (MediaHandler, MediaType)
+ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRepresentation=rep}} identifier accepts produces =
+-  defaultMTAnyToMTJSON $ case (act, firstAcceptedPick) of
++  mtAnyToJSON $ case (act, firstAcceptedPick) of
+     (_, Nothing)                         -> Left . MediaTypeError $ map MediaType.toMime accepts
+     (ActionMutate _, Just (x, mt))       -> Right (if rep == Just Full then x else NoAgg, mt)
+     -- no need for an aggregate on HEAD https://github.com/PostgREST/postgrest/issues/2849
+@@ -1003,23 +1003,21 @@ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRep
+     (ActionInvoke InvHead, Just (_, mt)) -> Right (NoAgg, mt)
+     (_, Just (x, mt))                    -> Right (x, mt)
+   where
+-    -- the initial handler in the schema cache has a */* to BuiltinAggJson but it doesn't preserve the media type (application/json)
+-    -- we just convert the default */* to application/json here
+-    -- TODO resolving to "application/json" for "*/*" is not correct when using a "*/*" custom handler media type.
+-    -- We should return "application/octet-stream" as the generic type instead.
+-    defaultMTAnyToMTJSON = mapRight (\(x, y) -> (x, if y == MTAny then MTApplicationJSON else y))
+-    firstAcceptedPick = listToMaybe $ mapMaybe matchMT accepts -- If there are multiple accepted media types, pick the first. This is usual in content negotiation.
+-    matchMT mt = case mt of
++    -- TODO initial */* is not overridable
++    -- initial handlers in the schema cache have a */* to BuiltinAggJson but they don't preserve the media type (application/json)
++    -- for now we just convert the resultant */* to application/json here
++    mtAnyToJSON = mapRight (\(x, y) -> (x, if y == MTAny then MTApplicationJSON else y))
++    -- if there are multiple accepted media types, pick the first
++    firstAcceptedPick = listToMaybe $ mapMaybe searchMT accepts
++    lookupIdent mt = -- first search for an aggregate that applies to the particular relation, then for one that applies to anyelement
++      HM.lookup (RelId identifier, mt) produces <|> HM.lookup (RelAnyElement, mt) produces
++    searchMT mt = case mt of
+       -- all the vendored media types have special handling as they have media type parameters, they cannot be overridden
+       m@(MTVndSingularJSON strip)                 -> Just (BuiltinAggSingleJson strip, m)
+       m@MTVndArrayJSONStrip                       -> Just (BuiltinAggArrayJsonStrip, m)
+       m@(MTVndPlan (MTVndSingularJSON strip) _ _) -> mtPlanToNothing $ Just (BuiltinAggSingleJson strip, m)
+       m@(MTVndPlan MTVndArrayJSONStrip _ _)       -> mtPlanToNothing $ Just (BuiltinAggArrayJsonStrip, m)
+       -- all the other media types can be overridden
+-      m@(MTVndPlan mType _ _)                     -> mtPlanToNothing $ (,) <$> lookupHandler mType <*> pure m
+-      x                                           -> (,) <$> lookupHandler x <*> pure x
++      m@(MTVndPlan mType _ _)                     -> mtPlanToNothing $ (,) <$> lookupIdent mType <*> pure m
++      x                                           -> (,) <$> lookupIdent x <*> pure x
+     mtPlanToNothing x = if configDbPlanEnabled conf then x else Nothing -- don't find anything if the plan media type is not allowed
+-    lookupHandler mt =
+-      HM.lookup (RelId identifier, MTAny) produces <|> -- lookup handler that applies to `*/*` and identifier
+-      HM.lookup (RelId identifier, mt) produces <|>    -- lookup handler that applies to a particular media type and identifier
+-      HM.lookup (RelAnyElement, mt) produces           -- lookup handler that applies to a particular media type and anyelement
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 96ae93d3..9228cc0a 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -1147,7 +1147,7 @@ mediaHandlers pgVer =
+           JOIN pg_type b ON t.typbasetype = b.oid
+           WHERE
+             t.typbasetype <> 0 and
+-            (t.typname ~* '^[A-Za-z0-9.-]+/[A-Za-z0-9.\+-]+$' or t.typname = '*/*')
++            t.typname ~* '^[A-Za-z0-9.-]+/[A-Za-z0-9.\+-]+$'
+       )
+       select
+         proc_schema.nspname           as handler_schema,
+diff --git a/test/spec/Feature/Query/CustomMediaSpec.hs b/test/spec/Feature/Query/CustomMediaSpec.hs
+index e07a77e2..258e5a51 100644
+--- a/test/spec/Feature/Query/CustomMediaSpec.hs
++++ b/test/spec/Feature/Query/CustomMediaSpec.hs
+@@ -222,81 +222,3 @@ spec = describe "custom media types" $ do
+         simpleBody r `shouldBe` readFixtureFile "lines.csv"
+         simpleHeaders r `shouldContain` [("Content-Type", "text/csv; charset=utf-8")]
+         simpleHeaders r `shouldContain` [("Content-Disposition", "attachment; filename=\"lines.csv\"")]
+-
+-  context "any media type" $ do
+-    context "on functions" $ do
+-      -- TODO not correct, it should return the generic "application/octet-stream"
+-      it "returns application/json for */* if not explicitly set" $ do
+-        request methodGet "/rpc/ret_any_mt" (acceptHdrs "*/*") ""
+-          `shouldRespondWith` "any"
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+-      it "accepts any media type and sets it as a header" $ do
+-        request methodGet "/rpc/ret_any_mt" (acceptHdrs "app/bingo") ""
+-          `shouldRespondWith` "any"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "app/bingo"]
+-          }
+-
+-        request methodGet "/rpc/ret_any_mt" (acceptHdrs "text/bango") ""
+-          `shouldRespondWith` "any"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "text/bango"]
+-          }
+-
+-        request methodGet "/rpc/ret_any_mt" (acceptHdrs "image/boingo") ""
+-          `shouldRespondWith` "any"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "image/boingo"]
+-          }
+-
+-      it "returns custom media type for */* if explicitly set" $ do
+-        request methodGet "/rpc/ret_some_mt" (acceptHdrs "*/*") ""
+-          `shouldRespondWith` "groucho"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "app/groucho"]
+-          }
+-
+-      it "accepts some media types if there's conditional logic" $ do
+-        request methodGet "/rpc/ret_some_mt" (acceptHdrs "app/chico") ""
+-          `shouldRespondWith` "chico"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "app/chico"]
+-          }
+-
+-        request methodGet "/rpc/ret_some_mt" (acceptHdrs "app/harpo") ""
+-          `shouldRespondWith` "harpo"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "app/harpo"]
+-          }
+-
+-        request methodGet "/rpc/ret_some_mt" (acceptHdrs "text/csv") ""
+-          `shouldRespondWith` 415
+-
+-    context "on tables" $ do
+-      -- TODO not correct, it should return the generic "application/octet-stream"
+-      it "returns application/json for */* if not explicitly set" $ do
+-        request methodGet "/some_numbers?val=eq.1" (acceptHdrs "*/*") ""
+-          `shouldRespondWith` "anything\n1"
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+-      it "accepts any media type and sets it as a header" $ do
+-        request methodGet "/some_numbers?val=eq.2" (acceptHdrs "magic/number") ""
+-          `shouldRespondWith` "magic\n2"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "magic/number"]
+-          }
+-        request methodGet "/some_numbers?val=eq.3" (acceptHdrs "crazy/bingo") ""
+-          `shouldRespondWith` "crazy\n3"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "crazy/bingo"]
+-          }
+-        request methodGet "/some_numbers?val=eq.4" (acceptHdrs "unknown/unknown") ""
+-          `shouldRespondWith` "anything\n4"
+-          { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "unknown/unknown"]
+-          }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index dc36affe..29999ecc 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -130,7 +130,6 @@ create domain "application/json" as json;
+ create domain "application/vnd.pgrst.object" as json;
+ create domain "text/tab-separated-values" as text;
+ create domain "text/csv" as text;
+-create domain "*/*" as bytea;
+ 
+ CREATE TABLE items (
+     id bigserial primary key
+@@ -3594,6 +3593,7 @@ $$ language sql;
+ 
+ create or replace function test.tsv_final (data "text/tab-separated-values")
+ returns "text/tab-separated-values" as $$
++  select set_config('response.headers', '[{"Cache-Control": "public"}, {"Cache-Control": "max-age=259200"}]', true);
+   select (E'id\tname\tclient_id\n' || data)::"text/tab-separated-values";
+ $$ language sql;
+ 
+@@ -3650,58 +3650,3 @@ create table budget_expenses (
+ , expense_amount numeric
+ , budget_category_id integer references budget_categories(id)
+ );
+-
+-create or replace function ret_any_mt ()
+-returns "*/*" as $$
+-  select 'any'::"*/*";
+-$$ language sql;
+-
+-create or replace function ret_some_mt ()
+-returns "*/*" as $$
+-declare
+-  req_accept text := current_setting('request.headers', true)::json->>'accept';
+-  resp bytea;
+-begin
+-  case req_accept
+-    when 'app/chico'   then resp := 'chico';
+-    when 'app/harpo'   then resp := 'harpo';
+-    when '*/*'         then
+-      perform set_config('response.headers', '[{"Content-Type": "app/groucho"}]', true);
+-      resp := 'groucho';
+-    else
+-      raise sqlstate 'PT415' using message = 'Unsupported Media Type';
+-  end case;
+-  return resp;
+-end; $$ language plpgsql;
+-
+-create table some_numbers as select x::int as val from generate_series(1,10) x;
+-
+-create or replace function some_trans (state "*/*", next some_numbers)
+-returns "*/*" as $$
+-  select (state || E'\n' || next.val::text::bytea)::"*/*";
+-$$ language sql;
+-
+-create or replace function some_final (data "*/*")
+-returns "*/*" as $$
+-declare
+-  req_accept text := current_setting('request.headers', true)::json->>'accept';
+-  prefix bytea;
+-begin
+-  case req_accept
+-    when 'magic/number' then
+-      prefix := 'magic';
+-    when 'crazy/bingo'  then
+-      prefix := 'crazy';
+-    else
+-      prefix := 'anything';
+-  end case;
+-  return (prefix || data)::"*/*";
+-end; $$ language plpgsql;
+-
+-drop aggregate if exists some_agg (some_numbers);
+-create aggregate test.some_agg (some_numbers) (
+-  initcond = ''
+-, stype = "*/*"
+-, sfunc = some_trans
+-, finalfunc = some_final
+-);

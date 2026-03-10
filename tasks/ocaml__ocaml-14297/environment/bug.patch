@@ -1,0 +1,145 @@
+diff --git a/.depend b/.depend
+index de9cdd5bfd..a61e14d78f 100644
+--- a/.depend
++++ b/.depend
+@@ -2215,7 +2215,6 @@ typing/typetexp.cmo : \
+     parsing/parsetree.cmi \
+     typing/out_type.cmi \
+     typing/oprint.cmi \
+-    utils/numbers.cmi \
+     utils/misc.cmi \
+     parsing/longident.cmi \
+     parsing/location.cmi \
+@@ -2240,7 +2239,6 @@ typing/typetexp.cmx : \
+     parsing/parsetree.cmi \
+     typing/out_type.cmx \
+     typing/oprint.cmx \
+-    utils/numbers.cmx \
+     utils/misc.cmx \
+     parsing/longident.cmx \
+     parsing/location.cmx \
+diff --git a/Changes b/Changes
+index 0b13feb6d1..adfa4e45be 100644
+--- a/Changes
++++ b/Changes
+@@ -328,9 +328,6 @@ Working version
+ - #13913: Use Blake128 as the hash function for the compiler's CRCs
+   (Vincent Laviron, review by Xavier Leroy and Gabriel Scherer)
+ 
+-- #14297: Avoid iterating on hash tables to produce types
+-  (Vincent Laviron, review by Nicolás Ojeda Bär and Gabriel Scherer)
+-
+ ### Build system:
+ 
+ - #13810: Support build of cross compilers to native freestanding targets
+diff --git a/testsuite/tests/typing-recmod/t08bad.compilers.reference b/testsuite/tests/typing-recmod/t08bad.compilers.reference
+index fb2e85ba65..389c049fcd 100644
+--- a/testsuite/tests/typing-recmod/t08bad.compilers.reference
++++ b/testsuite/tests/typing-recmod/t08bad.compilers.reference
+@@ -5,8 +5,8 @@ Error: This recursive type is not regular.
+        The type constructor A.t is defined as
+          type 'a A.t
+        but it is used as
+-         'a list A.t
++         'a array A.t
+        after the following expansion(s):
+-         < m : 'a list B.t; n : 'a array B.t > contains 'a list B.t,
+-         'a list B.t = 'a list A.t
++         < m : 'a list B.t; n : 'a array B.t > contains 'a array B.t,
++         'a array B.t = 'a array A.t
+        All uses need to match the definition for the recursive type to be regular.
+diff --git a/testsuite/tests/typing-recmod/t09bad.compilers.reference b/testsuite/tests/typing-recmod/t09bad.compilers.reference
+index 791ce275f5..4c24e1faed 100644
+--- a/testsuite/tests/typing-recmod/t09bad.compilers.reference
++++ b/testsuite/tests/typing-recmod/t09bad.compilers.reference
+@@ -5,8 +5,8 @@ Error: This recursive type is not regular.
+        The type constructor A.t is defined as
+          type 'a A.t
+        but it is used as
+-         'a list A.t
++         'a array A.t
+        after the following expansion(s):
+          'a B.t = < m : 'a list A.t; n : 'a array A.t >,
+-         < m : 'a list A.t; n : 'a array A.t > contains 'a list A.t
++         < m : 'a list A.t; n : 'a array A.t > contains 'a array A.t
+        All uses need to match the definition for the recursive type to be regular.
+diff --git a/typing/typetexp.ml b/typing/typetexp.ml
+index fcb19936b2..66766ad4f4 100644
+--- a/typing/typetexp.ml
++++ b/typing/typetexp.ml
+@@ -586,14 +586,11 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
+       let mkfield l f =
+         newty (Tvariant (create_row ~fields:[l,f] ~more:(newvar())
+                            ~closed:true ~fixed:None ~name:None)) in
+-      (* Using a reference to a map rather than a hash table gives us
+-         a canonical order when iterating. *)
+-      let module HMap = Numbers.Int.Map in
+-      let hfields = ref HMap.empty in
++      let hfields = Hashtbl.create 17 in
+       let add_typed_field loc l f =
+         let h = Btype.hash_variant l in
+         try
+-          let (l',f') = HMap.find h !hfields in
++          let (l',f') = Hashtbl.find hfields h in
+           (* Check for tag conflicts *)
+           if l <> l' then raise(Error(styp.ptyp_loc, env, Variant_tags(l, l')));
+           let ty = mkfield l f and ty' = mkfield l f' in
+@@ -602,7 +599,7 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
+           with Unify _trace ->
+             raise(Error(loc, env, Constructor_mismatch (ty,ty')))
+         with Not_found ->
+-          hfields := HMap.add h (l, f) !hfields
++          Hashtbl.add hfields h (l,f)
+       in
+       let add_field row_context field =
+         let rf_loc = field.prf_loc in
+@@ -635,7 +632,7 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
+                 Tconstr(p, tl, _) -> Some(p, tl)
+               | _                 -> None
+             in
+-            name := if HMap.is_empty !hfields then nm else None;
++            name := if Hashtbl.length hfields <> 0 then None else nm;
+             let fl = match get_desc (expand_head env cty.ctyp_type), nm with
+               Tvariant row, _ when Btype.static_row row ->
+                 row_fields row
+@@ -665,7 +662,7 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
+         if aliased then row_context else more_slot :: row_context
+       in
+       let tfields = List.map (add_field row_context) fields in
+-      let fields = HMap.fold (fun _ p l -> p :: l) !hfields [] in
++      let fields = List.rev (Hashtbl.fold (fun _ p l -> p :: l) hfields []) in
+       begin match present with None -> ()
+       | Some present ->
+           List.iter
+@@ -726,19 +723,16 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
+       raise (Error_forward (Builtin_attributes.error_of_extension ext))
+ 
+ and transl_fields env ~policy ~row_context o fields =
+-  (* Using a reference to a map rather than a hash table gives us
+-     a canonical order when iterating. *)
+-  let module HMap = Misc.Stdlib.String.Map in
+-  let hfields = ref HMap.empty in
++  let hfields = Hashtbl.create 17 in
+   let add_typed_field loc l ty =
+     try
+-      let ty' = HMap.find l !hfields in
++      let ty' = Hashtbl.find hfields l in
+       if is_equal env false [ty] [ty'] then () else
+         try unify env ty ty'
+         with Unify _trace ->
+           raise(Error(loc, env, Method_mismatch (l, ty, ty')))
+     with Not_found ->
+-      hfields := HMap.add l ty !hfields in
++      Hashtbl.add hfields l ty in
+   let add_field {pof_desc; pof_loc; pof_attributes;} =
+     let of_loc = pof_loc in
+     let of_attributes = pof_attributes in
+@@ -784,7 +778,7 @@ and transl_fields env ~policy ~row_context o fields =
+     { of_desc; of_loc; of_attributes; }
+   in
+   let object_fields = List.map add_field fields in
+-  let fields = HMap.fold (fun s ty l -> (s, ty) :: l) !hfields [] in
++  let fields = Hashtbl.fold (fun s ty l -> (s, ty) :: l) hfields [] in
+   let ty_init =
+      match o with
+      | Closed -> newty Tnil

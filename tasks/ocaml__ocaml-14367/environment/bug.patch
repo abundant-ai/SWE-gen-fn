@@ -1,0 +1,434 @@
+diff --git a/Changes b/Changes
+index 7afc59a4a7..922aaf53d5 100644
+--- a/Changes
++++ b/Changes
+@@ -129,10 +129,6 @@ Working version
+   (Antonin Décimo, review by Samuel Hym, Gabriel Scherer, Miod Vallat,
+   B. Szilvasy, and Nicolás Ojeda Bär)
+ 
+-- #14367: Gc.Tweak mechanism to allow named GC parameters
+-  (Stephen Dolan and Nick Barnes, review by Gabriel Scherer, David Allsopp and
+-  Antonin Décimo)
+-
+ - #14461: Fix racy socketpair on Windows. Address-in-use errors would sometimes
+   occur when concurrent threads or processes were trying to create socketpairs.
+   (Jessie Grosen, review by Antonin Décimo and Nicolás Ojeda Bär)
+diff --git a/runtime/caml/gc_ctrl.h b/runtime/caml/gc_ctrl.h
+index 89975e6396..af160f3f47 100644
+--- a/runtime/caml/gc_ctrl.h
++++ b/runtime/caml/gc_ctrl.h
+@@ -49,11 +49,6 @@ caml_result caml_gc_ramp_up(value callback, uintnat *out_suspended_work);
+ /* See the documentation of [Gc.ramp_down] in the standard library. */
+ void caml_gc_ramp_down(uintnat suspended_ramp_up_words);
+ 
+-/* See the [Gc.Tweak] module in the standard library */
+-void caml_init_gc_tweaks(void);
+-atomic_uintnat* caml_lookup_gc_tweak(const char* name, uintnat len);
+-void caml_print_gc_tweaks(void);
+-
+ #endif /* CAML_INTERNALS */
+ 
+ #endif /* CAML_GC_CTRL_H */
+diff --git a/runtime/gc_ctrl.c b/runtime/gc_ctrl.c
+index 9df9098f7d..85946e6330 100644
+--- a/runtime/gc_ctrl.c
++++ b/runtime/gc_ctrl.c
+@@ -39,7 +39,6 @@
+ #include "caml/startup.h"
+ #include "caml/fail.h"
+ #include "caml/callback.h"
+-#include <string.h>
+ 
+ atomic_uintnat caml_max_stack_wsize;
+ uintnat caml_fiber_wsz;
+@@ -49,7 +48,6 @@ extern _Atomic uintnat caml_custom_major_ratio; /* see custom.c */
+ extern _Atomic uintnat caml_custom_minor_ratio; /* see custom.c */
+ extern _Atomic uintnat caml_custom_minor_max_bsz; /* see custom.c */
+ extern uintnat caml_minor_heap_max_wsz; /* see domain.c */
+-extern atomic_uintnat caml_mark_stack_prune_factor; /* see major_gc.c */
+ 
+ CAMLprim value caml_gc_quick_stat(value v)
+ {
+@@ -374,18 +372,15 @@ CAMLprim value caml_runtime_variant (value unit)
+ #endif
+ }
+ 
+-static char *format_gc_tweaks(void);
+ CAMLprim value caml_runtime_parameters (value unit)
+ {
+ #define F_Z CAML_PRIuNAT
+ #define F_S CAML_PRIuSZT
+ 
+   CAMLassert (unit == Val_unit);
+-  char *tweaks = format_gc_tweaks();
+-  char *no_tweaks = "";
+-  value res = caml_alloc_sprintf
++  return caml_alloc_sprintf
+       ("b=%d,c=%"F_Z",e=%"F_Z",l=%"F_Z",M=%"F_Z",m=%"F_Z",n=%"F_Z","
+-       "o=%"F_Z",p=%d,s=%"F_S",t=%"F_Z",v=%"F_Z",V=%"F_Z",W=%"F_Z"%s",
++       "o=%"F_Z",p=%d,s=%"F_S",t=%"F_Z",v=%"F_Z",V=%"F_Z",W=%"F_Z"",
+        /* b */ (int) Caml_state->backtrace_active,
+        /* c */ caml_params->cleanup_on_exit,
+        /* e */ caml_params->runtime_events_log_wsize,
+@@ -400,16 +395,12 @@ CAMLprim value caml_runtime_parameters (value unit)
+        /* t */ caml_params->trace_level,
+        /* v */ caml_verb_gc,
+        /* V */ caml_params->verify_heap,
+-       /* W */ caml_runtime_warnings,
+-       /* X */ tweaks ? tweaks : no_tweaks
++       /* W */ caml_runtime_warnings
+        );
+-  free(tweaks);
+-  return res;
+ #undef F_Z
+ #undef F_S
+ }
+ 
+-
+ /* Control runtime warnings */
+ 
+ CAMLprim value caml_ml_enable_runtime_warnings(value vbool)
+@@ -502,126 +493,3 @@ CAMLprim value caml_ml_gc_ramp_down(value work) {
+   caml_gc_ramp_down(resumed_words);
+   return Val_unit;
+ }
+-
+-struct gc_tweak {
+-  const char* name;
+-  atomic_uintnat* ptr;
+-  uintnat initial_value;
+-};
+-static struct gc_tweak gc_tweaks[] = {
+-#define TWEAK(v) { #v, &caml_##v, 0 }
+-  TWEAK(mark_stack_prune_factor),
+-#undef TWEAK
+-};
+-enum {N_GC_TWEAKS = sizeof(gc_tweaks)/sizeof(gc_tweaks[0])};
+-
+-void caml_init_gc_tweaks(void)
+-{
+-  for (int i = 0; i < N_GC_TWEAKS; i++) {
+-    gc_tweaks[i].initial_value = *gc_tweaks[i].ptr;
+-  }
+-}
+-
+-void caml_print_gc_tweaks(void)
+-{
+-  for (int i = 0; i < N_GC_TWEAKS; i++) {
+-    fprintf(stderr, "%s (initial value %" CAML_PRIuNAT ")\n",
+-        gc_tweaks[i].name,
+-        gc_tweaks[i].initial_value);
+-  }
+-}
+-
+-atomic_uintnat* caml_lookup_gc_tweak(const char* name, uintnat len)
+-{
+-  for (int i = 0; i < N_GC_TWEAKS; i++) {
+-    if (strlen(gc_tweaks[i].name) == len &&
+-        memcmp(gc_tweaks[i].name, name, len) == 0) {
+-      return gc_tweaks[i].ptr;
+-    }
+-  }
+-  return NULL;
+-}
+-
+-CAMLprim value caml_gc_tweak_get(value name)
+-{
+-  CAMLparam1(name);
+-  atomic_uintnat* p = caml_lookup_gc_tweak(String_val(name),
+-                                           caml_string_length(name));
+-  if (p == NULL)
+-    caml_invalid_argument("Gc.Tweak: parameter not found");
+-  CAMLreturn (Val_long((long)*p));
+-}
+-
+-CAMLprim value caml_gc_tweak_set(value name, value v)
+-{
+-  CAMLparam2(name, v);
+-  atomic_uintnat* p = caml_lookup_gc_tweak(String_val(name),
+-                                           caml_string_length(name));
+-  if (p == NULL)
+-    caml_invalid_argument("Gc.Tweak: parameter not found");
+-  *p = (uintnat)Long_val(v);
+-  CAMLreturn (Val_unit);
+-}
+-
+-CAMLprim value caml_gc_tweak_list_active(value unit)
+-{
+-  CAMLparam1(unit);
+-  CAMLlocal3(list, name, pair);
+-  list = Val_emptylist;
+-  for (int i = N_GC_TWEAKS - 1; i >= 0; i--) {
+-    if (*gc_tweaks[i].ptr != gc_tweaks[i].initial_value) {
+-      name = caml_copy_string(gc_tweaks[i].name);
+-      pair = caml_alloc_2(0, name, Val_long((long)*gc_tweaks[i].ptr));
+-      list = caml_alloc_2(Tag_cons, pair, list);
+-    }
+-  }
+-  CAMLreturn(list);
+-}
+-
+-
+-/* Return the OCAMLRUNPARAMS form of any GC tweaks. Returns NULL if
+- * none are set, or if we can't allocate. */
+-static char *format_gc_tweaks(void)
+-{
+-  size_t len = 0;
+-  for (size_t i = 0; i < N_GC_TWEAKS; i++) {
+-    uintnat val = *gc_tweaks[i].ptr;
+-    if (val != gc_tweaks[i].initial_value) {
+-      len += (2 /* ',X' */
+-              + strlen(gc_tweaks[i].name)+1 /* 'tweak_name=' */);
+-      do { /* Count digits. We're not in any great hurry. */
+-        val /= 10;
+-        ++ len;
+-      } while(val);
+-    }
+-  }
+-  if (!len) { /* no gc_tweaks */
+-    return NULL;
+-  }
+-  ++ len; /* trailing NUL */
+-  char *buf = malloc(len);
+-  if (!buf) {
+-    goto fail_alloc;
+-  }
+-  char *p = buf;
+-
+-  for (size_t i = 0; i < N_GC_TWEAKS; i++) {
+-    uintnat val = *gc_tweaks[i].ptr;
+-    if (val != gc_tweaks[i].initial_value) {
+-      int item_len = snprintf(p, len, ",X%s=%"CAML_PRIuNAT,
+-                              gc_tweaks[i].name, val);
+-      if (item_len >= len) {
+-         /* surprise truncation: could be a race; just stop trying. */
+-        goto fail_truncate;
+-      }
+-      p += item_len;
+-      len -= item_len;
+-    }
+-  }
+-  return buf;
+-
+-fail_truncate:
+-  free(buf);
+-fail_alloc:
+-  return NULL;
+-}
+diff --git a/runtime/major_gc.c b/runtime/major_gc.c
+index 8d25fb9cbf..6720518288 100644
+--- a/runtime/major_gc.c
++++ b/runtime/major_gc.c
+@@ -44,10 +44,6 @@
+ /* Default speed setting for the major GC. */
+ _Atomic uintnat caml_percent_free = Percent_free_def;
+ 
+-/* The mark stack will be pruned if it grows bigger than
+-   1/caml_mark_stack_prune_factor of the domain's major heap size */
+-atomic_uintnat caml_mark_stack_prune_factor = 32;
+-
+ /* This variable is only written with the world stopped, so it need not be
+    atomic */
+ uintnat caml_major_cycles_completed = 0;
+@@ -1148,13 +1144,12 @@ static void realloc_mark_stack (struct mark_stack* stk)
+   uintnat mark_stack_large_bsize = 0;
+   uintnat mark_stack_bsize = stk->size * sizeof(mark_entry);
+   uintnat local_heap_bsize = caml_heap_size(Caml_state->shared_heap);
+-  uintnat factor = caml_mark_stack_prune_factor;
+ 
+   /* When the mark stack might not increase, we count the large mark entries
+      to adjust our allocation. This is needed because large mark stack entries
+      will not compress and because we are using a domain local heap bound we
+      need to fit large blocks into the local mark stack. See PR#11284 */
+-  if (factor > 0 && mark_stack_bsize >= local_heap_bsize / factor) {
++  if (mark_stack_bsize >= local_heap_bsize / 32) {
+     for (uintnat i = 0; i < stk->count; ++i) {
+       mark_entry* me = &stk->stack[i];
+       if (me->end - me->start > BITS_PER_WORD)
+@@ -1162,8 +1157,7 @@ static void realloc_mark_stack (struct mark_stack* stk)
+     }
+   }
+ 
+-  if (factor == 0 ||
+-      mark_stack_bsize - mark_stack_large_bsize < local_heap_bsize / factor) {
++  if (mark_stack_bsize - mark_stack_large_bsize < local_heap_bsize / 32) {
+     uintnat target_bsize = (mark_stack_bsize - mark_stack_large_bsize) * 2
+                               + mark_stack_large_bsize;
+     caml_gc_log ("Growing mark stack to %" CAML_PRIuNAT "k bytes"
+diff --git a/runtime/startup_aux.c b/runtime/startup_aux.c
+index 38eeafba34..829edad16a 100644
+--- a/runtime/startup_aux.c
++++ b/runtime/startup_aux.c
+@@ -23,7 +23,6 @@
+ /* See caml_startup_aux */
+ #include <pthread.h>
+ #endif
+-#include <string.h>
+ #include "caml/backtrace.h"
+ #include "caml/memory.h"
+ #include "caml/callback.h"
+@@ -38,7 +37,6 @@
+ #include "caml/startup_aux.h"
+ #include "caml/prims.h"
+ #include "caml/signals.h"
+-#include "caml/gc_ctrl.h"
+ 
+ #ifdef _WIN32
+ extern void caml_win32_unregister_overflow_detection (void);
+@@ -80,12 +78,12 @@ static void init_startup_params(void)
+   params.event_trace = 0;
+ }
+ 
+-static void scanmult (char *opt, uintnat *var)
++static void scanmult (char_os *opt, uintnat *var)
+ {
+-  char mult = ' ';
++  char_os mult = ' ';
+   unsigned int val = 1;
+-  sscanf (opt, "=%u%c", &val, &mult);
+-  sscanf (opt, "=0x%x%c", &val, &mult);
++  sscanf_os (opt, T("=%u%c"), &val, &mult);
++  sscanf_os (opt, T("=0x%x%c"), &val, &mult);
+   switch (mult) {
+   case 'k':   *var = (uintnat) val * 1024; break;
+   case 'M':   *var = (uintnat) val * (1024 * 1024); break;
+@@ -98,12 +96,9 @@ void caml_parse_ocamlrunparam(void)
+ {
+   init_startup_params();
+   uintnat val;
+-  caml_init_gc_tweaks();
+ 
+-  char_os *opt_os = caml_secure_getenv (T("OCAMLRUNPARAM"));
+-  if (opt_os == NULL) opt_os = caml_secure_getenv (T("CAMLRUNPARAM"));
+-  char *opt_tofree = opt_os ? caml_stat_strdup_noexc_of_os(opt_os) : NULL;
+-  char *opt = opt_tofree;
++  char_os *opt = caml_secure_getenv (T("OCAMLRUNPARAM"));
++  if (opt == NULL) opt = caml_secure_getenv (T("CAMLRUNPARAM"));
+ 
+   if (opt != NULL){
+     while (*opt != '\0'){
+@@ -127,27 +122,6 @@ void caml_parse_ocamlrunparam(void)
+         break;
+       case 'V': scanmult (opt, &params.verify_heap); break;
+       case 'W': scanmult (opt, &caml_runtime_warnings); break;
+-      case 'X': {
+-        char *name = opt;
+-        while (*opt != '=' && *opt != ',' && *opt != '\0') opt++;
+-        if (opt - name == strlen("help") &&
+-            memcmp(name, "help", opt - name) == 0) {
+-          fprintf(stderr, "Known GC tweaks:\n");
+-          caml_print_gc_tweaks();
+-        } else {
+-          atomic_uintnat* p = caml_lookup_gc_tweak(name, opt - name);
+-          if (p == NULL) {
+-            fprintf(stderr, "Ignored unknown GC tweak '%.*s'. "
+-                    "Use 'Xhelp' to list known tweaks\n",
+-                    (int)(opt - name), name);
+-          } else {
+-            scanmult(opt, &val);
+-            *p = val;
+-          }
+-        }
+-
+-        break;
+-      }
+       case ',': continue;
+       }
+       while (*opt != '\0'){
+@@ -156,8 +130,6 @@ void caml_parse_ocamlrunparam(void)
+     }
+   }
+ 
+-  caml_stat_free(opt_tofree);
+-
+   /* Validate */
+   if (params.max_domains < 1) {
+     caml_fatal_error("OCAMLRUNPARAM: max_domains(d) must be at least 1");
+diff --git a/stdlib/gc.ml b/stdlib/gc.ml
+index 9afa24e185..6455b9162e 100644
+--- a/stdlib/gc.ml
++++ b/stdlib/gc.ml
+@@ -197,10 +197,3 @@ external ramp_up : (unit -> 'a) -> 'a * suspended_collection_work
+ 
+ external ramp_down : suspended_collection_work -> unit
+   = "caml_ml_gc_ramp_down"
+-
+-module Tweak = struct
+-  external set : string -> int -> unit = "caml_gc_tweak_set"
+-  external get : string -> int = "caml_gc_tweak_get"
+-  external list_active : unit -> (string * int) list =
+-    "caml_gc_tweak_list_active"
+-end
+diff --git a/stdlib/gc.mli b/stdlib/gc.mli
+index 3b47d1ab14..1326c022a2 100644
+--- a/stdlib/gc.mli
++++ b/stdlib/gc.mli
+@@ -656,26 +656,3 @@ external ramp_down : suspended_collection_work -> unit
+   = "caml_ml_gc_ramp_down"
+ (** Notify the GC about some amount of collection work that was
+     suspended during a ramp-up phase, to be resumed now. *)
+-
+-(** GC Tweaks are unstable and undocumented configurable GC parameters,
+-    primarily intended for use by GC developers.
+-
+-    As well as using Gc.Tweak.set "foo" 42, they can also be configured in
+-    OCAMLRUNPARAM, using the following syntax:
+-
+-        OCAMLRUNPARAM='Xfoo=42'
+-
+-    Additionally, OCAMLRUNPARAM=Xhelp will show the available GC tweaks. *)
+-module Tweak : sig
+-  (** Change a parameter.
+-      Raises Invalid_argument if no such parameter exists *)
+-  val set : string -> int -> unit
+-
+-  (** Retrieve a parameter value.
+-      Raises Invalid_argument if no such parameter exists *)
+-  val get : string -> int
+-
+-  (** Returns the list of parameters and their values that currently
+-      have non-default values *)
+-  val list_active : unit -> (string * int) list
+-end
+diff --git a/testsuite/tests/misc/gctweaks.ml b/testsuite/tests/misc/gctweaks.ml
+deleted file mode 100644
+index a2b2eb3a28..0000000000
+--- a/testsuite/tests/misc/gctweaks.ml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-(* TEST *)
+-
+-let params () =
+-  String.split_on_char ',' (Sys.runtime_parameters ())
+-
+-let has_param p =
+-  List.exists (String.starts_with ~prefix:("X"^p)) (params ())
+-
+-let () =
+-  (match Gc.Tweak.get "blorp" with
+-   | exception Invalid_argument _ -> ()
+-   | _ -> assert false);
+-  (match Gc.Tweak.set "blorp" 100 with
+-   | exception Invalid_argument _ -> ()
+-   | _ -> assert false);
+-  assert (not (has_param "mark_stack_prune_factor"));
+-  let def = Gc.Tweak.get "mark_stack_prune_factor" in
+-  Gc.Tweak.set "mark_stack_prune_factor" 100;
+-  assert (List.mem "Xmark_stack_prune_factor=100" (params ()));
+-  Printf.printf "%d\n" (Gc.Tweak.get "mark_stack_prune_factor");
+-  (match Gc.Tweak.list_active () with
+-   | ["mark_stack_prune_factor", 100] -> ()
+-   | _ -> assert false);
+-  Gc.Tweak.set "mark_stack_prune_factor" def;
+-  assert (not (has_param "mark_stack_prune_factor"));
+-  assert (Gc.Tweak.list_active () = []);
+-  Printf.printf "ok\n";
+-  ()
+diff --git a/testsuite/tests/misc/gctweaks.reference b/testsuite/tests/misc/gctweaks.reference
+deleted file mode 100644
+index e4dd36f0f3..0000000000
+--- a/testsuite/tests/misc/gctweaks.reference
++++ /dev/null
+@@ -1,2 +0,0 @@
+-100
+-ok

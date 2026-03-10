@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     patch \
     build-essential \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Install OCaml and opam (OCaml package manager)
@@ -45,8 +46,18 @@ ENV PATH="/root/.opam/4.14.1/bin:${PATH}"
 RUN git config --global user.name "github-actions[bot]" && \
     git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-# Install dune, ppx packages, menhir, coq, ctypes, integers, spawn, pp, and additional dependencies for testing
-RUN opam install -y "dune<3.12" "ppx_expect<v0.16" "ppx_inline_test<v0.16" "menhir" "coq>=8.14" "result>=1.5" "lwt>=5.3.0" "ctypes" "integers" "spawn" "pp"
+# Install dune dependencies and test packages
+# Core dependencies based on opam/dune.opam with-dev-setup section
+RUN opam install -y \
+    lwt \
+    csexp \
+    menhir \
+    ppx_expect \
+    spawn \
+    ppx_inline_test \
+    ctypes \
+    uutf \
+    pp
 
 # Bootstrap dune from source (our version under test)
 RUN opam exec -- ocaml boot/bootstrap.ml

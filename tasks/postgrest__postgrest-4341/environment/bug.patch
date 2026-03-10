@@ -1,0 +1,188 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8e0f77d6..6b3416e3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ - Fix not logging OpenAPI queries when `log-query=main-query` is enabled by @steve-chavez in #4226
+ - Fix not logging explain query when `log-query=main-query` is enabled by @steve-chavez in #4319
+-- Fix not logging transaction variables and db-pre-request function when `log-query=main-query` is enabled by @steve-chavez in #3934
+ 
+ ### Added
+ 
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index 93d44129..c091b802 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -123,7 +123,7 @@ logWithZTime loggerState txt = do
+ 
+ logMainQ :: LoggerState -> MainQuery -> IO ()
+ logMainQ loggerState MainQuery{mqOpenAPI=(x, y, z),..} =
+-  let snipts  = renderSnippet <$> [mqTxVars, fromMaybe mempty mqPreReq, mqMain, x, y, z, fromMaybe mempty mqExplain]
++  let snipts  = renderSnippet <$> [mqMain, x, y, z, fromMaybe mempty mqExplain]
+       -- Does not log SQL when it's empty (happens on OPTIONS requests and when the openapi queries are not generated)
+       logQ q = when (q /= mempty) $ logWithZTime loggerState $ showOnSingleLine '\n' $ T.decodeUtf8 q in
+   mapM_ logQ snipts
+diff --git a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+index ff010267..55ed52b7 100644
+--- a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
++++ b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+@@ -196,23 +196,6 @@
+       pdSchema: public
+       pdVolatility: Volatile
+ 
+-- - qiName: do_nothing
+-    qiSchema: public
+-  - - pdDescription: null
+-      pdFuncSettings: []
+-      pdHasVariadic: false
+-      pdName: do_nothing
+-      pdParams: []
+-      pdReturnType:
+-        contents:
+-          contents:
+-            qiName: void
+-            qiSchema: pg_catalog
+-          tag: Scalar
+-        tag: Single
+-      pdSchema: public
+-      pdVolatility: Volatile
+-
+ - - qiName: get_guc_value
+     qiSchema: public
+   - - pdDescription: null
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index 0aeeb1a3..c50f15e7 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -95,9 +95,6 @@ create function notify_do_nothing() returns void as $_$
+   notify pgrst, 'nothing';
+ $_$ language sql;
+ 
+-create function do_nothing() returns void as $_$
+-$_$ language sql;
+-
+ create function reset_invalid_role_claim_key() returns void as $_$
+ begin
+   alter role postgrest_test_authenticator reset pgrst.jwt_role_claim_key;
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index cb062623..a997d82d 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1020,20 +1020,7 @@ def test_log_level(level, defaultenv):
+ def test_log_query(level, defaultenv):
+     "log_query=true should log the SQL query according to the log_level"
+ 
+-    def drain_stdout(proc):
+-        lines = []
+-        while True:
+-            chunk = proc.read_stdout(nlines=20)
+-            if not chunk:
+-                break
+-            lines.extend(chunk)
+-        return lines
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_LOG_LEVEL": level,
+-        "PGRST_LOG_QUERY": "main-query",
+-    }
++    env = {**defaultenv, "PGRST_LOG_LEVEL": level, "PGRST_LOG_QUERY": "main-query"}
+ 
+     with run(env=env) as postgrest:
+         response = postgrest.session.get("/")
+@@ -1063,9 +1050,15 @@ def test_log_query(level, defaultenv):
+         root_tables_regx = r".+: SELECT   n.nspname AS table_schema, .+ FROM pg_class c .+ ORDER BY table_schema, table_name"
+         root_procs_regx = r".+: WITH base_types AS \(.+\) SELECT   pn.nspname AS proc_schema, .+ FROM pg_proc p.+AND p.pronamespace = \$1::regnamespace"
+         root_descr_regx = r".+: SELECT pg_catalog\.obj_description\(\$1::regnamespace, 'pg_namespace'\)"
+-        set_config_regx = (
+-            r".+: select set_config\('search_path', \$1, true\), set_config\("
+-        )
++
++        def drain_stdout(proc):
++            lines = []
++            while True:
++                chunk = proc.read_stdout(nlines=20)
++                if not chunk:
++                    break
++                lines.extend(chunk)
++            return lines
+ 
+         output = drain_stdout(postgrest)
+ 
+@@ -1077,10 +1070,8 @@ def test_log_query(level, defaultenv):
+         root_tables = [line for line in output if re.match(root_tables_regx, line)]
+         root_procs = [line for line in output if re.match(root_procs_regx, line)]
+         root_descr = [line for line in output if re.match(root_descr_regx, line)]
+-        set_configs = [line for line in output if re.match(set_config_regx, line)]
+ 
+         if level == "crit":
+-            assert not set_configs
+             assert not project_queries
+             assert not project_counts
+             assert not infinite_queries
+@@ -1088,7 +1079,6 @@ def test_log_query(level, defaultenv):
+             assert not root_procs
+             assert not root_descr
+         elif level in {"error", "warn"}:
+-            assert len(set_configs) == 1
+             assert len(infinite_queries) == 1
+             assert not project_queries
+             assert not project_counts
+@@ -1096,7 +1086,6 @@ def test_log_query(level, defaultenv):
+             assert not root_procs
+             assert not root_descr
+         elif level == "info":
+-            assert len(set_configs) == 5
+             assert len(project_queries) == 3
+             assert len(project_counts) == 2
+             assert len(infinite_queries) == 1
+@@ -1104,7 +1093,6 @@ def test_log_query(level, defaultenv):
+             assert len(root_procs) == 1
+             assert len(root_descr) == 1
+         elif level == "debug":
+-            assert len(set_configs) == 5
+             assert len(project_queries) == 3
+             assert len(project_counts) == 2
+             assert len(infinite_queries) == 1
+@@ -1112,29 +1100,6 @@ def test_log_query(level, defaultenv):
+             assert len(root_procs) == 1
+             assert len(root_descr) == 1
+ 
+-    pre_req_env = {
+-        **env,
+-        "PGRST_DB_PRE_REQUEST": "do_nothing",
+-    }
+-
+-    with run(env=pre_req_env) as postgrest:
+-        response = postgrest.session.get("/projects")
+-        assert response.status_code == 200
+-
+-        output = drain_stdout(postgrest)
+-
+-        pre_request_regx = r'.+: select "do_nothing"()'
+-        pre_reqs = [line for line in output if re.match(pre_request_regx, line)]
+-
+-        if level == "crit":
+-            assert not pre_reqs
+-        elif level in {"error", "warn"}:
+-            assert not pre_reqs
+-        elif level == "info":
+-            assert len(pre_reqs) == 1
+-        elif level == "debug":
+-            assert len(pre_reqs) == 1
+-
+ 
+ def test_no_pool_connection_required_on_bad_http_logic(defaultenv):
+     "no pool connection should be consumed for failing on invalid http logic"
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 19167867..e9e1e70a 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3843,6 +3843,3 @@ $$ language sql;
+ create or replace function test.delete_items_returns_void() returns void as $$
+   delete from items;
+ $$ language sql;
+-
+-create function do_nothing() returns void as $_$
+-$_$ language sql;

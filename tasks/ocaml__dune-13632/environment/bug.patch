@@ -1,0 +1,465 @@
+diff --git a/doc/changes/added/13632.md b/doc/changes/added/13632.md
+deleted file mode 100644
+index 0d1f5b5b8..000000000
+--- a/doc/changes/added/13632.md
++++ /dev/null
+@@ -1 +0,0 @@
+-- Support for Rocq expected output tests (#13632, @rlepigre-skylabs-ai)
+diff --git a/doc/rocq.rst b/doc/rocq.rst
+index 9a5f6f9bc..fa6998451 100644
+--- a/doc/rocq.rst
++++ b/doc/rocq.rst
+@@ -81,11 +81,6 @@ The stanza builds all the ``.v`` files in the given directory and its
+ subdirectories if the :ref:`include-subdirs <include-subdirs-rocq>` stanza is
+ present.
+ 
+-When a ``.v`` file has a corresponding ``.expected`` file, Rocq's standard
+-output is captured instead of being output to the terminal, and the output is
+-diffed with the ``.expected`` file as part of the ``runtest`` alias. When the
+-output differs, it can be promoted as with, e.g., cram tests.
+-
+ For usage of this stanza, see the :ref:`rocq-examples`.
+ 
+ The semantics of the fields are:
+diff --git a/src/dune_rules/rocq/rocq_module.ml b/src/dune_rules/rocq/rocq_module.ml
+index 4254e3674..8b88fe094 100644
+--- a/src/dune_rules/rocq/rocq_module.ml
++++ b/src/dune_rules/rocq/rocq_module.ml
+@@ -87,11 +87,6 @@ let glob_file x ~obj_dir =
+   Path.Build.relative vo_dir (x.name ^ ".glob")
+ ;;
+ 
+-let output_file x ~obj_dir =
+-  let vo_dir = build_vo_dir ~obj_dir x in
+-  Path.Build.relative vo_dir (x.name ^ ".output")
+-;;
+-
+ (* As of today we do the same for build and install, it used not to be
+    the case *)
+ let standard_obj_files ~(mode : Rocq_mode.t) _obj_files_mode name =
+@@ -125,6 +120,15 @@ let obj_files x ~wrapper_name ~mode ~obj_dir ~obj_files_mode =
+   @ native_objs
+ ;;
+ 
++let to_dyn { source; prefix; name } =
++  let open Dyn in
++  record
++    [ "source", Path.to_dyn source
++    ; "prefix", list string prefix
++    ; "name", Name.to_dyn name
++    ]
++;;
++
+ let parse ~dir ~loc s =
+   let clist = List.rev @@ String.split s ~on:'.' in
+   match clist with
+diff --git a/src/dune_rules/rocq/rocq_module.mli b/src/dune_rules/rocq/rocq_module.mli
+index 2827edd93..1f5eac396 100644
+--- a/src/dune_rules/rocq/rocq_module.mli
++++ b/src/dune_rules/rocq/rocq_module.mli
+@@ -44,7 +44,6 @@ val prefix : t -> string list
+ val name : t -> Name.t
+ val dep_file : t -> obj_dir:Path.Build.t -> Path.Build.t
+ val glob_file : t -> obj_dir:Path.Build.t -> Path.Build.t
+-val output_file : t -> obj_dir:Path.Build.t -> Path.Build.t
+ 
+ (** Some of the object files should not be installed, we control this with the
+     following parameter *)
+diff --git a/src/dune_rules/rocq/rocq_rules.ml b/src/dune_rules/rocq/rocq_rules.ml
+index 0f819c5ca..bc968e410 100644
+--- a/src/dune_rules/rocq/rocq_rules.ml
++++ b/src/dune_rules/rocq/rocq_rules.ml
+@@ -799,24 +799,6 @@ module Per_file = struct
+   ;;
+ end
+ 
+-let setup_output_diff_rule ~loc ~dir ~sctx ~rocq_sources rocq_module =
+-  match Rocq_sources.expected_file rocq_sources rocq_module with
+-  | None -> Memo.return ()
+-  | Some expected ->
+-    let output = Rocq_module.output_file ~obj_dir:dir rocq_module in
+-    let diff =
+-      { Diff.file1 = Path.build expected; file2 = output; optional = false; mode = Text }
+-    in
+-    let alias = Alias.make ~dir Alias0.runtest in
+-    Simple_rules.Alias_rules.add
+-      sctx
+-      ~loc
+-      ~alias
+-      (let open Action_builder.O in
+-       let+ () = Action_builder.paths [ diff.file1; Path.build diff.file2 ] in
+-       Action.Full.make (Action.Diff diff))
+-;;
+-
+ let setup_rocqc_rule
+       ~scope
+       ~loc
+@@ -832,7 +814,6 @@ let setup_rocqc_rule
+       ~use_stdlib
+       ~ml_flags
+       ~theory_dirs
+-      ~rocq_sources
+       rocq_module
+   =
+   (* Process rocqdep and generate rules *)
+@@ -850,14 +831,7 @@ let setup_rocqc_rule
+       rocq_module
+     |> List.map ~f:fst
+   in
+-  let output_file =
+-    Option.map (Rocq_sources.expected_file rocq_sources rocq_module) ~f:(fun _ ->
+-      Rocq_module.output_file ~obj_dir:dir rocq_module)
+-  in
+-  let targets =
+-    let targets = Option.to_list output_file @ obj_files in
+-    Command.Args.Hidden_targets targets
+-  in
++  let target_obj_files = Command.Args.Hidden_targets obj_files in
+   let* args =
+     generic_rocq_args
+       ~sctx
+@@ -884,9 +858,8 @@ let setup_rocqc_rule
+      >>> Action_builder.With_targets.add ~file_targets
+          @@ Command.run
+               ~dir:(Path.build rocqc_dir)
+-              ?stdout_to:output_file
+               rocq
+-              (cflag :: targets :: args)
++              (cflag :: target_obj_files :: args)
+      (* The way we handle the transitive dependencies of .vo files is not safe for
+         sandboxing *)
+      >>| Action.Full.add_sandbox Sandbox_config.no_sandboxing)
+@@ -1143,25 +1116,24 @@ let setup_theory_rules ~sctx ~dir ~dir_contents (s : Rocq_stanza.Theory.t) =
+         ~boot_flags
+         ~stanza_rocqdep_flags:s.rocqdep_flags
+         rocq_modules
+-  >>> Memo.parallel_iter rocq_modules ~f:(fun rocq_module ->
+-    setup_rocqc_rule
+-      ~scope
+-      ~loc
+-      ~dir
+-      ~sctx
+-      ~file_targets:[]
+-      ~stanza_flags
+-      ~modules_flags
+-      ~rocqc_dir
+-      ~theories_deps
+-      ~mode
+-      ~wrapper_name
+-      ~use_stdlib
+-      ~ml_flags
+-      ~theory_dirs
+-      ~rocq_sources:rocq_dir_contents
+-      rocq_module
+-    >>> setup_output_diff_rule ~loc ~dir ~sctx ~rocq_sources:rocq_dir_contents rocq_module)
++  >>> Memo.parallel_iter
++        rocq_modules
++        ~f:
++          (setup_rocqc_rule
++             ~scope
++             ~loc
++             ~dir
++             ~sctx
++             ~file_targets:[]
++             ~stanza_flags
++             ~modules_flags
++             ~rocqc_dir
++             ~theories_deps
++             ~mode
++             ~wrapper_name
++             ~use_stdlib
++             ~ml_flags
++             ~theory_dirs)
+   (* And finally the rocqdoc rules *)
+   >>> setup_rocqdoc_rules ~sctx ~dir ~theories_deps s rocq_modules
+ ;;
+@@ -1279,8 +1251,10 @@ let extraction_wrapper_name (s : Rocq_stanza.Extraction.t) : string =
+ 
+ let setup_extraction_rules ~sctx ~dir ~dir_contents (s : Rocq_stanza.Extraction.t) =
+   let wrapper_name = extraction_wrapper_name s in
+-  let* rocq_sources = Dir_contents.rocq dir_contents in
+-  let rocq_module = Rocq_sources.extract rocq_sources s in
++  let* rocq_module =
++    let+ rocq = Dir_contents.rocq dir_contents in
++    Rocq_sources.extract rocq s
++  in
+   let file_targets =
+     Rocq_stanza.Extraction.ml_target_fnames s |> List.map ~f:(Path.Build.relative dir)
+   in
+@@ -1336,8 +1310,6 @@ let setup_extraction_rules ~sctx ~dir ~dir_contents (s : Rocq_stanza.Extraction.
+         ~use_stdlib:s.buildable.use_stdlib
+         ~ml_flags
+         ~theory_dirs:Path.Build.Set.empty
+-        ~rocq_sources
+-  >>> setup_output_diff_rule ~loc ~dir ~sctx ~rocq_sources rocq_module
+ ;;
+ 
+ let rocqtop_args_extraction ~sctx ~dir (s : Rocq_stanza.Extraction.t) rocq_module =
+diff --git a/src/dune_rules/rocq/rocq_sources.ml b/src/dune_rules/rocq/rocq_sources.ml
+index 2e85d1df3..48cefe82c 100644
+--- a/src/dune_rules/rocq/rocq_sources.ml
++++ b/src/dune_rules/rocq/rocq_sources.ml
+@@ -25,8 +25,6 @@ type t =
+          mode *)
+   ; extract : Rocq_module.t Loc.Map.t
+   ; rev_map : [ `Theory of Theory.t | `Extraction of Extraction.t ] Rocq_module.Map.t
+-  ; expected_files : Path.Build.t Path.Build.Map.t
+-    (* Maps source .v file path to its .expected file path, if it exists *)
+   }
+ 
+ let find_module ~source t =
+@@ -39,39 +37,26 @@ let empty =
+   ; directories = Rocq_lib_name.Map.empty
+   ; extract = Loc.Map.empty
+   ; rev_map = Rocq_module.Map.empty
+-  ; expected_files = Path.Build.Map.empty
+   }
+ ;;
+ 
+ let rocq_modules_of_files ~dirs =
+-  let build_mod_dir (sd : Source_file_dir.t) =
+-    let prefix = sd.path_to_root in
+-    let v_files = String.Set.filter sd.files ~f:(fun f -> Filename.check_suffix f ".v") in
+-    String.Set.to_list_map v_files ~f:(fun file ->
+-      let name, _ = Filename.split_extension file in
+-      let name = Rocq_module.Name.make name in
+-      Rocq_module.make
+-        ~source:(Path.build @@ Path.Build.relative sd.dir file)
+-        ~prefix
+-        ~name)
++  let filter_v_files
++        ({ Source_file_dir.dir = _; path_to_root = _; files; source_dir = _; stanzas = _ }
++         as sd)
++    =
++    { sd with files = String.Set.filter files ~f:(fun f -> Filename.check_suffix f ".v") }
+   in
+-  List.concat_map ~f:build_mod_dir (Nonempty_list.to_list dirs)
+-;;
+-
+-let expected_files_of_dirs ~dirs =
+-  let build_expected (sd : Source_file_dir.t) =
+-    let v_files = String.Set.filter sd.files ~f:(fun f -> Filename.check_suffix f ".v") in
+-    String.Set.to_list_map v_files ~f:(fun file ->
++  let dirs = Nonempty_list.to_list_map dirs ~f:filter_v_files in
++  let build_mod_dir
++        { Source_file_dir.dir; path_to_root = prefix; files; source_dir = _; stanzas = _ }
++    =
++    String.Set.to_list_map files ~f:(fun file ->
+       let name, _ = Filename.split_extension file in
+-      let expected_name = name ^ ".expected" in
+-      let source = Path.Build.relative sd.dir file in
+-      if String.Set.mem sd.files expected_name
+-      then Some (source, Path.Build.relative sd.dir expected_name)
+-      else None)
+-    |> List.filter_opt
++      let name = Rocq_module.Name.make name in
++      Rocq_module.make ~source:(Path.build @@ Path.Build.relative dir file) ~prefix ~name)
+   in
+-  List.concat_map ~f:build_expected (Nonempty_list.to_list dirs)
+-  |> Path.Build.Map.of_list_exn
++  List.concat_map ~f:build_mod_dir dirs
+ ;;
+ 
+ let library t ~name = Rocq_lib_name.Map.find_exn t.libraries name
+@@ -93,8 +78,7 @@ let extract t (stanza : Extraction.t) = Loc.Map.find_exn t.extract stanza.builda
+ let of_dir stanzas ~dir ~include_subdirs ~dirs =
+   check_no_unqualified include_subdirs;
+   let modules = rocq_modules_of_files ~dirs in
+-  let expected_files = expected_files_of_dirs ~dirs in
+-  List.fold_left stanzas ~init:{ empty with expected_files } ~f:(fun acc stanza ->
++  List.fold_left stanzas ~init:empty ~f:(fun acc stanza ->
+     match Stanza.repr stanza with
+     | Theory.T rocq ->
+       let modules = Rocq_module.eval ~dir rocq.modules ~standard:modules in
+@@ -140,13 +124,6 @@ let of_dir stanzas ~dir ~include_subdirs ~dirs =
+ 
+ let lookup_module t m = Rocq_module.Map.find t.rev_map m
+ 
+-let expected_file t m =
+-  let source = Rocq_module.source m in
+-  match Path.as_in_build_dir source with
+-  | Some source -> Path.Build.Map.find t.expected_files source
+-  | None -> None
+-;;
+-
+ let mlg_files ~sctx ~dir ~modules =
+   let open Memo.O in
+   let+ standard =
+diff --git a/src/dune_rules/rocq/rocq_sources.mli b/src/dune_rules/rocq/rocq_sources.mli
+index 3c84572a1..467ae7b20 100644
+--- a/src/dune_rules/rocq/rocq_sources.mli
++++ b/src/dune_rules/rocq/rocq_sources.mli
+@@ -42,9 +42,6 @@ val lookup_module
+   -> Rocq_module.t
+   -> [ `Theory of Theory.t | `Extraction of Extraction.t ] option
+ 
+-(** Returns the path to the .expected file for a module, if one exists *)
+-val expected_file : t -> Rocq_module.t -> Path.Build.t option
+-
+ val mlg_files
+   :  sctx:Super_context.t
+   -> dir:Path.Build.t
+diff --git a/test/blackbox-tests/test-cases/rocq/expected-modules.t b/test/blackbox-tests/test-cases/rocq/expected-modules.t
+deleted file mode 100644
+index bd4a66bf6..000000000
+--- a/test/blackbox-tests/test-cases/rocq/expected-modules.t
++++ /dev/null
+@@ -1,28 +0,0 @@
+-Test that expected files work with explicit (modules ...):
+-
+-  $ cat > dune-project <<EOF
+-  > (lang dune 3.21)
+-  > (using rocq 0.11)
+-  > EOF
+-
+-  $ cat > dune <<EOF
+-  > (rocq.theory
+-  >  (name a)
+-  >  (modules foo))
+-  > EOF
+-
+-  $ cat > foo.v <<EOF
+-  > Locate nat.
+-  > EOF
+-
+-  $ touch foo.expected
+-  $ dune runtest
+-  File "foo.expected", line 1, characters 0-0:
+-  --- foo.expected
+-  +++ foo.output
+-  @@ -0,0 +1 @@
+-  +Inductive Corelib.Init.Datatypes.nat
+-  [1]
+-  $ dune promote
+-  Promoting _build/default/foo.output to foo.expected.
+-  $ dune runtest
+diff --git a/test/blackbox-tests/test-cases/rocq/extraction/extract.t b/test/blackbox-tests/test-cases/rocq/extraction/extract.t
+index c76bc9bd0..e00b00deb 100644
+--- a/test/blackbox-tests/test-cases/rocq/extraction/extract.t
++++ b/test/blackbox-tests/test-cases/rocq/extraction/extract.t
+@@ -54,23 +54,3 @@
+   foo.exe
+   foo.ml
+   foo.mli
+-
+-  $ cat >extract.expected <<EOF
+-  > Hello!
+-  > EOF
+-  $ dune runtest
+-  File "./extract.v", line 8, characters 0-23:
+-  Warning: Setting extraction output directory by default to
+-  "$TESTCASE_ROOT/_build/default".
+-  Use "Set Extraction Output Directory" or command line option
+-  "-output-directory" to set a different directory for extracted files to
+-  appear in. [extraction-default-directory,extraction,default]
+-  File "extract.expected", line 1, characters 0-0:
+-  --- extract.expected
+-  +++ extract.output
+-  @@ -1 +0,0 @@
+-  -Hello!
+-  [1]
+-  $ dune promote
+-  Promoting _build/default/extract.output to extract.expected.
+-  $ dune runtest
+diff --git a/test/blackbox-tests/test-cases/rocq/rocq-expected-test.t b/test/blackbox-tests/test-cases/rocq/rocq-expected-test.t
+deleted file mode 100644
+index c7c62e463..000000000
+--- a/test/blackbox-tests/test-cases/rocq/rocq-expected-test.t
++++ /dev/null
+@@ -1,59 +0,0 @@
+-Testing the expected test support.
+-
+-  $ cat > dune-project <<EOF
+-  > (lang dune 3.21)
+-  > (using rocq 0.11)
+-  > EOF
+-
+-  $ cat > dune <<EOF
+-  > (include_subdirs qualified)
+-  > (rocq.theory
+-  >  (name a))
+-  > EOF
+-
+-  $ cat > foo.v <<EOF
+-  > Locate nat.
+-  > EOF
+-
+-  $ mkdir sub
+-  $ cat > sub/bar.v <<EOF
+-  > Locate bool.
+-  > EOF
+-
+-  $ dune build 2>&1 | sort
+-  Inductive Corelib.Init.Datatypes.bool
+-  Inductive Corelib.Init.Datatypes.nat
+-
+-  $ dune clean
+-  $ touch foo.expected
+-  $ dune build
+-  Inductive Corelib.Init.Datatypes.bool
+-  $ dune runtest
+-  File "foo.expected", line 1, characters 0-0:
+-  --- foo.expected
+-  +++ foo.output
+-  @@ -0,0 +1 @@
+-  +Inductive Corelib.Init.Datatypes.nat
+-  [1]
+-
+-  $ dune promote
+-  Promoting _build/default/foo.output to foo.expected.
+-  $ cat foo.expected
+-  Inductive Corelib.Init.Datatypes.nat
+-  $ dune runtest
+-
+-  $ touch sub/bar.expected
+-  $ dune build
+-  $ dune runtest
+-  File "sub/bar.expected", line 1, characters 0-0:
+-  --- sub/bar.expected
+-  +++ sub/bar.output
+-  @@ -0,0 +1 @@
+-  +Inductive Corelib.Init.Datatypes.bool
+-  [1]
+-
+-  $ dune promote
+-  Promoting _build/default/sub/bar.output to sub/bar.expected.
+-  $ cat sub/bar.expected
+-  Inductive Corelib.Init.Datatypes.bool
+-  $ dune runtest
+diff --git a/test/blackbox-tests/test-cases/rocq/rocq-test-mode.t b/test/blackbox-tests/test-cases/rocq/rocq-test-mode.t
+deleted file mode 100644
+index b8afcaa91..000000000
+--- a/test/blackbox-tests/test-cases/rocq/rocq-test-mode.t
++++ /dev/null
+@@ -1,31 +0,0 @@
+-Testing the expected test support.
+-
+-  $ cat > dune-project <<EOF
+-  > (lang dune 3.21)
+-  > (using rocq 0.11)
+-  > EOF
+-
+-  $ cat > dune <<EOF
+-  > (include_subdirs qualified)
+-  > (rocq.theory
+-  >  (flags (:standard -test-mode))
+-  >  (name a))
+-  > EOF
+-
+-  $ cat > foo.v <<EOF
+-  > Fail Check true = 13.
+-  > EOF
+-
+-  $ touch foo.expected
+-  $ dune runtest
+-  File "foo.expected", line 1, characters 0-0:
+-  --- foo.expected
+-  +++ foo.output
+-  @@ -0,0 +1,3 @@
+-  +File "./foo.v", line 1, characters 18-20:
+-  +The command has indeed failed with message:
+-  +The term "13" has type "nat" while it is expected to have type "bool".
+-  [1]
+-  $ dune promote
+-  Promoting _build/default/foo.output to foo.expected.
+-  $ dune runtest

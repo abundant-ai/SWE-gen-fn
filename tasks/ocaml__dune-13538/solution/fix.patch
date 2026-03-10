@@ -1,0 +1,90 @@
+diff --git a/src/dune_engine/sandbox.ml b/src/dune_engine/sandbox.ml
+index fea8d90e8..b08750214 100644
+--- a/src/dune_engine/sandbox.ml
++++ b/src/dune_engine/sandbox.ml
+@@ -36,6 +36,7 @@ type snapshot = [ `Dir | `File of Cached_digest.Reduced_stats.t ] Path.Map.t
+ type t =
+   { dir : Path.Build.t
+   ; snapshot : snapshot option
++  ; loc : Loc.t
+   }
+ 
+ let dir t = t.dir
+@@ -172,7 +173,7 @@ let create ~mode ~rule_loc ~dirs ~deps ~rule_dir ~rule_digest =
+     let sandbox_suffix = rule_digest |> Digest.to_string in
+     Path.Build.relative sandbox_dir sandbox_suffix
+   in
+-  let t = { dir = sandbox_dir; snapshot = None } in
++  let t = { dir = sandbox_dir; snapshot = None; loc = rule_loc } in
+   let open Fiber.O in
+   let+ () =
+     maybe_async (fun () ->
+@@ -297,11 +298,23 @@ let failed_to_delete_sandbox dir reason =
+ ;;
+ 
+ let destroy t =
+-  maybe_async (fun () ->
+-    try Path.rm_rf ~chmod:true (Path.build t.dir) with
+-    | Sys_error e -> failed_to_delete_sandbox t.dir (Pp.verbatim e)
+-    | Unix.Unix_error (error, syscall, arg) ->
+-      failed_to_delete_sandbox
+-        t.dir
+-        (Unix_error.Detailed.pp (Unix_error.Detailed.create error ~syscall ~arg)))
++  let queue_start = Time.now () in
++  let open Fiber.O in
++  let+ start, stop =
++    maybe_async (fun () ->
++      let start = Time.now () in
++      let () =
++        try Path.rm_rf ~chmod:true (Path.build t.dir) with
++        | Sys_error e -> failed_to_delete_sandbox t.dir (Pp.verbatim e)
++        | Unix.Unix_error (error, syscall, arg) ->
++          failed_to_delete_sandbox
++            t.dir
++            (Unix_error.Detailed.pp (Unix_error.Detailed.create error ~syscall ~arg))
++      in
++      let stop = Time.now () in
++      start, stop)
++  in
++  Dune_trace.emit ~buffered:true Sandbox (fun () ->
++    let queued = Time.diff start queue_start in
++    Dune_trace.Event.sandbox_destroy ~start ~stop ~queued t.loc ~dir:t.dir)
+ ;;
+diff --git a/src/dune_trace/dune_trace.mli b/src/dune_trace/dune_trace.mli
+index fe7b5d00b..764d847fd 100644
+--- a/src/dune_trace/dune_trace.mli
++++ b/src/dune_trace/dune_trace.mli
+@@ -37,6 +37,14 @@ module Event : sig
+ 
+   type t
+ 
++  val sandbox_destroy
++    :  start:Time.t
++    -> stop:Time.t
++    -> queued:Time.Span.t
++    -> Loc.t
++    -> dir:Path.Build.t
++    -> t
++
+   val evalauted_rules : rule_total:int -> t
+ 
+   module Exit_status : sig
+diff --git a/src/dune_trace/event.ml b/src/dune_trace/event.ml
+index c620bda35..1f8b0610a 100644
+--- a/src/dune_trace/event.ml
++++ b/src/dune_trace/event.ml
+@@ -745,3 +745,14 @@ let spawn_thread ~name =
+   let args = [ "name", Arg.string name ] in
+   Event.instant ~args ~name:"spawn_thread" now Thread
+ ;;
++
++let sandbox_destroy ~start ~stop ~queued loc ~dir =
++  let args =
++    [ "queued", Arg.span queued
++    ; "loc", Arg.string (Loc.to_file_colon_line loc)
++    ; "dir", Arg.build_path dir
++    ]
++  in
++  let dur = Time.diff stop start in
++  Event.complete ~args ~name:"destroy" ~start ~dur Sandbox
++;;

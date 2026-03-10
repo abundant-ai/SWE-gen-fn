@@ -1,0 +1,616 @@
+diff --git a/doc/relnotes.md b/doc/relnotes.md
+index 5aabb41ba..d049344ae 100644
+--- a/doc/relnotes.md
++++ b/doc/relnotes.md
+@@ -1653,10 +1653,9 @@ Features
+ 
+ - Periodic transactions and multi-period reports can now start on any date.
+   To enable this while still maintaining pretty good backward compatibility,
+-  hledger now treats inferred dates, and dates where the day is unspecified,
+-  as "flexible" (which can be automatically adjusted to interval boundaries),
+-  and dates specified to the day as "exact" (which can not).
+-  Eg:
++  hledger now keeps explicitly specified start dates as they are,
++  but still automatically adjusts inferred start dates to interval boundaries.
++  This means, eg:
+   
+   - A periodic rule like `~ monthly from 2023-01-15` now works as
+     you'd expect instead of raising an error. This also improves
+@@ -1665,13 +1664,10 @@ Features
+   - Period options like `-p 'monthly from 2023/1/15'` or `-M -b 2023/1/15`
+     now start the report on exactly 1/15 instead of being adjusted to 1/1.
+   
+-  Note: periods using `in` may look partial but are considered to specify exact dates.
+-  So weekly reports such as `-p 'weekly in 2023-01'`, which previously
+-  were adjusted to start on a monday, will now start exactly on 2023-01-01.
+-  This can also cause more verbose column headings.
+-	To guarantee simple week headings, you must now start such reports
+-  exactly on a monday, eg `-p 'weekly from 2022-12-26 to 2023-02'`.
+-  ([#1982])
++  - `-p 'weekly in 2023-01'`, which previously was adjusted to start on a monday,
++    now starts exactly on 2023-01-01. This can cause more verbose report headings.
++	To ensure simple week headings, now weekly reports must start on a monday,
++    eg `-p 'weekly from 2022-12-26 to 2023-02'`. ([#1982])
+ 
+ - You can now freely combine @/@@ notation and conversion postings
+   in a single transaction. This can help readability, and also allows
+diff --git a/hledger-lib/Hledger/Data/Dates.hs b/hledger-lib/Hledger/Data/Dates.hs
+index 15630e814..b43f5ca48 100644
+--- a/hledger-lib/Hledger/Data/Dates.hs
++++ b/hledger-lib/Hledger/Data/Dates.hs
+@@ -188,14 +188,20 @@ spansSpan :: [DateSpan] -> DateSpan
+ spansSpan spans = DateSpan (spanStartDate =<< headMay spans) (spanEndDate =<< lastMay spans)
+ 
+ -- | Split a DateSpan into consecutive exact spans of the specified Interval.
+--- If the first argument is true and the interval is Weeks, Months, Quarters or Years,
+--- the start date will be adjusted backward if needed to nearest natural interval boundary
+--- (a monday, first of month, first of quarter or first of year).
+ -- If no interval is specified, the original span is returned.
+ -- If the original span is the null date span, ie unbounded, the null date span is returned.
+ -- If the original span is empty, eg if the end date is <= the start date, no spans are returned.
+ --
+--- ==== Examples:
++-- ==== Date adjustment
++-- Some intervals respect the "adjust" flag (years, quarters, months, weeks, every Nth weekday
++-- of month seem to be the ones that need it). This will move the start date earlier, if needed,
++-- to the previous natural interval boundary (first of year, first of quarter, first of month,
++-- monday, previous Nth weekday of month). Related: #1982 #2218
++--
++-- The end date is always moved later if needed to the next natural interval boundary,
++-- so that the last period is the same length as the others.
++--
++-- ==== Examples
+ -- >>> let t i y1 m1 d1 y2 m2 d2 = splitSpan True i $ DateSpan (Just $ Flex $ fromGregorian y1 m1 d1) (Just $ Flex $ fromGregorian y2 m2 d2)
+ -- >>> t NoInterval 2008 01 01 2009 01 01
+ -- [DateSpan 2008]
+@@ -215,35 +221,35 @@ spansSpan spans = DateSpan (spanStartDate =<< headMay spans) (spanEndDate =<< la
+ -- [DateSpan 2007-W01,DateSpan 2008-W02,DateSpan 2008-W03]
+ -- >>> t (Weeks 2) 2008 01 01 2008 01 15
+ -- [DateSpan 2007-12-31..2008-01-13,DateSpan 2008-01-14..2008-01-27]
+--- >>> t (DayOfMonth 2) 2008 01 01 2008 04 01
+--- [DateSpan 2007-12-02..2008-01-01,DateSpan 2008-01-02..2008-02-01,DateSpan 2008-02-02..2008-03-01,DateSpan 2008-03-02..2008-04-01]
+--- >>> t (WeekdayOfMonth 2 4) 2011 01 01 2011 02 15
++-- >>> t (MonthDay 2) 2008 01 01 2008   04 01
++-- [DateSpan 2008-01-02..2008-02-01,DateSpan 2008-02-02..2008-03-01,DateSpan 2008-03-02..2008-04-01]
++-- >>> t (NthWeekdayOfMonth 2 4) 2011 01 01 2011 02 15
+ -- [DateSpan 2010-12-09..2011-01-12,DateSpan 2011-01-13..2011-02-09,DateSpan 2011-02-10..2011-03-09]
+ -- >>> t (DaysOfWeek [2]) 2011 01 01 2011 01 15
+ -- [DateSpan 2010-12-28..2011-01-03,DateSpan 2011-01-04..2011-01-10,DateSpan 2011-01-11..2011-01-17]
+--- >>> t (DayOfYear 11 29) 2011 10 01 2011 10 15
+--- [DateSpan 2010-11-29..2011-11-28]
+--- >>> t (DayOfYear 11 29) 2011 12 01 2012 12 15
+--- [DateSpan 2011-11-29..2012-11-28,DateSpan 2012-11-29..2013-11-28]
++-- >>> t (MonthAndDay 11 29) 2012 10 01 2013 10 15
++-- [DateSpan 2012-11-29..2013-11-28]
+ --
+ splitSpan :: Bool -> Interval -> DateSpan -> [DateSpan]
+-splitSpan _ _ (DateSpan Nothing Nothing) = [DateSpan Nothing Nothing]
+-splitSpan _ _ ds | isEmptySpan ds = []
+-splitSpan _ _ ds@(DateSpan (Just s) (Just e)) | s == e = [ds]
+-splitSpan _ NoInterval ds = [ds]
+-splitSpan _ (Days n) ds = splitspan id addDays n                    ds
+-splitSpan adjust (Weeks n)    ds = splitspan (if adjust then startofweek    else id) addDays (7*n)                ds
+-splitSpan adjust (Months n)   ds = splitspan (if adjust then startofmonth   else id) addGregorianMonthsClip n     ds
+-splitSpan adjust (Quarters n) ds = splitspan (if adjust then startofquarter else id) addGregorianMonthsClip (3*n) ds
+-splitSpan adjust (Years n)    ds = splitspan (if adjust then startofyear    else id) addGregorianYearsClip n      ds
+-splitSpan _ (DayOfMonth dom)  ds = splitspan (nthdayofmonthcontaining dom) (addGregorianMonthsToMonthday dom) 1 ds
+-splitSpan _ (DayOfYear m n)   ds = splitspan (nthdayofyearcontaining m n) (addGregorianYearsClip) 1 ds
+-splitSpan _ (WeekdayOfMonth n wd) ds = splitspan (nthweekdayofmonthcontaining n wd) advancemonths 1 ds
++splitSpan _      _                        (DateSpan Nothing Nothing) = [DateSpan Nothing Nothing]
++splitSpan _      _                        ds | isEmptySpan ds = []
++splitSpan _      _                        ds@(DateSpan (Just s) (Just e)) | s == e = [ds]
++splitSpan _      NoInterval               ds = [ds]
++splitSpan _      (Days n)                 ds = splitspan id addDays n ds
++splitSpan adjust (Weeks n)                ds = splitspan (if adjust then startofweek    else id) addDays                 (7*n) ds
++splitSpan adjust (Months n)               ds = splitspan (if adjust then startofmonth   else id) addGregorianMonthsClip  n     ds
++splitSpan adjust (Quarters n)             ds = splitspan (if adjust then startofquarter else id) addGregorianMonthsClip  (3*n) ds
++splitSpan adjust (Years n)                ds = splitspan (if adjust then startofyear    else id) addGregorianYearsClip   n     ds
++splitSpan adjust (NthWeekdayOfMonth n wd) ds = splitspan (if adjust then prevstart else nextstart) advancemonths          1     ds
+   where
++    prevstart = prevNthWeekdayOfMonth n wd
++    nextstart = nextNthWeekdayOfMonth n wd
+     advancemonths 0 = id
+-    advancemonths w = advancetonthweekday n wd . startofmonth . addGregorianMonthsClip w
+-splitSpan _ (DaysOfWeek [])         ds = [ds]
+-splitSpan _ (DaysOfWeek days@(n:_)) ds = spansFromBoundaries e bdrys
++    advancemonths m = advanceToNthWeekday n wd . startofmonth . addGregorianMonthsClip m
++splitSpan _      (MonthDay dom)           ds = splitspan (nextnthdayofmonth dom) (addGregorianMonthsToMonthday dom) 1 ds
++splitSpan _      (MonthAndDay m d)        ds = splitspan (nextmonthandday m d)   (addGregorianYearsClip)            1 ds
++splitSpan _      (DaysOfWeek [])          ds = [ds]
++splitSpan _      (DaysOfWeek days@(n:_))  ds = spansFromBoundaries e bdrys
+   where
+     (s, e) = dateSpanSplitLimits (nthdayofweekcontaining n) nextday ds
+     bdrys = concatMap (flip map starts . addDays) [0,7..]
+@@ -260,16 +266,18 @@ addGregorianMonthsToMonthday dom n d =
+   in fromGregorian y m dom
+ 
+ -- Split the given span into exact spans using the provided helper functions:
+--- 1. The start function is applied to the span's start date to get the first sub-span's start date.
+--- 2. The addInterval function is used to calculate the subsequent spans' start dates,
+--- possibly with stride increased by the mult multiplier.
+--- It should adapt to spans of varying length, eg if splitting on "every 31st of month"
+--- addInterval should adjust to 28/29/30 in short months but return to 31 in the long months.
++--
++-- 1. The start function is used to adjust the provided span's start date to get the first sub-span's start date.
++--
++-- 2. The next function is used to calculate subsequent sub-spans' start dates, possibly with stride increased by a multiplier.
++--    It should handle spans of varying length, eg when splitting on "every 31st of month",
++--    it adjusts to 28/29/30 in short months but returns to 31 in the long months.
++--
+ splitspan :: (Day -> Day) -> (Integer -> Day -> Day) -> Int -> DateSpan -> [DateSpan]
+-splitspan start addInterval mult ds = spansFromBoundaries e bdrys
++splitspan start next mult ds = spansFromBoundaries e bdrys
+   where
+-    (s, e) = dateSpanSplitLimits start (addInterval (toInteger mult)) ds
+-    bdrys = mapM (addInterval . toInteger) [0,mult..] $ start s
++    (s, e) = dateSpanSplitLimits start (next (toInteger mult)) ds
++    bdrys = mapM (next . toInteger) [0,mult..] $ start s
+ 
+ -- | Fill in missing start/end dates for calculating 'splitSpan'.
+ dateSpanSplitLimits :: (Day -> Day) -> (Day -> Day) -> DateSpan -> (Day, Day)
+@@ -620,7 +628,7 @@ startofquarter day = fromGregorian y (firstmonthofquarter m) 1
+       firstmonthofquarter m2 = ((m2-1) `div` 3) * 3 + 1
+ 
+ thisyear = startofyear
+-prevyear = startofyear . addGregorianYearsClip (-1)
++-- prevyear = startofyear . addGregorianYearsClip (-1)
+ nextyear = startofyear . addGregorianYearsClip 1
+ startofyear day = fromGregorian y 1 1 where (y,_,_) = toGregorian day
+ 
+@@ -632,65 +640,50 @@ intervalBoundaryBefore i d =
+     (DateSpan (Just start) _:_) -> fromEFDay start
+     _ -> d
+ 
+--- | For given date d find year-long interval that starts on given
+--- MM/DD of year and covers it.
+--- The given MM and DD should be basically valid (1-12 & 1-31),
+--- or an error is raised.
++-- | Find the next occurrence of the specified month and day of month, on or after the given date.
++-- The month should be 1-12 and the day of month should be 1-31, or an error will be raised.
+ --
+--- Examples: lets take 2017-11-22. Year-long intervals covering it that
+--- starts before Nov 22 will start in 2017. However
+--- intervals that start after Nov 23rd should start in 2016:
+ -- >>> let wed22nd = fromGregorian 2017 11 22
+--- >>> nthdayofyearcontaining 11 21 wed22nd
+--- 2017-11-21
+--- >>> nthdayofyearcontaining 11 22 wed22nd
++-- >>> nextmonthandday 11 21 wed22nd
++-- 2018-11-21
++-- >>> nextmonthandday 11 22 wed22nd
+ -- 2017-11-22
+--- >>> nthdayofyearcontaining 11 23 wed22nd
+--- 2016-11-23
+--- >>> nthdayofyearcontaining 12 02 wed22nd
+--- 2016-12-02
+--- >>> nthdayofyearcontaining 12 31 wed22nd
+--- 2016-12-31
+--- >>> nthdayofyearcontaining 1 1 wed22nd
+--- 2017-01-01
+-nthdayofyearcontaining :: Month -> MonthDay -> Day -> Day
+-nthdayofyearcontaining m mdy date
++-- >>> nextmonthandday 11 23 wed22nd
++-- 2017-11-23
++nextmonthandday :: Month -> MonthDay -> Day -> Day
++nextmonthandday m n date
+   -- PARTIAL:
+-  | not (validMonth m)  = error' $ "nthdayofyearcontaining: invalid month "++show m
+-  | not (validDay   mdy) = error' $ "nthdayofyearcontaining: invalid day "  ++show mdy
+-  | mmddOfSameYear <= date = mmddOfSameYear
+-  | otherwise = mmddOfPrevYear
+-  where mmddOfSameYear = addDays (toInteger mdy-1) $ applyN (m-1) nextmonth s
+-        mmddOfPrevYear = addDays (toInteger mdy-1) $ applyN (m-1) nextmonth $ prevyear s
+-        s = startofyear date
+-
+--- | For a given date d find the month-long period that starts on day n of a month
+--- that includes d. (It will begin on day n or either d's month or the previous month.)
+--- The given day of month should be in the range 1-31, or an error will be raised.
++  | not (validMonth m) = error' $ "nextmonthandday: month should be 1..12, not "++show m
++  | not (validDay   n) = error' $ "nextmonthandday: day should be 1..31, not "  ++show n
++  | mdthisyear >= date = mdthisyear
++  | otherwise          = mdnextyear
++  where
++    s = startofyear date
++    advancetomonth = applyN (m-1) nextmonth
++    advancetoday = addDays (toInteger n-1)
++    mdthisyear = advancetoday $ advancetomonth s
++    mdnextyear = advancetoday $ advancetomonth $ nextyear s
++
++-- | Find the next occurrence of the specified day of month, on or after the given date.
++-- The day of month should be 1-31, or an error will be raised.
+ --
+--- Examples: lets take 2017-11-22. Month-long intervals covering it that
+--- start on 1st-22nd of month will start in Nov. However
+--- intervals that start on 23rd-30th of month should start in Oct:
+ -- >>> let wed22nd = fromGregorian 2017 11 22
+--- >>> nthdayofmonthcontaining 1 wed22nd
+--- 2017-11-01
+--- >>> nthdayofmonthcontaining 12 wed22nd
+--- 2017-11-12
+--- >>> nthdayofmonthcontaining 22 wed22nd
++-- >>> nextnthdayofmonth 21 wed22nd
++-- 2017-12-21
++-- >>> nextnthdayofmonth 22 wed22nd
+ -- 2017-11-22
+--- >>> nthdayofmonthcontaining 23 wed22nd
+--- 2017-10-23
+--- >>> nthdayofmonthcontaining 30 wed22nd
+--- 2017-10-30
+-nthdayofmonthcontaining :: MonthDay -> Day -> Day
+-nthdayofmonthcontaining mdy date
++-- >>> nextnthdayofmonth 23 wed22nd
++-- 2017-11-23
++nextnthdayofmonth :: MonthDay -> Day -> Day
++nextnthdayofmonth n date
+   -- PARTIAL:
+-  | not (validDay mdy) = error' $ "nthdayofmonthcontaining: invalid day "  ++show mdy
+-  | nthOfSameMonth <= date = nthOfSameMonth
+-  | otherwise = nthOfPrevMonth
+-  where nthOfSameMonth = nthdayofmonth mdy s
+-        nthOfPrevMonth = nthdayofmonth mdy $ prevmonth s
+-        s = startofmonth date
++  | not (validDay n)       = error' $ "nextnthdayofmonth: day should be 1..31, not "  ++show n
++  | nthofthismonth >= date = nthofthismonth
++  | otherwise              = nthofnextmonth
++  where
++    s = startofmonth date
++    nthofthismonth = nthdayofmonth n s
++    nthofnextmonth = nthdayofmonth n $ nextmonth s
+ 
+ -- | For given date d find week-long interval that starts on nth day of week
+ -- and covers it.
+@@ -716,37 +709,66 @@ nthdayofweekcontaining n d | nthOfSameWeek <= d = nthOfSameWeek
+           nthOfPrevWeek = addDays (toInteger n-1) $ prevweek s
+           s = startofweek d
+ 
+--- | For given date d find month-long interval that starts on nth weekday of month
+--- and covers it.
++-- -- | Find the next occurrence of some weekday, on or after the given date d.
++-- --
++-- -- >>> let wed22nd = fromGregorian 2017 11 22
++-- -- >>> nextnthdayofweek 1 wed22nd
++-- -- 2017-11-20
++-- -- >>> nextnthdayofweek 2 wed22nd
++-- -- 2017-11-21
++-- -- >>> nextnthdayofweek 3 wed22nd
++-- -- 2017-11-22
++-- -- >>> nextnthdayofweek 4 wed22nd
++-- -- 2017-11-16
++-- -- >>> nextnthdayofweek 5 wed22nd
++-- -- 2017-11-17
++-- nextdayofweek :: WeekDay -> Day -> Day
++-- nextdayofweek n d | nthOfSameWeek <= d = nthOfSameWeek
++--                            | otherwise = nthOfPrevWeek
++--     where nthOfSameWeek = addDays (toInteger n-1) s
++--           nthOfPrevWeek = addDays (toInteger n-1) $ prevweek s
++--           s = startofweek d
++
++-- | Find the next occurrence of some nth weekday of a month, on or after the given date d.
+ --
+--- Examples: 2017-11-22 is 3rd Wed of Nov. Month-long intervals that cover it and
+--- start on 1st-4th Wed will start in Nov. However
+--- intervals that start on 4th Thu or Fri or later should start in Oct:
+ -- >>> let wed22nd = fromGregorian 2017 11 22
+--- >>> nthweekdayofmonthcontaining 1 3 wed22nd
+--- 2017-11-01
+--- >>> nthweekdayofmonthcontaining 3 2 wed22nd
+--- 2017-11-21
+--- >>> nthweekdayofmonthcontaining 4 3 wed22nd
++-- >>> nextNthWeekdayOfMonth 3 3 wed22nd  -- next third wednesday
++-- 2017-12-20
++-- >>> nextNthWeekdayOfMonth 4 3 wed22nd  -- next fourth wednesday
+ -- 2017-11-22
+--- >>> nthweekdayofmonthcontaining 4 4 wed22nd
+--- 2017-10-26
+--- >>> nthweekdayofmonthcontaining 4 5 wed22nd
+--- 2017-10-27
+-nthweekdayofmonthcontaining :: Int -> WeekDay -> Day -> Day
+-nthweekdayofmonthcontaining n wd d | nthWeekdaySameMonth <= d  = nthWeekdaySameMonth
+-                                   | otherwise = nthWeekdayPrevMonth
+-    where nthWeekdaySameMonth = advancetonthweekday n wd $ startofmonth d
+-          nthWeekdayPrevMonth = advancetonthweekday n wd $ prevmonth d
+-
+--- | Advance to nth weekday wd after given start day s
++-- >>> nextNthWeekdayOfMonth 5 3 wed22nd  -- next fifth wednesday
++-- 2017-11-29
++nextNthWeekdayOfMonth :: Int -> WeekDay -> Day -> Day
++nextNthWeekdayOfMonth n wd d
++  | nthweekdaythismonth >= d = nthweekdaythismonth
++  | otherwise                = nthweekdaynextmonth
++  where
++    nthweekdaythismonth = advanceToNthWeekday n wd $ startofmonth d
++    nthweekdaynextmonth = advanceToNthWeekday n wd $ nextmonth d
++
++-- | Find the previous occurrence of some nth weekday of a month, on or before the given date d.
++--
++-- >>> let wed22nd = fromGregorian 2017 11 22
++-- >>> prevNthWeekdayOfMonth 4 3 wed22nd
++-- 2017-11-22
++-- >>> prevNthWeekdayOfMonth 5 2 wed22nd
++-- 2017-10-31
++prevNthWeekdayOfMonth :: Int -> WeekDay -> Day -> Day
++prevNthWeekdayOfMonth n wd d
++  | nthweekdaythismonth <= d = nthweekdaythismonth
++  | otherwise                = nthweekdayprevmonth
++  where
++    nthweekdaythismonth = advanceToNthWeekday n wd $ startofmonth d
++    nthweekdayprevmonth = advanceToNthWeekday n wd $ prevmonth d
++
++-- | Advance to the nth occurrence of the given weekday, on or after the given date.
+ -- Can call error.
+-advancetonthweekday :: Int -> WeekDay -> Day -> Day
+-advancetonthweekday n wd s =
++advanceToNthWeekday :: Int -> WeekDay -> Day -> Day
++advanceToNthWeekday n wd s =
+   -- PARTIAL:
+   maybe err (addWeeks (n-1)) $ firstMatch (>=s) $ iterate (addWeeks 1) $ firstweekday s
+   where
+-    err = error' "advancetonthweekday: should not happen"
++    err = error' "advanceToNthWeekday: should not happen"
+     addWeeks k = addDays (7 * toInteger k)
+     firstMatch p = headMay . dropWhile (not . p)
+     firstweekday = addDays (toInteger wd-1) . startofweek
+@@ -965,41 +987,41 @@ weekdaysp = fmap headErr . group . sort <$> sepBy1 weekday (string' ",")  -- PAR
+ -- >>> p "every week to 2009"
+ -- Right (Weeks 1,DateSpan ..2008-12-31)
+ -- >>> p "every 2nd day of month"
+--- Right (DayOfMonth 2,DateSpan ..)
++-- Right (MonthDay 2,DateSpan ..)
+ -- >>> p "every 2nd day"
+--- Right (DayOfMonth 2,DateSpan ..)
++-- Right (MonthDay 2,DateSpan ..)
+ -- >>> p "every 2nd day 2009.."
+--- Right (DayOfMonth 2,DateSpan 2009-01-01..)
++-- Right (MonthDay 2,DateSpan 2009-01-01..)
+ -- >>> p "every 2nd day 2009-"
+--- Right (DayOfMonth 2,DateSpan 2009-01-01..)
++-- Right (MonthDay 2,DateSpan 2009-01-01..)
+ -- >>> p "every 29th Nov"
+--- Right (DayOfYear 11 29,DateSpan ..)
++-- Right (MonthAndDay 11 29,DateSpan ..)
+ -- >>> p "every 29th nov ..2009"
+--- Right (DayOfYear 11 29,DateSpan ..2008-12-31)
++-- Right (MonthAndDay 11 29,DateSpan ..2008-12-31)
+ -- >>> p "every nov 29th"
+--- Right (DayOfYear 11 29,DateSpan ..)
++-- Right (MonthAndDay 11 29,DateSpan ..)
+ -- >>> p "every Nov 29th 2009.."
+--- Right (DayOfYear 11 29,DateSpan 2009-01-01..)
++-- Right (MonthAndDay 11 29,DateSpan 2009-01-01..)
+ -- >>> p "every 11/29 from 2009"
+--- Right (DayOfYear 11 29,DateSpan 2009-01-01..)
++-- Right (MonthAndDay 11 29,DateSpan 2009-01-01..)
+ -- >>> p "every 11/29 since 2009"
+--- Right (DayOfYear 11 29,DateSpan 2009-01-01..)
++-- Right (MonthAndDay 11 29,DateSpan 2009-01-01..)
+ -- >>> p "every 2nd Thursday of month to 2009"
+--- Right (WeekdayOfMonth 2 4,DateSpan ..2008-12-31)
++-- Right (NthWeekdayOfMonth 2 4,DateSpan ..2008-12-31)
+ -- >>> p "every 1st monday of month to 2009"
+--- Right (WeekdayOfMonth 1 1,DateSpan ..2008-12-31)
++-- Right (NthWeekdayOfMonth 1 1,DateSpan ..2008-12-31)
+ -- >>> p "every tue"
+ -- Right (DaysOfWeek [2],DateSpan ..)
+ -- >>> p "every 2nd day of week"
+ -- Right (DaysOfWeek [2],DateSpan ..)
+ -- >>> p "every 2nd day of month"
+--- Right (DayOfMonth 2,DateSpan ..)
++-- Right (MonthDay 2,DateSpan ..)
+ -- >>> p "every 2nd day"
+--- Right (DayOfMonth 2,DateSpan ..)
++-- Right (MonthDay 2,DateSpan ..)
+ -- >>> p "every 2nd day 2009.."
+--- Right (DayOfMonth 2,DateSpan 2009-01-01..)
++-- Right (MonthDay 2,DateSpan 2009-01-01..)
+ -- >>> p "every 2nd day of month 2009.."
+--- Right (DayOfMonth 2,DateSpan 2009-01-01..)
++-- Right (MonthDay 2,DateSpan 2009-01-01..)
+ periodexprp :: Day -> TextParser m (Interval, DateSpan)
+ periodexprp rdate = do
+   skipNonNewlineSpaces
+@@ -1028,9 +1050,9 @@ reportingintervalp = choice'
+     , Months 2 <$ string' "bimonthly"
+     , string' "every" *> skipNonNewlineSpaces *> choice'
+         [ DaysOfWeek . pure <$> (nth <* skipNonNewlineSpaces <* string' "day" <* of_ "week")
+-        , DayOfMonth <$> (nth <* skipNonNewlineSpaces <* string' "day" <* optOf_ "month")
+-        , liftA2 WeekdayOfMonth nth $ skipNonNewlineSpaces *> weekday <* optOf_ "month"
+-        , uncurry DayOfYear <$> (md <* optOf_ "year")
++        , MonthDay <$> (nth <* skipNonNewlineSpaces <* string' "day" <* optOf_ "month")
++        , liftA2 NthWeekdayOfMonth nth $ skipNonNewlineSpaces *> weekday <* optOf_ "month"
++        , uncurry MonthAndDay <$> (md <* optOf_ "year")
+         , DaysOfWeek <$> weekdaysp
+         , DaysOfWeek [1..5] <$ string' "weekday"
+         , DaysOfWeek [6..7] <$ string' "weekendday"
+@@ -1049,8 +1071,8 @@ reportingintervalp = choice'
+     optOf_ period = optional . try $ of_ period
+ 
+     nth = decimal <* choice (map string' ["st","nd","rd","th"])
+-    d_o_y = runPermutation $ liftA2 DayOfYear (toPermutation $ (month <|> mon) <* skipNonNewlineSpaces)
+-                                              (toPermutation $ nth <* skipNonNewlineSpaces)
++    d_o_y = runPermutation $ liftA2 MonthAndDay (toPermutation $ (month <|> mon) <* skipNonNewlineSpaces)
++                                                (toPermutation $ nth <* skipNonNewlineSpaces)
+ 
+     -- Parse any of several variants of a basic interval, eg "daily", "every day", "every N days".
+     tryinterval :: Text -> Text -> (Int -> Interval) -> TextParser m Interval
+diff --git a/hledger-lib/Hledger/Data/PeriodicTransaction.hs b/hledger-lib/Hledger/Data/PeriodicTransaction.hs
+index 282238b41..3a636f45e 100644
+--- a/hledger-lib/Hledger/Data/PeriodicTransaction.hs
++++ b/hledger-lib/Hledger/Data/PeriodicTransaction.hs
+@@ -114,10 +114,6 @@ instance Show PeriodicTransaction where
+ -- <BLANKLINE>
+ --
+ -- >>> _ptgen "every 2nd day of month from 2017/02 to 2017/04"
+--- 2017-01-02
+---     ; generated-transaction: ~ every 2nd day of month from 2017/02 to 2017/04
+---     a           $1.00
+--- <BLANKLINE>
+ -- 2017-02-02
+ --     ; generated-transaction: ~ every 2nd day of month from 2017/02 to 2017/04
+ --     a           $1.00
+@@ -128,10 +124,6 @@ instance Show PeriodicTransaction where
+ -- <BLANKLINE>
+ --
+ -- >>> _ptgen "every 30th day of month from 2017/1 to 2017/5"
+--- 2016-12-30
+---     ; generated-transaction: ~ every 30th day of month from 2017/1 to 2017/5
+---     a           $1.00
+--- <BLANKLINE>
+ -- 2017-01-30
+ --     ; generated-transaction: ~ every 30th day of month from 2017/1 to 2017/5
+ --     a           $1.00
+@@ -150,10 +142,6 @@ instance Show PeriodicTransaction where
+ -- <BLANKLINE>
+ --
+ -- >>> _ptgen "every 2nd Thursday of month from 2017/1 to 2017/4"
+--- 2016-12-08
+---     ; generated-transaction: ~ every 2nd Thursday of month from 2017/1 to 2017/4
+---     a           $1.00
+--- <BLANKLINE>
+ -- 2017-01-12
+ --     ; generated-transaction: ~ every 2nd Thursday of month from 2017/1 to 2017/4
+ --     a           $1.00
+@@ -168,10 +156,6 @@ instance Show PeriodicTransaction where
+ -- <BLANKLINE>
+ --
+ -- >>> _ptgen "every nov 29th from 2017 to 2019"
+--- 2016-11-29
+---     ; generated-transaction: ~ every nov 29th from 2017 to 2019
+---     a           $1.00
+--- <BLANKLINE>
+ -- 2017-11-29
+ --     ; generated-transaction: ~ every nov 29th from 2017 to 2019
+ --     a           $1.00
+diff --git a/hledger-lib/Hledger/Data/Types.hs b/hledger-lib/Hledger/Data/Types.hs
+index 40ca26089..254e7ea6e 100644
+--- a/hledger-lib/Hledger/Data/Types.hs
++++ b/hledger-lib/Hledger/Data/Types.hs
+@@ -116,7 +116,7 @@ data DateSpan = DateSpan (Maybe EFDay) (Maybe EFDay) deriving (Eq,Ord,Generic)
+ 
+ instance Default DateSpan where def = DateSpan Nothing Nothing
+ 
+--- Typical report periods (spans of time), both finite and open-ended.
++-- Some common report subperiods, both finite and open-ended.
+ -- A higher-level abstraction than DateSpan.
+ data Period =
+     DayPeriod Day
+@@ -132,16 +132,8 @@ data Period =
+ 
+ instance Default Period where def = PeriodAll
+ 
+----- Typical report period/subperiod durations, from a day to a year.
+---data Duration =
+---    DayLong
+---   WeekLong
+---   MonthLong
+---   QuarterLong
+---   YearLong
+---  deriving (Eq,Ord,Show,Generic)
+-
+--- Ways in which a period can be divided into subperiods.
++-- All the kinds of report interval allowed in a period expression
++-- (to generate periodic reports or periodic transactions).
+ data Interval =
+     NoInterval
+   | Days Int
+@@ -149,13 +141,10 @@ data Interval =
+   | Months Int
+   | Quarters Int
+   | Years Int
+-  | DayOfMonth Int
+-  | WeekdayOfMonth Int Int
+-  | DaysOfWeek [Int]
+-  | DayOfYear Int Int -- Month, Day
+-  -- WeekOfYear Int
+-  -- MonthOfYear Int
+-  -- QuarterOfYear Int
++  | NthWeekdayOfMonth Int Int  -- n,              weekday 1-7
++  | MonthDay Int               -- 1-31
++  | MonthAndDay Int Int        -- month 1-12,     monthday 1-31
++  | DaysOfWeek [Int]           -- [weekday 1-7]
+   deriving (Eq,Show,Ord,Generic)
+ 
+ instance Default Interval where def = NoInterval
+diff --git a/hledger/hledger.m4.md b/hledger/hledger.m4.md
+index 10f864171..1291c19d3 100644
+--- a/hledger/hledger.m4.md
++++ b/hledger/hledger.m4.md
+@@ -4692,22 +4692,48 @@ More complex intervals can be specified using `-p/--period`, described below.
+ 
+ ## Date adjustments
+ 
+-A report interval other than daily may cause the report's start and end date
+-to be adjusted, as follows:
++### Start date adjustment
+ 
+-A "soft" start date -
+-ie one which was not specified explicitly, but inferred, perhaps from the journal -
+-will be adjusted earlier if needed to start on a natural subperiod boundary.
++If you let hledger infer a report's start date, it will adjust the date to the previous natural boundary of the report interval,
++for convenient periodic reports. (If you don't want that, specify a start date.)
+ 
+-A "hard" start date - one specified explicitly, eg by `-b` - will not be adjusted (since hledger 1.29).
+-This makes it possible to start the subperiods on any date.
+-If you specify a start date, it's ideal to set it to a subperiod boundary
+-(eg a monday for weekly reports, a first day of month for monthly reports..),
+-as this will generate simple subperiod headings; otherwise they will be more verbose.
++For example, if the journal's first transaction is on january 10th,
+ 
+-The end date - even if specified explicitly, eg by `-e` -
+-will be adjusted later as needed to enclose a whole number of report intervals.
+-Eg in a `--yearly` report, all subperiods will be one year long.
++- `hledger register` (no report interval) will start the report on january 10th.
++- `hledger register --monthly` will start the report on the previous month boundary, january 1st.
++- `hledger register --monthly --begin 1/5` will start the report on january 5th [1].
++
++Also if you are generating transactions or budget goals with [periodic transaction rules](#periodic-transactions),
++their start date may be adjusted in a similar way (in certain situations). <!-- TBD -->
++
++### End date adjustment
++
++A report's end date is always adjusted to include a whole number of intervals,
++so that the last subperiod has the same length as the others.
++
++For example, if the journal's last transaction is on february 20th,
++
++- `hledger register` will end the report on february 20th.
++- `hledger register --monthly` will end the report at the end of february.
++- `hledger register --monthly --end 2/14` also will end the report at the end of february.
++- `hledger register --monthly --begin 1/5 --end 2/14` will end the report on march 4th [1].
++
++[1] Since hledger 1.29.
++
++## Period headings
++
++With non-standard subperiods, hledger will show "STARTDATE..ENDDATE" headings.
++With standard subperiods (ie, starting on a natural interval boundary), you'll see more compact headings, which are usually preferable.
++(Though month names will be in english, currently.)
++
++So if you are specifying a start date and you want compact headings:
++choose a start of year for yearly reports,
++a start of quarter for quarterly reports,
++a start of month for monthly reports, etc.
++(Remember, you can write eg `-b 2024` or `1/1` as a shortcut for a start of year,
++or `2024-04` or `202404` or `Apr` for a start of month or quarter.)
++For weekly reports, choose a date that's a Monday.
++(You can try different dates until you see the short headings, or write eg `-b '3 weeks ago'`.)
+ 
+ ## Period expressions
+ 
+@@ -4796,7 +4822,7 @@ Monthly on a custom day:
+ - `every Nth day [of month]` (`31st day` will be adjusted to each month's last day)
+ - `every Nth WEEKDAYNAME [of month]`
+ 
+-Yearly on a custom day:
++Yearly on a custom month and day:
+ 
+ - `every MM/DD [of year]` (month number and day of month number)
+ - `every MONTHNAME DDth [of year]` (full or three-letter english month name, case insensitive, and day of month number)
+@@ -5184,7 +5210,7 @@ $ hledger print --forecast --today=2023/4/21
+     expenses:rent                  $1000
+ ```
+ 
+-Here there are no ordinary transactions, so the forecasted transactions begin on the first occurence after today's date.
++Here there are no ordinary transactions, so the forecasted transactions begin on the first occurrence after today's date.
+ (You won't normally use `--today`; it's just to make these examples reproducible.)
+ 
+ ## Forecast reports

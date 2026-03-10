@@ -1,0 +1,177 @@
+diff --git a/doc/changes/fixed/13696.md b/doc/changes/fixed/13696.md
+deleted file mode 100644
+index 9d8b28f22..000000000
+--- a/doc/changes/fixed/13696.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+-- Improve handling of empty files in the `diff` action. These are now correctly
+-  distinguished from *empty* files. (#13696, @rgrinberg)
+-
+-- Pass `/dev/null` to `--diff-command` instead of non-existent files (#13696,
+-  @rgrinberg)
+diff --git a/src/dune_engine/diff_action.ml b/src/dune_engine/diff_action.ml
+index bead610ae..60bd2a342 100644
+--- a/src/dune_engine/diff_action.ml
++++ b/src/dune_engine/diff_action.ml
+@@ -6,19 +6,11 @@ let compare_files = function
+   | Text -> Io.compare_text_files
+ ;;
+ 
+-let compare_files { Diff.optional; mode; file1; file2 } =
+-  let file2_exists = lazy (Fpath.exists (Path.Build.to_string file2)) in
+-  if optional && not (Lazy.force file2_exists)
+-  then
+-    (* Small optimization to avoid stat'ing file1 *)
+-    `Eq true
+-  else (
+-    let file1_exists = Fpath.exists (Path.to_string file1) in
+-    match file1_exists, Lazy.force file2_exists with
+-    | true, true -> `Eq (compare_files mode file1 (Path.build file2) = Eq)
+-    | false, false -> `Eq true
+-    | true, false -> if optional then `Eq true else `Delete
+-    | false, true -> `Eq false)
++let diff_eq_files { Diff.optional; mode; file1; file2 } =
++  let file1 = if Fpath.exists (Path.to_string file1) then file1 else Dev_null.path in
++  let file2 = Path.build file2 in
++  (optional && not (Fpath.exists (Path.to_string file2)))
++  || compare_files mode file1 file2 = Eq
+ ;;
+ 
+ let exec loc ({ Diff.optional; file1; file2; mode } as diff) =
+@@ -28,12 +20,11 @@ let exec loc ({ Diff.optional; file1; file2; mode } as diff) =
+       try Fpath.unlink_exn (Path.Build.to_string file2) with
+       | Unix.Unix_error (ENOENT, _, _) -> ())
+   in
+-  match compare_files diff with
+-  | `Eq true ->
++  if diff_eq_files diff
++  then (
+     remove_intermediate_file ();
+-    Fiber.return ()
+-  | `Eq false | `Delete ->
+-    (* CR-soon rgrinberg: handle deletion *)
++    Fiber.return ())
++  else (
+     let is_copied_from_source_tree file =
+       match Path.extract_build_context_dir_maybe_sandboxed file with
+       | None -> false
+@@ -82,5 +73,5 @@ let exec loc ({ Diff.optional; file1; file2; mode } as diff) =
+            then register `Copy
+          | true ->
+            if in_source_or_target then register `Move else remove_intermediate_file ());
+-        Fiber.return ())
++        Fiber.return ()))
+ ;;
+diff --git a/src/dune_engine/print_diff.ml b/src/dune_engine/print_diff.ml
+index 219521460..9819098ac 100644
+--- a/src/dune_engine/print_diff.ml
++++ b/src/dune_engine/print_diff.ml
+@@ -97,14 +97,16 @@ let make_metadata ~has_embedded_location promotion loc =
+ module External = struct
+   let which prog = Bin.which ~path:(Env_path.path Env.initial) prog
+ 
+-  let diff ~skip_trailing_cr ~dir promotion loc (label1, file1) (label2, file2) =
++  let diff ~skip_trailing_cr ~dir promotion loc file1 file2 =
+     which "diff"
+     |> Option.map ~f:(fun prog ->
+       let relative = Path.reach ~from:dir in
++      let file1 = relative file1 in
++      let file2 = relative file2 in
+       let args =
+-        [ "-u"; "--label"; relative label1; "--label"; relative label2 ]
++        [ "-u"; "--label"; file1; "--label"; file2 ]
+         @ (if skip_trailing_cr then [ "--strip-trailing-cr" ] else [])
+-        @ [ relative file1; relative file2 ]
++        @ [ file1; file2 ]
+       in
+       { dir
+       ; prog
+@@ -156,8 +158,6 @@ module External = struct
+   ;;
+ end
+ 
+-let noent_to_dev_null f = if Fpath.exists (Path.to_string f) then f else Dev_null.path
+-
+ let prepare ~skip_trailing_cr promotion path1 path2 =
+   let dir, loc =
+     let dir, file1 =
+@@ -170,10 +170,6 @@ let prepare ~skip_trailing_cr promotion path1 path2 =
+     in
+     dir, Loc.in_file file1
+   in
+-  let label1 = path1 in
+-  let label2 = path2 in
+-  let path1 = noent_to_dev_null path1 in
+-  let path2 = noent_to_dev_null path2 in
+   let fallback =
+     With_fallback.fail
+       (User_error.make
+@@ -181,8 +177,8 @@ let prepare ~skip_trailing_cr promotion path1 path2 =
+          ?promotion
+          [ Pp.textf
+              "Files %s and %s differ."
+-             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root label1))
+-             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root label2))
++             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root path1))
++             (Path.to_string_maybe_quoted (Path.drop_optional_sandbox_root path2))
+          ])
+   in
+   match !Clflags.diff_command with
+@@ -219,9 +215,7 @@ let prepare ~skip_trailing_cr promotion path1 path2 =
+       | None -> fallback
+       | Some diff -> With_fallback.run diff ~fallback
+     in
+-    let diff =
+-      External.diff ~skip_trailing_cr ~dir promotion loc (label1, path1) (label2, path2)
+-    in
++    let diff = External.diff ~skip_trailing_cr ~dir promotion loc path1 path2 in
+     if Execution_env.inside_dune
+     then or_fallback ~fallback diff
+     else (
+diff --git a/test/blackbox-tests/test-cases/promote/non-existent-dir.t b/test/blackbox-tests/test-cases/promote/non-existent-dir.t
+index b1d647d63..5300293bc 100644
+--- a/test/blackbox-tests/test-cases/promote/non-existent-dir.t
++++ b/test/blackbox-tests/test-cases/promote/non-existent-dir.t
+@@ -18,7 +18,7 @@ dune promote should be able to promote into directories that don't exist
+ 
+   $ dune build ./foo --diff-command "$SHELL $PWD/diff.sh"
+   File "dir/foo", line 1, characters 0-0:
+-  a: /dev/null
++  a: dir/foo
+   b: foo
+   [1]
+ 
+diff --git a/test/blackbox-tests/test-cases/promote/non-existent-empty.t/run.t b/test/blackbox-tests/test-cases/promote/non-existent-empty.t/run.t
+index dcab53c72..6dff112af 100644
+--- a/test/blackbox-tests/test-cases/promote/non-existent-empty.t/run.t
++++ b/test/blackbox-tests/test-cases/promote/non-existent-empty.t/run.t
+@@ -6,27 +6,18 @@ Tests for promoting with non existent reference
+   x-non-existent-empty missing
+ 
+   $ dune build @blah-non-existent-empty
+-  File "x-non-existent-empty", line 1, characters 0-0:
+-  Error: Files _build/default/x-non-existent-empty and _build/default/x.gen
+-  differ.
+-  [1]
+ 
+   $ dune promote
+-  Promoting _build/default/x.gen to x-non-existent-empty.
+ 
+   $ file_status x-non-existent-empty
+-  x-non-existent-empty exists
++  x-non-existent-empty missing
+ 
+   $ file_status x-non-existent-non-empty
+   x-non-existent-non-empty missing
+ 
+   $ dune build @blah-non-existent-non-empty 2>&1 | dune_cmd subst '^.+/diff:' 'diff:'
+   File "x-non-existent-non-empty", line 1, characters 0-0:
+-  --- x-non-existent-non-empty
+-  +++ y.gen
+-  @@ -0,0 +1 @@
+-  +foobar
+-  \ No newline at end of file
++  diff: x-non-existent-non-empty: No such file or directory
+   [1]
+ 
+   $ dune promote

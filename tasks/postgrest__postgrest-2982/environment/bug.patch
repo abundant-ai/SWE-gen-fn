@@ -1,0 +1,123 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 60b9e7aa..c5e05855 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,7 +25,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2846, Fix error when requesting `Prefer: count=<type>` and doing null filtering on embedded resources - @laurenceisla
+  - #2959, Fix setting `default_transaction_isolation` unnecessarily - @steve-chavez
+  - #2929, Fix arrow filtering on RPC returning dynamic TABLE with composite type - @steve-chavez
+- - #2963, Fix RPCs not embedding correctly when using overloaded functions for computed relationships - @laurenceisla
+ 
+ ## [11.2.0] - 2023-08-10
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a30114be..fc5cdc0f 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -399,7 +399,7 @@ addRels schema action allRels parentNode (Node rPlan@ReadPlan{relName,relHint,re
+             Relationship{relCardinality=M2M _} -> -- m2m does internal implicit joins that don't need aliasing
+               rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, relJoinConds=getJoinConditions Nothing parentAlias r}
+             ComputedRelationship{} ->
+-              rPlan{from=relForeignTable r, relToParent=Just r{relTableAlias=maybe (relTable r) (QualifiedIdentifier mempty) parentAlias}, relAggAlias=aggAlias, fromAlias=newAlias}
++              rPlan{from=relForeignTable r, relToParent=Just r{relTable=maybe (relTable r) (QualifiedIdentifier mempty) parentAlias}, relAggAlias=aggAlias, fromAlias=newAlias}
+             _ ->
+               rPlan{from=relForeignTable r, relToParent=Just r, relAggAlias=aggAlias, fromAlias=newAlias, relJoinConds=getJoinConditions newAlias parentAlias r}
+           ) <$> rel
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 06e4ad1f..02a4a892 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -242,10 +242,8 @@ getQualifiedIdentifier rel mainQi tblAlias = case rel of
+ fromF :: Maybe Relationship -> QualifiedIdentifier -> Maybe Alias -> SQL.Snippet
+ fromF rel mainQi tblAlias = "FROM " <>
+   (case rel of
+-    -- Due to the use of CTEs on RPC, we need to cast the parameter to the table name in case of function overloading.
+-    -- See https://github.com/PostgREST/postgrest/issues/2963#issuecomment-1736557386
+-    Just ComputedRelationship{relFunction,relTableAlias,relTable} -> fromQi relFunction <> "(" <> pgFmtIdent (qiName relTableAlias) <> "::" <> fromQi relTable <> ")"
+-    _                                                             -> fromQi mainQi) <>
++    Just ComputedRelationship{relFunction,relTable} -> fromQi relFunction <> "(" <> pgFmtIdent (qiName relTable) <> ")"
++    _                                               -> fromQi mainQi) <>
+   maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias <>
+   (case rel of
+     Just Relationship{relCardinality=M2M Junction{junTable=jt}} -> ", " <> fromQi jt
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 5358a051..214fa7f0 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -882,7 +882,6 @@ allComputedRels =
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    pure (QualifiedIdentifier mempty mempty) <*>
+     column HD.bool <*>
+     column HD.bool
+ 
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index 8b7c7c60..e9eed8c3 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -31,7 +31,6 @@ data Relationship = Relationship
+   { relFunction     :: QualifiedIdentifier
+   , relTable        :: QualifiedIdentifier
+   , relForeignTable :: QualifiedIdentifier
+-  , relTableAlias   :: QualifiedIdentifier
+   , relToOne        :: Bool
+   , relIsSelf       :: Bool
+   }
+diff --git a/test/spec/Feature/Query/ComputedRelsSpec.hs b/test/spec/Feature/Query/ComputedRelsSpec.hs
+index b2a9256a..f7d85849 100644
+--- a/test/spec/Feature/Query/ComputedRelsSpec.hs
++++ b/test/spec/Feature/Query/ComputedRelsSpec.hs
+@@ -192,29 +192,3 @@ spec = describe "computed relationships" $ do
+           {"name":"Windows 10","computed_clients":{"name":"Microsoft"}}
+         ]}
+       ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  -- https://github.com/PostgREST/postgrest/issues/2963
+-  context "can be defined using overloaded functions" $ do
+-    it "tables" $ do
+-      get "/items?select=*,computed_rel_overload(*)&limit=1"
+-        `shouldRespondWith`
+-        [json|
+-          [{"id":1,"computed_rel_overload":[{"id":1}]}]
+-        |] { matchHeaders = [matchContentTypeJson] }
+-      get "/items2?select=*,computed_rel_overload(*)&limit=1"
+-        `shouldRespondWith`
+-        [json|
+-          [{"id":1,"computed_rel_overload":[{"id":1},{"id":2}]}]
+-        |] { matchHeaders = [matchContentTypeJson] }
+-
+-    it "rpc" $ do
+-      get "/rpc/search?id=1&select=*,computed_rel_overload(*)"
+-        `shouldRespondWith`
+-        [json|
+-          [{"id":1,"computed_rel_overload":[{"id":1}]}]
+-        |] { matchHeaders = [matchContentTypeJson] }
+-      get "/rpc/search2?id=1&select=*,computed_rel_overload(*)"
+-        `shouldRespondWith`
+-        [json|
+-          [{"id":1,"computed_rel_overload":[{"id":1},{"id":2}]}]
+-        |] { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index bf40a860..f3a39202 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3456,18 +3456,3 @@ returns table(id int, val complex) as $$
+   union
+   select 3, row(0.3, 0.7)::complex as val;
+ $$ language sql;
+-
+-create function computed_rel_overload(items) returns setof items2 as $$
+-  select * from items2 limit 1
+-$$ language sql;
+-
+-create function computed_rel_overload(items2) returns setof items2 as $$
+-  select * from items2 limit 2
+-$$ language sql;
+-
+-create function search2(id bigint) returns setof items2
+-language plpgsql
+-stable
+-as $$ begin
+-  return query select items2.id from items2 where items2.id=search2.id;
+-end$$;

@@ -1,0 +1,270 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7b58559a..94ac0296 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,8 +22,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1100, Customizable OpenAPI title - @AnthonyFisi
+  - #2506, Add `server-trace-header` for tracing HTTP requests.  - @steve-chavez
+    + When the client sends the request header specified in the config it will be included in the response headers.
+- - #2694, Make `db-root-spec` stable. - @steve-chavez
+-   + This can be used to override the OpenAPI spec with a custom database function
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index f8973f51..705af6aa 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -111,11 +111,12 @@ postgrest conf appState connWorker =
+         appConf <- AppState.getConfig appState -- the config must be read again because it can reload
+         maybeSchemaCache <- AppState.getSchemaCache appState
+         pgVer <- AppState.getPgVersion appState
++        jsonDbS <- AppState.getJsonDbS appState
+ 
+         let
+           eitherResponse :: IO (Either Error Wai.Response)
+           eitherResponse =
+-            runExceptT $ postgrestResponse appState appConf maybeSchemaCache pgVer authResult req
++            runExceptT $ postgrestResponse appState appConf maybeSchemaCache jsonDbS pgVer authResult req
+ 
+         response <- either Error.errorResponseFor identity <$> eitherResponse
+         -- Launch the connWorker when the connection is down.  The postgrest
+@@ -131,11 +132,12 @@ postgrestResponse
+   :: AppState.AppState
+   -> AppConfig
+   -> Maybe SchemaCache
++  -> ByteString
+   -> PgVersion
+   -> AuthResult
+   -> Wai.Request
+   -> Handler IO Wai.Response
+-postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@AuthResult{..} req = do
++postgrestResponse appState conf@AppConfig{..} maybeSchemaCache jsonDbS pgVer authResult@AuthResult{..} req = do
+   sCache <-
+     case maybeSchemaCache of
+       Just sCache ->
+@@ -150,7 +152,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+       ApiRequest.userApiRequest conf sCache req body
+ 
+   Response.optionalRollback conf apiRequest $
+-    handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
++    handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements jsonDbS pgVer apiRequest sCache
+ 
+ runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState mode authenticated prepared handler = do
+@@ -168,8 +170,8 @@ runDbHandler appState mode authenticated prepared handler = do
+ 
+   liftEither resp
+ 
+-handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
+-handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache =
++handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> ByteString -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
++handleRequest AuthResult{..} conf appState authenticated prepared jsonDbS pgVer apiReq@ApiRequest{..} sCache =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       rPlan <- liftEither $ Plan.readPlan identifier conf sCache apiReq
+@@ -221,6 +223,6 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+   where
+     runQuery mode query =
+       runDbHandler appState mode authenticated prepared $ do
+-        Query.setPgLocals conf authClaims authRole apiReq pgVer
++        Query.setPgLocals conf authClaims authRole apiReq jsonDbS pgVer
+         Query.runPreReq conf
+         query
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 1a36a186..390c5815 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -7,6 +7,7 @@ module PostgREST.AppState
+   , getConfig
+   , getSchemaCache
+   , getIsListenerOn
++  , getJsonDbS
+   , getMainThreadId
+   , getPgVersion
+   , getRetryNextIn
+@@ -19,6 +20,7 @@ module PostgREST.AppState
+   , putConfig
+   , putSchemaCache
+   , putIsListenerOn
++  , putJsonDbS
+   , putPgVersion
+   , putRetryNextIn
+   , signalListener
+@@ -56,6 +58,8 @@ data AppState = AppState
+   , statePgVersion                :: IORef PgVersion
+   -- | No schema cache at the start. Will be filled in by the connectionWorker
+   , stateSchemaCache              :: IORef (Maybe SchemaCache)
++  -- | Cached SchemaCache in json
++  , stateJsonDbS                  :: IORef ByteString
+   -- | Binary semaphore to make sure just one connectionWorker can run at a time
+   , stateWorkerSem                :: MVar ()
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+@@ -86,6 +90,7 @@ initWithPool pool conf = do
+   appState <- AppState pool
+     <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
+     <*> newIORef Nothing
++    <*> newIORef mempty
+     <*> newEmptyMVar
+     <*> newEmptyMVar
+     <*> newIORef False
+@@ -141,6 +146,12 @@ getSchemaCache = readIORef . stateSchemaCache
+ putSchemaCache :: AppState -> Maybe SchemaCache -> IO ()
+ putSchemaCache appState = atomicWriteIORef (stateSchemaCache appState)
+ 
++getJsonDbS :: AppState -> IO ByteString
++getJsonDbS = readIORef . stateJsonDbS
++
++putJsonDbS :: AppState -> ByteString -> IO ()
++putJsonDbS appState = atomicWriteIORef (stateJsonDbS appState)
++
+ getWorkerSem :: AppState -> MVar ()
+ getWorkerSem = stateWorkerSem
+ 
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index b48ca98f..4eec0799 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -34,7 +34,8 @@ import qualified PostgREST.SchemaCache.Proc   as Proc
+ 
+ import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+ 
+-import PostgREST.ApiRequest              (ApiRequest (..))
++import PostgREST.ApiRequest              (ApiRequest (..),
++                                          Target (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferParameters (..),
+                                           PreferTransaction (..),
+@@ -234,10 +235,10 @@ optionalRollback AppConfig{..} ApiRequest{..} = do
+ 
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> Text ->
+-               ApiRequest -> PgVersion -> DbHandler ()
+-setPgLocals conf claims role req actualPgVersion = lift $
++               ApiRequest -> ByteString -> PgVersion -> DbHandler ()
++setPgLocals conf claims role req jsonDbS actualPgVersion = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+-    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
++    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql ++ specSql))
+     HD.noResult (configDbPreparedStatements conf)
+   where
+     methodSql = setConfigLocal mempty ("request.method", iMethod req)
+@@ -256,6 +257,9 @@ setPgLocals conf claims role req actualPgVersion = lift $
+     searchPathSql =
+       let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath conf) in
+       setConfigLocal mempty ("search_path", schemas)
++    specSql = case iTarget req of
++      TargetProc{tpIsRootSpec=True} -> [setConfigLocal mempty ("request.spec", jsonDbS)]
++      _                             -> mempty
+     usesLegacyGucs = configDbUseLegacyGucs conf && actualPgVersion < pgVersion140
+ 
+     unquoted :: JSON.Value -> Text
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 11fcf464..a8b76011 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -9,7 +9,9 @@ module PostgREST.Workers
+   , runAdmin
+   ) where
+ 
++import qualified Data.Aeson                 as JSON
+ import qualified Data.ByteString            as BS
++import qualified Data.ByteString.Lazy       as LBS
+ import qualified Data.Text                  as T
+ import qualified Hasql.Notifications        as SQL
+ import qualified Hasql.Session              as SQL
+@@ -177,6 +179,8 @@ loadSchemaCache appState = do
+ 
+     Right sCache -> do
+       AppState.putSchemaCache appState (Just sCache)
++      when (isJust configDbRootSpec) .
++        AppState.putJsonDbS appState . LBS.toStrict $ JSON.encode sCache
+       AppState.logWithZTime appState "Schema cache loaded"
+       return SCLoaded
+ 
+diff --git a/test/spec/Feature/OpenApi/RootSpec.hs b/test/spec/Feature/OpenApi/RootSpec.hs
+index c450d464..b20c257d 100644
+--- a/test/spec/Feature/OpenApi/RootSpec.hs
++++ b/test/spec/Feature/OpenApi/RootSpec.hs
+@@ -9,6 +9,8 @@ import Test.Hspec.Wai.JSON
+ 
+ import Protolude hiding (get)
+ 
++import SpecHelper
++
+ spec :: SpecWith ((), Application)
+ spec =
+   describe "root spec function" $ do
+@@ -20,3 +22,9 @@ spec =
+            "info": {"title": "PostgREST API", "description": "This is a dynamic API generated by PostgREST"}
+           }|]
+         { matchHeaders = ["Content-Type" <:> "application/openapi+json; charset=utf-8"] }
++
++    it "accepts application/json" $
++      request methodGet "/"
++        [("Accept", "application/json")] "" `shouldRespondWith`
++        200
++        { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 65ca199d..9da56a3c 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -1,5 +1,6 @@
+ module Main where
+ 
++import qualified Data.Aeson                 as JSON
+ import qualified Hasql.Pool                 as P
+ import qualified Hasql.Transaction.Sessions as HT
+ 
+@@ -13,6 +14,7 @@ import PostgREST.Config          (AppConfig (..))
+ import PostgREST.Config.Database (queryPgVersion)
+ import PostgREST.SchemaCache     (querySchemaCache)
+ import Protolude                 hiding (toList, toS)
++import Protolude.Conv            (toS)
+ import SpecHelper
+ 
+ import qualified PostgREST.AppState as AppState
+@@ -80,6 +82,8 @@ main = do
+       appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just baseSchemaCache)
++      when (isJust $ configDbRootSpec config) $
++        AppState.putJsonDbS appState $ toS $ JSON.encode baseSchemaCache
+       return ((), postgrest config appState $ pure ())
+ 
+     -- For tests that run with a different SchemaCache(depends on configSchemas)
+@@ -91,6 +95,8 @@ main = do
+       appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just customSchemaCache)
++      when (isJust $ configDbRootSpec config) $
++        AppState.putJsonDbS appState $ toS $ JSON.encode baseSchemaCache
+       return ((), postgrest config appState $ pure ())
+ 
+   let withApp              = app testCfg
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 37ec19f0..c8f40e7b 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -1907,8 +1907,20 @@ openapi json = $$
+     }
+   }
+ $$;
++accept text;
+ begin
+-  return openapi;
++accept = case when current_setting('server_version_num')::int >= 140000
++         then current_setting('request.headers', true)::json->>'accept'
++         else current_setting('request.header.accept', true)
++         end;
++case accept
++  when 'application/openapi+json' then
++    return openapi;
++  when 'application/json' then
++    return (current_setting('request.spec', true)::json)->'dbRelationships'->0->0;
++  else
++    return openapi;
++  end case;
+ end
+ $_$ language plpgsql;
+ 

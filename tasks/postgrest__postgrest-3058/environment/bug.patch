@@ -1,0 +1,172 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e034ee21..5c7a11d0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,7 +18,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Solves #1548, #2699, #2763, #2170, #1462, #1102, #1374, #2901
+  - #2799, Add timezone in Prefer header - @taimoorzaeem
+  - #3001, Add `statement_timeout` set on functions - @taimoorzaeem
+- - #3045, Apply superuser settings on impersonated roles if they have PostgreSQL 15 `GRANT SET ON PARAMETER` privilege - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 3183da80..ed20481f 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -376,7 +376,6 @@ establishConnection appState =
+ reReadConfig :: Bool -> AppState -> IO ()
+ reReadConfig startingUp appState = do
+   AppConfig{..} <- getConfig appState
+-  pgVer <- getPgVersion appState
+   dbSettings <-
+     if configDbConfig then do
+       qDbSettings <- usePool appState $ queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements
+@@ -397,7 +396,7 @@ reReadConfig startingUp appState = do
+       pure mempty
+   (roleSettings, roleIsolationLvl) <-
+     if configDbConfig then do
+-      rSettings <- usePool appState $ queryRoleSettings pgVer configDbPreparedStatements
++      rSettings <- usePool appState $ queryRoleSettings configDbPreparedStatements
+       case rSettings of
+         Left e -> do
+           logWithZTime appState "An error ocurred when trying to query the role settings"
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 4624d47d..29e87a4a 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -13,7 +13,7 @@ module PostgREST.Config.Database
+ 
+ import Control.Arrow ((***))
+ 
+-import PostgREST.Config.PgVersion (PgVersion (..), pgVersion150)
++import PostgREST.Config.PgVersion (PgVersion (..))
+ 
+ import qualified Data.HashMap.Strict as HM
+ 
+@@ -127,8 +127,8 @@ queryDbSettings preConfFunc prepared =
+       |]::Text
+     decodeSettings = HD.rowList $ (,) <$> column HD.text <*> column HD.text
+ 
+-queryRoleSettings :: PgVersion -> Bool -> Session (RoleSettings, RoleIsolationLvl)
+-queryRoleSettings pgVer prepared =
++queryRoleSettings :: Bool -> Session (RoleSettings, RoleIsolationLvl)
++queryRoleSettings prepared =
+   let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+   transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ SQL.Statement sql HE.noParams (processRows <$> rows) prepared
+   where
+@@ -157,10 +157,7 @@ queryRoleSettings pgVer prepared =
+         i.value as iso_lvl,
+         coalesce(array_agg(row(kv.key, kv.value)) filter (where key <> 'default_transaction_isolation'), '{}') as role_settings
+       from kv_settings kv
+-      join pg_settings ps on ps.name = kv.key |] <>
+-      (if pgVer >= pgVersion150
+-        then "and (ps.context = 'user' or has_parameter_privilege(current_user::regrole::oid, ps.name, 'set')) "
+-        else "and ps.context = 'user' ") <> [q|
++      join pg_settings ps on ps.name = kv.key and ps.context = 'user'
+       left join iso_setting i on i.rolname = kv.rolname
+       group by kv.rolname, i.value;
+     |]
+diff --git a/src/PostgREST/Config/PgVersion.hs b/src/PostgREST/Config/PgVersion.hs
+index 3307cbe0..69f5d526 100644
+--- a/src/PostgREST/Config/PgVersion.hs
++++ b/src/PostgREST/Config/PgVersion.hs
+@@ -13,7 +13,6 @@ module PostgREST.Config.PgVersion
+   , pgVersion121
+   , pgVersion130
+   , pgVersion140
+-  , pgVersion150
+   ) where
+ 
+ import qualified Data.Aeson as JSON
+@@ -63,6 +62,3 @@ pgVersion130 = PgVersion 130000 "13.0"
+ 
+ pgVersion140 :: PgVersion
+ pgVersion140 = PgVersion 140000 "14.0"
+-
+-pgVersion150 :: PgVersion
+-pgVersion150 = PgVersion 150000 "15.0"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index c8314f6c..6733c7b3 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -233,14 +233,12 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+     shouldRollback =
+       preferTransaction == Just Rollback
+ 
+--- | Set transaction scoped settings
++-- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
+                ApiRequest -> Maybe Text -> DbHandler ()
+ setPgLocals AppConfig{..} claims role roleSettings ApiRequest{..} tout = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+-    -- To ensure `GRANT SET ON PARAMETER <superuser_setting> TO authenticator` works, the role settings must be set before the impersonated role.
+-    -- Otherwise the GRANT SET would have to be applied to the impersonated role. See https://github.com/PostgREST/postgrest/issues/3045
+-    ("select " <> intercalateSnippet ", " (searchPathSql : roleSettingsSql ++ roleSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ timezoneSql ++ timeoutSql ++ appSettingsSql))
++    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ timezoneSql ++ timeoutSql ++ appSettingsSql))
+     HD.noResult configDbPreparedStatements
+   where
+     methodSql = setConfigWithConstantName ("request.method", iMethod)
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index bd4593ab..92ad23c5 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -1,7 +1,6 @@
+ -- \ir big_schema.sql big schema test currently skipped, see test_io.py
+ \ir db_config.sql
+ 
+-set check_function_bodies = false; -- to allow conditionals based on the pg version
+ set search_path to public;
+ 
+ CREATE ROLE postgrest_test_anonymous;
+@@ -19,13 +18,6 @@ CREATE ROLE postgrest_test_w_superuser_settings;
+ alter role postgrest_test_w_superuser_settings set log_min_duration_statement = 1;
+ alter role postgrest_test_w_superuser_settings set log_min_messages = 'fatal';
+ 
+-DO $do$BEGIN
+-  IF (SELECT current_setting('server_version_num')::INT >= 150000) THEN
+-    ALTER ROLE postgrest_test_w_superuser_settings SET log_min_duration_sample = 12345;
+-    GRANT SET ON PARAMETER log_min_duration_sample to postgrest_test_authenticator;
+-  END IF;
+-END$do$;
+-
+ GRANT
+   postgrest_test_anonymous, postgrest_test_author,
+   postgrest_test_serializable, postgrest_test_repeatable_read,
+@@ -194,7 +186,3 @@ $$ language sql set statement_timeout = '1s';
+ create or replace function four_sec_timeout() returns void as $$
+   select pg_sleep(3);
+ $$ language sql set statement_timeout = '4s';
+-
+-create function get_postgres_version() returns int as $$
+-  select current_setting('server_version_num')::int;
+-$$ language sql;
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index b42d6620..21202fdc 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1065,24 +1065,6 @@ def test_succeed_w_role_having_superuser_settings(defaultenv):
+         assert response.status_code == 200
+ 
+ 
+-def test_get_granted_superuser_setting(defaultenv):
+-    "Should succeed when the impersonated role has granted superuser settings"
+-
+-    env = {**defaultenv, "PGRST_DB_CONFIG": "true", "PGRST_JWT_SECRET": SECRET}
+-
+-    with run(stdin=SECRET.encode(), env=env) as postgrest:
+-        response_ver = postgrest.session.get("/rpc/get_postgres_version")
+-        pg_ver = eval(response_ver.text)
+-        if pg_ver >= 150000:
+-            headers = jwtauthheader(
+-                {"role": "postgrest_test_w_superuser_settings"}, SECRET
+-            )
+-            response = postgrest.session.get(
+-                "/rpc/get_guc_value?name=log_min_duration_sample", headers=headers
+-            )
+-            assert response.text == '"12345ms"'
+-
+-
+ def test_fail_with_invalid_dbname_and_automatic_recovery_disabled(defaultenv):
+     "Should fail without retries when automatic recovery is disabled and dbname is invalid"
+     dbname = "INVALID"

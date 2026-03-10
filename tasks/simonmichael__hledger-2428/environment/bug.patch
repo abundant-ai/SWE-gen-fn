@@ -1,0 +1,979 @@
+diff --git a/hledger-lib/Hledger/Data/Journal.hs b/hledger-lib/Hledger/Data/Journal.hs
+index 14732acef..2d05de113 100644
+--- a/hledger-lib/Hledger/Data/Journal.hs
++++ b/hledger-lib/Hledger/Data/Journal.hs
+@@ -308,10 +308,10 @@ journalRenumberAccountDeclarations j = j{jdeclaredaccounts=jdas'}
+     -- it seems unneeded except perhaps for debugging
+ 
+ -- | Debug log the ordering of a journal's account declarations
+--- (at debug level 7+).
++-- (at debug level 5+).
+ dbgJournalAcctDeclOrder :: String -> Journal -> Journal
+ dbgJournalAcctDeclOrder prefix =
+-  dbg7With ((prefix++) . showAcctDeclsSummary . jdeclaredaccounts)
++  dbg5With ((prefix++) . showAcctDeclsSummary . jdeclaredaccounts)
+   where
+     showAcctDeclsSummary :: [(AccountName,AccountDeclarationInfo)] -> String
+     showAcctDeclsSummary adis
+diff --git a/hledger-lib/Hledger/Data/Types.hs b/hledger-lib/Hledger/Data/Types.hs
+index b5f991400..1196197c1 100644
+--- a/hledger-lib/Hledger/Data/Types.hs
++++ b/hledger-lib/Hledger/Data/Types.hs
+@@ -672,8 +672,6 @@ data SepFormat
+   | Ssv  -- semicolon-separated
+   deriving (Eq, Ord)
+ 
+--- XXX A little confusion, this is also used to name readers in splitReaderPrefix.
+--- readers, input formats, and output formats overlap but are distinct concepts.
+ -- | The id of a data format understood by hledger, eg @journal@ or @csv@.
+ -- The --output-format option selects one of these for output.
+ data StorageFormat 
+diff --git a/hledger-lib/Hledger/Read/CsvReader.hs b/hledger-lib/Hledger/Read/CsvReader.hs
+index 747c92138..c957865ab 100644
+--- a/hledger-lib/Hledger/Read/CsvReader.hs
++++ b/hledger-lib/Hledger/Read/CsvReader.hs
+@@ -46,12 +46,7 @@ reader sep = Reader
+   {rFormat     = Sep sep
+   ,rExtensions = [show sep]
+   ,rReadFn     = parse sep
+-  ,rParser     = fail "sorry, CSV files can't be included yet"  -- PARTIAL:
+-    -- This unnecessarily shows the CSV file's first line in the error message,
+-    -- but gives a more useful message than just calling error'.
+-    -- XXX Note every call to error' in Hledger.Read.* is potentially a similar problem -
+-    -- the error message is good enough when the file was specified directly by the user,
+-    -- but not good if it was loaded by a possibly long chain of include directives.
++  ,rParser     = error' "sorry, CSV files can't be included yet"  -- PARTIAL:
+   }
+ 
+ -- | Parse and post-process a "Journal" from CSV data, or give an error.
+diff --git a/hledger-lib/Hledger/Read/JournalReader.hs b/hledger-lib/Hledger/Read/JournalReader.hs
+index 3343e4cf3..aef71e90c 100644
+--- a/hledger-lib/Hledger/Read/JournalReader.hs
++++ b/hledger-lib/Hledger/Read/JournalReader.hs
+@@ -71,8 +71,9 @@ module Hledger.Read.JournalReader (
+ where
+ 
+ --- ** imports
++import qualified Control.Monad.Fail as Fail (fail)
+ import qualified Control.Exception as C
+-import Control.Monad (forM_, when, void, unless, filterM)
++import Control.Monad (forM_, when, void, unless)
+ import Control.Monad.IO.Class (MonadIO, liftIO)
+ import Control.Monad.Except (ExceptT(..), runExceptT)
+ import Control.Monad.State.Strict (evalStateT,get,modify',put)
+@@ -93,7 +94,6 @@ import Text.Megaparsec.Char
+ import Text.Printf
+ import System.FilePath
+ import "Glob" System.FilePath.Glob hiding (match)
+--- import "filepattern" System.FilePattern.Directory
+ 
+ import Hledger.Data
+ import Hledger.Read.Common
+@@ -103,8 +103,7 @@ import qualified Hledger.Read.CsvReader as CsvReader (reader)
+ import qualified Hledger.Read.RulesReader as RulesReader (reader)
+ import qualified Hledger.Read.TimeclockReader as TimeclockReader (reader)
+ import qualified Hledger.Read.TimedotReader as TimedotReader (reader)
+-import System.Directory (canonicalizePath, doesFileExist)
+-import Data.Functor ((<&>))
++import System.Directory (canonicalizePath)
+ 
+ --- ** doctest setup
+ -- $setup
+@@ -167,47 +166,27 @@ findReader Nothing (Just path) =
+     (prefix,path') = splitReaderPrefix path
+     ext            = map toLower $ drop 1 $ takeExtension path'
+ 
+--- | A prefix used to specify a particular reader to be used for a file path,
+--- overriding the file extension. It is a valid reader name followed by a colon.
+--- Eg journal:, csv:, timeclock:, timedot:.
+--- type ReaderPrefix = String
+-
+--- | A file path with an optional reader prefix.
++-- | A file path optionally prefixed by a reader name and colon
++-- (journal:, csv:, timedot:, etc.).
+ type PrefixedFilePath = FilePath
+ 
+--- | Separate a file path and its reader prefix, if any.
+---
+--- >>> splitReaderPrefix "csv:-"
+--- (Just csv,"-")
++-- | If a filepath is prefixed by one of the reader names and a colon,
++-- split that off. Eg "csv:-" -> (Just "csv", "-").
++-- These reader prefixes can be used to force a specific reader,
++-- overriding the file extension. 
+ splitReaderPrefix :: PrefixedFilePath -> (Maybe StorageFormat, FilePath)
+ splitReaderPrefix f =
+   let 
+-    candidates = [(Just r, drop (length r + 1) f) | r <- readerNames ++ ["ssv","tsv"], (r++":") `isPrefixOf` f]
+-    (strPrefix, newF) = headDef (Nothing, f) candidates
++  candidates = [(Just r, drop (length r + 1) f) | r <- readerNames ++ ["ssv","tsv"], (r++":") `isPrefixOf` f]
++  (strPrefix, newF) = headDef (Nothing, f) candidates
+   in case strPrefix of
+-    Just "csv" -> (Just (Sep Csv), newF)
+-    Just "tsv" -> (Just (Sep Tsv), newF)
+-    Just "ssv" -> (Just (Sep Ssv), newF)
+-    Just "journal" -> (Just Journal', newF)
+-    Just "timeclock" -> (Just Timeclock, newF)
+-    Just "timedot" -> (Just Timedot, newF)
+-    _ -> (Nothing, f)
+-
+--- -- | Does this file path have a reader prefix ?
+--- hasReaderPrefix :: PrefixedFilePath -> Bool
+--- hasReaderPrefix = isJust . fst. splitReaderPrefix
+-
+--- -- | Add a reader prefix to a file path, unless it already has one.
+--- -- The argument should be a valid reader name.
+--- --
+--- -- >>> addReaderPrefix "csv" "a.txt"
+--- -- >>> "csv:a.txt"
+--- -- >>> addReaderPrefix "csv" "timedot:a.txt"
+--- -- >>> "timedot:a.txt"
+--- addReaderPrefix :: ReaderPrefix -> FilePath -> PrefixedFilePath
+--- addReaderPrefix readername f
+---   | hasReaderPrefix f = f
+---   | otherwise = readername <> ":" <> f
++  Just "csv" -> (Just (Sep Csv), newF)
++  Just "tsv" -> (Just (Sep Tsv), newF)
++  Just "ssv" -> (Just (Sep Ssv), newF)
++  Just "journal" -> (Just Journal', newF)
++  Just "timeclock" -> (Just Timeclock, newF)
++  Just "timedot" -> (Just Timedot, newF)
++  _ -> (Nothing, f)
+ 
+ --- ** reader
+ 
+@@ -304,177 +283,82 @@ directivep = (do
+   ) <?> "directive"
+ 
+ -- | Parse an include directive, and the file(s) it refers to, possibly recursively.
+--- include's argument is a file path or glob pattern (see findMatchedFiles for details),
+--- optionally with a file type prefix. Relative paths are relative to the current file.
++-- include's argument is a file path or glob pattern, optionally with a file type prefix.
++-- ~ at the start is expanded to the user's home directory.
++-- Relative paths are relative to the current file.
++-- Examples: foo.j, ../foo/bar.j, timedot:/foo/2020*, *.journal
+ includedirectivep :: MonadIO m => ErroringJournalParser m ()
+ includedirectivep = do
+-  -- save the position
+-  off <- getOffset
+-  pos <- getSourcePos
+-
+-  -- parse the directive
++  -- parse
+   string "include"
+   lift skipNonNewlineSpaces1
+   prefixedglob <- rstrip . T.unpack <$> takeWhileP Nothing (`notElem` [';','\n'])
+   lift followingcommentp
++  -- save the position (does sequencing wrt newline matter ? seems not)
++  parentoff <- getOffset
++  parentpos <- getSourcePos
++  -- find file(s)
+   let (mprefix,glb) = splitReaderPrefix prefixedglob
+-  f <- sourcePosFilePath pos
+-  when (null $ dbg6 (f <> " include: glob pattern") glb) $
+-    customFailure $ parseErrorAt off $ "include needs a file path or glob pattern argument"
+-
+-  -- Find the file or glob-matched files (just the ones from this include directive), with some IO error checking.
+-  -- Also report whether a glob pattern was used, and not just a literal file path.
+-  -- (paths, isglob) <- findMatchedFiles off pos glb
+-  paths <- findMatchedFiles off pos glb
+-
+-  -- XXX worth the trouble ? no
+-  -- Comprehensively exclude files already processed. Some complexities here:
+-  -- If this include directive uses a glob pattern, remove duplicates. 
+-  -- Ie if this glob pattern matches any files we have already processed (or the current file),
+-  -- due to multiple includes in sequence or in a cycle, exclude those files so they're not processed again.
+-  -- If this include directive uses a literal file path, don't remove duplicates.
+-  -- Multiple includes in sequence will cause the included file to be processed multiple times.
+-  -- Multiple includes forming a cycle will be detected and reported as an error in parseIncludedFile.
+-  -- let paths' = if isglob then filter (...) paths else paths
+-
+-  -- if there was a reader prefix, apply it to all the file paths
++  paths <- getFilePaths parentoff parentpos glb
+   let prefixedpaths = case mprefix of
+         Nothing  -> paths
+         Just fmt -> map ((show fmt++":")++) paths
+-
+-  -- Parse each one, as if inlined here.
+-  -- Reset the position to the `include` line, for error messages.
+-  setOffset off
+-  forM_ prefixedpaths $ parseIncludedFile off pos
++  -- parse them inline
++  forM_ prefixedpaths $ parseChild parentpos
+ 
+   where
+-
+-    -- | Find the files matched by a literal path or a glob pattern.
+-    -- Examples: foo.j, ../foo/bar.j, timedot:/foo/2020*, *.journal, **.journal.
+-    --
+-    -- Uses the current parse context for detecting the current directory and for error messages.
+-    -- Expands a leading tilde to the user's home directory.
+-    -- Converts ** without a slash to **/*, like zsh's GLOB_STAR_SHORT, so ** also matches file name parts.
+-    -- Checks if any matched paths are directories and excludes those.
+-    -- Converts all matched paths to their canonical form.
+-    --
+-    -- Glob patterns never match dot files or files under dot directories,
+-    -- even if it seems like they should; this is a workaround for Glob bug #49.
+-    -- This workaround is disabled if the --old-glob flag is present in the command line
+-    -- (detected with unsafePerformIO; it's not worth a ton of boilerplate).
+-    -- In that case, be aware ** recursive globs will search intermediate dot directories.
+-
+-    findMatchedFiles :: (MonadIO m) => Int -> SourcePos -> FilePath -> JournalParser m [FilePath]
+-    findMatchedFiles off pos globpattern = do
+-
+-      -- Some notes about the Glob library that we use (related: https://github.com/Deewiant/glob/issues/49):
+-      -- It does not expand tilde.
+-      -- It does not canonicalise paths.
+-      -- The results are not in any particular order.
+-      -- The results can include directories.
+-      -- DIRPAT/ is equivalent to DIRPAT, except results will end with // (double slash).
+-      -- A . or .. path component can match the current or parent directories (including them in the results).
+-      -- * matches zero or more characters in a file or directory name.
+-      -- * at the start of a file name ignores dot-named files and directories, by default.
+-      -- ** (or zero or more consecutive *'s) not followed by slash is equivalent to *.
+-      -- A **/ component matches any number of directory parts.
+-      -- A **/ ignores dot-named directories in its starting and ending directories, by default.
+-      -- But **/ does search intermediate dot-named directories. Eg it can find a/.b/c.
+-
+-      -- expand a tilde at the start of the glob pattern, or throw an error
+-      expandedglob <- lift $ expandHomePath globpattern `orRethrowIOError` "failed to expand ~"
+-
+-      -- get the directory of the including file
+-      parentfile <- sourcePosFilePath pos
+-      let cwd = takeDirectory parentfile
+-
+-      -- Don't allow 3 or more stars.
+-      when ("***" `isInfixOf` expandedglob) $
+-        customFailure $ parseErrorAt off $ "Invalid glob pattern: too many stars, use * or **"
+-
+-      -- Make ** also match file name parts like zsh's GLOB_STAR_SHORT.
+-      let
+-        expandedglob' =
+-          -- ** without a slash is equivalent to **/*
+-          case regexReplace (toRegex' $ T.pack "\\*\\*([^/\\])") "**/*\\1" expandedglob of
+-            Right s -> s
+-            Left  _ -> expandedglob   -- ignore any error, there should be none
+-
+-      -- Compile as a Pattern. Can throw an error.
+-      g <- case tryCompileWith compDefault{errorRecovery=False} expandedglob' of
+-        Left e  -> customFailure $ parseErrorAt off $ "Invalid glob pattern: " ++ e
+-        Right x -> pure x
+-      let isglob = not $ isLiteral g
+-
+-      -- Find all matched paths. These might include directories or the current file.
+-      paths <- liftIO $ globDir1 g cwd
+-
+-      -- Exclude any directories or symlinks to directories, and canonicalise, and sort.
+-      files <- liftIO $
+-        filterM doesFileExist paths
+-        >>= mapM canonicalizePath
+-        <&> sort
+-
+-      -- Work around a Glob bug with dot dirs: while **/ ignores dot dirs in the starting and ending dirs,
+-      -- it does search dot dirs in between those two (Glob #49).
+-      -- This could be inconvenient, eg making it hard to avoid VCS directories in a source tree.
+-      -- We work around as follows: when any glob was used, paths involving dot dirs are excluded in post processing.
+-      -- Unfortunately this means valid globs like .dotdir/* can't be used; only literal paths can match
+-      -- things in dot dirs. An --old-glob command line flag disables this workaround, for backward compatibility.
+-      oldglobflag <- liftIO $ getFlag ["old-glob"]
+-      let
+-        files2 = (if isglob && not oldglobflag then filter (not.hasdotdir) else id) files
+-          where
+-            hasdotdir p = any isdotdir $ splitPath p
+-              where
+-                isdotdir c = "." `isPrefixOf` c && "/" `isSuffixOf` c
+-
+-      -- Throw an error if no files were matched.
+-      when (null files2) $
+-        customFailure $ parseErrorAt off $ "No files were matched by glob pattern: " ++ globpattern
+-
+-      -- If a glob was used, exclude the current file, for convenience.
+-      let
+-        files3 =
+-          dbg6 (parentfile <> " include: matched files" <> if isglob then " (excluding current file)" else "") $
+-          (if isglob then filter (/= parentfile) else id) files2
+-
+-      return files3
+-
+-    -- Parse the given included file (and any deeper includes, recursively)
+-    -- as if it was inlined in the current (parent) file.
+-    -- The position in the parent file is provided for error messages.
+-    parseIncludedFile :: MonadIO m => Int -> SourcePos -> PrefixedFilePath -> ErroringJournalParser m ()
+-    parseIncludedFile off _pos prefixedpath = do
++    getFilePaths
++      :: MonadIO m => Int -> SourcePos -> FilePath -> JournalParser m [FilePath]
++    getFilePaths parseroff parserpos fileglobpattern = do
++        -- Expand a ~ at the start of the glob pattern, if any.
++        fileglobpattern' <- lift $ expandHomePath fileglobpattern
++                         `orRethrowIOError` (show parserpos ++ " locating " ++ fileglobpattern)
++        -- Compile the glob pattern.
++        fileglob <- case tryCompileWith compDefault{errorRecovery=False} fileglobpattern' of
++            Right x -> pure x
++            Left e -> customFailure $ parseErrorAt parseroff $ "Invalid glob pattern: " ++ e
++        -- Get the directory of the including file. This will be used to resolve relative paths.
++        let parentfilepath = sourceName parserpos
++        realparentfilepath <- liftIO $ canonicalizePath parentfilepath   -- Follow a symlink. If the path is already absolute, the operation never fails. 
++        let curdir = takeDirectory realparentfilepath
++        -- Find all matched files, in lexicographic order mimicking the output of 'ls'.
++        filepaths <- liftIO $ sort <$> globDir1 fileglob curdir
++        if (not . null) filepaths
++            then pure filepaths
++            else customFailure $ parseErrorAt parseroff $
++                   "No existing files match pattern: " ++ fileglobpattern
++
++    parseChild :: MonadIO m => SourcePos -> PrefixedFilePath -> ErroringJournalParser m ()
++    parseChild parentpos prefixedpath = do
+       let (_mprefix,filepath) = splitReaderPrefix prefixedpath
+ 
+-      -- Throw an error if a cycle is detected
+       parentj <- get
+       let parentfilestack = jincludefilestack parentj
+-      when (dbg7 "parseIncludedFile: reading" filepath `elem` parentfilestack) $
+-        customFailure $ parseErrorAt off $ "This included file forms a cycle: " ++ filepath
++      when (filepath `elem` parentfilestack) $
++        Fail.fail ("Cyclic include: " ++ filepath)
+ 
+-      -- Read the file's content, or throw an error
+-      childInput <- lift $ readFilePortably filepath `orRethrowIOError` "failed to read a file"
++      childInput <-
++        dbg6Msg ("parseChild: "++takeFileName filepath) $
++        lift $ readFilePortably filepath
++          `orRethrowIOError` (show parentpos ++ " reading " ++ filepath)
+       let initChildj = newJournalWithParseStateFrom filepath parentj
+ 
+-      -- Choose a reader based on the file path prefix or file extension,
++      -- Choose a reader/parser based on the file path prefix or file extension,
+       -- defaulting to JournalReader. Duplicating readJournal a bit here.
+       let r = fromMaybe reader $ findReader Nothing (Just prefixedpath)
+           parser = rParser r
+-      dbg7IO "parseIncludedFile: trying reader" (rFormat r)
++      dbg6IO "parseChild: trying reader" (rFormat r)
+ 
+-      -- Parse the file (and its own includes, if any) to a Journal
+-      -- with file path and source text attached. Or throw an error.
++      -- Parse the file (of whichever format) to a Journal, with file path and source text attached.
+       updatedChildj <- journalAddFile (filepath, childInput) <$>
+                         parseIncludeFile parser initChildj filepath childInput
+ 
+-      -- Child journal was parsed successfully; now merge it into the parent journal.
+-      -- Debug logging is provided for troubleshooting account display order (eg).
++      -- Merge this child journal into the parent journal
++      -- (with debug logging for troubleshooting account display order).
+       -- The parent journal is the second argument to journalConcat; this means
+       -- its parse state is kept, and its lists are appended to child's (which
+       -- ultimately produces the right list order, because parent's and child's
+-      -- lists are in reverse order at this stage. Cf #1909)
++      -- lists are in reverse order at this stage. Cf #1909).
+       let
+         parentj' =
+           dbgJournalAcctDeclOrder ("parseChild: child " <> childfilename <> " acct decls: ") updatedChildj
+@@ -485,28 +369,21 @@ includedirectivep = do
+             childfilename = takeFileName filepath
+             parentfilename = maybe "(unknown)" takeFileName $ headMay $ jincludefilestack parentj  -- XXX more accurate than journalFilePath for some reason
+ 
+-      -- And update the current parse state.
++      -- Update the parse state.
+       put parentj'
+ 
+-      where
+-        newJournalWithParseStateFrom :: FilePath -> Journal -> Journal
+-        newJournalWithParseStateFrom filepath j = nulljournal{
+-          jparsedefaultyear      = jparsedefaultyear j
+-          ,jparsedefaultcommodity = jparsedefaultcommodity j
+-          ,jparseparentaccounts   = jparseparentaccounts j
+-          ,jparsedecimalmark      = jparsedecimalmark j
+-          ,jparsealiases          = jparsealiases j
+-          ,jdeclaredcommodities           = jdeclaredcommodities j
+-          -- ,jparsetransactioncount = jparsetransactioncount j
+-          ,jparsetimeclockentries = jparsetimeclockentries j
+-          ,jincludefilestack      = filepath : jincludefilestack j
+-          }
+-
+--- Get the canonical path of the file referenced by this parse position.
+--- Symbolic links will be dereferenced. This probably will always succeed
+--- (since the parse file's path is probably always absolute).
+-sourcePosFilePath :: (MonadIO m) => SourcePos -> m FilePath
+-sourcePosFilePath = liftIO . canonicalizePath . sourceName
++    newJournalWithParseStateFrom :: FilePath -> Journal -> Journal
++    newJournalWithParseStateFrom filepath j = nulljournal{
++      jparsedefaultyear      = jparsedefaultyear j
++      ,jparsedefaultcommodity = jparsedefaultcommodity j
++      ,jparseparentaccounts   = jparseparentaccounts j
++      ,jparsedecimalmark      = jparsedecimalmark j
++      ,jparsealiases          = jparsealiases j
++      ,jdeclaredcommodities           = jdeclaredcommodities j
++      -- ,jparsetransactioncount = jparsetransactioncount j
++      ,jparsetimeclockentries = jparsetimeclockentries j
++      ,jincludefilestack      = filepath : jincludefilestack j
++      }
+ 
+ -- | Lift an IO action into the exception monad, rethrowing any IO
+ -- error with the given message prepended.
+@@ -515,7 +392,7 @@ orRethrowIOError io msg = do
+   eResult <- liftIO $ (Right <$> io) `C.catch` \(e::C.IOException) -> pure $ Left $ printf "%s:\n%s" msg (show e)
+   case eResult of
+     Right res -> pure res
+-    Left errMsg -> fail errMsg
++    Left errMsg -> Fail.fail errMsg
+ 
+ -- Parse an account directive, adding its info to the journal's
+ -- list of account declarations.
+@@ -634,7 +511,7 @@ commoditydirectiveonelinep = do
+     pure $ (off, amt)
+   lift skipNonNewlineSpaces
+   _ <- lift followingcommentp
+-  let comm = Commodity{csymbol=acommodity, cformat=Just $ dbg7 "style from commodity directive" astyle}
++  let comm = Commodity{csymbol=acommodity, cformat=Just $ dbg6 "style from commodity directive" astyle}
+   if isNothing $ asdecimalmark astyle
+   then customFailure $ parseErrorAt off pleaseincludedecimalpoint
+   else modify' (\j -> j{jdeclaredcommodities=M.insert acommodity comm $ jdeclaredcommodities j})
+@@ -680,7 +557,7 @@ formatdirectivep expectedsym = do
+     then
+       if isNothing $ asdecimalmark astyle
+       then customFailure $ parseErrorAt off pleaseincludedecimalpoint
+-      else return $ dbg7 "style from format subdirective" astyle
++      else return $ dbg6 "style from format subdirective" astyle
+     else customFailure $ parseErrorAt off $
+          printf "commodity directive symbol \"%s\" and format directive symbol \"%s\" should be the same" expectedsym acommodity
+ 
+@@ -1267,8 +1144,8 @@ tests_JournalReader = testGroup "JournalReader" [
+      assertParse ignoredpricecommoditydirectivep "N $\n"
+ 
+   ,testGroup "includedirectivep" [
+-      testCase "include" $ assertParseErrorE includedirectivep "include nosuchfile\n" "No files were matched by glob pattern: nosuchfile"
+-     ,testCase "glob" $ assertParseErrorE includedirectivep "include nosuchfile*\n" "No files were matched by glob pattern: nosuchfile*"
++      testCase "include" $ assertParseErrorE includedirectivep "include nosuchfile\n" "No existing files match pattern: nosuchfile"
++     ,testCase "glob" $ assertParseErrorE includedirectivep "include nosuchfile*\n" "No existing files match pattern: nosuchfile*"
+      ]
+ 
+   ,testCase "marketpricedirectivep" $ assertParseEq marketpricedirectivep
+diff --git a/hledger-lib/Hledger/Utils/IO.hs b/hledger-lib/Hledger/Utils/IO.hs
+index fea742dce..0ad91e577 100644
+--- a/hledger-lib/Hledger/Utils/IO.hs
++++ b/hledger-lib/Hledger/Utils/IO.hs
+@@ -52,7 +52,6 @@ module Hledger.Utils.IO (
+ 
+   -- * Command line parsing
+   progArgs,
+-  getFlag,
+   getOpt,
+   parseYN,
+   parseYNA,
+@@ -501,15 +500,6 @@ progArgs = unsafePerformIO getArgs
+ --  a few cases involving --color (see useColorOnStdoutUnsafe)
+ --  --debug
+ 
+--- | Given one or more long or short flag names,
+--- report whether this flag is present in the command line.
+--- Concatenated short flags (-a -b written as -ab) are not supported.
+-getFlag :: [String] -> IO Bool
+-getFlag names = do
+-  let flags = map toFlag names
+-  args <- getArgs
+-  return $ any (`elem` args) flags
+-
+ -- | Given one or more long or short option names, read the rightmost value of this option from the command line arguments.
+ -- If the value is missing raise an error.
+ -- Concatenated short flags (-a -b written as -ab) are not supported.
+diff --git a/hledger-lib/Hledger/Utils/Parse.hs b/hledger-lib/Hledger/Utils/Parse.hs
+index 61fb2e6ce..c5c0fc6d0 100644
+--- a/hledger-lib/Hledger/Utils/Parse.hs
++++ b/hledger-lib/Hledger/Utils/Parse.hs
+@@ -454,17 +454,22 @@ customErrorBundlePretty errBundle =
+ -- (1) it should be possible to convert any parse error into a "final"
+ -- parse error,
+ -- (2) it should be possible to take a parse error thrown from an include
+--- file and re-throw it in the context of the parent file, and
++-- file and re-throw it in the parent file, and
+ -- (3) the pretty-printing of "final" parse errors should be consistent
+--- with that of ordinary parse errors, but should also report the stack of
+--- parent files when errors are thrown from included files.
++-- with that of ordinary parse errors, but should also report a stack of
++-- files for errors thrown from include files.
+ --
+ -- In order to pretty-print a "final" parse error (goal 3), it must be
+ -- bundled with include filepaths and its full source text. When a "final"
+ -- parse error is thrown from within a parser, we do not have access to
+--- the full source, so we must hold the parse error ('FinalParseError') 
+--- until it can be combined with the full source (and any parent file paths)
+--- by the parser's caller ('FinalParseErrorBundle').
++-- the full source, so we must hold the parse error until it can be joined
++-- with its source (and include filepaths, if it was thrown from an
++-- include file) by the parser's caller.
++--
++-- A parse error with include filepaths and its full source text is
++-- represented by the 'FinalParseErrorBundle' type, while a parse error in
++-- need of either include filepaths, full source text, or both is
++-- represented by the 'FinalParseError' type.
+ 
+ data FinalParseError' e
+   -- a parse error thrown as a "final" parse error
+diff --git a/hledger/Hledger/Cli/CliOptions.hs b/hledger/Hledger/Cli/CliOptions.hs
+index 42d797b56..a1f4eeb79 100644
+--- a/hledger/Hledger/Cli/CliOptions.hs
++++ b/hledger/Hledger/Cli/CliOptions.hs
+@@ -298,8 +298,7 @@ hiddenflagsformainmode = [
+   ,flagNone ["pretty-tables"]        (setopt "pretty" "always") "legacy flag that was renamed"
+   ,flagNone ["anon"]                 (setboolopt "anon") "deprecated, renamed to --obfuscate"  -- #2133, handled by anonymiseByOpts
+   ,flagNone ["obfuscate"]            (setboolopt "obfuscate") "slightly obfuscate hledger's output. Warning, does not give privacy. Formerly --anon."  -- #2133, handled by maybeObfuscate
+-  ,flagNone ["old-timeclock", "timeclock-old"] (setboolopt "oldtimeclock") "don't pair timeclock entries by account name"
+-  ,flagNone ["old-glob"]             (setboolopt "oldglob") "don't always exclude dot files/dirs to work around Glob bug"
++  ,flagNone ["timeclock-old"]        (setboolopt "oldtimeclock") "don't pair timeclock entries by account name"
+   ,flagReq  ["rules-file"]           (\s opts -> Right $ setopt "rules" s opts) "RULESFILE" "was renamed to --rules"
+   ]
+ 
+diff --git a/hledger/hledger.m4.md b/hledger/hledger.m4.md
+index a0c3e173a..f82ff2282 100644
+--- a/hledger/hledger.m4.md
++++ b/hledger/hledger.m4.md
+@@ -2509,46 +2509,28 @@ file contains digit group marks (eg thousands separators).
+ You can pull in the content of additional files by writing an include directive, like this:
+ 
+ ```journal
+-include SOMEFILE
++include FILEPATH
+ ```
+ 
+-This has the same effect as if SOMEFILE's content was inlined at this point.
+-(With any include directives in SOMEFILE processed similarly, recursively.)
++Only journal files can include, and only journal, timeclock or timedot files can be included (not CSV files, currently).
+ 
+-Only journal files can include other files. They can include journal, timeclock or timedot files, but not CSV files.
++If the file path does not begin with a slash, it is relative to the current file's folder. 
+ 
+-If the file path begins with a tilde, that means your home directory: `include ~/main.journal`.
++A tilde means home directory, eg: `include ~/main.journal`.
+ 
+-If it begins with a slash, it is an absolute path: `include /home/user/main.journal`.
+-Otherwise it is relative to the including file's folder: `include ../finances/main.journal`.
++The path may contain [glob patterns] to match multiple files, eg: `include *.journal`.
+ 
+-Also, the path may have a file type prefix to force a specific file format, overriding the file extension(s)
+-(as described in [Data formats](#data-formats)): `include timedot:notes/2023.md`.
++There is limited support for recursive wildcards: `**/` (the slash is required)
++matches 0 or more subdirectories. It's not super convenient since you have to 
++avoid include cycles and including directories, but this can be done, eg:
++`include */**/*.journal`.
+ 
+-The path may contain [glob patterns](https://en.wikipedia.org/wiki/Glob_(programming))
+-to match multiple files.
+-hledger's globs are similar to zsh's:
+-`?` to match any character;
+-`[a-z]` to match any character in a range;
+-`*` to match zero or more characters that aren't a path separator (like `/`);
+-`**` to match zero or more subdirectories and/or zero or more characters at the start of a file name;
+-etc.
+-Also, hledger's globs always exclude the including file itself.
+-So, you can do 
+-
+-- `include *.journal` to include all other journal files in the current directory (excluding [dot files](https://en.wikipedia.org/wiki/Hidden_file_and_hidden_directory))
+-- `include **.journal` to include all other journal files in this directory and below (excluding dot directories/files)
+-- `include timelogs/2???.timedot` to include all timedot files named like a year number.
+-
+-There is a limitation: hledger's globs always exclude paths involving dot files or dot directories.
+-This is a workaround for unavoidable dot directory traversal; 
+-you can disable it and revert to older behaviour with the `--old-glob` flag, for now.
+-
+-If you are using many, or deeply nested, include files, and have an error that's hard to pinpoint:
+-a good troubleshooting command is `hledger files --debug=6` (or 7).
+-
+-<!-- https://hackage.haskell.org/package/Glob-0.9.2/docs/System-FilePath-Glob.html#v:compile -->
++The path may also be prefixed to force a specific file format,
++overriding the file extension (as described in
++[Data formats](#data-formats)):
++`include timedot:~/notes/2023*.md`.
+ 
++[glob patterns]: https://hackage.haskell.org/package/Glob-0.9.2/docs/System-FilePath-Glob.html#v:compile
+ 
+ ## `P` directive
+ 
+diff --git a/hledger/test/cli/multiple-files.test b/hledger/test/cli/multiple-files.test
+index 4b7523efa..e89c905f7 100644
+--- a/hledger/test/cli/multiple-files.test
++++ b/hledger/test/cli/multiple-files.test
+@@ -41,7 +41,7 @@ $ hledger print -f personal.journal -f business.journal -f alias.journal -f pers
+ 
+ 
+ # ** 3. files can be of different formats
+-$ hledger print -f personal.journal -f a.timeclock -f b.timedot
++$ hledger print -f personal.journal -f ../journal/a.timeclock -f ../journal/b.timedot
+ 2014-01-02
+     expenses:food              $1
+     assets:cash
+diff --git a/hledger/test/errors/csvnoinclude.test b/hledger/test/errors/csvnoinclude.test
+index 1eca09bf6..eb04bb3c0 100644
+--- a/hledger/test/errors/csvnoinclude.test
++++ b/hledger/test/errors/csvnoinclude.test
+@@ -1,3 +1,4 @@
+ $$$ hledger check -f  csvnoinclude.j
+->>>2 /CSV files can't be included yet/
++>>>2 /Error: sorry, CSV files can't be included yet
++/
+ >>>= 1
+diff --git a/hledger/test/cli/a.timeclock b/hledger/test/journal/a.timeclock
+similarity index 100%
+rename from hledger/test/cli/a.timeclock
+rename to hledger/test/journal/a.timeclock
+diff --git a/hledger/test/cli/b.timedot b/hledger/test/journal/b.timedot
+similarity index 100%
+rename from hledger/test/cli/b.timedot
+rename to hledger/test/journal/b.timedot
+diff --git a/hledger/test/journal/include.test b/hledger/test/journal/include.test
+new file mode 100644
+index 000000000..134673164
+--- /dev/null
++++ b/hledger/test/journal/include.test
+@@ -0,0 +1,105 @@
++# * include directive
++
++# ** 1. nested includes in subdirectories
++$  mkdir -p b/c/d ; printf '2010/1/1\n (D)  1\n' >b/c/d/d.journal ; printf '2010/1/1\n (C)  1\ninclude d/d.journal\n' >b/c/c.journal ; printf '2010/1/1\n (B)  1\ninclude c/c.journal\n' >b/b.journal ; printf '2010/1/1\n (A)  1\ninclude b/b.journal\n' >a.journal ; hledger -f a.journal print; rm -rf a.journal bG
++2010-01-01
++    (A)               1
++
++2010-01-01
++    (B)               1
++
++2010-01-01
++    (C)               1
++
++2010-01-01
++    (D)               1
++
++>= 0
++
++# ** 2. Including other formats.
++<
++2016/1/1
++   (x)  1
++
++include a.timeclock
++include b.timedot
++$ hledger -f - print
++2016-01-01
++    (x)               1
++
++2016-01-01 * 12:00-16:00
++    (a:aa)           4.00h
++
++2016-01-01 *
++    (b.bb)            1.00
++
++>=
++
++# ** 3. include glob patterns
++<
++include *b.journal
++$  printf '2018/01/01\n (A)  1\n' >ab.journal; printf '2018/01/01\n  (B)  1' >bb.journal; hledger -f - print; rm -f ab.journal bb.journal
++2018-01-01
++    (A)               1
++
++2018-01-01
++    (B)               1
++
++>=
++
++# ** 4. include invalid glob patterns
++<
++include [.journal
++$ hledger -f - print
++>2 //
++>= 1
++
++# ** 5. include nonexistent file
++<
++include doesnotexist.journal
++$ hledger -f - print
++>2 //
++>= 1
++
++# ** 6. trailing whitespace after the filename is ignored
++<
++include a.timeclock  
++$ hledger -f - check
++
++# ** 7. a same-line or multi-line following comment is ignored
++<
++include a.timeclock  ; comment
++ ; comment
++ ; comment
++$ hledger -f - check
++
++# ** 8. include relative to home
++<
++include ~/included.journal
++$  printf '2018/01/01\n (A)  1\n' >included.journal; HOME="$PWD" hledger -f - print; rm -rf included.journal
++2018-01-01
++    (A)               1
++
++>= 0
++
++# The next tests require hard coded file names, so are not concurrent-safe.
++# They use different file names so a single concurrent shelltest invocation will be fine.
++
++# ** 9. test that order of include files is maintained
++$  printf 'include _b\n' >_a; touch _b; hledger -f _a stats -v | grep _ | sed -e 's%.*/%%'; rm -rf _a _b
++_a
++_b
++
++# ** 10. and with --auto code path
++$  printf 'include _d\n=\n' >_c; touch _d; hledger -f _c stats -v --auto | grep _ | sed -e 's%.*/%%'; rm -rf _c _d
++_c
++_d
++
++# ** 11. include using old !include directive
++<
++!include f.journal
++$  printf '2018/01/01\n (A)  1\n' >f.journal; hledger -f - print; rm -f f.journal
++2018-01-01
++    (A)               1
++
++>=
+diff --git a/hledger/test/journal/include/.cycle/cycle.j b/hledger/test/journal/include/.cycle/cycle.j
+deleted file mode 100644
+index 91b75d85d..000000000
+--- a/hledger/test/journal/include/.cycle/cycle.j
++++ /dev/null
+@@ -1 +0,0 @@
+-include cycle2/cycle2.j
+diff --git a/hledger/test/journal/include/.cycle/cycle2/cycle2.j b/hledger/test/journal/include/.cycle/cycle2/cycle2.j
+deleted file mode 100644
+index b22e22c1f..000000000
+--- a/hledger/test/journal/include/.cycle/cycle2/cycle2.j
++++ /dev/null
+@@ -1 +0,0 @@
+-include ../cycle.j
+diff --git a/hledger/test/journal/include/.cycle/cycleglob.j b/hledger/test/journal/include/.cycle/cycleglob.j
+deleted file mode 100644
+index bd09962f6..000000000
+--- a/hledger/test/journal/include/.cycle/cycleglob.j
++++ /dev/null
+@@ -1 +0,0 @@
+-include */*.j
+diff --git a/hledger/test/journal/include/.dota.j b/hledger/test/journal/include/.dota.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/a.j b/hledger/test/journal/include/a.j
+deleted file mode 100644
+index b8edfa9da..000000000
+--- a/hledger/test/journal/include/a.j
++++ /dev/null
+@@ -1,4 +0,0 @@
+-include a*.j
+-
+-2016-01-01
+-   (a)      1
+diff --git a/hledger/test/journal/include/a.timeclock b/hledger/test/journal/include/a.timeclock
+deleted file mode 100644
+index 394258589..000000000
+--- a/hledger/test/journal/include/a.timeclock
++++ /dev/null
+@@ -1,2 +0,0 @@
+-i 2016-01-01 12:00:00 a:aa
+-o 2016-01-01 16:00:00
+diff --git a/hledger/test/journal/include/a2.j b/hledger/test/journal/include/a2.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/b.timedot b/hledger/test/journal/include/b.timedot
+deleted file mode 100644
+index ccbea9760..000000000
+--- a/hledger/test/journal/include/b.timedot
++++ /dev/null
+@@ -1,3 +0,0 @@
+-2016/1/1
+-b.bb  ....
+-
+diff --git a/hledger/test/journal/include/b/.dotdir/dotdirb.j b/hledger/test/journal/include/b/.dotdir/dotdirb.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/b/b.j b/hledger/test/journal/include/b/b.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/b/bb/.dotdir/dotdirbb.j b/hledger/test/journal/include/b/bb/.dotdir/dotdirbb.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/b/bb/bb.j b/hledger/test/journal/include/b/bb/bb.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/c/c.j b/hledger/test/journal/include/c/c.j
+deleted file mode 100644
+index e69de29bb..000000000
+diff --git a/hledger/test/journal/include/include.test b/hledger/test/journal/include/include.test
+deleted file mode 100644
+index 70932b359..000000000
+--- a/hledger/test/journal/include/include.test
++++ /dev/null
+@@ -1,137 +0,0 @@
+-# * include directive
+-
+-# ** 1. journal, timeclock, and timedot files can be included.
+-# Trailing whitespace or comments are ignored.
+-# The order of includes is respected.
+-include a.j  
+-include b.timedot ; comment
+-include a.timeclock
+- ; comment
+-
+-$ hledger -f - print
+-2016-01-01
+-    (a)               1
+-
+-2016-01-01 *
+-    (b.bb)            1.00
+-
+-2016-01-01 * 12:00-16:00
+-    (a:aa)           4.00h
+-
+->=
+-
+-# ** 2. The old !include spelling still works.
+-<
+-!include f.journal
+-$  printf '2018/01/01\n (A)  1\n' >f.journal; hledger -f - print; rm -f f.journal
+-2018-01-01
+-    (A)               1
+-
+->=
+-
+-# ** 3. A leading tilde is expanded to $HOME.
+-<
+-include ~/included.journal
+-$  printf '2018/01/01\n (A)  1\n' >included.journal; HOME="$PWD" hledger -f - print; rm -rf included.journal
+-2018-01-01
+-    (A)               1
+-
+->= 0
+-
+-# ** 4. include with no argument -> argument error
+-<
+-include 
+-$ hledger -f- files
+->2 /include needs a.*argument/
+->=1
+-
+-# ** 5. include a nonexistent file -> no files matched error
+-<
+-include nosuchfile
+-$ hledger -f- files
+->2 /No files were matched/
+->=1
+-
+-# ** 6. Including a directory literally -> no files matched error
+-<
+-include b
+-$ hledger -f- files
+->2 /No files were matched/
+->=1
+-
+-# ** 7. Include invalid glob patterns -> invalid glob error
+-<
+-include [.journal
+-$ hledger -f - print
+->2 /Invalid glob/
+->= 1
+-
+-# ** 8. Three or more *'s -> invalid glob error
+-<
+-include ***
+-$ hledger -f- files
+->2 /Invalid glob/
+->=1
+-
+-# ** 9. Including the current file literally -> cycle error.
+-$ hledger -f self.j files
+->2 /cycle/
+->=1
+-
+-# ** 10. Including the current file via glob -> harmless, globs ignore current file.
+-$ hledger -f selfglob.j files | sed -E 's|.*hledger/test/journal/include/||'
+-selfglob.j
+-
+-# ** 11. Including a cycle, all literally -> cycle error
+-$ hledger -f .cycle/cycle.j files
+->2 /cycle/
+->=1
+-
+-# ** 12. Including a cycle, involving globs -> cycle error
+-$ hledger -f .cycle/cycleglob.j files
+->2 /cycle/
+->=1
+-
+-# ** 13. Glob patterns ignore the current file (once).
+-$ hledger -f a.j files | sed -E 's|.*hledger/test/journal/include/||'
+-a.j
+-a2.j
+-
+-# ** 14. Include */**/*.j -> all non-dot .j files in or below non-dot subdirectories.
+-<
+-include */**/*.j
+-$ hledger -f - files | sed -E 's|.*hledger/test/journal/include/||'
+--
+-b/b.j
+-b/bb/bb.j
+-c/c.j
+-
+-# ** 15. ** without a slash can also match filename start, equivalent to **/* -> same result as above.
+-<
+-include */**.j
+-$ hledger -f - files | sed -E 's|.*hledger/test/journal/include/||'
+--
+-b/b.j
+-b/bb/bb.j
+-c/c.j
+-
+-# ** 16. To avoid intermediate dot dirs in the above, we exclude all glob-matched paths involving dot dirs.
+-# So this does not find b/bb/.dotdir/dotdirbb.j, unfortunately:
+-<
+-include b/.dotdir/*.j
+-$ hledger -f - files | sed -E 's|.*hledger/test/journal/include/||'
+->2 /No files were matched/
+-# sed hides the non-zero exit code
+-
+-# ** 17. This workaround can be disabled with --old-glob, for now.
+-$ hledger -f - files --old-glob | sed -E 's|.*hledger/test/journal/include/||'
+--
+-b/.dotdir/dotdirb.j
+-
+-# ** 18. A literal path can always match dot files/dirs.
+-<
+-include b/.dotdir/dotdirb.j
+-$ hledger -f - files | sed -E 's|.*hledger/test/journal/include/||'
+--
+-b/.dotdir/dotdirb.j
+-
+diff --git a/hledger/test/journal/include/self.j b/hledger/test/journal/include/self.j
+deleted file mode 100644
+index 428713f5d..000000000
+--- a/hledger/test/journal/include/self.j
++++ /dev/null
+@@ -1 +0,0 @@
+-include self.j
+diff --git a/hledger/test/journal/include/selfglob.j b/hledger/test/journal/include/selfglob.j
+deleted file mode 100644
+index 0323e0b54..000000000
+--- a/hledger/test/journal/include/selfglob.j
++++ /dev/null
+@@ -1 +0,0 @@
+-include selfg*.j
+diff --git a/hledger/test/timeclock.test b/hledger/test/timeclock.test
+index ecf5a95c0..ec59b9f48 100644
+--- a/hledger/test/timeclock.test
++++ b/hledger/test/timeclock.test
+@@ -147,7 +147,7 @@ $ hledger -f timeclock:- print
+ 
+ >=
+ 
+-# ** 12. The --old-timeclock flag reverts to the old behavior.
++# ** 12. The --timeclock-old flag reverts to the old behavior.
+ <
+ i 2009/1/1 08:00:00
+ o 2009/1/1 09:00:00 stuff on checkout record  is ignored
+@@ -157,7 +157,7 @@ o 2009/1/2 09:00:00
+ i 2009/1/3 08:00:00 some:account name  and a description
+ o 2009/1/3 09:00:00
+ 
+-$ hledger --old-timeclock -f timeclock:- print
++$ hledger --timeclock-old -f timeclock:- print
+ >
+ 2009-01-01 * 08:00-09:00
+     ()           1.00h

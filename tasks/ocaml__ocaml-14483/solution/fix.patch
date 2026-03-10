@@ -1,0 +1,137 @@
+diff --git a/.depend b/.depend
+index 633e89ac1b..e33bc26082 100644
+--- a/.depend
++++ b/.depend
+@@ -7094,6 +7094,7 @@ driver/compmisc.cmo : \
+     utils/load_path.cmi \
+     typing/ident.cmi \
+     typing/env.cmi \
++    typing/ctype.cmi \
+     utils/config.cmi \
+     driver/compenv.cmi \
+     utils/clflags.cmi \
+@@ -7107,6 +7108,7 @@ driver/compmisc.cmx : \
+     utils/load_path.cmx \
+     typing/ident.cmx \
+     typing/env.cmx \
++    typing/ctype.cmx \
+     utils/config.cmx \
+     driver/compenv.cmx \
+     utils/clflags.cmx \
+diff --git a/Changes b/Changes
+index 31e2e7eb1f..11d617a246 100644
+--- a/Changes
++++ b/Changes
+@@ -271,6 +271,14 @@ Working version
+   (Jacques Garrigue and Takafumi Saikawa, reported by Olivier Nicole,
+    review by Gabriel Scherer)
+ 
++- #14483: Reset type ID and level counters between compilations to restore
++  reproducibility of debug information between `ocamlc -c foo.mli foo.ml` versus
++  `ocamlc -c foo.mli; ocamlc -c foo.ml`. Also hashcons the identifiers used for
++  persistent structures across resets of the type checker. In particular, that
++  means the initialisation of globals in Matching do not become observable in
++  the marshalled output.
++  (David Allsopp, review by Gabriel Scherer)
++
+ ### Other libraries:
+ 
+ - #13700, #14454: Use POSIX thread-safe getgrnam_r, getgrgid_r, getpwnam_r,
+diff --git a/driver/compmisc.ml b/driver/compmisc.ml
+index f2179c6ba2..9027b5ea98 100644
+--- a/driver/compmisc.ml
++++ b/driver/compmisc.ml
+@@ -69,6 +69,8 @@ let init_path ?(standard_library=Config.standard_library)
+ let initial_env () =
+   Ident.reinit();
+   Types.Uid.reinit();
++  Types.reset();
++  Ctype.reset();
+   let initially_opened_module =
+     if !Clflags.nopervasives then
+       None
+diff --git a/typing/ctype.ml b/typing/ctype.ml
+index d2811263b2..44ef818ca4 100644
+--- a/typing/ctype.ml
++++ b/typing/ctype.ml
+@@ -318,6 +318,13 @@ let increase_global_level () =
+ let restore_global_level gl =
+   global_level := gl
+ 
++(* Reset all level counters - used between compilation units *)
++let reset () =
++  current_level := 0;
++  nongen_level := 0;
++  global_level := 0;
++  saved_levels := []
++
+ (**** Some type creators ****)
+ 
+ (* Re-export generic type creators *)
+diff --git a/typing/ctype.mli b/typing/ctype.mli
+index d6112cd0ae..f5d9508ebf 100644
+--- a/typing/ctype.mli
++++ b/typing/ctype.mli
+@@ -95,6 +95,9 @@ val create_scope: unit -> int
+            the scope continues until the end of the compilation unit
+            or toplevel session. *)
+ 
++val reset: unit -> unit
++        (* Reset all level counters - used between compilation units *)
++
+ val newty: type_desc -> type_expr
+ val new_scoped_ty: int -> type_desc -> type_expr
+ val newvar: ?name:string -> unit -> type_expr
+diff --git a/typing/env.ml b/typing/env.ml
+index fd26bbb800..285b8388b7 100644
+--- a/typing/env.ml
++++ b/typing/env.ml
+@@ -904,11 +904,24 @@ let components_of_module ~alerts ~uid env ps path addr mty shape =
+     }
+   }
+ 
++(* Maintain the same physical name for .cmi names even across type-checker
++   resets. In particular, this means that lazy thunks (e.g. in Matching) do not
++   need to be reset as persistent names in identifiers in those lambda blocks
++   will be physically identical across type-checker resets.
++   See also tests in testsuite/tests/tool-ocamlc-determinism *)
++let hashcons_name =
++  let names = String.Tbl.create 1023 in
++  fun name ->
++    try String.Tbl.find names name
++    with Not_found ->
++      String.Tbl.add names name name;
++      name
++
+ let sign_of_cmi ~freshen { Persistent_env.Persistent_signature.cmi; _ } =
+   let name = cmi.cmi_name in
+   let sign = cmi.cmi_sign in
+   let flags = cmi.cmi_flags in
+-  let id = Ident.create_persistent name in
++  let id = Ident.create_persistent (hashcons_name name) in
+   let path = Pident id in
+   let alerts =
+     List.fold_left (fun acc -> function Alerts s -> s | _ -> acc)
+diff --git a/typing/types.ml b/typing/types.ml
+index ed2063f0d8..b3ea522a1b 100644
+--- a/typing/types.ml
++++ b/typing/types.ml
+@@ -754,6 +754,8 @@ let match_row_field ~present ~absent ~either (f : row_field) =
+ 
+ let new_id = Local_store.s_ref (-1)
+ 
++let reset () = new_id := -1
++
+ let create_expr = Transient_expr.create
+ 
+ let proto_newty3 ~level ~scope desc  =
+diff --git a/typing/types.mli b/typing/types.mli
+index 9b9e7d945a..00503796e2 100644
+--- a/typing/types.mli
++++ b/typing/types.mli
+@@ -769,3 +769,5 @@ val set_univar: type_expr option ref -> type_expr -> unit
+ val link_kind: inside:field_kind -> field_kind -> unit
+ val link_commu: inside:commutable -> commutable -> unit
+ val set_commu_ok: commutable -> unit
++
++val reset : unit -> unit

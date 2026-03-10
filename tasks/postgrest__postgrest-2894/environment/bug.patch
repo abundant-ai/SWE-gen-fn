@@ -1,0 +1,489 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e240728c..d763b67a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2856, Add the `--version` CLI option that prints the version information - @laurenceisla
+  - #1655, Improve `details` field of the singular error response - @taimoorzaeem
+  - #740, Add `Preference-Applied` in response for `Prefer: return=representation/headers-only/minimal` - @taimoorzaeem
+- - #1601, Add optional `nulls=stripped` parameter for mediatypes `application/vnd.pgrst.array+json` and `application/vnd.pgrst.object+json` - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 9017b1ca..8e279426 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -218,7 +218,6 @@ test-suite spec
+                       Feature.Query.RelatedQueriesSpec
+                       Feature.Query.RpcSpec
+                       Feature.Query.SingularSpec
+-                      Feature.Query.NullsStrip
+                       Feature.Query.SpreadQueriesSpec
+                       Feature.Query.UnicodeSpec
+                       Feature.Query.UpdateSpec
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 26724acf..87858688 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -366,14 +366,13 @@ producedMediaTypes conf action path =
+     ActionInvoke _  -> invokeMediaTypes
+     ActionInfo      -> defaultMediaTypes
+     ActionMutate _  -> defaultMediaTypes
+-    ActionInspect _ -> inspectMediaTypes
++    ActionInspect _ -> [MTOpenAPI, MTApplicationJSON, MTAny]
+   where
+-    inspectMediaTypes = [MTOpenAPI, MTApplicationJSON, MTArrayJSONStrip, MTAny]
+     invokeMediaTypes =
+       defaultMediaTypes
+         ++ rawMediaTypes
+         ++ [MTOpenAPI | pathIsRootSpec path]
+     defaultMediaTypes =
+-      [MTApplicationJSON, MTArrayJSONStrip, MTSingularJSON True, MTSingularJSON False, MTGeoJSON, MTTextCSV] ++
++      [MTApplicationJSON, MTSingularJSON, MTGeoJSON, MTTextCSV] ++
+       [MTPlan MTApplicationJSON PlanText mempty | configDbPlanEnabled conf] ++ [MTAny]
+     rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 1283725d..e6795d4a 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -478,7 +478,7 @@ instance PgrstError Error where
+   headers (JwtTokenInvalid m)    = [MediaType.toContentType MTApplicationJSON, invalidTokenHeader m]
+   headers JwtTokenRequired       = [MediaType.toContentType MTApplicationJSON, requiredTokenHeader]
+   headers (PgErr err)            = headers err
+-  headers SingularityError{}     = [MediaType.toContentType (MTSingularJSON False)]
++  headers SingularityError{}     = [MediaType.toContentType MTSingularJSON]
+   headers _                      = [MediaType.toContentType MTApplicationJSON]
+ 
+ instance JSON.ToJSON Error where
+diff --git a/src/PostgREST/MediaType.hs b/src/PostgREST/MediaType.hs
+index 17840938..7ae45664 100644
+--- a/src/PostgREST/MediaType.hs
++++ b/src/PostgREST/MediaType.hs
+@@ -19,8 +19,7 @@ import Protolude
+ -- | Enumeration of currently supported media types
+ data MediaType
+   = MTApplicationJSON
+-  | MTArrayJSONStrip
+-  | MTSingularJSON Bool
++  | MTSingularJSON
+   | MTGeoJSON
+   | MTTextCSV
+   | MTTextPlain
+@@ -34,20 +33,19 @@ data MediaType
+   | MTPlan MediaType MTPlanFormat [MTPlanOption]
+   deriving Show
+ instance Eq MediaType where
+-  MTApplicationJSON    == MTApplicationJSON = True
+-  MTArrayJSONStrip     == MTArrayJSONStrip  = True
+-  MTSingularJSON x     == MTSingularJSON y  = x == y
+-  MTGeoJSON            == MTGeoJSON         = True
+-  MTTextCSV            == MTTextCSV         = True
+-  MTTextPlain          == MTTextPlain       = True
+-  MTTextXML            == MTTextXML         = True
+-  MTOpenAPI            == MTOpenAPI         = True
+-  MTUrlEncoded         == MTUrlEncoded      = True
+-  MTOctetStream        == MTOctetStream     = True
+-  MTAny                == MTAny             = True
+-  MTOther x            == MTOther y         = x == y
+-  MTPlan{}             == MTPlan{}          = True
+-  _                    == _                 = False
++  MTApplicationJSON == MTApplicationJSON = True
++  MTSingularJSON    == MTSingularJSON    = True
++  MTGeoJSON         == MTGeoJSON         = True
++  MTTextCSV         == MTTextCSV         = True
++  MTTextPlain       == MTTextPlain       = True
++  MTTextXML         == MTTextXML         = True
++  MTOpenAPI         == MTOpenAPI         = True
++  MTUrlEncoded      == MTUrlEncoded      = True
++  MTOctetStream     == MTOctetStream     = True
++  MTAny             == MTAny             = True
++  MTOther x         == MTOther y         = x == y
++  MTPlan{}          == MTPlan{}          = True
++  _                 == _                 = False
+ 
+ data MTPlanOption
+   = PlanAnalyze | PlanVerbose | PlanSettings | PlanBuffers | PlanWAL
+@@ -68,20 +66,18 @@ toContentType ct = (hContentType, toMime ct <> charset)
+ 
+ -- | Convert from MediaType to a ByteString representing the mime type
+ toMime :: MediaType -> ByteString
+-toMime MTApplicationJSON      = "application/json"
+-toMime MTArrayJSONStrip       = "application/vnd.pgrst.array+json;nulls=stripped"
+-toMime MTGeoJSON              = "application/geo+json"
+-toMime MTTextCSV              = "text/csv"
+-toMime MTTextPlain            = "text/plain"
+-toMime MTTextXML              = "text/xml"
+-toMime MTOpenAPI              = "application/openapi+json"
+-toMime (MTSingularJSON True)  = "application/vnd.pgrst.object+json;nulls=stripped"
+-toMime (MTSingularJSON False) = "application/vnd.pgrst.object+json"
+-toMime MTUrlEncoded           = "application/x-www-form-urlencoded"
+-toMime MTOctetStream          = "application/octet-stream"
+-toMime MTAny                  = "*/*"
+-toMime (MTOther ct)           = ct
+-toMime (MTPlan mt fmt opts)   =
++toMime MTApplicationJSON = "application/json"
++toMime MTGeoJSON         = "application/geo+json"
++toMime MTTextCSV         = "text/csv"
++toMime MTTextPlain       = "text/plain"
++toMime MTTextXML         = "text/xml"
++toMime MTOpenAPI         = "application/openapi+json"
++toMime MTSingularJSON    = "application/vnd.pgrst.object+json"
++toMime MTUrlEncoded      = "application/x-www-form-urlencoded"
++toMime MTOctetStream     = "application/octet-stream"
++toMime MTAny             = "*/*"
++toMime (MTOther ct)      = ct
++toMime (MTPlan mt fmt opts) =
+   "application/vnd.pgrst.plan+" <> toMimePlanFormat fmt <>
+   ("; for=\"" <> toMime mt <> "\"") <>
+   (if null opts then mempty else "; options=" <> BS.intercalate "|" (toMimePlanOption <$> opts))
+@@ -110,46 +106,26 @@ toMimePlanFormat PlanText = "text"
+ --
+ -- >>> decodeMediaType "application/vnd.pgrst.plan+json;for=\"text/csv\""
+ -- MTPlan MTTextCSV PlanJSON []
+---
+--- >>> decodeMediaType "application/vnd.pgrst.array+json;nulls=stripped"
+--- MTArrayJSONStrip
+---
+--- >>> decodeMediaType "application/vnd.pgrst.array+json"
+--- MTApplicationJSON
+---
+--- >>> decodeMediaType "application/vnd.pgrst.object+json;nulls=stripped"
+--- MTSingularJSON True
+---
+--- >>> decodeMediaType "application/vnd.pgrst.object+json"
+--- MTSingularJSON False
+-
+ decodeMediaType :: BS.ByteString -> MediaType
+ decodeMediaType mt =
+   case BS.split (BS.c2w ';') mt of
+-    "application/json":_                     -> MTApplicationJSON
+-    "application/geo+json":_                 -> MTGeoJSON
+-    "text/csv":_                             -> MTTextCSV
+-    "text/plain":_                           -> MTTextPlain
+-    "text/xml":_                             -> MTTextXML
+-    "application/openapi+json":_             -> MTOpenAPI
+-    "application/x-www-form-urlencoded":_    -> MTUrlEncoded
+-    "application/octet-stream":_             -> MTOctetStream
+-    "application/vnd.pgrst.plan":rest        -> getPlan PlanText rest
+-    "application/vnd.pgrst.plan+text":rest   -> getPlan PlanText rest
+-    "application/vnd.pgrst.plan+json":rest   -> getPlan PlanJSON rest
+-    "application/vnd.pgrst.object+json":rest -> checkSingularNullStrip rest
+-    "application/vnd.pgrst.object":rest      -> checkSingularNullStrip rest
+-    "application/vnd.pgrst.array+json":rest  -> checkArrayNullStrip rest
+-    "*/*":_                                  -> MTAny
+-    other:_                                  -> MTOther other
+-    _                                        -> MTAny
++    "application/json":_                   -> MTApplicationJSON
++    "application/geo+json":_               -> MTGeoJSON
++    "text/csv":_                           -> MTTextCSV
++    "text/plain":_                         -> MTTextPlain
++    "text/xml":_                           -> MTTextXML
++    "application/openapi+json":_           -> MTOpenAPI
++    "application/vnd.pgrst.object+json":_  -> MTSingularJSON
++    "application/vnd.pgrst.object":_       -> MTSingularJSON
++    "application/x-www-form-urlencoded":_  -> MTUrlEncoded
++    "application/octet-stream":_           -> MTOctetStream
++    "application/vnd.pgrst.plan":rest      -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+text":rest -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+json":rest -> getPlan PlanJSON rest
++    "*/*":_                                -> MTAny
++    other:_                                -> MTOther other
++    _                                      -> MTAny
+   where
+-    checkArrayNullStrip ["nulls=stripped"] = MTArrayJSONStrip
+-    checkArrayNullStrip  _                 = MTApplicationJSON
+-
+-    checkSingularNullStrip ["nulls=stripped"] = MTSingularJSON True
+-    checkSingularNullStrip  _                 = MTSingularJSON False
+-
+     getPlan fmt rest =
+       let
+         opts         = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 49289112..4c805ef9 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -847,8 +847,7 @@ mediaToAggregate mt binField apiReq@ApiRequest{iAction=act, iPreferences=Prefere
+   if noAgg then NoAgg
+   else case mt of
+     MTApplicationJSON     -> BuiltinAggJson
+-    MTSingularJSON strip  -> BuiltinAggSingleJson strip
+-    MTArrayJSONStrip      -> BuiltinAggArrayJsonStrip
++    MTSingularJSON        -> BuiltinAggSingleJson
+     MTGeoJSON             -> BuiltinAggGeoJson
+     MTTextCSV             -> BuiltinAggCsv
+     MTAny                 -> BuiltinAggJson
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 7623c0a0..af77ce9b 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -206,7 +206,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan, mrResAgg} apiReq@ApiRequest{
+ failNotSingular :: MediaType -> ResultSet -> DbHandler ()
+ failNotSingular _ RSPlan{} = pure ()
+ failNotSingular mediaType RSStandard{rsQueryTotal=queryTotal} =
+-  when (elem mediaType [MTSingularJSON True,MTSingularJSON False]  && queryTotal /= 1) $ do
++  when (mediaType == MTSingularJSON && queryTotal /= 1) $ do
+     lift SQL.condemn
+     throwError $ Error.singularityError queryTotal
+ 
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 21e31236..ad2b859a 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -186,29 +186,24 @@ asCsvF = asCsvHeaderF <> " || '\n' || " <> asCsvBodyF
+       ")"
+     asCsvBodyF = "coalesce(string_agg(substring(_postgrest_t::text, 2, length(_postgrest_t::text) - 2), '\n'), '')"
+ 
+-addNullsToSnip :: Bool -> SQL.Snippet -> SQL.Snippet
+-addNullsToSnip strip snip =
+-  if strip then "json_strip_nulls(" <> snip <> ")" else  snip
+-
+-asJsonSingleF :: Maybe Routine -> Bool -> SQL.Snippet
+-asJsonSingleF rout strip
+-  | returnsScalar = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t.pgrst_scalar)->0"  <> ", 'null')"
+-  | otherwise     = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t)->0"  <> ", 'null')"
++asJsonSingleF :: Maybe Routine -> SQL.Snippet
++asJsonSingleF rout
++  | returnsScalar = "coalesce(json_agg(_postgrest_t.pgrst_scalar)->0, 'null')"
++  | otherwise     = "coalesce(json_agg(_postgrest_t)->0, 'null')"
+   where
+     returnsScalar = maybe False funcReturnsScalar rout
+ 
+-asJsonF :: Maybe Routine -> Bool -> SQL.Snippet
+-asJsonF rout strip
+-  | returnsSingleComposite    = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t)->0" <> ", 'null')"
+-  | returnsScalar             = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t.pgrst_scalar)->0" <> ", 'null')"
+-  | returnsSetOfScalar        = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t.pgrst_scalar)" <> ", '[]')"
+-  | otherwise                 = "coalesce(" <> addNullsToSnip strip "json_agg(_postgrest_t)" <> ", '[]')"
++asJsonF :: Maybe Routine -> SQL.Snippet
++asJsonF rout
++  | returnsSingleComposite              = "coalesce(json_agg(_postgrest_t)->0, 'null')"
++  | returnsScalar                       = "coalesce(json_agg(_postgrest_t.pgrst_scalar)->0, 'null')"
++  | returnsSetOfScalar                  = "coalesce(json_agg(_postgrest_t.pgrst_scalar), '[]')"
++  | otherwise                           = "coalesce(json_agg(_postgrest_t), '[]')"
+   where
+     (returnsSingleComposite, returnsScalar, returnsSetOfScalar) = case rout of
+       Just r  -> (funcReturnsSingleComposite r, funcReturnsScalar r, funcReturnsSetOfScalar r)
+       Nothing -> (False, False, False)
+ 
+-
+ asXmlF :: Maybe FieldName -> SQL.Snippet
+ asXmlF (Just fieldName) = "coalesce(xmlagg(_postgrest_t." <> pgFmtIdent fieldName <> "), '')"
+ -- TODO unreachable because a previous step(binaryField) will validate that there's a field. This will be cleared once custom media types are implemented.
+@@ -498,11 +493,10 @@ setConfigLocalJson prefix keyVals = [setConfigLocal mempty (prefix, gucJsonVal k
+ 
+ aggF :: Maybe Routine -> ResultAggregate -> SQL.Snippet
+ aggF rout = \case
+-  BuiltinAggJson             -> asJsonF rout False
+-  BuiltinAggArrayJsonStrip   -> asJsonF rout True
+-  BuiltinAggSingleJson strip -> asJsonSingleF rout strip
+-  BuiltinAggGeoJson          -> asGeoJsonF
+-  BuiltinAggCsv              -> asCsvF
+-  BuiltinAggXml    bField    -> asXmlF    bField
+-  BuiltinAggBinary bField    -> asBinaryF bField
+-  NoAgg                      -> "''::text"
++  BuiltinAggJson          -> asJsonF rout
++  BuiltinAggSingleJson    -> asJsonSingleF rout
++  BuiltinAggGeoJson       -> asGeoJsonF
++  BuiltinAggCsv           -> asCsvF
++  BuiltinAggXml    bField -> asXmlF    bField
++  BuiltinAggBinary bField -> asBinaryF bField
++  NoAgg                   -> "''::text"
+diff --git a/src/PostgREST/Response/OpenAPI.hs b/src/PostgREST/Response/OpenAPI.hs
+index fc137a06..8e957e0d 100644
+--- a/src/PostgREST/Response/OpenAPI.hs
++++ b/src/PostgREST/Response/OpenAPI.hs
+@@ -350,7 +350,7 @@ makeProcPathItem pd = ("/rpc/" ++ toS (pdName pd), pe)
+       & summary .~ pSum
+       & description .~ mfilter (/="") pDesc
+       & tags .~ Set.fromList ["(rpc) " <> pdName pd]
+-      & produces ?~ makeMimeList [MTApplicationJSON, MTSingularJSON True, MTSingularJSON False]
++      & produces ?~ makeMimeList [MTApplicationJSON, MTSingularJSON]
+       & at 200 ?~ "OK"
+     getOp = procOp
+       & parameters .~ makeProcGetParams (pdParams pd)
+@@ -406,8 +406,8 @@ postgrestSpec (prettyVersion, docsVersion) rels pds ti (s, h, p, b) sd allowSecu
+   & definitions .~ fromList (makeTableDef rels <$> ti)
+   & parameters .~ fromList (makeParamDefs ti)
+   & paths .~ makePathItems pds ti
+-  & produces .~ makeMimeList [MTApplicationJSON, MTSingularJSON True, MTSingularJSON False, MTTextCSV]
+-  & consumes .~ makeMimeList [MTApplicationJSON, MTSingularJSON True, MTSingularJSON False, MTTextCSV]
++  & produces .~ makeMimeList [MTApplicationJSON, MTSingularJSON, MTTextCSV]
++  & consumes .~ makeMimeList [MTApplicationJSON, MTSingularJSON, MTTextCSV]
+   & securityDefinitions .~ makeSecurityDefinitions securityDefName allowSecurityDef
+   & security .~ [SecurityRequirement (fromList [(securityDefName, [])]) | allowSecurityDef]
+     where
+diff --git a/src/PostgREST/SchemaCache/Routine.hs b/src/PostgREST/SchemaCache/Routine.hs
+index d4e68133..0fed645c 100644
+--- a/src/PostgREST/SchemaCache/Routine.hs
++++ b/src/PostgREST/SchemaCache/Routine.hs
+@@ -90,8 +90,7 @@ type RoutineMap = HM.HashMap QualifiedIdentifier [Routine]
+ 
+ data ResultAggregate
+    = BuiltinAggJson
+-   | BuiltinAggSingleJson Bool
+-   | BuiltinAggArrayJsonStrip
++   | BuiltinAggSingleJson
+    | BuiltinAggGeoJson
+    | BuiltinAggCsv
+    | BuiltinAggXml    (Maybe FieldName)
+diff --git a/test/spec/Feature/Query/NullsStrip.hs b/test/spec/Feature/Query/NullsStrip.hs
+deleted file mode 100644
+index ef31b145..00000000
+--- a/test/spec/Feature/Query/NullsStrip.hs
++++ /dev/null
+@@ -1,116 +0,0 @@
+-module Feature.Query.NullsStrip where
+-
+-import Network.Wai (Application)
+-
+-import Network.HTTP.Types
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "Stripping null values from JSON response" $ do
+-    let arrayStrip = ("Accept", "application/vnd.pgrst.array+json;nulls=stripped")
+-    let singularStrip = ("Accept", "application/vnd.pgrst.object+json;nulls=stripped")
+-
+-    context "strip nulls from response" $ do
+-      it "strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped" $ do
+-        request methodGet  "/organizations?select=*"
+-          [arrayStrip]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"id":1,"name":"Referee Org","manager_id":1},{"id":2,"name":"Auditor Org","manager_id":2},{"id":3,"name":"Acme","referee":1,"auditor":2,"manager_id":3},{"id":4,"name":"Umbrella","referee":1,"auditor":2,"manager_id":4},{"id":5,"name":"Cyberdyne","referee":3,"auditor":4,"manager_id":5},{"id":6,"name":"Oscorp","referee":3,"auditor":4,"manager_id":6}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-        request methodPost  "/organizations?select=*"
+-          [arrayStrip,("Prefer","return=representation")]
+-          [json|{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}|]
+-          `shouldRespondWith`
+-          [json|[{"id":7,"name":"John","manager_id":6}]|]
+-          { matchStatus  = 201
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-        request methodPatch  "/organizations?id=eq.3&select=*"
+-          [arrayStrip, ("Prefer","return=representation")]
+-          [json|{"name":"John","referee":null}|]
+-          `shouldRespondWith`
+-          [json|[{"id":3,"name":"John","auditor":2,"manager_id":3}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-      it "strips nulls when Accept: application/vnd.pgrst.object+json;nulls=stripped" $
+-        request methodGet  "/organizations?limit=1"
+-          [singularStrip]
+-          ""
+-          `shouldRespondWith`
+-          [json|{"id":1,"name":"Referee Org","manager_id":1}|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTSingularStrip]
+-          }
+-
+-      it "throws error when Accept: application/vnd.pgrst.object+json;nulls=stripped and result not singular" $
+-        request methodGet  "/organizations?select=*"
+-          [singularStrip]
+-          ""
+-          `shouldRespondWith`
+-          [json|{"details":"The result contains 6 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+-          { matchStatus  = 406
+-          , matchHeaders = [matchContentTypeSingular]
+-          }
+-
+-    context "strip nulls from response even if explicitly selected" $ do
+-      it "strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped" $ do
+-        request methodGet  "/organizations?select=id,referee,auditor"
+-          [arrayStrip]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"id":1},{"id":2},{"id":3,"referee":1,"auditor":2},{"id":4,"referee":1,"auditor":2},{"id":5,"referee":3,"auditor":4},{"id":6,"referee":3,"auditor":4}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-        request methodPost  "/organizations?select=id,referee,auditor"
+-          [arrayStrip,("Prefer","return=representation")]
+-          [json|{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}|]
+-          `shouldRespondWith`
+-          [json|[{"id":7}]|]
+-          { matchStatus  = 201
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-        request methodPatch  "/organizations?id=eq.3&select=id,name,referee,auditor"
+-          [arrayStrip, ("Prefer","return=representation")]
+-          [json|{"name":"John","referee":null}|]
+-          `shouldRespondWith`
+-          [json|[{"id":3,"name":"John","auditor":2}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTArrayStrip]
+-          }
+-
+-      it "strips nulls when Accept: application/vnd.pgrst.object+json;nulls=stripped" $
+-        request methodGet  "/organizations?select=id,referee,auditor&limit=1"
+-          [singularStrip]
+-          ""
+-          `shouldRespondWith`
+-          [json|{"id":1}|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchCTSingularStrip]
+-          }
+-
+-    context "doesn't strip nulls" $ do
+-      it "doesn't strips nulls when Accept: application/vnd.pgrst.array+json" $
+-        request methodGet  "/organizations?select=id,referee,auditor"
+-          [("Accept", "application/vnd.pgrst.array+json")]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"id":1,"referee":null,"auditor":null},{"id":2,"referee":null,"auditor":null},{"id":3,"referee":1,"auditor":2},{"id":4,"referee":1,"auditor":2},{"id":5,"referee":3,"auditor":4},{"id":6,"referee":3,"auditor":4}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index c6e1c12c..c99c1e80 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -45,7 +45,6 @@ import qualified Feature.Query.HtmlRawOutputSpec
+ import qualified Feature.Query.InsertSpec
+ import qualified Feature.Query.JsonOperatorSpec
+ import qualified Feature.Query.MultipleSchemaSpec
+-import qualified Feature.Query.NullsStrip
+ import qualified Feature.Query.PgSafeUpdateSpec
+ import qualified Feature.Query.PlanSpec
+ import qualified Feature.Query.PostGISSpec
+@@ -140,7 +139,6 @@ main = do
+         , ("Feature.Query.RawOutputTypesSpec"            , Feature.Query.RawOutputTypesSpec.spec)
+         , ("Feature.Query.RpcSpec"                       , Feature.Query.RpcSpec.spec actualPgVersion)
+         , ("Feature.Query.SingularSpec"                  , Feature.Query.SingularSpec.spec)
+-        , ("Feature.Query.NullsStrip"                    , Feature.Query.NullsStrip.spec)
+         , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec actualPgVersion)
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index cc96ad5a..c5b1a383 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -40,12 +40,6 @@ matchContentTypeJson = "Content-Type" <:> "application/json; charset=utf-8"
+ matchContentTypeSingular :: MatchHeader
+ matchContentTypeSingular = "Content-Type" <:> "application/vnd.pgrst.object+json; charset=utf-8"
+ 
+-matchCTArrayStrip :: MatchHeader
+-matchCTArrayStrip = "Content-Type" <:> "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
+-
+-matchCTSingularStrip :: MatchHeader
+-matchCTSingularStrip = "Content-Type" <:> "application/vnd.pgrst.object+json;nulls=stripped; charset=utf-8"
+-
+ matchHeaderAbsent :: HeaderName -> MatchHeader
+ matchHeaderAbsent name = MatchHeader $ \headers _body ->
+   case lookup name headers of

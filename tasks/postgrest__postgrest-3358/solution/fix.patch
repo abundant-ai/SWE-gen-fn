@@ -1,0 +1,170 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3896bac8..3336ae49 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #2887, Add Preference `max-affected` to limit affected resources - @taimoorzaeem
+  - #3171, Add an ability to dump config via admin API - @skywriter
+- - #3061, Apply all function settings as transaction-scoped settings - @taimoorzaeem
+  - #3171, #3046, Log schema cache stats to stderr - @steve-chavez
+  - #3210, Dump schema cache through admin API - @taimoorzaeem
+  - #2676, Performance improvement on bulk json inserts, around 10% increase on requests per second by removing `json_typeof` from write queries - @steve-chavez
+@@ -23,6 +22,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Shows the correct JSON format in the `hints` field
+  - #3340, Log when the LISTEN channel gets a notification - @steve-chavez
+  - #3184, Log full pg version to stderr on connection - @steve-chavez
++ - #3242. Add config `db-hoisted-tx-settings` to apply only hoisted function settings - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index d903b443..2740e705 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -298,6 +298,21 @@ db-extra-search-path
+ 
+   Multiple schemas can be added in a comma-separated string, e.g. ``public, extensions``.
+ 
++.. _db-hoisted-tx-settings:
++
++db-hoisted-tx-settings
++----------------------
++
++  =============== ==================================================================================
++  **Type**        String
++  **Default**     statement_timeout, plan_filter.statement_cost_limit, default_transaction_isolation
++  **Reloadable**  Y
++  **Environment** PGRST_DB_HOISTED_TX_SETTINGS
++  **In-Database** pgrst.db_hoisted_tx_settings
++  =============== ==================================================================================
++
++  Hoisted settings are allowed to be applied as transaction-scoped function settings. Multiple settings can be added in a comma-separated string, e.g. ``work_mem, statement_timeout``.
++
+ .. _db-max-rows:
+ 
+ db-max-rows
+diff --git a/docs/references/transactions.rst b/docs/references/transactions.rst
+index a6922eb0..6bef2b74 100644
+--- a/docs/references/transactions.rst
++++ b/docs/references/transactions.rst
+@@ -303,7 +303,7 @@ When calling the above function (see :ref:`functions`), the statement timeout wi
+ 
+ .. note::
+ 
+-   Currently, only ``statement_timeout`` is applied for functions.
++   Only the transactions that are hoisted by config :ref:`db-hoisted-tx-settings` will be applied.
+ 
+ .. _main_query:
+ 
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index ef2a7813..4a885c7f 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -74,6 +74,7 @@ data AppConfig = AppConfig
+   , configDbChannel                :: Text
+   , configDbChannelEnabled         :: Bool
+   , configDbExtraSearchPath        :: [Text]
++  , configDbHoistedTxSettings      :: [Text]
+   , configDbMaxRows                :: Maybe Integer
+   , configDbPlanEnabled            :: Bool
+   , configDbPoolSize               :: Int
+@@ -146,6 +147,7 @@ toText conf =
+       ,("db-channel",                q . configDbChannel)
+       ,("db-channel-enabled",            T.toLower . show . configDbChannelEnabled)
+       ,("db-extra-search-path",      q . T.intercalate "," . configDbExtraSearchPath)
++      ,("db-hoisted-tx-settings",    q . T.intercalate "," . configDbHoistedTxSettings)
+       ,("db-max-rows",                   maybe "\"\"" show . configDbMaxRows)
+       ,("db-plan-enabled",               T.toLower . show . configDbPlanEnabled)
+       ,("db-pool",                       show . configDbPoolSize)
+@@ -241,6 +243,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe "pgrst" <$> optString "db-channel")
+     <*> (fromMaybe True <$> optBool "db-channel-enabled")
+     <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
++    <*> (maybe defaultHoistedAllowList splitOnCommas <$> optValue "db-hoisted-tx-settings")
+     <*> optWithAlias (optInt "db-max-rows")
+                      (optInt "max-rows")
+     <*> (fromMaybe False <$> optBool "db-plan-enabled")
+@@ -418,6 +421,8 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     splitOnCommas (C.String s) = T.strip <$> T.splitOn "," s
+     splitOnCommas _            = []
+ 
++    defaultHoistedAllowList = ["statement_timeout","plan_filter.statement_cost_limit","default_transaction_isolation"]
++
+ -- | Read the JWT secret from a file if configJwtSecret is actually a
+ -- filepath(has @ as its prefix). To check if the JWT secret is provided is
+ -- in fact a file path, it must be decoded as 'Text' to be processed.
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index e7310c99..44776084 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -56,6 +56,7 @@ dbSettingsNames =
+   ,"db_root_spec"
+   ,"db_schemas"
+   ,"db_tx_end"
++  ,"db_hoisted_tx_settings"
+   ,"jwt_aud"
+   ,"jwt_role_claim_key"
+   ,"jwt_secret"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 7332f7b4..ab6ddf8c 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -181,7 +181,7 @@ actionQuery (MaybeDb plan@InspectPlan{ipSchema=tSchema}) AppConfig{..} _ pgVer s
+       tableAccess <- SQL.statement [tSchema] (SchemaCache.accessibleTables pgVer configDbPreparedStatements)
+       MaybeDbResult plan . Just <$> ((,,)
+             (HM.filterWithKey (\qi _ -> S.member qi tableAccess) $ SchemaCache.dbTables sCache)
+-        <$> SQL.statement tSchema (SchemaCache.accessibleFuncs pgVer configDbPreparedStatements)
++        <$> SQL.statement (tSchema, configDbHoistedTxSettings) (SchemaCache.accessibleFuncs pgVer configDbPreparedStatements)
+         <*> SQL.statement tSchema (SchemaCache.schemaDescription configDbPreparedStatements))
+     OAIgnorePriv ->
+       MaybeDbResult plan . Just <$> ((,,)
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 3811a7b8..b6dca5ba 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -150,7 +150,7 @@ querySchemaCache AppConfig{..} = do
+   tabs    <- SQL.statement schemas $ allTables pgVer prepared
+   keyDeps <- SQL.statement (schemas, configDbExtraSearchPath) $ allViewsKeyDependencies prepared
+   m2oRels <- SQL.statement mempty $ allM2OandO2ORels pgVer prepared
+-  funcs   <- SQL.statement schemas $ allFunctions pgVer prepared
++  funcs   <- SQL.statement (schemas, configDbHoistedTxSettings) $ allFunctions pgVer prepared
+   cRels   <- SQL.statement mempty $ allComputedRels prepared
+   reps    <- SQL.statement schemas $ dataRepresentations prepared
+   mHdlers <- SQL.statement schemas $ mediaHandlers pgVer prepared
+@@ -363,13 +363,13 @@ dataRepresentations = SQL.Statement sql (arrayParam HE.text) decodeRepresentatio
+        OR (dst_t.typtype = 'd' AND c.castsource IN ('json'::regtype::oid , 'text'::regtype::oid)))
+     |]
+ 
+-allFunctions :: PgVersion -> Bool -> SQL.Statement [Schema] RoutineMap
+-allFunctions pgVer = SQL.Statement sql (arrayParam HE.text) decodeFuncs
++allFunctions :: PgVersion -> Bool -> SQL.Statement ([Schema], [Text]) RoutineMap
++allFunctions pgVer = SQL.Statement sql (contrazip2 (arrayParam HE.text) (arrayParam HE.text)) decodeFuncs
+   where
+     sql = funcsSqlQuery pgVer <> " AND pn.nspname = ANY($1)"
+ 
+-accessibleFuncs :: PgVersion -> Bool -> SQL.Statement Schema RoutineMap
+-accessibleFuncs pgVer = SQL.Statement sql (param HE.text) decodeFuncs
++accessibleFuncs :: PgVersion -> Bool -> SQL.Statement (Schema, [Text]) RoutineMap
++accessibleFuncs pgVer = SQL.Statement sql (contrazip2 (param HE.text) (arrayParam HE.text)) decodeFuncs
+   where
+     sql = funcsSqlQuery pgVer <> " AND pn.nspname = $1 AND has_function_privilege(p.oid, 'execute')"
+ 
+@@ -451,7 +451,7 @@ funcsSqlQuery pgVer = [q|
+   JOIN pg_namespace tn ON tn.oid = t.typnamespace
+   LEFT JOIN pg_class comp ON comp.oid = t.typrelid
+   LEFT JOIN pg_description as d ON d.objoid = p.oid
+-  LEFT JOIN LATERAL unnest(proconfig) iso_config ON iso_config like 'default_transaction_isolation%'
++  LEFT JOIN LATERAL unnest(proconfig) iso_config ON iso_config LIKE 'default_transaction_isolation%'
+   LEFT JOIN LATERAL (
+     SELECT
+       array_agg(row(
+@@ -459,7 +459,7 @@ funcsSqlQuery pgVer = [q|
+         substr(setting, strpos(setting, '=') + 1)
+       )) as kvs
+     FROM unnest(proconfig) setting
+-    WHERE setting not LIKE 'default_transaction_isolation%'
++    WHERE setting ~ ANY($2)
+   ) func_settings ON TRUE
+   WHERE t.oid <> 'trigger'::regtype AND COALESCE(a.callable, true)
+ |] <> (if pgVer >= pgVersion110 then "AND prokind = 'f'" else "AND NOT (proisagg OR proiswindow)")

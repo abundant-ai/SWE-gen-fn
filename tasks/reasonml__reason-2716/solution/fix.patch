@@ -1,0 +1,272 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 5b061cb0..69a3b6b0 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -2,6 +2,7 @@
+ 
+ - Add `\u{hex-escape}` syntax (@anmonteiro,
+   [#2738](https://github.com/reasonml/reason/pull/2738))
++- Support local open and let bindings (@SanderSpies) [#2716](https://github.com/reasonml/reason/pull/2716)
+ 
+ ## 3.11.0
+ 
+diff --git a/src/reason-parser/reason_attributes.ml b/src/reason-parser/reason_attributes.ml
+index c944eb84..12da0bcd 100644
+--- a/src/reason-parser/reason_attributes.ml
++++ b/src/reason-parser/reason_attributes.ml
+@@ -41,6 +41,9 @@ let rec partitionAttributes ?(partDoc=false) ?(allowUncurry=true) attrs : attrib
+   | ({ attr_name = {txt="reason.preserve_braces"}; _} as attr) :: atTl ->
+     let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
+     {partition with stylisticAttrs=attr::partition.stylisticAttrs}
++  | ({ attr_name = {txt="reason.openSyntaxNotation"}; _} as attr) :: atTl ->
++    let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
++    {partition with stylisticAttrs=attr::partition.stylisticAttrs}
+   | atHd :: atTl ->
+     let partition = partitionAttributes ~partDoc ~allowUncurry atTl in
+     {partition with stdAttrs=atHd::partition.stdAttrs}
+@@ -88,3 +91,9 @@ let maybe_remove_stylistic_attrs attrs should_preserve =
+       | { attr_name = {txt="reason.raw_literal"}; _} -> true
+       | _ -> false)
+       attrs
++
++let is_open_notation_attr { attr_name = {txt}; _} =
++  txt = "reason.openSyntaxNotation"
++
++let has_open_notation_attr stylisticAttrs =
++  List.exists is_open_notation_attr stylisticAttrs
+diff --git a/src/reason-parser/reason_parser.mly b/src/reason-parser/reason_parser.mly
+index 1af8d5bd..053127a3 100644
+--- a/src/reason-parser/reason_parser.mly
++++ b/src/reason-parser/reason_parser.mly
+@@ -2481,7 +2481,7 @@ class_type_declaration_details:
+  *)
+ braced_expr:
+ mark_position_exp
+-  ( LBRACE seq_expr RBRACE
++  ( LBRACE seq_expr(SEMI?) RBRACE
+     { add_brace_attr $2 }
+   | LBRACE DOTDOTDOT expr_optional_constraint COMMA? RBRACE
+     { let loc = mklocation $symbolstartpos $endpos in
+@@ -2503,28 +2503,28 @@ mark_position_exp
+     { mkexp (Pexp_object $2) }
+ ) {$1};
+ 
+-seq_expr_no_seq [@recover.expr default_expr ()]:
+-| expr SEMI? { $1 }
+-| opt_LET_MODULE_ident module_binding_body SEMI seq_expr
++seq_expr_no_seq [@recover.expr default_expr ()] (semi):
++| expr semi { $1 }
++| opt_LET_MODULE_ident module_binding_body SEMI seq_expr(SEMI?)
+   { mkexp (Pexp_letmodule($1, $2, $4)) }
+-| item_attributes LET? OPEN override_flag as_loc(mod_longident) SEMI seq_expr
++| item_attributes LET? OPEN override_flag as_loc(mod_longident) SEMI seq_expr(SEMI?)
+   { let loc = (mklocation $startpos($1) $endpos($4)) in
+     let me = Ast_helper.Mod.ident ~loc $5 in
+     let od = Ast_helper.Opn.mk ~override:$4 ~loc me in
+     let exp = mkexp (Pexp_open(od, $7)) in
+     { exp with pexp_attributes = $1 }
+   }
+-| str_exception_declaration SEMI seq_expr {
++| str_exception_declaration SEMI seq_expr(SEMI?) {
+    mkexp (Pexp_letexception ($1, $3)) }
+-| let_bindings SEMI seq_expr
++| let_bindings SEMI seq_expr(SEMI?)
+   { let loc = mklocation $startpos($1) $endpos($3) in
+     expr_of_let_bindings ~loc $1 $3
+   }
+-| let_bindings SEMI?
++| let_bindings semi
+   { let loc = mklocation $symbolstartpos $endpos in
+     expr_of_let_bindings ~loc $1 (ghunit ~loc ())
+   }
+-| as_loc(LETOP) letop_bindings SEMI seq_expr
++| as_loc(LETOP) letop_bindings SEMI seq_expr(SEMI?)
+   { let (pbop_pat, pbop_exp, rev_ands) = $2 in
+     let ands = List.rev rev_ands in
+     let pbop_loc = mklocation $symbolstartpos $endpos($2) in
+@@ -2532,15 +2532,15 @@ seq_expr_no_seq [@recover.expr default_expr ()]:
+     mkexp ~loc:pbop_loc (Pexp_letop { let_; ands; body = $4}) }
+ ;
+ 
+-seq_expr:
++seq_expr(semi):
+ mark_position_exp
+-  ( seq_expr_no_seq
++  ( seq_expr_no_seq(semi)
+     { $1 }
+-  | item_extension_sugar mark_position_exp(seq_expr_no_seq)
++  | item_extension_sugar mark_position_exp(seq_expr_no_seq(SEMI?))
+     { expression_extension $1 $2 }
+-  | expr SEMI seq_expr
++  | expr SEMI seq_expr(SEMI?)
+     { mkexp (Pexp_sequence($1, $3)) }
+-  | item_extension_sugar expr SEMI seq_expr
++  | item_extension_sugar expr SEMI seq_expr(SEMI?)
+     { let loc = mklocation $startpos($1) $endpos($2) in
+       mkexp (Pexp_sequence(expression_extension ~loc $1 $2, $4)) }
+   ) { $1 }
+@@ -2874,10 +2874,10 @@ mark_position_exp
+   | FUN optional_expr_extension match_cases(expr) %prec below_BAR
+     { $2 (mkexp (Pexp_function $3)) }
+   | SWITCH optional_expr_extension simple_expr_no_constructor
+-    LBRACE match_cases(seq_expr) RBRACE
++    LBRACE match_cases(seq_expr(SEMI?)) RBRACE
+     { $2 (mkexp (Pexp_match ($3, $5))) }
+   | TRY optional_expr_extension simple_expr_no_constructor
+-    LBRACE match_cases(seq_expr) RBRACE
++    LBRACE match_cases(seq_expr(SEMI?)) RBRACE
+     { $2 (mkexp (Pexp_try ($3, $5))) }
+   | IF optional_expr_extension parenthesized_expr
+        simple_expr ioption(preceded(ELSE,expr))
+@@ -3007,6 +3007,10 @@ parenthesized_expr:
+ %inline bigarray_access:
+   DOT LBRACE lseparated_nonempty_list(COMMA, expr) COMMA? RBRACE { $3 }
+ 
++expr_list_or_seq_expr:
++  | expr_list { $1 }
++  | seq_expr(SEMI) { [$1] };
++
+ (* The grammar of simple exprs changes slightly according to context:
+  * - in most cases, calls (like f(x)) are allowed
+  * - in some contexts, calls are forbidden
+@@ -3033,8 +3037,15 @@ parenthesized_expr:
+     { may_tuple $startpos $endpos $2 }
+   | E as_loc(POSTFIXOP)
+     { mkexp(Pexp_apply(mkoperator $2, [Nolabel, $1])) }
+-  | od=open_dot_declaration DOT LPAREN expr_list RPAREN
+-    { mkexp(Pexp_open(od, may_tuple $startpos($3) $endpos($5) $4)) }
++  | od=open_dot_declaration DOT LPAREN expr_list_or_seq_expr RPAREN
++    {
++      let loc = mklocation $symbolstartpos $endpos in
++      let openSyntaxNotationAttribute = {
++        Ppxlib.Parsetree.attr_name = mkloc "reason.openSyntaxNotation" loc;
++        attr_payload = PStr [];
++        attr_loc = Location.none
++      } in
++      mkexp ~attrs:[openSyntaxNotationAttribute] (Pexp_open(od, may_tuple $startpos($3) $endpos($5) $4)) }
+   | E DOT as_loc(label_longident)
+     { mkexp(Pexp_field($1, $3)) }
+   | od=open_dot_declaration DOT LBRACE RBRACE
+@@ -3119,11 +3130,6 @@ parenthesized_expr:
+       mkinfixop $1 (mkoperator op) $3 }
+   | E as_loc(MINUSGREATER) simple_expr_no_call
+     { mkinfixop $1 (mkoperator {$2 with txt = "|."}) $3 }
+-  | od=open_dot_declaration DOT LPAREN MODULE module_expr COLON package_type RPAREN
+-    { let loc = mklocation $symbolstartpos $endpos in
+-      mkexp (Pexp_open(od,
+-        mkexp ~loc (Pexp_constraint (mkexp ~ghost:true ~loc (Pexp_pack $5), $7))))
+-    }
+   | extension
+     { mkexp (Pexp_extension $1) }
+ ;
+diff --git a/src/reason-parser/reason_pprint_ast.ml b/src/reason-parser/reason_pprint_ast.ml
+index ba092976..e3ea38f5 100644
+--- a/src/reason-parser/reason_pprint_ast.ml
++++ b/src/reason-parser/reason_pprint_ast.ml
+@@ -4342,7 +4342,7 @@ let printer = object(self:'self)
+       | None -> raise (Invalid_argument "No match for unparsing expression")
+     )
+ 
+-  method formatNonSequencyExpression e =
++  method formatNonSequencyExpression ?parent e =
+     (*
+      * Instead of printing:
+      *   let result =  { open Fmt; strf(foo);}
+@@ -4364,7 +4364,18 @@ let printer = object(self:'self)
+      * E.g., avoid M.(M2.v) being printed as M.M2.v
+      * Or ReasonReact.(<> {string("Test")} </>);
+      *)
+-    | _ -> makeList ~wrap:("(",")") ~break:IfNeed [self#unparseExpr e]
++    | _ -> (
++      match parent with
++      | Some parent when has_open_notation_attr parent.pexp_attributes ->
++        makeList
++          ~break:IfNeed
++          ~inline:(true, false)
++          ~postSpace:true
++          ~wrap:("(",")")
++          ~sep:(SepFinal (";", ""))
++          (self#letList e)
++      | Some _ | None -> makeList ~wrap:("(",")") ~break:IfNeed [self#unparseExpr e]
++    )
+ 
+   (*
+      It's not enough to only check if precedence of an infix left/right is
+@@ -5508,7 +5519,7 @@ let printer = object(self:'self)
+      * list containing the location indicating start/end of the "let-item" and
+      * its layout. *)
+     let rec processLetList acc expr =
+-      let {stdAttrs; arityAttrs; jsxAttrs} =
++      let {stdAttrs; arityAttrs; jsxAttrs; stylisticAttrs} =
+         partitionAttributes ~allowUncurry:false expr.pexp_attributes
+       in
+       match (stdAttrs, expr.pexp_desc) with
+@@ -5534,26 +5545,35 @@ let printer = object(self:'self)
+             (* Add this when check to make sure these are handled as regular "simple expressions" *)
+             when not (self#isSeriesOfOpensFollowedByNonSequencyExpression {expr with pexp_attributes = []}) ->
+           let overrideStr = match me.popen_override with | Override -> "!" | Fresh -> "" in
+-          let openLayout = label ~space:true
+-            (atom ("open" ^ overrideStr))
+-            (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
+-          in
+-          let attrsOnOpen =
+-            makeList ~inline:(true, true) ~postSpace:true ~break:Always
+-            ((self#attributes attrs)@[openLayout])
+-          in
+-          (* Just like the bindings, have to synthesize a location since the
+-           * Pexp location is parsed (potentially) beginning with the open
+-           * brace {} in the let sequence. *)
+-          let layout = source_map ~loc:me.popen_loc attrsOnOpen in
+-          let loc = {
+-            me.popen_loc with
+-            loc_start = {
+-              me.popen_loc.loc_start with
+-              pos_lnum = expr.pexp_loc.loc_start.pos_lnum
+-            }
+-          } in
+-          processLetList ((loc, layout)::acc) e
++          if (has_open_notation_attr stylisticAttrs) then (
++            (Location.none, label
++              (label
++                (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
++                (atom (".")))
++              (makeLetSequence ~wrap:("(", ")") (self#letList e))) :: acc
++          )
++          else (
++            let openLayout = label ~space:true
++              (atom ("open" ^ overrideStr))
++              (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
++            in
++            let attrsOnOpen =
++              makeList ~inline:(true, true) ~postSpace:true ~break:Always
++              ((self#attributes attrs)@[openLayout])
++            in
++            (* Just like the bindings, have to synthesize a location since the
++            * Pexp location is parsed (potentially) beginning with the open
++            * brace {} in the let sequence. *)
++            let layout = source_map ~loc:me.popen_loc attrsOnOpen in
++            let loc = {
++              me.popen_loc with
++              loc_start = {
++                me.popen_loc.loc_start with
++                pos_lnum = expr.pexp_loc.loc_start.pos_lnum
++              }
++            } in
++            processLetList ((loc, layout)::acc) e
++          )
+         | ([], Pexp_letmodule (s, me, e)) ->
+             let prefixText = "module" in
+             let bindingName = atom ~loc:s.loc (moduleIdent s) in
+@@ -6448,9 +6468,9 @@ let printer = object(self:'self)
+                   (label
+                     (self#moduleExpressionToFormattedApplicationItems me.popen_expr)
+                     (atom (".")))
+-                  (self#formatNonSequencyExpression e))
+-          else
+-            Some (makeLetSequence (self#letList x))
++                  (self#formatNonSequencyExpression ~parent:x e))
++            else
++              Some  (makeLetSequence (self#letList e))
+         | Pexp_send (e, s) ->
+           let needparens = match e.pexp_desc with
+             | Pexp_apply (ee, _) ->

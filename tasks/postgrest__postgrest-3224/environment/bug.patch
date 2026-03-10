@@ -1,0 +1,564 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 45b26f07..c1637d3f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,8 +17,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3149, Misleading "Starting PostgREST.." logs on schema cache reloading - @steve-chavez
+  - #2815, Build static executable with GSSAPI support - @wolfgangwalther
+  - #3205, Fix wrong subquery error returning a status of 400 Bad Request - @steve-chavez
+- - #3224, Return status code 406 for non-accepted media type instead of code 415 - @wolfgangwalther
+- - #3160, Fix using select= query parameter for custom media type handlers - @wolfgangwalther
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 2a7b5cb7..e1fb40e1 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -65,7 +65,7 @@ instance PgrstError ApiRequestError where
+   status AggregatesNotAllowed{}      = HTTP.status400
+   status AmbiguousRelBetween{}       = HTTP.status300
+   status AmbiguousRpc{}              = HTTP.status300
+-  status MediaTypeError{}            = HTTP.status406
++  status MediaTypeError{}            = HTTP.status415
+   status InvalidBody{}               = HTTP.status400
+   status InvalidFilters              = HTTP.status405
+   status InvalidPreferences{}        = HTTP.status400
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 564a6fe5..b948c88b 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -97,6 +97,7 @@ data WrappedReadPlan = WrappedReadPlan {
+ , wrTxMode   :: SQL.Mode
+ , wrHandler  :: MediaHandler
+ , wrMedia    :: MediaType
++, wrIdent    :: QualifiedIdentifier
+ }
+ 
+ data MutateReadPlan = MutateReadPlan {
+@@ -105,6 +106,7 @@ data MutateReadPlan = MutateReadPlan {
+ , mrTxMode     :: SQL.Mode
+ , mrHandler    :: MediaHandler
+ , mrMedia      :: MediaType
++, mrIdent      :: QualifiedIdentifier
+ }
+ 
+ data CallReadPlan = CallReadPlan {
+@@ -114,6 +116,7 @@ data CallReadPlan = CallReadPlan {
+ , crProc     :: Routine
+ , crHandler  :: MediaHandler
+ , crMedia    :: MediaType
++, crIdent    :: QualifiedIdentifier
+ }
+ 
+ data InspectPlan = InspectPlan {
+@@ -124,17 +127,17 @@ data InspectPlan = InspectPlan {
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Either Error WrappedReadPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  (hdler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  return $ WrappedReadPlan rPlan SQL.Read handler mediaType
++  return $ WrappedReadPlan rPlan SQL.Read hdler mediaType identifier
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error MutateReadPlan
+ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+   mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+-  return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType
++  (hdler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache)
++  return $ MutateReadPlan rPlan mPlan SQL.Write hdler mediaType identifier
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} invMethod = do
+@@ -158,16 +161,12 @@ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferenc
+           (InvPost, Routine.Immutable) -> SQL.Read
+           (InvPost, Routine.Volatile)  -> SQL.Write
+       cPlan = callPlan proc apiRequest paramKeys args rPlan
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest relIdentifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  (hdler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest relIdentifier iAcceptMediaType (dbMediaHandlers sCache)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  return $ CallReadPlan rPlan cPlan txMode proc handler mediaType
++  return $ CallReadPlan rPlan cPlan txMode proc hdler mediaType relIdentifier
+   where
+     qsParams' = QueryParams.qsParams iQueryParams
+ 
+-hasDefaultSelect :: ReadPlanTree -> Bool
+-hasDefaultSelect (Node ReadPlan{select=[CoercibleSelectField{csField=CoercibleField{cfName}}]} []) = cfName == "*"
+-hasDefaultSelect _ = False
+-
+ inspectPlan :: ApiRequest -> Either Error InspectPlan
+ inspectPlan apiRequest = do
+   let producedMTs = [MTOpenAPI, MTApplicationJSON, MTAny]
+@@ -994,8 +993,8 @@ addFilterToLogicForest :: CoercibleFilter -> [CoercibleLogicTree] -> [CoercibleL
+ addFilterToLogicForest flt lf = CoercibleStmnt flt : lf
+ 
+ -- | Do content negotiation. i.e. choose a media type based on the intersection of accepted/produced media types.
+-negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] -> MediaHandlerMap -> Bool -> Either ApiRequestError ResolvedHandler
+-negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRepresentation=rep}} identifier accepts produces defaultSelect =
++negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] -> MediaHandlerMap -> Either ApiRequestError ResolvedHandler
++negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRepresentation=rep}} identifier accepts produces =
+   case (act, firstAcceptedPick) of
+     (_, Nothing)                         -> Left . MediaTypeError $ map MediaType.toMime accepts
+     (ActionMutate _, Just (x, mt))       -> Right (if rep == Just Full then x else NoAgg, mt)
+@@ -1018,9 +1017,6 @@ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRep
+       x                                           -> lookupHandler x
+     mtPlanToNothing x = if configDbPlanEnabled conf then x else Nothing -- don't find anything if the plan media type is not allowed
+     lookupHandler mt =
+-      when' defaultSelect (HM.lookup (RelId identifier, MTAny) produces) <|> -- lookup for identifier and `*/*`
+-      when' defaultSelect (HM.lookup (RelId identifier, mt) produces) <|>    -- lookup for identifier and a particular media type
+-      HM.lookup (RelAnyElement, mt) produces                                    -- lookup for anyelement and a particular media type
+-    when' :: Bool -> Maybe a -> Maybe a
+-    when' True (Just a) = Just a
+-    when' _ _           = Nothing
++      HM.lookup (RelId identifier, MTAny) produces <|> -- lookup for identifier and `*/*`
++      HM.lookup (RelId identifier, mt) produces <|>    -- lookup for identifier and a particular media type
++      HM.lookup (RelAnyElement, mt) produces           -- lookup for anyelement and a particular media type
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 46b9711b..ceb0d971 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -70,6 +70,7 @@ readQuery WrappedReadPlan{..} conf@AppConfig{..} apiReq@ApiRequest{iPreferences=
+   resultSet <-
+      lift . SQL.statement mempty $
+       Statements.prepareRead
++        wrIdent
+         (QueryBuilder.readPlanToQuery wrReadPlan)
+         (if preferCount == Just EstimatedCount then
+            -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+@@ -156,6 +157,7 @@ invokeQuery rout CallReadPlan{..} apiReq@ApiRequest{iPreferences=Preferences{..}
+   resultSet <-
+     lift . SQL.statement mempty $
+       Statements.prepareCall
++        crIdent
+         rout
+         (QueryBuilder.callPlanToQuery crCallPlan pgVer)
+         (QueryBuilder.readPlanToQuery crReadPlan)
+@@ -194,6 +196,7 @@ writeQuery MutateReadPlan{..} ApiRequest{iPreferences=Preferences{..}} conf =
+   in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
++      mrIdent
+       (QueryBuilder.readPlanToQuery mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index cdf28558..03f6177b 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -85,8 +85,7 @@ import PostgREST.Plan.Types              (CoercibleField (..),
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeLimit, rangeOffset)
+ import PostgREST.SchemaCache.Identifiers (FieldName,
+-                                          QualifiedIdentifier (..),
+-                                          RelIdentifier (..))
++                                          QualifiedIdentifier (..))
+ import PostgREST.SchemaCache.Routine     (MediaHandler (..),
+                                           Routine (..),
+                                           funcReturnsScalar,
+@@ -222,11 +221,10 @@ asJsonF rout strip
+ asGeoJsonF ::  SQL.Snippet
+ asGeoJsonF = "json_build_object('type', 'FeatureCollection', 'features', coalesce(json_agg(ST_AsGeoJSON(_postgrest_t)::json), '[]'))"
+ 
+-customFuncF :: Maybe Routine -> QualifiedIdentifier -> RelIdentifier -> SQL.Snippet
+-customFuncF rout funcQi _
++customFuncF :: Maybe Routine -> QualifiedIdentifier -> QualifiedIdentifier -> SQL.Snippet
++customFuncF rout funcQi target
+   | (funcReturnsScalar <$> rout) == Just True = fromQi funcQi <> "(_postgrest_t.pgrst_scalar)"
+-customFuncF _ funcQi RelAnyElement            = fromQi funcQi <> "(_postgrest_t)"
+-customFuncF _ funcQi (RelId target)           = fromQi funcQi <> "(_postgrest_t::" <> fromQi target <> ")"
++  | otherwise                                 = fromQi funcQi <> "(_postgrest_t::" <> fromQi target <> ")"
+ 
+ locationF :: [Text] -> SQL.Snippet
+ locationF pKeys = [qc|(
+@@ -561,12 +559,12 @@ setConfigWithConstantNameJSON prefix keyVals = [setConfigWithConstantName (prefi
+     arrayByteStringToText :: [(ByteString, ByteString)] -> [(Text,Text)]
+     arrayByteStringToText keyVal = (T.decodeUtf8 *** T.decodeUtf8) <$> keyVal
+ 
+-handlerF :: Maybe Routine -> MediaHandler -> SQL.Snippet
+-handlerF rout = \case
++handlerF :: Maybe Routine -> QualifiedIdentifier -> MediaHandler -> SQL.Snippet
++handlerF rout target = \case
+   BuiltinAggArrayJsonStrip   -> asJsonF rout True
+   BuiltinAggSingleJson strip -> asJsonSingleF rout strip
+   BuiltinOvAggJson           -> asJsonF rout False
+   BuiltinOvAggGeoJson        -> asGeoJsonF
+   BuiltinOvAggCsv            -> asCsvF
+-  CustomFunc funcQi target   -> customFuncF rout funcQi target
++  CustomFunc funcQi          -> customFuncF rout funcQi target
+   NoAgg                      -> "''::text"
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index e298347e..77947d04 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -25,11 +25,12 @@ import qualified Hasql.Statement                   as SQL
+ import Control.Lens ((^?))
+ 
+ import PostgREST.ApiRequest.Preferences
+-import PostgREST.MediaType              (MTVndPlanFormat (..),
+-                                         MediaType (..))
++import PostgREST.MediaType               (MTVndPlanFormat (..),
++                                          MediaType (..))
+ import PostgREST.Query.SqlFragment
+-import PostgREST.SchemaCache.Routine    (MediaHandler (..), Routine,
+-                                         funcReturnsSingle)
++import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier)
++import PostgREST.SchemaCache.Routine     (MediaHandler (..), Routine,
++                                          funcReturnsSingle)
+ 
+ import Protolude
+ 
+@@ -55,9 +56,9 @@ data ResultSet
+   | RSPlan BS.ByteString -- ^ the plan of the query
+ 
+ 
+-prepareWrite :: SQL.Snippet -> SQL.Snippet -> Bool -> Bool -> MediaType -> MediaHandler ->
++prepareWrite :: QualifiedIdentifier -> SQL.Snippet -> SQL.Snippet -> Bool -> Bool -> MediaType -> MediaHandler ->
+                 Maybe PreferRepresentation -> Maybe PreferResolution -> [Text] -> Bool -> SQL.Statement () ResultSet
+-prepareWrite selectQuery mutateQuery isInsert isPut mt handler rep resolution pKeys =
++prepareWrite qi selectQuery mutateQuery isInsert isPut mt handler rep resolution pKeys =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+  where
+   checkUpsert snip = if isInsert && (isPut || resolution == Just MergeDuplicates) then snip else "''"
+@@ -68,7 +69,7 @@ prepareWrite selectQuery mutateQuery isInsert isPut mt handler rep resolution pK
+       "'' AS total_result_set, " <>
+       "pg_catalog.count(_postgrest_t) AS page_total, " <>
+       locF <> " AS header, " <>
+-      handlerF Nothing handler <> " AS body, " <>
++      handlerF Nothing qi handler <> " AS body, " <>
+       responseHeadersF <> " AS response_headers, " <>
+       responseStatusF  <> " AS response_status, " <>
+       pgrstInsertedF <> " AS response_inserted " <>
+@@ -93,8 +94,8 @@ prepareWrite selectQuery mutateQuery isInsert isPut mt handler rep resolution pK
+     MTVndPlan{} -> planRow
+     _           -> fromMaybe (RSStandard Nothing 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow False)
+ 
+-prepareRead :: SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> MediaHandler -> Bool -> SQL.Statement () ResultSet
+-prepareRead selectQuery countQuery countTotal mt handler =
++prepareRead :: QualifiedIdentifier -> SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> MediaHandler -> Bool -> SQL.Statement () ResultSet
++prepareRead qi selectQuery countQuery countTotal mt handler =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+  where
+   snippet =
+@@ -103,7 +104,7 @@ prepareRead selectQuery countQuery countTotal mt handler =
+     "SELECT " <>
+       countResultF <> " AS total_result_set, " <>
+       "pg_catalog.count(_postgrest_t) AS page_total, " <>
+-      handlerF Nothing handler <> " AS body, " <>
++      handlerF Nothing qi handler <> " AS body, " <>
+       responseHeadersF <> " AS response_headers, " <>
+       responseStatusF <> " AS response_status, " <>
+       "''" <> " AS response_inserted " <>
+@@ -116,10 +117,10 @@ prepareRead selectQuery countQuery countTotal mt handler =
+     MTVndPlan{} -> planRow
+     _           -> HD.singleRow $ standardRow True
+ 
+-prepareCall :: Routine -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
++prepareCall :: QualifiedIdentifier -> Routine -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
+                MediaType -> MediaHandler -> Bool ->
+                SQL.Statement () ResultSet
+-prepareCall rout callProcQuery selectQuery countQuery countTotal mt handler =
++prepareCall qi rout callProcQuery selectQuery countQuery countTotal mt handler =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+   where
+     snippet =
+@@ -130,7 +131,7 @@ prepareCall rout callProcQuery selectQuery countQuery countTotal mt handler =
+         (if funcReturnsSingle rout
+           then "1"
+           else "pg_catalog.count(_postgrest_t)") <> " AS page_total, " <>
+-        handlerF (Just rout) handler <> " AS body, " <>
++        handlerF (Just rout) qi handler <> " AS body, " <>
+         responseHeadersF <> " AS response_headers, " <>
+         responseStatusF <> " AS response_status, " <>
+         "''" <> " AS response_inserted " <>
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index b3fa8650..34a8d60f 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -1207,9 +1207,7 @@ mediaHandlers pgVer =
+ 
+ decodeMediaHandlers :: HD.Result MediaHandlerMap
+ decodeMediaHandlers =
+-  HM.fromList . fmap (\(x, y, z, w) ->
+-    let rel = if isAnyElement y then RelAnyElement else RelId y
+-    in ((rel, z), (CustomFunc x rel, w)) ) <$> HD.rowList caggRow
++  HM.fromList . fmap (\(x, y, z, w) -> ((if isAnyElement y then RelAnyElement else RelId y, z), (CustomFunc x, w)) ) <$> HD.rowList caggRow
+   where
+     caggRow = (,,,)
+               <$> (QualifiedIdentifier <$> column HD.text <*> column HD.text)
+diff --git a/src/PostgREST/SchemaCache/Identifiers.hs b/src/PostgREST/SchemaCache/Identifiers.hs
+index 2cc01f2e..80993540 100644
+--- a/src/PostgREST/SchemaCache/Identifiers.hs
++++ b/src/PostgREST/SchemaCache/Identifiers.hs
+@@ -20,7 +20,7 @@ import qualified Data.Text  as T
+ import Protolude
+ 
+ data RelIdentifier = RelId QualifiedIdentifier | RelAnyElement
+-  deriving (Eq, Ord, Generic, JSON.ToJSON, JSON.ToJSONKey, Show)
++  deriving (Eq, Ord, Generic, JSON.ToJSON, JSON.ToJSONKey)
+ instance Hashable RelIdentifier
+ 
+ -- | Represents a pg identifier with a prepended schema name "schema.table".
+diff --git a/src/PostgREST/SchemaCache/Routine.hs b/src/PostgREST/SchemaCache/Routine.hs
+index 446d8462..c01cb482 100644
+--- a/src/PostgREST/SchemaCache/Routine.hs
++++ b/src/PostgREST/SchemaCache/Routine.hs
+@@ -108,7 +108,7 @@ data MediaHandler
+    | BuiltinOvAggGeoJson
+    | BuiltinOvAggCsv
+    -- custom
+-   | CustomFunc QualifiedIdentifier RelIdentifier
++   | CustomFunc QualifiedIdentifier
+    | NoAgg
+    deriving (Eq, Show)
+ 
+diff --git a/test/spec/Feature/OpenApi/OpenApiSpec.hs b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+index eae5fef3..e5b2e72b 100644
+--- a/test/spec/Feature/OpenApi/OpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+@@ -30,15 +30,15 @@ spec actualPgVersion = describe "OpenAPI" $ do
+         , matchHeaders = ["Content-Type" <:> "application/openapi+json; charset=utf-8"]
+         }
+ 
+-  it "should respond to openapi request on none root path with 406" $
++  it "should respond to openapi request on none root path with 415" $
+     request methodGet "/items"
+             (acceptHdrs "application/openapi+json") ""
+-      `shouldRespondWith` 406
++      `shouldRespondWith` 415
+ 
+-  it "should respond to openapi request with unsupported media type with 406" $
++  it "should respond to openapi request with unsupported media type with 415" $
+     request methodGet "/"
+             (acceptHdrs "text/csv") ""
+-      `shouldRespondWith` 406
++      `shouldRespondWith` 415
+ 
+   it "includes postgrest.org current version api docs" $ do
+     r <- simpleBody <$> get "/"
+diff --git a/test/spec/Feature/Query/CustomMediaSpec.hs b/test/spec/Feature/Query/CustomMediaSpec.hs
+index 1b177386..c5c17860 100644
+--- a/test/spec/Feature/Query/CustomMediaSpec.hs
++++ b/test/spec/Feature/Query/CustomMediaSpec.hs
+@@ -31,7 +31,7 @@ spec = describe "custom media types" $ do
+       request methodGet "/lines" (acceptHdrs "text/plain") ""
+         `shouldRespondWith`
+         [json| {"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: text/plain"} |]
+-        { matchStatus  = 406
++        { matchStatus  = 415
+         , matchHeaders = [matchContentTypeJson]
+         }
+ 
+@@ -115,7 +115,7 @@ spec = describe "custom media types" $ do
+         [json|
+           {"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: text/xml"}
+         |]
+-        { matchStatus = 406
++        { matchStatus = 415
+         , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+         }
+ 
+@@ -140,7 +140,7 @@ spec = describe "custom media types" $ do
+           ""
+         `shouldRespondWith`
+           [json|{"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: text/plain"}|]
+-          { matchStatus = 406
++          { matchStatus = 415
+           , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+           }
+ 
+@@ -156,7 +156,7 @@ spec = describe "custom media types" $ do
+           (acceptHdrs "application/octet-stream") ""
+         `shouldRespondWith`
+           [json| {"code":"PGRST107","details":null,"hint":null,"message":"None of these media types are available: application/octet-stream"} |]
+-          { matchStatus = 406 }
++          { matchStatus = 415 }
+ 
+     -- TODO SOH (start of heading) is being added to results
+     it "works if there's an anyelement aggregate defined" $ do
+@@ -230,76 +230,6 @@ spec = describe "custom media types" $ do
+         simpleHeaders r `shouldContain` [("Content-Type", "text/csv; charset=utf-8")]
+         simpleHeaders r `shouldContain` [("Content-Disposition", "attachment; filename=\"lines.csv\"")]
+ 
+-  -- https://github.com/PostgREST/postgrest/issues/3160
+-  context "using select query parameter" $ do
+-    it "without select" $ do
+-      request methodGet "/projects?id=in.(1,2)" (acceptHdrs "pg/outfunc") ""
+-        `shouldRespondWith`
+-        [str|(1,"Windows 7",1)
+-            |(2,"Windows 10",1)
+-            |]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+-        }
+-
+-    it "with fewer columns selected" $ do
+-      request methodGet "/projects?id=in.(1,2)&select=id,name" (acceptHdrs "pg/outfunc") ""
+-        `shouldRespondWith`
+-        [str|(1,"Windows 7")
+-            |(2,"Windows 10")
+-            |]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+-        }
+-
+-    it "with columns in different order" $ do
+-      request methodGet "/projects?id=in.(1,2)&select=name,id,client_id" (acceptHdrs "pg/outfunc") ""
+-        `shouldRespondWith`
+-        [str|("Windows 7",1,1)
+-            |("Windows 10",2,1)
+-            |]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+-        }
+-
+-    it "with computed columns" $ do
+-      request methodGet "/items?id=in.(1,2)&select=id,always_true" (acceptHdrs "pg/outfunc") ""
+-        `shouldRespondWith`
+-        [str|(1,t)
+-            |(2,t)
+-            |]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+-        }
+-
+-    -- TODO: Embeddings should not return JSON. Arrays of record would be much better.
+-    it "with embedding" $ do
+-      request methodGet "/projects?id=in.(1,2)&select=*,clients(id)" (acceptHdrs "pg/outfunc") ""
+-        `shouldRespondWith`
+-        [str|(1,"Windows 7",1,"{""id"": 1}")
+-            |(2,"Windows 10",1,"{""id"": 1}")
+-            |]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "pg/outfunc"]
+-        }
+-
+-    it "will fail for specific aggregate with fewer columns" $ do
+-      request methodGet "/lines?select=id" (acceptHdrs "application/vnd.twkb") ""
+-        `shouldRespondWith` 406
+-
+-    it "will fail for specific aggregate with more columns" $ do
+-      request methodGet "/lines?select=id,name,geom,id" (acceptHdrs "application/vnd.twkb") ""
+-        `shouldRespondWith` 406
+-
+-    it "will fail for specific aggregate with columns in different order" $ do
+-      request methodGet "/lines?select=name,id,geom" (acceptHdrs "application/vnd.twkb") ""
+-        `shouldRespondWith` 406
+-
+-    -- This is just because it would be hard to detect this case, so we better error in this case, too.
+-    it "will fail for specific aggregate with columns in same order" $ do
+-      request methodGet "/lines?select=id,name,geom" (acceptHdrs "application/vnd.twkb") ""
+-        `shouldRespondWith` 406
+-
+   context "any media type" $ do
+     context "on functions" $ do
+       it "returns application/json for */* if not explicitly set" $ do
+@@ -349,7 +279,7 @@ spec = describe "custom media types" $ do
+           }
+ 
+         request methodGet "/rpc/ret_some_mt" (acceptHdrs "text/csv") ""
+-          `shouldRespondWith` 406
++          `shouldRespondWith` 415
+ 
+     context "on tables" $ do
+       it "returns application/json for */* if not explicitly set" $ do
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index de63dcce..704fe877 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -463,12 +463,12 @@ disabledSpec =
+   it "doesn't work if db-plan-enabled=false(the default)" $ do
+     request methodGet "/projects?id=in.(1,2,3)"
+          (acceptHdrs "application/vnd.pgrst.plan") ""
+-      `shouldRespondWith` 406
++      `shouldRespondWith` 415
+ 
+     request methodGet "/rpc/getallprojects?id=in.(1,2,3)"
+       (acceptHdrs "application/vnd.pgrst.plan") ""
+-      `shouldRespondWith` 406
++      `shouldRespondWith` 415
+ 
+     request methodDelete "/projects?id=in.(1,2,3)"
+            (acceptHdrs "application/vnd.pgrst.plan") ""
+-      `shouldRespondWith` 406
++      `shouldRespondWith` 415
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index e1ce20aa..073cb482 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -939,12 +939,12 @@ spec actualPgVersion = do
+         }
+ 
+   describe "Accept headers" $ do
+-    it "should respond an unknown accept type with 406" $
++    it "should respond an unknown accept type with 415" $
+       request methodGet "/simple_pk"
+               (acceptHdrs "text/unknowntype") ""
+         `shouldRespondWith`
+         [json|{"message":"None of these media types are available: text/unknowntype","code":"PGRST107","details":null,"hint":null}|]
+-        { matchStatus  = 406
++        { matchStatus  = 415
+         , matchHeaders = [matchContentTypeJson]
+         }
+ 
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 4887e8fa..fc146157 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -656,10 +656,10 @@ spec actualPgVersion =
+       it "rejects unknown content type even if payload is good" $ do
+         request methodPost "/rpc/sayhello"
+           (acceptHdrs "audio/mpeg3") [json| { "name": "world" } |]
+-            `shouldRespondWith` 406
++            `shouldRespondWith` 415
+         request methodGet "/rpc/sayhello?name=world"
+           (acceptHdrs "audio/mpeg3") ""
+-            `shouldRespondWith` 406
++            `shouldRespondWith` 415
+       it "rejects malformed json payload" $ do
+         p <- request methodPost "/rpc/sayhello"
+           (acceptHdrs "application/json") "sdfsdf"
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index be677e5f..d086c614 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3550,8 +3550,8 @@ returns "application/vnd.geo2+json" as $$
+   select (jsonb_build_object('type', 'FeatureCollection', 'hello', 'world'))::"application/vnd.geo2+json";
+ $$ language sql;
+ 
+-drop aggregate if exists test.geo2json_agg_any(anyelement);
+-create aggregate test.geo2json_agg_any(anyelement) (
++drop aggregate if exists test.geo2json_agg(anyelement);
++create aggregate test.geo2json_agg(anyelement) (
+   initcond = '[]'
+ , stype = "application/vnd.geo2+json"
+ , sfunc = geo2json_trans
+@@ -3714,7 +3714,7 @@ begin
+       perform set_config('response.headers', json_build_array(json_build_object('Content-Type', 'app/groucho'))::text, true);
+       resp := 'groucho';
+     else
+-      raise sqlstate 'PT406' using message = 'Not Acceptable';
++      raise sqlstate 'PT415' using message = 'Unsupported Media Type';
+   end case;
+   return resp;
+ end; $$ language plpgsql;
+@@ -3755,16 +3755,3 @@ create aggregate test.some_agg (some_numbers) (
+ 
+ create view bad_subquery as
+ select * from projects where id = (select id from projects);
+-
+--- custom generic mimetype
+-create domain "pg/outfunc" as text;
+-create function test.outfunc_trans (state text, next anyelement)
+-returns "pg/outfunc" as $$
+-  select (state || next::text || E'\n')::"pg/outfunc";
+-$$ language sql;
+-
+-create aggregate test.outfunc_agg (anyelement) (
+-  initcond = ''
+-, stype = "pg/outfunc"
+-, sfunc = outfunc_trans
+-);

@@ -1,0 +1,226 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index c48dd033..03a1e82e 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -198,7 +198,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       cPlan <- liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+-      resultSet <- runQuery (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
++      resultSet <- runQuery (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf
+       return $ Response.invokeResponse invMethod (Plan.crProc cPlan) apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 15a65fa0..1f400df7 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -56,7 +56,6 @@ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            Schema)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..),
+                                            ProcParam (..), ProcsMap,
+-                                           procReturnsCompositeAlias,
+                                            procReturnsScalar,
+                                            procReturnsSetOfScalar)
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+@@ -551,7 +550,6 @@ callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq =
+ , funCArgs = Just args
+ , funCScalar = procReturnsScalar proc
+ , funCSetOfScalar = procReturnsSetOfScalar proc
+-, funCRetCompositeAlias = procReturnsCompositeAlias proc
+ , funCReturning = inferColsEmbedNeeds readReq []
+ }
+   where
+diff --git a/src/PostgREST/Plan/CallPlan.hs b/src/PostgREST/Plan/CallPlan.hs
+index f9635665..90c6405f 100644
+--- a/src/PostgREST/Plan/CallPlan.hs
++++ b/src/PostgREST/Plan/CallPlan.hs
+@@ -17,13 +17,12 @@ import           PostgREST.SchemaCache.Proc        (ProcDescription (..),
+ import Protolude
+ 
+ data CallPlan = FunctionCall
+-  { funCQi                :: QualifiedIdentifier
+-  , funCParams            :: CallParams
+-  , funCArgs              :: Maybe LBS.ByteString
+-  , funCScalar            :: Bool
+-  , funCSetOfScalar       :: Bool
+-  , funCRetCompositeAlias :: Bool
+-  , funCReturning         :: [FieldName]
++  { funCQi          :: QualifiedIdentifier
++  , funCParams      :: CallParams
++  , funCArgs        :: Maybe LBS.ByteString
++  , funCScalar      :: Bool
++  , funCSetOfScalar :: Bool
++  , funCReturning   :: [FieldName]
+   }
+ 
+ data CallParams
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 76e4e940..6f5f08d0 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -152,15 +152,15 @@ deleteQuery mrPlan apiReq@ApiRequest{..} conf = do
+   optionalRollback conf apiReq
+   pure resultSet
+ 
+-invokeQuery :: ProcDescription -> CallReadPlan -> ApiRequest -> AppConfig -> PgVersion -> DbHandler ResultSet
+-invokeQuery proc CallReadPlan{crReadPlan, crCallPlan, crBinField} apiReq@ApiRequest{iPreferences=Preferences{..}, ..} conf@AppConfig{..} pgVer = do
++invokeQuery :: ProcDescription -> CallReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++invokeQuery proc CallReadPlan{crReadPlan, crCallPlan, crBinField} apiReq@ApiRequest{iPreferences=Preferences{..}, ..} conf@AppConfig{..} = do
+   resultSet <-
+     lift . SQL.statement mempty $
+       Statements.prepareCall
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingleComposite proc)
+         (Proc.procReturnsSetOfScalar proc)
+-        (QueryBuilder.callPlanToQuery crCallPlan pgVer)
++        (QueryBuilder.callPlanToQuery crCallPlan)
+         (QueryBuilder.readPlanToQuery crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount preferCount)
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index d8aa0b3c..fa73e500 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -22,8 +22,6 @@ import qualified Hasql.DynamicStatements.Snippet as SQL
+ import Data.Tree (Tree (..))
+ 
+ import PostgREST.ApiRequest.Preferences   (PreferResolution (..))
+-import PostgREST.Config.PgVersion         (PgVersion, pgVersion110,
+-                                           pgVersion130)
+ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.SchemaCache.Proc         (ProcParam (..))
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+@@ -165,8 +163,8 @@ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+     whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+-callPlanToQuery :: CallPlan -> PgVersion -> SQL.Snippet
+-callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar returnsCompositeAlias returnings) pgVer =
++callPlanToQuery :: CallPlan -> SQL.Snippet
++callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar returnings) =
+   "SELECT " <> (if returnsScalar || returnsSetOfScalar then "pgrst_call AS pgrst_scalar " else returnedColumns) <> " " <>
+   fromCall
+   where
+@@ -177,8 +175,7 @@ callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar re
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+-    callIt argument | pgVer < pgVersion130 && pgVer >= pgVersion110 && returnsCompositeAlias = "(SELECT (" <> SQL.sql (fromQi qi) <> "(" <> argument <> ")).*) pgrst_call"
+-                    | otherwise                                                              = SQL.sql (fromQi qi) <> "(" <> argument <> ") pgrst_call"
++    callIt argument = SQL.sql (fromQi qi) <> "(" <> argument <> ") pgrst_call"
+ 
+     fmtParams :: [ProcParam] -> SQL.Snippet
+     fmtParams prms = SQL.sql $ BS.intercalate ", "
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index e970756a..00a317f7 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -248,7 +248,6 @@ decodeProcs =
+                   <*> column HD.text
+                   <*> column HD.bool
+                   <*> column HD.bool
+-                  <*> column HD.bool
+                   <*> column HD.bool)
+               <*> (parseVolatility <$> column HD.char)
+               <*> column HD.bool
+@@ -256,15 +255,15 @@ decodeProcs =
+     addKey :: ProcDescription -> (QualifiedIdentifier, ProcDescription)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+ 
+-    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> Bool -> RetType
+-    parseRetType schema name isSetOf isComposite isVoid isCompositeAlias
++    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> RetType
++    parseRetType schema name isSetOf isComposite isVoid
+       | isVoid    = Single $ Scalar True
+       | isSetOf   = SetOf pgType
+       | otherwise = Single pgType
+       where
+         qi = QualifiedIdentifier schema name
+         pgType
+-          | isComposite = Composite qi isCompositeAlias
++          | isComposite = Composite qi
+           | otherwise   = Scalar False
+ 
+     parseVolatility :: Char -> ProcVolatility
+@@ -341,7 +340,6 @@ procsSqlQuery pgVer = [q|
+      or COALESCE(proargmodes::text[] && '{t,b,o}', false)
+     ) AS rettype_is_composite,
+     ('void'::regtype = t.oid) AS rettype_is_void,
+-    bt.oid <> bt.base as rettype_is_composite_alias,
+     p.provolatile,
+     p.provariadic > 0 as hasvariadic
+   FROM pg_proc p
+diff --git a/src/PostgREST/SchemaCache/Proc.hs b/src/PostgREST/SchemaCache/Proc.hs
+index e1337d4d..cf792138 100644
+--- a/src/PostgREST/SchemaCache/Proc.hs
++++ b/src/PostgREST/SchemaCache/Proc.hs
+@@ -13,7 +13,6 @@ module PostgREST.SchemaCache.Proc
+   , procReturnsSingleComposite
+   , procReturnsVoid
+   , procTableName
+-  , procReturnsCompositeAlias
+   ) where
+ 
+ import qualified Data.Aeson          as JSON
+@@ -26,7 +25,7 @@ import Protolude
+ 
+ data PgType
+   = Scalar Bool -- True if the type is void
+-  | Composite QualifiedIdentifier Bool -- True if the composite is a domain alias(used to work around a bug in pg 11 and 12, see QueryBuilder.hs)
++  | Composite QualifiedIdentifier
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 
+ data RetType
+@@ -80,16 +79,10 @@ procReturnsSetOfScalar proc = case proc of
+   ProcDescription{pdReturnType = SetOf (Scalar _)} -> True
+   _                                                -> False
+ 
+-procReturnsCompositeAlias :: ProcDescription -> Bool
+-procReturnsCompositeAlias proc = case proc of
+-  ProcDescription{pdReturnType = Single (Composite _ True)} -> True
+-  ProcDescription{pdReturnType = SetOf (Composite _ True)}  -> True
+-  _                                                         -> False
+-
+ procReturnsSingleComposite :: ProcDescription -> Bool
+ procReturnsSingleComposite proc = case proc of
+-  ProcDescription{pdReturnType = Single (Composite _ _)} -> True
+-  _                                                      -> False
++  ProcDescription{pdReturnType = Single (Composite _)} -> True
++  _                                                    -> False
+ 
+ procReturnsVoid :: ProcDescription -> Bool
+ procReturnsVoid proc = case proc of
+@@ -98,6 +91,6 @@ procReturnsVoid proc = case proc of
+ 
+ procTableName :: ProcDescription -> Maybe TableName
+ procTableName proc = case pdReturnType proc of
+-  SetOf  (Composite qi _) -> Just $ qiName qi
+-  Single (Composite qi _) -> Just $ qiName qi
+-  _                       -> Nothing
++  SetOf  (Composite qi) -> Just $ qiName qi
++  Single (Composite qi) -> Just $ qiName qi
++  _                     -> Nothing
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 9b99f421..090a0415 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -15,7 +15,7 @@ import Text.Heredoc
+ import PostgREST.Config.PgVersion (PgVersion, pgVersion100,
+                                    pgVersion109, pgVersion110,
+                                    pgVersion112, pgVersion114,
+-                                   pgVersion140)
++                                   pgVersion130, pgVersion140)
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
+@@ -376,7 +376,8 @@ spec actualPgVersion =
+           ]|]
+           { matchHeaders = [matchContentTypeJson] }
+ 
+-      when (actualPgVersion >= pgVersion110) $
++      -- https://github.com/PostgREST/postgrest/pull/2677#issuecomment-1444976849
++      when (actualPgVersion >= pgVersion130) $
+         it "can embed if rpc returns domain of table type" $ do
+           post "/rpc/getproject_domain?select=id,name,client:clients(id),tasks(id)"
+               [json| { "id": 1} |]

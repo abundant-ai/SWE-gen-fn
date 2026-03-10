@@ -1,0 +1,266 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 392e6bc5..e8bfa6bc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + New option `db-pool-max-idletime` (default 30s).
+    + This is equivalent to the old option `db-pool-timeout` of PostgREST 10.0.0.
+    + A config alias for `db-pool-timeout` is included.
++ - #2703, Add pre-config function - @steve-chavez
++    + New config option `db-pre-config`(empty by default)
++    + Allows using the in-database configuration without SUPERUSER
+ 
+ ## [11.0.1] - 2023-04-27
+ 
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 57fcf27c..cb5a36b8 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -136,6 +136,9 @@ exampleConfigFile =
+       |## Enable in-database configuration
+       |db-config = true
+       |
++      |## Function for in-database configuration
++      |## db-pre-config = "postgrest.pre_config"
++      |
+       |## Extra schemas to add to the search_path of every request
+       |db-extra-search-path = "public"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index e3e10205..7b559d4c 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -80,6 +80,7 @@ data AppConfig = AppConfig
+   , configDbRootSpec               :: Maybe QualifiedIdentifier
+   , configDbSchemas                :: NonEmpty Text
+   , configDbConfig                 :: Bool
++  , configDbPreConfig              :: Maybe QualifiedIdentifier
+   , configDbTxAllowOverride        :: Bool
+   , configDbTxRollbackAll          :: Bool
+   , configDbUri                    :: Text
+@@ -144,6 +145,7 @@ toText conf =
+       ,("db-root-spec",              q . maybe mempty dumpQi . configDbRootSpec)
+       ,("db-schemas",                q . T.intercalate "," . toList . configDbSchemas)
+       ,("db-config",                     T.toLower . show . configDbConfig)
++      ,("db-pre-config",             q . maybe mempty dumpQi . configDbPreConfig)
+       ,("db-tx-end",                 q . showTxEnd)
+       ,("db-uri",                    q . configDbUri)
+       ,("db-use-legacy-gucs",            T.toLower . show . configDbUseLegacyGucs)
+@@ -240,6 +242,7 @@ parser optPath env dbSettings roleSettings =
+     <*> (fromList . maybe ["public"] splitOnCommas <$> optWithAlias (optValue "db-schemas")
+                                                                     (optValue "db-schema"))
+     <*> (fromMaybe True <$> optBool "db-config")
++    <*> (fmap toQi <$> optString "db-pre-config")
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+     <*> (fromMaybe "postgresql://" <$> optString "db-uri")
+@@ -358,21 +361,14 @@ parser optPath env dbSettings roleSettings =
+                                (C.Key -> C.Parser C.Value a -> C.Parser C.Config b) ->
+                                C.Key -> (C.Value -> a) -> C.Parser C.Config b
+     overrideFromDbOrEnvironment necessity key coercion =
+-      case reloadableDbSetting <|> M.lookup envVarName env of
++      case dbConf <|> M.lookup envVarName env of
+         Just dbOrEnvVal -> pure $ justIfMaybe $ coercion $ C.String dbOrEnvVal
+-        Nothing  -> necessity key (coercion <$> C.value)
++        Nothing         -> necessity key (coercion <$> C.value)
+       where
+         dashToUnderscore '-' = '_'
+         dashToUnderscore c   = c
+         envVarName = "PGRST_" <> (toUpper . dashToUnderscore <$> toS key)
+-        reloadableDbSetting =
+-          let dbSettingName = T.pack $ dashToUnderscore <$> toS key in
+-          if dbSettingName `notElem` [
+-            "server_host", "server_port", "server_unix_socket", "server_unix_socket_mode", "admin_server_port", "log_level",
+-            "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_acquisition_timeout",
+-            "db_pool_max_lifetime", "db_pool_max_idletime", "db_config"]
+-          then lookup dbSettingName dbSettings
+-          else Nothing
++        dbConf = lookup (T.pack $ dashToUnderscore <$> toS key) dbSettings
+ 
+     coerceText :: C.Value -> Text
+     coerceText (C.String s) = s
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 9f64f1d7..711fdc6c 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -21,12 +21,41 @@ import qualified Hasql.Statement            as SQL
+ import qualified Hasql.Transaction          as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ 
+-import Text.InterpolatedString.Perl6 (q)
++import Text.InterpolatedString.Perl6 (q, qc)
+ 
+ import Protolude
+ 
+ type RoleSettings = (HM.HashMap ByteString (HM.HashMap ByteString ByteString))
+ 
++prefix :: Text
++prefix = "pgrst."
++
++-- | In-db settings names
++dbSettingsNames :: [Text]
++dbSettingsNames =
++  (prefix <>) <$>
++  ["db_anon_role"
++  ,"db_pre_config"
++  ,"db_extra_search_path"
++  ,"db_max_rows"
++  ,"db_plan_enabled"
++  ,"db_pre_request"
++  ,"db_prepared_statements"
++  ,"db_root_spec"
++  ,"db_schemas"
++  ,"db_tx_end"
++  ,"db_use_legacy_gucs"
++  ,"jwt_aud"
++  ,"jwt_role_claim_key"
++  ,"jwt_secret"
++  ,"jwt_secret_is_base64"
++  ,"openapi_mode"
++  ,"openapi_security_active"
++  ,"openapi_server_proxy_uri"
++  ,"raw_media_types"
++  ,"server_trace_header"
++  ]
++
+ queryPgVersion :: Bool -> Session PgVersion
+ queryPgVersion prepared = statement mempty $ pgVersionStatement prepared
+ 
+@@ -36,37 +65,56 @@ pgVersionStatement = SQL.Statement sql HE.noParams versionRow
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+ 
+-queryDbSettings :: Bool -> Session [(Text, Text)]
+-queryDbSettings prepared =
++-- | Query the in-database configuration. The settings have the following priorities:
++--
++-- 1. Role + with database-specific settings:
++--    ALTER ROLE authenticator IN DATABASE postgres SET <prefix>jwt_aud = 'val';
++-- 2. Role + with settings:
++--    ALTER ROLE authenticator SET <prefix>jwt_aud = 'overridden';
++-- 3. pre-config function:
++--    CREATE FUNCTION pre_config() .. PERFORM set_config(<prefix>jwt_aud, 'pre_config_aud'..)
++--
++-- The example above will result in <prefix>jwt_aud = 'val'
++-- A setting on the database only will have no effect: ALTER DATABASE postgres SET <prefix>jwt_aud = 'xx'
++queryDbSettings :: Maybe Text -> Bool -> Session [(Text, Text)]
++queryDbSettings preConfFunc prepared =
+   let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ dbSettingsStatement prepared
+-
+--- | Get db settings from the connection role. Global settings will be overridden by database specific settings.
+-dbSettingsStatement :: Bool -> SQL.Statement () [(Text, Text)]
+-dbSettingsStatement = SQL.Statement sql HE.noParams decodeSettings
++  transaction SQL.ReadCommitted SQL.Read $ SQL.statement dbSettingsNames $ SQL.Statement sql (arrayParam HE.text) decodeSettings prepared
+   where
+-    sql = [q|
++    sql = [qc|
+       WITH
+-      role_setting (database, setting) AS (
+-        SELECT setdatabase,
+-               unnest(setconfig)
+-          FROM pg_catalog.pg_db_role_setting
+-         WHERE setrole = CURRENT_USER::regrole::oid
+-           AND setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname = CURRENT_CATALOG))
++      role_setting AS (
++        SELECT setdatabase as database,
++               unnest(setconfig) as setting
++        FROM pg_catalog.pg_db_role_setting
++        WHERE setrole = CURRENT_USER::regrole::oid
++          AND setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname = CURRENT_CATALOG))
+       ),
+-      kv_settings (database, k, v) AS (
++      kv_settings AS (
+         SELECT database,
+-               substr(setting, 1, strpos(setting, '=') - 1),
+-               substr(setting, strpos(setting, '=') + 1)
+-          FROM role_setting
+-         WHERE setting LIKE 'pgrst.%'
++               substr(setting, 1, strpos(setting, '=') - 1) as k,
++               substr(setting, strpos(setting, '=') + 1) as v
++        FROM role_setting
++        {preConfigF}
+       )
+       SELECT DISTINCT ON (key)
+-             replace(k, 'pgrst.', '') AS key,
++             replace(k, '{prefix}', '') AS key,
+              v AS value
+-        FROM kv_settings
+-       ORDER BY key, database DESC;
++      FROM kv_settings
++      WHERE k = ANY($1) AND v IS NOT NULL
++      ORDER BY key, database DESC NULLS LAST;
+     |]
++    preConfigF = case preConfFunc of
++      Nothing   -> mempty
++      Just func -> [qc|
++          UNION
++          SELECT
++            null as database,
++            x as k,
++            current_setting(x, true) as v
++          FROM unnest($1) x
++          JOIN {func}() _ ON TRUE
++      |]::Text
+     decodeSettings = HD.rowList $ (,) <$> column HD.text <*> column HD.text
+ 
+ queryRoleSettings :: Bool -> Session RoleSettings
+@@ -111,3 +159,9 @@ compositeArrayColumn = arrayColumn . HD.composite
+ 
+ arrayColumn :: HD.Value a -> HD.Row [a]
+ arrayColumn = column . HD.listArray . HD.nonNullable
++
++param :: HE.Value a -> HE.Params a
++param = HE.param . HE.nonNullable
++
++arrayParam :: HE.Value a -> HE.Params [a]
++arrayParam = param . HE.foldableArray . HE.nonNullable
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 28c1cf50..f3e98a6d 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -25,13 +25,17 @@ import Hasql.Connection (acquire)
+ import Network.Socket
+ import Network.Socket.ByteString
+ 
+-import PostgREST.AppState         (AppState)
+-import PostgREST.Config           (AppConfig (..), readAppConfig)
+-import PostgREST.Config.Database  (queryDbSettings, queryPgVersion,
+-                                   queryRoleSettings)
+-import PostgREST.Config.PgVersion (PgVersion (..), minimumPgVersion)
+-import PostgREST.Error            (checkIsFatal)
+-import PostgREST.SchemaCache      (querySchemaCache)
++import PostgREST.AppState                (AppState)
++import PostgREST.Config                  (AppConfig (..),
++                                          readAppConfig)
++import PostgREST.Config.Database         (queryDbSettings,
++                                          queryPgVersion,
++                                          queryRoleSettings)
++import PostgREST.Config.PgVersion        (PgVersion (..),
++                                          minimumPgVersion)
++import PostgREST.Error                   (checkIsFatal)
++import PostgREST.SchemaCache             (querySchemaCache)
++import PostgREST.SchemaCache.Identifiers (dumpQi)
+ 
+ import qualified PostgREST.AppState as AppState
+ 
+@@ -89,8 +93,8 @@ connectionWorker appState = do
+           when configDbChannelEnabled $
+             AppState.signalListener appState
+           AppState.logWithZTime appState "Connection successful"
+-          -- this could be fail because the connection drops, but the
+-          -- loadSchemaCache will pick the error and retry again
++          -- this could be fail because the connection drops, but the loadSchemaCache will pick the error and retry again
++          -- We cannot retry after it fails immediately, because db-pre-config could have user errors. We just log the error and continue.
+           when configDbConfig $ reReadConfig False appState
+           scStatus <- loadSchemaCache appState
+           case scStatus of
+@@ -237,7 +241,7 @@ reReadConfig startingUp appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   dbSettings <-
+     if configDbConfig then do
+-      qDbSettings <- AppState.usePool appState $ queryDbSettings configDbPreparedStatements
++      qDbSettings <- AppState.usePool appState $ queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements
+       case qDbSettings of
+         Left e -> do
+           AppState.logWithZTime appState

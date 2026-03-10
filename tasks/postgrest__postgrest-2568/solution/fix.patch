@@ -1,0 +1,115 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 357fcc9e..c3667ae6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Fixed
+ 
++ - #2565, Fix bad M2M embedding on RPC - @steve-chavez
++
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 07accc74..fa75a3bb 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -209,7 +209,7 @@ compressedRel Relationship{..} =
+     : case relCardinality of
+         M2M Junction{..} -> [
+             "cardinality" .= ("many-to-many" :: Text)
+-          , "relationship" .= (qiName junTable <> " using " <> junConstraint1 <> fmtEls (snd <$> junColumns1) <> " and " <> junConstraint2 <> fmtEls (snd <$> junColumns2))
++          , "relationship" .= (qiName junTable <> " using " <> junConstraint1 <> fmtEls (snd <$> junColsSource) <> " and " <> junConstraint2 <> fmtEls (snd <$> junColsTarget))
+           ]
+         M2O cons relColumns -> [
+             "cardinality" .= ("many-to-one" :: Text)
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 54c69f10..86e61bbf 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -399,7 +399,7 @@ mutatePlan mutation qi ApiRequest{..} sCache readReq = mapLeft ApiRequestError $
+     returnings =
+       if iPreferRepresentation == None
+         then []
+-        else returningCols readReq pkCols
++        else inferColsEmbedNeeds readReq pkCols
+     pkCols = maybe mempty tablePKCols $ HM.lookup qi $ dbTables sCache
+     logic = map snd qsLogic
+     rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+@@ -413,7 +413,7 @@ callPlan proc apiReq readReq = FunctionCall {
+ , funCArgs = payRaw <$> iPayload apiReq
+ , funCScalar = procReturnsScalar proc
+ , funCMultipleCall = iPreferParameters apiReq == Just MultipleObjects
+-, funCReturning = returningCols readReq []
++, funCReturning = inferColsEmbedNeeds readReq []
+ }
+   where
+     paramsAsSingleObject = iPreferParameters apiReq == Just SingleObject
+@@ -424,14 +424,15 @@ callPlan proc apiReq readReq = FunctionCall {
+       prms  -> KeyParams $ specifiedParams prms
+     specifiedParams = filter (\x -> ppName x `S.member` iColumns apiReq)
+ 
+-returningCols :: ReadPlanTree -> [FieldName] -> [FieldName]
+-returningCols rr@(Node _ forest) pkCols
++-- | Infers the columns needed for an embed to be successful after a mutation or a function call.
++inferColsEmbedNeeds :: ReadPlanTree -> [FieldName] -> [FieldName]
++inferColsEmbedNeeds (Node ReadPlan{select} forest) pkCols
+   -- if * is part of the select, we must not add pk or fk columns manually -
+   -- otherwise those would be selected and output twice
+   | "*" `elem` fldNames = ["*"]
+   | otherwise           = returnings
+   where
+-    fldNames = fstFieldNames rr
++    fldNames = (\((fld, _), _, _) -> fld) <$> select
+     -- Without fkCols, when a mutatePlan to
+     -- /projects?select=name,clients(name) occurs, the RETURNING SQL part would
+     -- be `RETURNING name`(see QueryBuilder).  This would make the embedding
+@@ -445,8 +446,8 @@ returningCols rr@(Node _ forest) pkCols
+           Just $ fst <$> cols
+         Node ReadPlan{relToParent=Just Relationship{relCardinality=O2O _ cols}} _ ->
+           Just $ fst <$> cols
+-        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}} _ ->
+-          Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2M Junction{junColsSource=cols}}} _ ->
++          Just $ fst <$> cols
+         Node ReadPlan{relToParent=Just ComputedRelationship{}} _ ->
+           Nothing
+         Node ReadPlan{relToParent=Nothing} _ ->
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index e51170cd..94e181ca 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -1,8 +1,6 @@
+-{-# LANGUAGE NamedFieldPuns #-}
+ module PostgREST.Plan.ReadPlan
+   ( ReadPlanTree
+   , ReadPlan(..)
+-  , fstFieldNames
+   , JoinCondition(..)
+   ) where
+ 
+@@ -46,8 +44,3 @@ data ReadPlan = ReadPlan
+   -- ^ used for aliasing
+   }
+   deriving (Eq)
+-
+--- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
+-fstFieldNames :: ReadPlanTree -> [FieldName]
+-fstFieldNames (Node ReadPlan{select} _) =
+-  fst . (\(f, _, _) -> f) <$> select
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index e8b18a64..db912faa 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -56,8 +56,8 @@ data Junction = Junction
+   { junTable       :: QualifiedIdentifier
+   , junConstraint1 :: FKConstraint
+   , junConstraint2 :: FKConstraint
+-  , junColumns1    :: [(FieldName, FieldName)]
+-  , junColumns2    :: [(FieldName, FieldName)]
++  , junColsSource  :: [(FieldName, FieldName)]
++  , junColsTarget  :: [(FieldName, FieldName)]
+   }
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 

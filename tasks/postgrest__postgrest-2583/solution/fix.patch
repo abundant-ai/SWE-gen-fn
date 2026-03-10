@@ -1,0 +1,147 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b08bab27..8092f89e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,7 +23,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+  - #2565, Fix bad M2M embedding on RPC - @steve-chavez
+-
++ - #2575, Replace misleading error message when no function is found with a hint containing functions/parameters names suggestions - @laurenceisla
++ - #2569, Replace misleading error message when no relationship is found with a hint containing parent/child names suggestions - @laurenceisla
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e7985405..3d0ec489 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -35,7 +35,8 @@ import PostgREST.MediaType                (MediaType (..))
+ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            QualifiedIdentifier)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..))
+-import PostgREST.SchemaCache.Relationship (Relationship)
++import PostgREST.SchemaCache.Relationship (Relationship,
++                                           RelationshipsMap)
+ 
+ import Protolude
+ 
+@@ -72,7 +73,7 @@ data ApiRequestError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
+-  | NoRelBetween Text Text Text
++  | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] Bool MediaType Bool [QualifiedIdentifier] [ProcDescription]
+   | NotEmbedded Text
+   | ParseRequestError Text Text
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 7e45df48..e6352b8c 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -18,6 +18,7 @@ module PostgREST.Error
+ import qualified Data.Aeson                as JSON
+ import qualified Data.ByteString.Char8     as BS
+ import qualified Data.FuzzySet             as Fuzzy
++import qualified Data.HashMap.Strict       as HM
+ import qualified Data.Text                 as T
+ import qualified Data.Text.Encoding        as T
+ import qualified Data.Text.Encoding.Error  as T
+@@ -36,12 +37,14 @@ import           PostgREST.ApiRequest.Types (ApiRequestError (..),
+ import           PostgREST.MediaType        (MediaType (..))
+ import qualified PostgREST.MediaType        as MediaType
+ 
+-import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..))
++import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..),
++                                           Schema)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..),
+                                            ProcParam (..))
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+-                                           Relationship (..))
++                                           Relationship (..),
++                                           RelationshipsMap)
+ import Protolude
+ 
+ 
+@@ -174,11 +177,11 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= ("Only is null or not is null filters are allowed on embedded resources":: Text),
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (NoRelBetween parent child schema) = JSON.object [
++  toJSON (NoRelBetween parent child embedHint schema allRels) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= ("Verify that '" <> parent <> "' and '" <> child <> "' exist in the schema '" <> schema <> "' and that there is a foreign key relationship between them. If a new relationship was created, try reloading the schema cache." :: Text)]
++    "details" .= ("Searched for a foreign key relationship between '" <> parent <> "' and '" <> child <> maybe mempty ("' using the hint '" <>) embedHint <> "' in the schema '" <> schema <> "', but no matches were found."),
++    "hint"    .= noRelBetweenHint parent child schema allRels]
+ 
+   toJSON (AmbiguousRelBetween parent child rels) = JSON.object [
+     "code"    .= SchemaCacheErrorCode01,
+@@ -214,6 +217,52 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= ("Try renaming the parameters or the function itself in the database so function overloading can be resolved" :: Text)]
+ 
++-- |
++-- If no relationship is found then:
++--
++-- Looks for parent suggestions if parent not found
++-- Looks for child suggestions if parent is found but child is not
++-- Gives no suggestions if both are found (it means that there is a problem with the embed hint)
++--
++-- >>> :set -Wno-missing-fields
++-- >>> let qi t = QualifiedIdentifier "api" t
++-- >>> let rel ft = Relationship{relForeignTable = qi ft}
++-- >>> let rels = HM.fromList [((qi "films", "api"), [rel "directors", rel "roles", rel "actors"])]
++--
++-- >>> noRelBetweenHint "film" "directors" "api" rels
++-- Just "Perhaps you meant 'films' instead of 'film'."
++--
++-- >>> noRelBetweenHint "films" "role" "api" rels
++-- Just "Perhaps you meant 'roles' instead of 'role'."
++--
++-- >>> noRelBetweenHint "films" "role" "api" rels
++-- Just "Perhaps you meant 'roles' instead of 'role'."
++--
++-- >>> noRelBetweenHint "films" "actors" "api" rels
++-- Nothing
++--
++-- >>> noRelBetweenHint "noclosealternative" "roles" "api" rels
++-- Nothing
++--
++-- >>> noRelBetweenHint "films" "noclosealternative" "api" rels
++-- Nothing
++--
++-- >>> noRelBetweenHint "films" "noclosealternative" "noclosealternative" rels
++-- Nothing
++--
++noRelBetweenHint :: Text -> Text -> Schema -> RelationshipsMap -> Maybe Text
++noRelBetweenHint parent child schema allRels = ("Perhaps you meant '" <>) <$>
++  if isJust findParent
++    then (<> "' instead of '" <> child <> "'.") <$> suggestChild
++    else (<> "' instead of '" <> parent <> "'.") <$> suggestParent
++  where
++    findParent = HM.lookup (QualifiedIdentifier schema parent, schema) allRels
++    fuzzySetOfParents  = Fuzzy.fromList [qiName (fst p) | p <- HM.keys allRels, snd p == schema]
++    fuzzySetOfChildren = Fuzzy.fromList [qiName (relForeignTable c) | c <- fromMaybe [] findParent]
++    suggestParent = Fuzzy.getOne fuzzySetOfParents parent
++    -- Do not give suggestion if the child is found in the relations (weight = 1.0)
++    suggestChild  = headMay [snd k | k <- Fuzzy.get fuzzySetOfChildren child, fst k < 1.0]
++
+ -- |
+ -- If no function is found with the given name, it does a fuzzy search to all the functions
+ -- in the same schema and shows the best match as hint.
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 3d5b4259..ff30b915 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -208,7 +208,7 @@ getJoinConditions tblAlias parentAlias Relationship{relTable=qi,relForeignTable=
+ findRel :: Schema -> RelationshipsMap -> NodeName -> NodeName -> Maybe Hint -> Either ApiRequestError Relationship
+ findRel schema allRels origin target hint =
+   case rels of
+-    []  -> Left $ NoRelBetween origin target schema
++    []  -> Left $ NoRelBetween origin target hint schema allRels
+     [r] -> Right r
+     rs  -> Left $ AmbiguousRelBetween origin target rs
+   where

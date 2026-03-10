@@ -1,0 +1,235 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 9d01be85..93a055ab 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -145,17 +145,12 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+ 
+   body <- lift $ Wai.strictRequestBody req
+ 
+-  (parseTime, apiRequest) <-
+-    calcTiming configServerTimingEnabled $
+-      liftEither . mapLeft Error.ApiRequestError $
+-        ApiRequest.userApiRequest conf req body sCache
++  apiRequest <-
++    liftEither . mapLeft Error.ApiRequestError $
++      ApiRequest.userApiRequest conf req body sCache
+ 
+-  let
+-    jwtAndParseTiming =
+-      [(SMJwt, if configServerTimingEnabled then Auth.getJwtDur req else Nothing)
+-      ,(SMParse, parseTime)]
+-
+-  handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtAndParseTiming
++  let jwtTiming = (SMJwt, if configServerTimingEnabled then Auth.getJwtDur req else Nothing)
++  handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtTiming
+ 
+ runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState isoLvl mode authenticated prepared handler = do
+@@ -169,72 +164,72 @@ runDbHandler appState isoLvl mode authenticated prepared handler = do
+ 
+   liftEither resp
+ 
+-handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> [(ServerMetric, Maybe Double)] -> Handler IO Wai.Response
+-handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache jwtAndParseTime =
++handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> (ServerMetric, Maybe Double) -> Handler IO Wai.Response
++handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache jwtTime =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       (planTime', wrPlan) <- withTiming $ liftEither $ Plan.wrappedReadPlan identifier conf sCache apiReq
+-      (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
++      (rsTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+-      (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
++      (rsTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.createResponse identifier mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+-      (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
++      (rsTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.updateResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+-      (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
++      (rsTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.singleUpsertResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+-      (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
++      (rsTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.deleteResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       (planTime', cPlan) <- withTiming $ liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+-      (txTime', resultSet) <- withTiming $ runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan)) (pdTimeout $ Plan.crProc cPlan) (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
++      (rsTime', resultSet) <- withTiming $ runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan)) (pdTimeout $ Plan.crProc cPlan) (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+       (planTime', iPlan) <- withTiming $ liftEither $ Plan.inspectPlan apiReq
+-      (txTime', oaiResult) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.ipTxmode iPlan) $ Query.openApiQuery sCache pgVer conf tSchema
++      (rsTime', oaiResult) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.ipTxmode iPlan) $ Query.openApiQuery sCache pgVer conf tSchema
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.openApiResponse (T.decodeUtf8 prettyVersion, docsVersion) headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMQuery, rsTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetIdent identifier) -> do
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.infoIdentResponse identifier sCache
+-      let metrics = Map.fromList $ (SMRender, renderTime'):jwtAndParseTime
++      let metrics = Map.fromList [(SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetProc identifier _) -> do
+       (planTime', cPlan) <- withTiming $ liftEither $ Plan.callReadPlan identifier conf sCache apiReq ApiRequest.InvHead
+       (renderTime', pgrst) <- withTiming $ liftEither $ Response.infoProcResponse (Plan.crProc cPlan)
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMRender, renderTime')] ++ jwtAndParseTime
++      let metrics = Map.fromList [(SMPlan, planTime'), (SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetDefaultSpec _) -> do
+       (renderTime', pgrst) <- withTiming $ liftEither Response.infoRootResponse
+-      let metrics = Map.fromList $ (SMRender, renderTime'):jwtAndParseTime
++      let metrics = Map.fromList [(SMRender, renderTime'), jwtTime]
+       return $ pgrstResponse metrics  pgrst
+ 
+     _ ->
+@@ -253,16 +248,13 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     pgrstResponse :: ServerTimingData -> Response.PgrstResponse -> Wai.Response
+     pgrstResponse timings (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([renderServerTimingHeader timings | configServerTimingEnabled conf])) bod
+ 
+-    withTiming = calcTiming $ configServerTimingEnabled conf
+-
+-calcTiming :: Bool -> Handler IO a -> Handler IO (Maybe Double, a)
+-calcTiming timingEnabled f = if timingEnabled
+-    then do
+-      (t, r) <- timeItT f
+-      pure (Just t, r)
+-    else do
+-      r <- f
+-      pure (Nothing, r)
++    withTiming f = if configServerTimingEnabled conf
++        then do
++          (t, r) <- timeItT f
++          pure (Just t, r)
++        else do
++          r <- f
++          pure (Nothing, r)
+ 
+ traceHeaderMiddleware :: AppConfig -> Wai.Middleware
+ traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
+diff --git a/src/PostgREST/Response/Performance.hs b/src/PostgREST/Response/Performance.hs
+index e5479d68..dfc4c41e 100644
+--- a/src/PostgREST/Response/Performance.hs
++++ b/src/PostgREST/Response/Performance.hs
+@@ -12,16 +12,15 @@ import           Protolude
+ 
+ data ServerMetric =
+     SMJwt
+-  | SMParse
+   | SMRender
+   | SMPlan
+-  | SMTransaction
++  | SMQuery
+   deriving (Show, Eq, Ord)
+ type ServerTimingData = Map ServerMetric (Maybe Double)
+ 
+ -- | Render the Server-Timing header from a ServerTimingData
+ --
+--- >>> renderServerTimingHeader $ Map.fromList [(SMPlan, 0.1), (SMTransaction, 0.2), (SMRender, 0.3), (SMJwt, 0.4)]
++-- >>> renderServerTimingHeader $ Map.fromList [(SMPlan, 0.1), (SMQuery, 0.2), (SMRender, 0.3), (SMJwt, 0.4)]
+ -- ("Server-Timing","jwt;dur=400000.0, render;dur=300000.0, plan;dur=100000.0, query;dur=200000.0")
+ renderServerTimingHeader :: ServerTimingData -> HTTP.Header
+ renderServerTimingHeader timingData =
+@@ -29,8 +28,7 @@ renderServerTimingHeader timingData =
+ renderTiming :: (ServerMetric, Maybe Double) -> BS.ByteString
+ renderTiming (metric, time) = maybe "" (\x -> BS.concat [renderMetric metric, BS.pack $ ";dur=" <> showFFloat (Just 1) (x * 1000000) ""]) time
+   where
+-    renderMetric SMPlan        = "plan"
+-    renderMetric SMTransaction = "transaction"
+-    renderMetric SMRender      = "render"
+-    renderMetric SMJwt         = "jwt"
+-    renderMetric SMParse       = "parse"
++    renderMetric SMPlan   = "plan"
++    renderMetric SMQuery  = "query"
++    renderMetric SMRender = "render"
++    renderMetric SMJwt    = "jwt"
+diff --git a/test/spec/Feature/Query/ServerTimingSpec.hs b/test/spec/Feature/Query/ServerTimingSpec.hs
+index 21a1b550..94a2d026 100644
+--- a/test/spec/Feature/Query/ServerTimingSpec.hs
++++ b/test/spec/Feature/Query/ServerTimingSpec.hs
+@@ -22,7 +22,7 @@ spec =
+           `shouldRespondWith`
+           [json|[{"id":6,"name":"Oscorp","referee":3,"auditor":4,"manager_id":6}]|]
+           { matchStatus  = 200
+-          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+           }
+ 
+       it "works with post request" $
+@@ -32,7 +32,7 @@ spec =
+           `shouldRespondWith`
+           [json|[{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}]|]
+           { matchStatus  = 201
+-          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+           }
+ 
+       it "works with patch request" $
+@@ -41,7 +41,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+             }
+ 
+       it "works with put request" $
+@@ -51,7 +51,7 @@ spec =
+           `shouldRespondWith`
+             [json| [ { "name": "Python", "rank": 19 } ]|]
+             { matchStatus  = 200
+-            , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++            , matchHeaders = map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+             }
+ 
+       it "works with delete request" $
+@@ -61,7 +61,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+             }
+ 
+       it "works with rpc call" $
+@@ -71,5 +71,5 @@ spec =
+           `shouldRespondWith`
+           [json|{"x": 1, "y": 2}|]
+           { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
++          , matchHeaders = map matchServerTimingHasTiming ["jwt", "plan", "query", "render"]
+           }

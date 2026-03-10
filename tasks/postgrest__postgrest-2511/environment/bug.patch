@@ -1,0 +1,550 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cf30d6b6..a01cd795 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,13 +5,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Added
+-
+- - #1414, Add related orders - @steve-chavez
+-  + On a many-to-one or one-to-one relationship, you can order a parent by a child column `/projects?select=*,clients(*)&order=clients(name).desc.nullsfirst`
+-
+-### Fixed
+-
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 06c99a7d..1e4deecc 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -209,7 +209,6 @@ test-suite spec
+                       Feature.Query.QuerySpec
+                       Feature.Query.RangeSpec
+                       Feature.Query.RawOutputTypesSpec
+-                      Feature.Query.RelatedQueriesSpec
+                       Feature.Query.RpcSpec
+                       Feature.Query.SingularSpec
+                       Feature.Query.UnicodeSpec
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 54cdcb2b..01a1e289 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -74,9 +74,6 @@ import Protolude hiding (try)
+ -- >>> deriving instance Show Filter
+ -- >>> deriving instance Show JoinType
+ -- >>> deriving instance Show SelectItem
+--- >>> deriving instance Show OrderDirection
+--- >>> deriving instance Show OrderNulls
+--- >>> deriving instance Show OrderTerm
+ 
+ data QueryParams =
+   QueryParams
+@@ -586,51 +583,23 @@ pQuotedValue = toS <$> (char '"' *> many pCharsOrSlashed <* char '"')
+ pDelimiter :: Parser Char
+ pDelimiter = char '.' <?> "delimiter (.)"
+ 
+--- |
+--- Parses the elements in the order query parameter
+---
+--- >>> P.parse pOrder "" "name.desc.nullsfirst"
+--- Right [OrderTerm {otTerm = ("name",[]), otDirection = Just OrderDesc, otNullOrder = Just OrderNullsFirst}]
+---
+--- >>> P.parse pOrder "" "json_col->key.asc.nullslast"
+--- Right [OrderTerm {otTerm = ("json_col",[JArrow {jOp = JKey {jVal = "key"}}]), otDirection = Just OrderAsc, otNullOrder = Just OrderNullsLast}]
+---
+--- >>> P.parse pOrder "" "clients(json_col->key).desc.nullsfirst"
+--- Right [OrderRelationTerm {otRelation = "clients", otRelTerm = ("json_col",[JArrow {jOp = JKey {jVal = "key"}}]), otDirection = Just OrderDesc, otNullOrder = Just OrderNullsFirst}]
+---
+--- >>> P.parse pOrder "" "clients(name,id)"
+--- Left (line 1, column 8):
+--- unexpected '('
+--- expecting letter, digit, "-", "->>", "->", delimiter (.), "," or end of input
+---
+--- >>> P.parse pOrder "" "name,clients(name),id"
+--- Right [OrderTerm {otTerm = ("name",[]), otDirection = Nothing, otNullOrder = Nothing},OrderRelationTerm {otRelation = "clients", otRelTerm = ("name",[]), otDirection = Nothing, otNullOrder = Nothing},OrderTerm {otTerm = ("id",[]), otDirection = Nothing, otNullOrder = Nothing}]
+ pOrder :: Parser [OrderTerm]
+-pOrder = lexeme (try pOrderRelationTerm <|> pOrderTerm) `sepBy1` char ','
++pOrder = lexeme pOrderTerm `sepBy1` char ','
++
++pOrderTerm :: Parser OrderTerm
++pOrderTerm = do
++  fld <- pField
++  dir <- optionMaybe $
++         try (pDelimiter *> string "asc" $> OrderAsc) <|>
++         try (pDelimiter *> string "desc" $> OrderDesc)
++  nls <- optionMaybe pNulls <* pEnd <|>
++         pEnd $> Nothing
++  return $ OrderTerm fld dir nls
+   where
+-    pOrderTerm = do
+-      fld <- pField
+-      dir <- optionMaybe pOrdDir
+-      nls <- optionMaybe pNulls <* pEnd <|>
+-             pEnd $> Nothing
+-      return $ OrderTerm fld dir nls
+-
+-    pOrderRelationTerm = do
+-      nam <- pFieldName
+-      fld <- between (char '(') (char ')') pField
+-      dir <- optionMaybe pOrdDir
+-      nls <- optionMaybe pNulls <* pEnd <|> pEnd $> Nothing
+-      return $ OrderRelationTerm nam fld dir nls
+-
+-    pNulls :: Parser OrderNulls
+     pNulls = try (pDelimiter *> string "nullsfirst" $> OrderNullsFirst) <|>
+              try (pDelimiter *> string "nullslast"  $> OrderNullsLast)
+-
+-    pOrdDir :: Parser OrderDirection
+-    pOrdDir = try (pDelimiter *> string "asc" $> OrderAsc) <|>
+-              try (pDelimiter *> string "desc" $> OrderDesc)
+-
+-    pEnd = try (void $ lookAhead (char ',')) <|> try eof
++    pEnd = try (void $ lookAhead (char ',')) <|>
++           try eof
+ 
+ pLogicTree :: Parser LogicTree
+ pLogicTree = Stmnt <$> try pLogicFilter
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index cc1a17ac..0fbcbe53 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -64,7 +64,6 @@ data ApiRequestError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
+-  | NotToOne Text Text
+   | NoRelBetween Text Text Text
+   | NoRpc Text Text [Text] Bool MediaType Bool
+   | NotEmbedded Text
+@@ -83,19 +82,12 @@ data RangeError
+ type NodeName = Text
+ type Depth = Integer
+ 
+-data OrderTerm
+-  = OrderTerm
+-    { otTerm      :: Field
+-    , otDirection :: Maybe OrderDirection
+-    , otNullOrder :: Maybe OrderNulls
+-    }
+-  | OrderRelationTerm
+-    { otRelation  :: FieldName
+-    , otRelTerm   :: Field
+-    , otDirection :: Maybe OrderDirection
+-    , otNullOrder :: Maybe OrderNulls
+-    }
+-  deriving Eq
++data OrderTerm = OrderTerm
++  { otTerm      :: Field
++  , otDirection :: Maybe OrderDirection
++  , otNullOrder :: Maybe OrderNulls
++  }
++  deriving (Eq)
+ 
+ data OrderDirection
+   = OrderAsc
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index d7aaeb00..14e1cb87 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -64,8 +64,6 @@ instance PgrstError ApiRequestError where
+   status InvalidRpcMethod{}      = HTTP.status405
+   status InvalidRange{}          = HTTP.status416
+   status NotFound                = HTTP.status404
+-  status NotToOne{}              = HTTP.status400
+-
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+   status NotEmbedded{}           = HTTP.status400
+@@ -125,7 +123,7 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON NotFound = JSON.object []
+   toJSON (NotEmbedded resource) = JSON.object [
+     "code"    .= ApiRequestErrorCode08,
+-    "message" .= ("'" <> resource <> "' is not an embedded resource in this request" :: Text),
++    "message" .= ("Cannot apply filter because '" <> resource <> "' is not an embedded resource in this request" :: Text),
+     "details" .= JSON.Null,
+     "hint"    .= ("Verify that '" <> resource <> "' is included in the 'select' query parameter." :: Text)]
+ 
+@@ -153,18 +151,11 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (NotToOne origin target) = JSON.object [
+-    "code"    .= ApiRequestErrorCode18,
+-    "message" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+     "details" .= JSON.Null,
+     "hint"    .= ("Verify that '" <> parent <> "' and '" <> child <> "' exist in the schema '" <> schema <> "' and that there is a foreign key relationship between them. If a new relationship was created, try reloading the schema cache." :: Text)]
+-
+   toJSON (AmbiguousRelBetween parent child rels) = JSON.object [
+     "code"    .= SchemaCacheErrorCode01,
+     "message" .= ("Could not embed because more than one relationship was found for '" <> parent <> "' and '" <> child <> "'" :: Text),
+@@ -470,7 +461,6 @@ data ErrorCode
+   | ApiRequestErrorCode15
+   | ApiRequestErrorCode16
+   | ApiRequestErrorCode17
+-  | ApiRequestErrorCode18
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -512,7 +502,6 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode15  -> "115"
+   ApiRequestErrorCode16  -> "116"
+   ApiRequestErrorCode17  -> "117"
+-  ApiRequestErrorCode18  -> "118"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 99c906d3..851c707f 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -52,8 +52,7 @@ import PostgREST.SchemaCache.Proc         (ProcDescription (..),
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+                                            Relationship (..),
+-                                           RelationshipsMap,
+-                                           relIsToOne)
++                                           RelationshipsMap)
+ import PostgREST.SchemaCache.Table        (tablePKCols)
+ 
+ import PostgREST.Plan.CallPlan
+@@ -97,7 +96,6 @@ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Eit
+ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-  addRelatedOrders =<<
+   addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+@@ -301,28 +299,6 @@ addOrders ApiRequest{..} rReq =
+     addOrderToNode :: (EmbedPath, [OrderTerm]) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+     addOrderToNode = updateNode (\o (Node q f) -> Node q{order=o} f)
+ 
+--- Validates that the related resource on the order is an embedded resource,
+--- e.g. if `clients` is inside the `select` in /projects?order=clients(id)&select=*,clients(*),
+--- and if it's a to-one relationship, it adds the right alias to the OrderRelationTerm so the generated query can succeed.
+--- TODO might be clearer if there's an additional intermediate type
+-addRelatedOrders :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+-  newOrder <- getRelOrder `traverse` order
+-  Node rp{order=newOrder} <$> addRelatedOrders `traverse` forest
+-  where
+-    getRelOrder ot@OrderTerm{}                   = Right ot
+-    getRelOrder ot@OrderRelationTerm{otRelation} =
+-      let foundRP = rootLabel <$> find (\(Node ReadPlan{relName, relAlias} _) -> Just otRelation `elem` [Just relName, relAlias] ) forest in
+-      case foundRP of
+-        Just ReadPlan{relName,relAlias,relAggAlias,relToParent} ->
+-          let isToOne = relIsToOne <$> relToParent
+-              name    = fromMaybe relName relAlias in
+-          if isToOne == Just True
+-            then Right $ ot{otRelation=relAggAlias}
+-            else Left $ NotToOne (qiName from) name
+-        Nothing ->
+-          Left $ NotEmbedded otRelation
+-
+ addRanges :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addRanges ApiRequest{..} rReq =
+   case iAction of
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index c72ad451..0cacbdcf 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -27,8 +27,7 @@ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.SchemaCache.Proc         (ProcParam (..))
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+-                                           Relationship (..),
+-                                           relIsToOne)
++                                           Relationship (..))
+ 
+ import PostgREST.ApiRequest.Types
+ import PostgREST.Plan.CallPlan
+@@ -64,7 +63,12 @@ getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, re
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+       (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+-    (sel, joi) = if relIsToOne rel
++    isToOne = case rel of
++      Relationship{relCardinality=M2O _ _} -> True
++      Relationship{relCardinality=O2O _ _} -> True
++      ComputedRelationship{relToOne=True}  -> True
++      _                                    -> False
++    (sel, joi) = if isToOne
+       then
+         ( SQL.sql ("row_to_json(" <> aggAlias <> ".*) AS " <> aliasOrName)
+         , correlatedSubquery subquery aggAlias "TRUE")
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 77ea8fb4..24eb20e6 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -244,15 +244,11 @@ pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+-  fmtOTerm ot <> " " <>
++  pgFmtField qi (otTerm ot) <> " " <>
+   SQL.sql (BS.unwords [
+     maybe mempty direction $ otDirection ot,
+     maybe mempty nullOrder $ otNullOrder ot])
+   where
+-    fmtOTerm = \case
+-      OrderTerm{otTerm}                        -> pgFmtField qi otTerm
+-      OrderRelationTerm{otRelation, otRelTerm} -> pgFmtField (QualifiedIdentifier mempty otRelation) otRelTerm
+-
+     direction OrderAsc  = "ASC"
+     direction OrderDesc = "DESC"
+ 
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index e8b18a64..615eda2c 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -6,7 +6,6 @@ module PostgREST.SchemaCache.Relationship
+   , Relationship(..)
+   , Junction(..)
+   , RelationshipsMap
+-  , relIsToOne
+   ) where
+ 
+ import qualified Data.Aeson          as JSON
+@@ -63,10 +62,3 @@ data Junction = Junction
+ 
+ -- | Key based on the source table and the foreign table schema
+ type RelationshipsMap = HM.HashMap (QualifiedIdentifier, Schema)  [Relationship]
+-
+-relIsToOne :: Relationship -> Bool
+-relIsToOne rel = case rel of
+-  Relationship{relCardinality=M2O _ _} -> True
+-  Relationship{relCardinality=O2O _ _} -> True
+-  ComputedRelationship{relToOne=True}  -> True
+-  _                                    -> False
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 7b0afac7..8cc2b23d 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -291,7 +291,7 @@ spec actualPgVersion = do
+           {"hint":"Verify that 'non_existent_projects' is included in the 'select' query parameter.",
+            "details":null,
+            "code":"PGRST108",
+-           "message":"'non_existent_projects' is not an embedded resource in this request"}|]
++           "message":"Cannot apply filter because 'non_existent_projects' is not an embedded resource in this request"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+@@ -300,7 +300,7 @@ spec actualPgVersion = do
+           {"hint":"Verify that 'amiga_projectsss' is included in the 'select' query parameter.",
+            "details":null,
+            "code":"PGRST108",
+-           "message":"'amiga_projectsss' is not an embedded resource in this request"}|]
++           "message":"Cannot apply filter because 'amiga_projectsss' is not an embedded resource in this request"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+@@ -309,7 +309,7 @@ spec actualPgVersion = do
+           {"hint":"Verify that 'tasks2' is included in the 'select' query parameter.",
+            "details":null,
+            "code":"PGRST108",
+-           "message":"'tasks2' is not an embedded resource in this request"}|]
++           "message":"Cannot apply filter because 'tasks2' is not an embedded resource in this request"}|]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }
+diff --git a/test/spec/Feature/Query/RelatedQueriesSpec.hs b/test/spec/Feature/Query/RelatedQueriesSpec.hs
+deleted file mode 100644
+index ddb35c37..00000000
+--- a/test/spec/Feature/Query/RelatedQueriesSpec.hs
++++ /dev/null
+@@ -1,135 +0,0 @@
+-module Feature.Query.RelatedQueriesSpec where
+-
+-import Network.Wai (Application)
+-
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "related orders" $ do
+-    it "works on a many-to-one relationship" $ do
+-      get "/projects?select=id,clients(name)&order=clients(name).nullsfirst" `shouldRespondWith`
+-        [json|[
+-          {"id":5,"clients":null},
+-          {"id":3,"clients":{"name":"Apple"}},
+-          {"id":4,"clients":{"name":"Apple"}},
+-          {"id":1,"clients":{"name":"Microsoft"}},
+-          {"id":2,"clients":{"name":"Microsoft"}} ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/projects?select=id,client:clients(name)&order=client(name).asc" `shouldRespondWith`
+-        [json|[
+-          {"id":3,"client":{"name":"Apple"}},
+-          {"id":4,"client":{"name":"Apple"}},
+-          {"id":1,"client":{"name":"Microsoft"}},
+-          {"id":2,"client":{"name":"Microsoft"}},
+-          {"id":5,"client":null} ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/videogames?select=id,computed_designers(id)&order=computed_designers(id).desc" `shouldRespondWith`
+-        [json|[
+-          {"id":3,"computed_designers":{"id":2}},
+-          {"id":4,"computed_designers":{"id":2}},
+-          {"id":1,"computed_designers":{"id":1}},
+-          {"id":2,"computed_designers":{"id":1}}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on a one-to-one relationship and jsonb column" $ do
+-      get "/trash?select=id,trash_details(id,jsonb_col)&order=trash_details(jsonb_col->key).asc" `shouldRespondWith`
+-        [json|[
+-          {"id":2,"trash_details":{"id":2,"jsonb_col":{"key": 6}}},
+-          {"id":3,"trash_details":{"id":3,"jsonb_col":{"key": 8}}},
+-          {"id":1,"trash_details":{"id":1,"jsonb_col":{"key": 10}}}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/trash?select=id,trash_details(id,jsonb_col)&order=trash_details(jsonb_col->key).desc" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"trash_details":{"id":1,"jsonb_col":{"key": 10}}},
+-          {"id":3,"trash_details":{"id":3,"jsonb_col":{"key": 8}}},
+-          {"id":2,"trash_details":{"id":2,"jsonb_col":{"key": 6}}}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "works on an embedded resource" $ do
+-      get "/users?select=name,tasks(id,name,projects(id,name))&tasks.order=projects(id).desc&limit=1" `shouldRespondWith`
+-        [json| [{
+-          "name":"Angela Martin",
+-          "tasks":[
+-            {"id": 3, "name":"Design w10","projects":{"id":2,"name":"Windows 10"}},
+-            {"id": 4, "name":"Code w10","projects":{"id":2,"name":"Windows 10"}},
+-            {"id": 1, "name":"Design w7","projects":{"id":1,"name":"Windows 7"}},
+-            {"id": 2, "name":"Code w7","projects":{"id":1,"name":"Windows 7"}}
+-          ]
+-        }]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/users?select=name,tasks(id,name,projects(id,name))&tasks.order=projects(id).desc,name&limit=1" `shouldRespondWith`
+-        [json| [{
+-          "name":"Angela Martin",
+-          "tasks":[
+-            {"id": 4, "name":"Code w10","projects":{"id":2,"name":"Windows 10"}},
+-            {"id": 3, "name":"Design w10","projects":{"id":2,"name":"Windows 10"}},
+-            {"id": 2, "name":"Code w7","projects":{"id":1,"name":"Windows 7"}},
+-            {"id": 1, "name":"Design w7","projects":{"id":1,"name":"Windows 7"}}
+-          ]
+-        }]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/users?select=name,tasks(id,name,projects(id,name))&tasks.order=projects(id).asc&limit=1" `shouldRespondWith`
+-        [json|[{
+-          "name":"Angela Martin",
+-          "tasks":[
+-            {"id":1,"name":"Design w7","projects":{"id":1,"name":"Windows 7"}},
+-            {"id":2,"name":"Code w7","projects":{"id":1,"name":"Windows 7"}},
+-            {"id":3,"name":"Design w10","projects":{"id":2,"name":"Windows 10"}},
+-            {"id":4,"name":"Code w10","projects":{"id":2,"name":"Windows 10"}}
+-          ]
+-        }]|]
+-        { matchStatus  = 200
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "fails when is not a to-one relationship" $ do
+-      get "/clients?select=*,projects(*)&order=projects(id)" `shouldRespondWith`
+-        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'clients' and 'projects' do not form a many-to-one or one-to-one relationship"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/clients?select=*,pros:projects(*)&order=pros(id)" `shouldRespondWith`
+-        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'clients' and 'pros' do not form a many-to-one or one-to-one relationship"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/designers?select=id,computed_videogames(id)&order=computed_videogames(id).desc" `shouldRespondWith`
+-        [json|{"code":"PGRST118","details":null,"hint":null,"message":"'designers' and 'computed_videogames' do not form a many-to-one or one-to-one relationship"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+-    it "fails when the resource is not embedded" $
+-      get "/projects?select=id,clients(name)&order=clientsx(name).nullsfirst" `shouldRespondWith`
+-        [json|{
+-          "code":"PGRST108",
+-          "details":null,
+-          "hint":"Verify that 'clientsx' is included in the 'select' query parameter.",
+-          "message":"'clientsx' is not an embedded resource in this request"
+-        }|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 72306bf5..886d50c3 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -53,7 +53,6 @@ import qualified Feature.Query.QueryLimitedSpec
+ import qualified Feature.Query.QuerySpec
+ import qualified Feature.Query.RangeSpec
+ import qualified Feature.Query.RawOutputTypesSpec
+-import qualified Feature.Query.RelatedQueriesSpec
+ import qualified Feature.Query.RpcSpec
+ import qualified Feature.Query.SingularSpec
+ import qualified Feature.Query.UnicodeSpec
+@@ -150,7 +149,6 @@ main = do
+         , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec)
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+-        , ("Feature.Query.RelatedQueriesSpec"            , Feature.Query.RelatedQueriesSpec.spec)
+         ]
+ 
+   hspec $ do
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index c6f25641..aee8e421 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -826,9 +826,3 @@ INSERT INTO country(id, name) VALUES (1, 'Afghanistan'), (2, 'Algeria');
+ 
+ TRUNCATE TABLE capital CASCADE;
+ INSERT INTO capital(id, name, country_id) VALUES (1, 'Kabul', 1), (2, 'Algiers', 2);
+-
+-TRUNCATE TABLE trash CASCADE;
+-INSERT INTO trash(id) VALUES (1), (2), (3);
+-
+-TRUNCATE TABLE trash_details CASCADE;
+-INSERT INTO trash_details(id,jsonb_col) VALUES (1,'{"key": 10}'), (2,'{"key": 6}'), (3,'{"key": 8}');
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 8fec1f12..a4593b95 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2996,12 +2996,3 @@ CREATE TABLE public.tb (
+ 
+ CREATE VIEW test.va AS SELECT a1 FROM public.ta;
+ CREATE VIEW test.vb AS SELECT b1 FROM public.tb;
+-
+-create table test.trash(
+-  id int primary key
+-);
+-
+-create table test.trash_details(
+-  id int primary key references test.trash(id),
+-  jsonb_col jsonb
+-);

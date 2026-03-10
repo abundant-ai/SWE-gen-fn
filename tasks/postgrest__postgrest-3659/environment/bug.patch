@@ -1,0 +1,81 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b86b3ef0..ebc94db1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,7 +14,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+  - #3091, Broken link in OpenAPI description `externalDocs` - @salim-b
+- - #3659, Embed One-to-One relationship with different column order properly - @wolfgangwalther
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 61e54264..fda01d62 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -756,29 +756,34 @@ allM2OandO2ORels =
+     WITH
+     pks_uniques_cols AS (
+       SELECT
++        connamespace,
+         conrelid,
+-        array_agg(key order by key) as cols
+-      FROM pg_constraint,
+-      LATERAL unnest(conkey) AS _(key)
++        jsonb_agg(column_info.cols) as cols
++      FROM pg_constraint
++      JOIN lateral (
++        SELECT array_agg(cols.attname order by cols.attnum) as cols
++        FROM ( select unnest(conkey) as col) _
++        JOIN pg_attribute cols on cols.attrelid = conrelid and cols.attnum = col
++      ) column_info ON TRUE
+       WHERE
+-        contype IN ('p', 'u')
+-        AND connamespace <> 'pg_catalog'::regnamespace
+-      GROUP BY oid, conrelid
++        contype IN ('p', 'u') and
++        connamespace <> 'pg_catalog'::regnamespace
++      GROUP BY connamespace, conrelid
+     )
+     SELECT
+       ns1.nspname AS table_schema,
+       tab.relname AS table_name,
+       ns2.nspname AS foreign_table_schema,
+       other.relname AS foreign_table_name,
+-      traint.conrelid = traint.confrelid AS is_self,
++      (ns1.nspname, tab.relname) = (ns2.nspname, other.relname) AS is_self,
+       traint.conname  AS constraint_name,
+       column_info.cols_and_fcols,
+-      (column_info.cols IN (SELECT cols FROM pks_uniques_cols WHERE conrelid = traint.conrelid)) AS one_to_one
++      (column_info.cols IN (SELECT * FROM jsonb_array_elements(pks_uqs.cols))) AS one_to_one
+     FROM pg_constraint traint
+     JOIN LATERAL (
+       SELECT
+         array_agg(row(cols.attname, refs.attname) order by ord) AS cols_and_fcols,
+-        array_agg(cols.attnum order by cols.attnum) AS cols
++        jsonb_agg(cols.attname order by ord) AS cols
+       FROM unnest(traint.conkey, traint.confkey) WITH ORDINALITY AS _(col, ref, ord)
+       JOIN pg_attribute cols ON cols.attrelid = traint.conrelid AND cols.attnum = col
+       JOIN pg_attribute refs ON refs.attrelid = traint.confrelid AND refs.attnum = ref
+@@ -787,6 +792,7 @@ allM2OandO2ORels =
+     JOIN pg_class tab ON tab.oid = traint.conrelid
+     JOIN pg_class other ON other.oid = traint.confrelid
+     JOIN pg_namespace ns2 ON ns2.oid = other.relnamespace
++    LEFT JOIN pks_uniques_cols pks_uqs ON pks_uqs.connamespace = traint.connamespace AND pks_uqs.conrelid = traint.conrelid
+     WHERE traint.contype = 'f'
+     AND traint.conparentid = 0
+     ORDER BY traint.conrelid, traint.conname|]
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 67cfd7f6..d20c3688 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2839,7 +2839,7 @@ CREATE TABLE test.students_info(
+ , code text
+ , address text
+ , primary key(id, code)
+-, foreign key (code, id) references test.students(code, id) on delete cascade
++, foreign key (id, code) references test.students(id, code) on delete cascade
+ );
+ 
+ CREATE TABLE test.country(

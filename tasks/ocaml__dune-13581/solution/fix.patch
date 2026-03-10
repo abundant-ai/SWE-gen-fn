@@ -1,0 +1,101 @@
+diff --git a/doc/changes/fixed/13581.md b/doc/changes/fixed/13581.md
+new file mode 100644
+index 000000000..9603fb80b
+--- /dev/null
++++ b/doc/changes/fixed/13581.md
+@@ -0,0 +1,2 @@
++- Respect the `(dir ..)` field on packages when setting up cram tests (#13581,
++  @rgrinberg)
+diff --git a/src/dune_lang/dune_project.ml b/src/dune_lang/dune_project.ml
+index b67847113..edb588028 100644
+--- a/src/dune_lang/dune_project.ml
++++ b/src/dune_lang/dune_project.ml
+@@ -122,6 +122,12 @@ let stanza_parser t ~dir =
+   Decoder.set Package_mask.key mask parser
+ ;;
+ 
++let exclusive_package t ~dir =
++  match Package_mask.package_env ~dir ~packages:t.exclusive_dir_packages with
++  | Inside_package p -> Some p
++  | Forbidden_packages _ -> None
++;;
++
+ let file t = t.project_file
+ 
+ let implicit_transitive_deps t ocaml_version =
+diff --git a/src/dune_lang/dune_project.mli b/src/dune_lang/dune_project.mli
+index 639056af4..0e6b6f363 100644
+--- a/src/dune_lang/dune_project.mli
++++ b/src/dune_lang/dune_project.mli
+@@ -15,6 +15,7 @@ type t
+ 
+ val to_dyn : t -> Dyn.t
+ val packages : t -> Package.t Package.Name.Map.t
++val exclusive_package : t -> dir:Path.Source.t -> Package_id.t option
+ val name : t -> Dune_project_name.t
+ val version : t -> Package_version.t option
+ val root : t -> Path.Source.t
+diff --git a/src/dune_rules/cram/cram_rules.ml b/src/dune_rules/cram/cram_rules.ml
+index 7578a5446..422fc09ae 100644
+--- a/src/dune_rules/cram/cram_rules.ml
++++ b/src/dune_rules/cram/cram_rules.ml
+@@ -201,19 +201,41 @@ let collect_stanzas =
+     | Some dir -> collect_whole_subtree [ acc ] dir
+ ;;
+ 
+-let rules ~sctx ~dir tests =
++let rules ~sctx ~dir tests project =
+   let* stanzas = collect_stanzas ~dir
+   and* with_package_mask =
+-    Dune_load.mask ()
+-    >>| Only_packages.enumerate
+-    >>| function
+-    | `All -> fun _packages f -> f ()
+-    | `Set only ->
+-      fun packages f ->
+-        Memo.when_
+-          (Package.Name.Set.is_empty packages
+-           || Package.Name.Set.(not (is_empty (inter only packages))))
+-          f
++    let+ mask = Dune_load.mask () >>| Only_packages.enumerate in
++    match
++      Dune_project.exclusive_package project ~dir:(Path.Build.drop_build_context_exn dir)
++      |> Option.map ~f:Package.Id.name
++    with
++    | None ->
++      (match mask with
++       | `All -> fun _packages f -> f ()
++       | `Set only ->
++         fun packages f ->
++           Memo.when_
++             (Package.Name.Set.is_empty packages
++              || Package.Name.Set.(not (is_empty (inter only packages))))
++             f)
++    | Some p ->
++      let singleton = Package.Name.Set.singleton p in
++      let with_validate_packages packages ~f =
++        if Package.Name.Set.is_empty packages || Package.Name.Set.equal packages singleton
++        then f ()
++        else
++          Code_error.raise
++            "All cram tests in this directory belong to a particular package by virtue \
++             of the dir stanza in the packge declaration itself. It's not possible to \
++             re-assign it to another package using the cram stanza"
++            [ "package", Package.Name.to_dyn p ]
++      in
++      (match mask with
++       | `All -> fun packages f -> with_validate_packages packages ~f
++       | `Set only ->
++         if Package.Name.Set.mem only p
++         then fun packages f -> with_validate_packages packages ~f
++         else fun packages _f -> with_validate_packages packages ~f:Memo.return)
+   in
+   Memo.parallel_iter tests ~f:(fun test ->
+     let* spec =
+@@ -396,5 +418,5 @@ let rules ~sctx ~dir source_dir =
+   cram_tests source_dir
+   >>= function
+   | [] -> Memo.return ()
+-  | tests -> rules ~sctx ~dir tests
++  | tests -> rules ~sctx ~dir tests (Source_tree.Dir.project source_dir)
+ ;;

@@ -1,0 +1,365 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b0e3d1ee..3866e705 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Removed
++
++ - #3757, Remove support for `Prefer: params=single-object` - @joelonsql
++   + This preference was deprecated in favor of Functions with an array of JSON objects
+ 
+ ### Added
+ 
+diff --git a/docs/references/api/functions.rst b/docs/references/api/functions.rst
+index c251db27..af15180a 100644
+--- a/docs/references/api/functions.rst
++++ b/docs/references/api/functions.rst
+@@ -131,10 +131,6 @@ For this the ``Content-Type: application/json`` header must be included in the r
+ 
+  If an overloaded function has a single ``json`` or ``jsonb`` unnamed parameter, PostgREST will call this function as a fallback provided that no other overloaded function is found with the parameters sent in the POST request.
+ 
+-.. warning::
+-
+- Sending the JSON request body as a single argument is also possible with :ref:`Prefer: params=single-object <prefer_params>` but this method is **deprecated**.
+-
+ .. _function_single_unnamed:
+ 
+ Functions with a single unnamed parameter
+diff --git a/docs/references/api/preferences.rst b/docs/references/api/preferences.rst
+index d50917a3..89d65de9 100644
+--- a/docs/references/api/preferences.rst
++++ b/docs/references/api/preferences.rst
+@@ -15,7 +15,6 @@ The following preferences are supported.
+ - ``Prefer: missing``. See :ref:`bulk_insert_default`.
+ - ``Prefer: max-affected``, See :ref:`prefer_max_affected`.
+ - ``Prefer: tx``. See :ref:`prefer_tx`.
+-- ``Prefer: params``. See :ref:`prefer_params`.
+ 
+ .. _prefer_handling:
+ 
+@@ -224,31 +223,3 @@ To illustrate the use of this preference, consider the following scenario where
+       "details": "The query affects 14 rows",
+       "hint": null
+   }
+-
+-.. _prefer_params:
+-
+-Single JSON object as Function Parameter
+-----------------------------------------
+-
+-.. warning::
+-
+-  Using this preference is **deprecated** in favor of :ref:`function_single_json`.
+-
+-:code:`Prefer: params=single-object` allows sending the JSON request body as the single argument of a :ref:`function <functions>`.
+-
+-.. code-block:: postgres
+-
+-  CREATE FUNCTION mult_them(param json) RETURNS int AS $$
+-    SELECT (param->>'x')::int * (param->>'y')::int
+-  $$ LANGUAGE SQL;
+-
+-.. code-block:: bash
+-
+-  curl "http://localhost:3000/rpc/mult_them" \
+-    -X POST -H "Content-Type: application/json" \
+-    -H "Prefer: params=single-object" \
+-    -d '{ "x": 4, "y": 2 }'
+-
+-.. code-block:: json
+-
+-  8
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index b869c4a9..59bcc122 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -12,7 +12,6 @@ module PostgREST.ApiRequest.Preferences
+   , PreferCount(..)
+   , PreferHandling(..)
+   , PreferMissing(..)
+-  , PreferParameters(..)
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+   , PreferTransaction(..)
+@@ -37,7 +36,6 @@ import Protolude
+ -- >>> import Text.Pretty.Simple (pPrint)
+ -- >>> deriving instance Show PreferResolution
+ -- >>> deriving instance Show PreferRepresentation
+--- >>> deriving instance Show PreferParameters
+ -- >>> deriving instance Show PreferCount
+ -- >>> deriving instance Show PreferTransaction
+ -- >>> deriving instance Show PreferMissing
+@@ -51,7 +49,6 @@ data Preferences
+   = Preferences
+     { preferResolution     :: Maybe PreferResolution
+     , preferRepresentation :: Maybe PreferRepresentation
+-    , preferParameters     :: Maybe PreferParameters
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+     , preferMissing        :: Maybe PreferMissing
+@@ -71,7 +68,6 @@ data Preferences
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+---     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Nothing
+@@ -89,7 +85,6 @@ data Preferences
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+---     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Just ApplyNulls
+@@ -122,7 +117,6 @@ data Preferences
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Just Full
+---     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+ --     , preferMissing = Just ApplyDefaults
+@@ -137,7 +131,6 @@ fromHeaders allowTxDbOverride acceptedTzNames headers =
+   Preferences
+     { preferResolution     = parsePrefs [MergeDuplicates, IgnoreDuplicates]
+     , preferRepresentation = parsePrefs [Full, None, HeadersOnly]
+-    , preferParameters     = parsePrefs [SingleObject]
+     , preferCount          = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction    = if allowTxDbOverride then parsePrefs [Commit, Rollback] else Nothing
+     , preferMissing        = parsePrefs [ApplyDefaults, ApplyNulls]
+@@ -151,7 +144,6 @@ fromHeaders allowTxDbOverride acceptedTzNames headers =
+     mapToHeadVal = map toHeaderValue
+     acceptedPrefs = mapToHeadVal [MergeDuplicates, IgnoreDuplicates] ++
+                     mapToHeadVal [Full, None, HeadersOnly] ++
+-                    mapToHeadVal [SingleObject] ++
+                     mapToHeadVal [ExactCount, PlannedCount, EstimatedCount] ++
+                     mapToHeadVal [Commit, Rollback] ++
+                     mapToHeadVal [ApplyDefaults, ApplyNulls] ++
+@@ -179,7 +171,7 @@ fromHeaders allowTxDbOverride acceptedTzNames headers =
+     prefMap = Map.fromList . fmap (\pref -> (toHeaderValue pref, pref))
+ 
+ prefAppliedHeader :: Preferences -> Maybe HTTP.Header
+-prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing, preferHandling, preferTimezone, preferMaxAffected } =
++prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferCount, preferTransaction, preferMissing, preferHandling, preferTimezone, preferMaxAffected } =
+   if null prefsVals
+     then Nothing
+     else Just (HTTP.hPreferenceApplied, combined)
+@@ -189,7 +181,6 @@ prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferPar
+         toHeaderValue <$> preferResolution
+       , toHeaderValue <$> preferMissing
+       , toHeaderValue <$> preferRepresentation
+-      , toHeaderValue <$> preferParameters
+       , toHeaderValue <$> preferCount
+       , toHeaderValue <$> preferTransaction
+       , toHeaderValue <$> preferHandling
+@@ -231,15 +222,6 @@ instance ToHeaderValue PreferRepresentation where
+   toHeaderValue None        = "return=minimal"
+   toHeaderValue HeadersOnly = "return=headers-only"
+ 
+--- | How to pass parameters to stored procedures.
+--- TODO: deprecated. Remove on next major version.
+-data PreferParameters
+-  = SingleObject    -- ^ Pass all parameters as a single json object to a stored procedure.
+-  deriving Eq
+-
+-instance ToHeaderValue PreferParameters where
+-  toHeaderValue SingleObject    = "params=single-object"
+-
+ -- | How to determine the count of (expected) results
+ data PreferCount
+   = ExactCount     -- ^ Exact count (slower).
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e4fb6dc3..32d93612 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -81,7 +81,7 @@ data ApiRequestError
+   | LimitNoOrderError
+   | NotFound
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+-  | NoRpc Text Text [Text] Bool MediaType Bool [QualifiedIdentifier] [Routine]
++  | NoRpc Text Text [Text] MediaType Bool [QualifiedIdentifier] [Routine]
+   | NotEmbedded Text
+   | PutLimitNotAllowedError
+   | QueryParamError QPError
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 9c7d6d3a..9cd0f80f 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -221,24 +221,23 @@ instance JSON.ToJSON ApiRequestError where
+     (Just $ JSON.toJSONList (compressedRel <$> rels))
+     (Just $ JSON.String $ "Try changing '" <> child <> "' to one of the following: " <> relHint rels <> ". Find the desired relationship in the 'details' key.")
+ 
+-  toJSON (NoRpc schema procName argumentKeys hasPreferSingleObject contentType isInvPost allProcs overloadedProcs)  =
++  toJSON (NoRpc schema procName argumentKeys contentType isInvPost allProcs overloadedProcs)  =
+     let func = schema <> "." <> procName
+         prms = T.intercalate ", " argumentKeys
+         prmsMsg = "(" <> prms <> ")"
+         prmsDet = " with parameter" <> (if length argumentKeys > 1 then "s " else " ") <> prms
+         fmtPrms p = if null argumentKeys then " without parameters" else p
+-        onlySingleParams = hasPreferSingleObject || (isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream])
++        onlySingleParams = isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream]
+     in toJsonPgrstError
+     SchemaCacheErrorCode02
+     ("Could not find the function " <> func <> (if onlySingleParams then "" else fmtPrms prmsMsg) <> " in the schema cache")
+     (Just $ JSON.String $ "Searched for the function " <> func <>
+-      (case (hasPreferSingleObject, isInvPost, contentType) of
+-        (True, _, _)                 -> " with a single json/jsonb parameter"
+-        (_, True, MTTextPlain)       -> " with a single unnamed text parameter"
+-        (_, True, MTTextXML)         -> " with a single unnamed xml parameter"
+-        (_, True, MTOctetStream)     -> " with a single unnamed bytea parameter"
+-        (_, True, MTApplicationJSON) -> fmtPrms prmsDet <> " or with a single unnamed json/jsonb parameter"
+-        _                            -> fmtPrms prmsDet) <>
++      (case (isInvPost, contentType) of
++        (True, MTTextPlain)       -> " with a single unnamed text parameter"
++        (True, MTTextXML)         -> " with a single unnamed xml parameter"
++        (True, MTOctetStream)     -> " with a single unnamed bytea parameter"
++        (True, MTApplicationJSON) -> fmtPrms prmsDet <> " or with a single unnamed json/jsonb parameter"
++        _                         -> fmtPrms prmsDet) <>
+       ", but no matches were found in the schema cache.")
+     -- The hint will be null in the case of single unnamed parameter functions
+     (if onlySingleParams
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 926ab3f9..2d30e207 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -166,12 +166,12 @@ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..}
+   return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation identifier
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+-callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} invMethod = do
++callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs},..} invMethod = do
+   let paramKeys = case invMethod of
+         InvRead _ -> S.fromList $ fst <$> qsParams'
+         Inv       -> iColumns
+   proc@Function{..} <- mapLeft ApiRequestError $
+-    findProc identifier paramKeys (preferParameters == Just SingleObject) (dbRoutines sCache) iContentMediaType (invMethod == Inv)
++    findProc identifier paramKeys (dbRoutines sCache) iContentMediaType (invMethod == Inv)
+   let relIdentifier = QualifiedIdentifier pdSchema (fromMaybe pdName $ Routine.funcTableName proc) -- done so a set returning function can embed other relations
+   rPlan <- readPlan relIdentifier conf sCache apiRequest
+   let args = case (invMethod, iContentMediaType) of
+@@ -207,10 +207,10 @@ inspectPlan apiRequest headersOnly schema = do
+   Search a pg proc by matching name and arguments keys to parameters. Since a function can be overloaded,
+   the name is not enough to find it. An overloaded function can have a different volatility or even a different return type.
+ -}
+-findProc :: QualifiedIdentifier -> S.Set Text -> Bool -> RoutineMap -> MediaType -> Bool -> Either ApiRequestError Routine
+-findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPost =
++findProc :: QualifiedIdentifier -> S.Set Text -> RoutineMap -> MediaType -> Bool -> Either ApiRequestError Routine
++findProc qi argumentsKeys allProcs contentMediaType isInvPost =
+   case matchProc of
+-    ([], [])     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) paramsAsSingleObject contentMediaType isInvPost (HM.keys allProcs) lookupProcName
++    ([], [])     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) contentMediaType isInvPost (HM.keys allProcs) lookupProcName
+     -- If there are no functions with named arguments, fallback to the single unnamed argument function
+     ([], [proc]) -> Right proc
+     ([], procs)  -> Left $ AmbiguousRpc (toList procs)
+@@ -241,13 +241,9 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+     matchesParams proc =
+       let
+         params = pdParams proc
+-        firstType = (ppType <$> headMay params)
+       in
+-      -- exceptional case for Prefer: params=single-object
+-      if paramsAsSingleObject
+-        then length params == 1 && (firstType == Just "json" || firstType == Just "jsonb")
+       -- If the function has no parameters, the arguments keys must be empty as well
+-      else if null params
++      if null params
+         then null argumentsKeys && not (isInvPost && contentMediaType `elem` [MTOctetStream, MTTextPlain, MTTextXML])
+       -- A function has optional and required parameters. Optional parameters have a default value and
+       -- don't require arguments for the function to be executed, required parameters must have an argument present.
+@@ -972,7 +968,7 @@ resolveOrError ctx (Just table) field =
+     cf                          -> Right $ withJsonParse ctx cf
+ 
+ callPlan :: Routine -> ApiRequest -> S.Set FieldName -> CallArgs -> ReadPlanTree -> CallPlan
+-callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq = FunctionCall {
++callPlan proc ApiRequest{} paramKeys args readReq = FunctionCall {
+   funCQi = QualifiedIdentifier (pdSchema proc) (pdName proc)
+ , funCParams = callParams
+ , funCArgs = args
+@@ -982,11 +978,9 @@ callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq =
+ , funCReturning = inferColsEmbedNeeds readReq []
+ }
+   where
+-    paramsAsSingleObject = preferParameters == Just SingleObject
+     specifiedParams = filter (\x -> ppName x `S.member` paramKeys)
+     callParams = case pdParams proc of
+-      [prm] | paramsAsSingleObject -> OnePosParam prm
+-            | ppName prm == mempty -> OnePosParam prm
++      [prm] | ppName prm == mempty -> OnePosParam prm
+             | otherwise            -> KeyParams $ specifiedParams [prm]
+       prms  -> KeyParams $ specifiedParams prms
+ 
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index d50f825b..68a68c4b 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -69,7 +69,7 @@ actionResponse (DbCrudResult WrappedReadPlan{wrMedia, wrHdrsOnly=headersOnly, cr
+     RSStandard{..} -> do
+       let
+         (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
++        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
+         headers =
+           [ contentRange
+           , ( "Content-Location"
+@@ -99,7 +99,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationCreate, mrMutateP
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+       prefHeader = prefAppliedHeader $
+         Preferences (if null pkCols && isNothing (qsOnConflict iQueryParams) then Nothing else preferResolution)
+-        preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling preferTimezone Nothing []
++        preferRepresentation preferCount preferTransaction preferMissing preferHandling preferTimezone Nothing []
+       headers =
+         catMaybes
+           [ if null rsLocation then
+@@ -139,7 +139,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling preferTimezone preferMaxAffected []
++      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction preferMissing preferHandling preferTimezone preferMaxAffected []
+       headers = catMaybes [contentRangeHeader, prefHeader]
+ 
+     let (status, headers', body) =
+@@ -158,7 +158,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationUpdate, mrMedia}
+ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationSingleUpsert, mrMedia} resultSet) ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} _ _ _ _ _ = case resultSet of
+   RSStandard {..} -> do
+     let
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction Nothing preferHandling preferTimezone Nothing []
+       cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+     let isInsertIfGTZero i = if i > 0 then HTTP.status201 else HTTP.status200
+@@ -181,7 +181,7 @@ actionResponse (DbCrudResult MutateReadPlan{mrMutation=MutationDelete, mrMedia}
+       contentRangeHeader =
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
+       headers = contentRangeHeader : prefHeader
+ 
+     let (status, headers', body) =
+@@ -206,7 +206,7 @@ actionResponse (DbCallResult CallReadPlan{crMedia, crInvMthd=invMethod, crProc=p
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone preferMaxAffected []
+       headers = contentRange : prefHeader
+ 
+     let (status', headers', body) =
+diff --git a/src/PostgREST/Response/OpenAPI.hs b/src/PostgREST/Response/OpenAPI.hs
+index 741d4a30..fe40e3c0 100644
+--- a/src/PostgREST/Response/OpenAPI.hs
++++ b/src/PostgREST/Response/OpenAPI.hs
+@@ -175,7 +175,6 @@ makePreferParam ts =
+     val :: Text -> [Text]
+     val = \case
+       "count"      -> ["count=none"]
+-      "params"     -> ["params=single-object"]
+       "return"     -> ["return=representation", "return=minimal", "return=none"]
+       "resolution" -> ["resolution=ignore-duplicates", "resolution=merge-duplicates"]
+       _            -> []

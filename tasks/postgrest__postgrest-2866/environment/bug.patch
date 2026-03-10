@@ -1,0 +1,138 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ca93c0ca..1c026e0f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,8 +30,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2840, Fix `Prefer: missing=default` with DOMAIN default values - @steve-chavez
+  - #2849, Fix HEAD unnecessarily executing aggregates - @steve-chavez
+  - #2594, Fix unused index on jsonb/jsonb arrow filter and order (``/bets?data->>contractId=eq.1`` and ``/bets?order=data->>contractId``) - @steve-chavez
+- - #2861, Fix character and bit columns with fixed length not inserting/updating properly - @laurenceisla
+-   + Fixes the error "value too long for type character(1)" when the char length of the column was bigger than one.
+ 
+ ## [11.1.0] - 2023-06-07
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index b56549f8..19d2815b 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -573,19 +573,19 @@ tablesSqlQuery pgVer =
+           d.description AS description,
+   |] <> columnDefault <> [q| AS column_default,
+           not (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
+-          CASE
+-              WHEN t.typtype = 'd' THEN
+-              CASE
+-                  WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
+-                  ELSE format_type(a.atttypid, a.atttypmod)
+-              END
+-              ELSE
+               CASE
+-                  WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
+-                  ELSE format_type(a.atttypid, a.atttypmod)
+-              END
+-          END::text AS data_type,
+-          format_type(a.atttypid, a.atttypmod)::text AS nominal_data_type,
++                  WHEN t.typtype = 'd' THEN
++                  CASE
++                      WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
++                      ELSE format_type(a.atttypid, a.atttypmod)
++                  END
++                  ELSE
++                  CASE
++                      WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
++                      ELSE format_type(a.atttypid, a.atttypmod)
++                  END
++              END::text AS data_type,
++          t.oid AS data_type_id,
+           information_schema._pg_char_max_length(
+               information_schema._pg_truetypid(a.*, t.*),
+               information_schema._pg_truetypmod(a.*, t.*)
+@@ -627,7 +627,7 @@ tablesSqlQuery pgVer =
+           info.description,
+           info.is_nullable::boolean,
+           info.data_type,
+-          info.nominal_data_type,
++          info.data_type_id::regtype::text,
+           info.character_maximum_length,
+           info.column_default,
+           coalesce(enum_info.vals, '{}')) order by info.position) as columns
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index ea799efb..c98bd48f 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -391,22 +391,6 @@ spec actualPgVersion = do
+           `shouldRespondWith` [json|[{ id: 20 }]|]
+             { matchStatus  = 201 }
+ 
+-    -- https://github.com/PostgREST/postgrest/issues/2861
+-    context "bit and char columns with length" $ do
+-      it "should insert to a bit column with length" $
+-        request methodPost "/bitchar_with_length?select=bit"
+-            [("Prefer", "return=representation")]
+-            [json|{"bit": "10101"}|]
+-          `shouldRespondWith` [json|[{ "bit": "10101" }]|]
+-            { matchStatus  = 201 }
+-
+-      it "should insert to a char column with length" $
+-        request methodPost "/bitchar_with_length?select=char"
+-            [("Prefer", "return=representation")]
+-            [json|{"char": "abcde"}|]
+-          `shouldRespondWith` [json|[{ "char": "abcde" }]|]
+-            { matchStatus  = 201 }
+-
+     context "POST with ?columns parameter" $ do
+       it "ignores json keys not included in ?columns" $ do
+         request methodPost "/articles?columns=id,body" [("Prefer", "return=representation")]
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 523a8873..5f552b7e 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -384,22 +384,6 @@ spec actualPgVersion = do
+             , matchHeaders = ["Preference-Applied" <:> "missing=default"]
+             }
+ 
+-    -- https://github.com/PostgREST/postgrest/issues/2861
+-    context "bit and char columns with length" $ do
+-      it "should update a bit column with length" $
+-        request methodPatch "/bitchar_with_length?char=eq.aaaaa"
+-            [("Prefer", "return=representation")]
+-            [json|{"bit": "11100"}|]
+-          `shouldRespondWith` [json|[{ "bit": "11100", "char": "aaaaa" }]|]
+-            { matchStatus  = 200 }
+-
+-      it "should update a char column with length" $
+-        request methodPatch "/bitchar_with_length?bit=eq.00000"
+-            [("Prefer", "return=representation")]
+-            [json|{"char": "zzzyy"}|]
+-          `shouldRespondWith` [json|[{ "bit": "00000", "char": "zzzyy" }]|]
+-            { matchStatus  = 200 }
+-
+   context "tables with self reference foreign keys" $ do
+     context "embeds children after update" $ do
+       it "without filters" $
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index a2ba2e24..d4d23d37 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -849,7 +849,3 @@ INSERT INTO datarep_todos VALUES (4, 'Opus Magnum', NULL, NULL);
+ TRUNCATE TABLE datarep_next_two_todos CASCADE;
+ INSERT INTO datarep_next_two_todos VALUES (1, 2, 3, 'school related');
+ INSERT INTO datarep_next_two_todos VALUES (2, 1, 3, 'do these first');
+-
+-TRUNCATE TABLE bitchar_with_length CASCADE;
+-INSERT INTO bitchar_with_length(bit, char) VALUES ('00000', 'aaaaa');
+-INSERT INTO bitchar_with_length(bit, char) VALUES ('11111', 'bbbbb');
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 9c5260ef..dc2a02c6 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3302,9 +3302,3 @@ create table bets (
+ 
+ create index bets_data_json  on bets ((data_json  ->>'contractId'));
+ create index bets_data_jsonb on bets ((data_jsonb ->>'contractId'));
+-
+--- https://github.com/PostgREST/postgrest/issues/2861
+-CREATE TABLE bitchar_with_length (
+-  bit bit(5),
+-  char char(5)
+-);

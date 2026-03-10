@@ -1,0 +1,146 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 92ec196c..94ac0296 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Allows doing an anti join, e.g. `/projects?select=*,clients(*)&clients=is.null`
+    + Allows using or across related tables conditions
+  - #1100, Customizable OpenAPI title - @AnthonyFisi
++ - #2506, Add `server-trace-header` for tracing HTTP requests.  - @steve-chavez
++   + When the client sends the request header specified in the config it will be included in the response headers.
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index dc0a4bf5..cc35428c 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -187,6 +187,7 @@ test-suite spec
+                       Feature.CorsSpec
+                       Feature.ExtraSearchPathSpec
+                       Feature.LegacyGucsSpec
++                      Feature.ObservabilitySpec
+                       Feature.OpenApi.DisabledOpenApiSpec
+                       Feature.OpenApi.IgnorePrivOpenApiSpec
+                       Feature.OpenApi.OpenApiSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 384bcc95..705af6aa 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -48,7 +48,7 @@ import PostgREST.ApiRequest       (Action (..), ApiRequest (..),
+                                    Mutation (..), Target (..))
+ import PostgREST.AppState         (AppState)
+ import PostgREST.Auth             (AuthResult (..))
+-import PostgREST.Config           (AppConfig (..), LogLevel (..))
++import PostgREST.Config           (AppConfig (..))
+ import PostgREST.Config.PgVersion (PgVersion (..))
+ import PostgREST.Error            (Error)
+ import PostgREST.Query            (DbHandler)
+@@ -73,7 +73,7 @@ run installHandlers maybeRunWithSocket appState = do
+ 
+   Workers.runAdmin conf appState $ serverSettings conf
+ 
+-  let app = postgrest configLogLevel appState (Workers.connectionWorker appState)
++  let app = postgrest conf appState (Workers.connectionWorker appState)
+ 
+   case configServerUnixSocket of
+     Just socket ->
+@@ -97,17 +97,18 @@ serverSettings AppConfig{..} =
+     & setServerName ("postgrest/" <> prettyVersion)
+ 
+ -- | PostgREST application
+-postgrest :: LogLevel -> AppState.AppState -> IO () -> Wai.Application
+-postgrest logLevel appState connWorker =
++postgrest :: AppConfig -> AppState.AppState -> IO () -> Wai.Application
++postgrest conf appState connWorker =
++  Response.traceHeaderMiddleware conf .
+   Cors.middleware .
+   Auth.middleware appState .
+-  Logger.middleware logLevel $
++  Logger.middleware (configLogLevel conf) $
+     -- fromJust can be used, because the auth middleware will **always** add
+     -- some AuthResult to the vault.
+     \req respond -> case fromJust $ Auth.getResult req of
+       Left err -> respond $ Error.errorResponseFor err
+       Right authResult -> do
+-        conf <- AppState.getConfig appState
++        appConf <- AppState.getConfig appState -- the config must be read again because it can reload
+         maybeSchemaCache <- AppState.getSchemaCache appState
+         pgVer <- AppState.getPgVersion appState
+         jsonDbS <- AppState.getJsonDbS appState
+@@ -115,7 +116,7 @@ postgrest logLevel appState connWorker =
+         let
+           eitherResponse :: IO (Either Error Wai.Response)
+           eitherResponse =
+-            runExceptT $ postgrestResponse appState conf maybeSchemaCache jsonDbS pgVer authResult req
++            runExceptT $ postgrestResponse appState appConf maybeSchemaCache jsonDbS pgVer authResult req
+ 
+         response <- either Error.errorResponseFor identity <$> eitherResponse
+         -- Launch the connWorker when the connection is down.  The postgrest
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 81a117e3..74c0032a 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -32,6 +32,7 @@ import qualified Data.Aeson             as JSON
+ import qualified Data.ByteString        as BS
+ import qualified Data.ByteString.Base64 as B64
+ import qualified Data.ByteString.Lazy   as LBS
++import qualified Data.CaseInsensitive   as CI
+ import qualified Data.Configurator      as C
+ import qualified Data.Map.Strict        as M
+ import qualified Data.Text              as T
+@@ -93,6 +94,7 @@ data AppConfig = AppConfig
+   , configRawMediaTypes            :: [MediaType]
+   , configServerHost               :: Text
+   , configServerPort               :: Int
++  , configServerTraceHeader        :: Maybe (CI.CI BS.ByteString)
+   , configServerUnixSocket         :: Maybe FilePath
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
+@@ -150,6 +152,7 @@ toText conf =
+       ,("raw-media-types",           q . T.decodeUtf8 . BS.intercalate "," . fmap toMime . configRawMediaTypes)
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
++      ,("server-trace-header",       q . T.decodeUtf8 . maybe mempty CI.original . configServerTraceHeader)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
+       ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
+@@ -247,6 +250,7 @@ parser optPath env dbSettings =
+     <*> (maybe [] (fmap (MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
++    <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index ae72cfcf..bdbfa14b 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -14,12 +14,14 @@ module PostgREST.Response
+   , addRetryHint
+   , isServiceUnavailable
+   , optionalRollback
++  , traceHeaderMiddleware
+   ) where
+ 
+ import qualified Data.Aeson                as JSON
+ import qualified Data.ByteString.Char8     as BS
+ import qualified Data.ByteString.Lazy      as LBS
+ import qualified Data.HashMap.Strict       as HM
++import qualified Data.List                 as L
+ import           Data.Text.Read            (decimal)
+ import qualified Network.HTTP.Types.Header as HTTP
+ import qualified Network.HTTP.Types.Status as HTTP
+@@ -291,3 +293,11 @@ addHeadersIfNotIncluded :: [HTTP.Header] -> [HTTP.Header] -> [HTTP.Header]
+ addHeadersIfNotIncluded newHeaders initialHeaders =
+   filter (\(nk, _) -> isNothing $ find (\(ik, _) -> ik == nk) initialHeaders) newHeaders ++
+   initialHeaders
++
++traceHeaderMiddleware :: AppConfig -> Wai.Middleware
++traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
++  case configServerTraceHeader of
++    Nothing -> app req respond
++    Just hdr ->
++      let hdrVal = L.lookup hdr $ Wai.requestHeaders req in
++      app req (respond . Wai.mapResponseHeaders ([(hdr, fromMaybe mempty hdrVal)] ++))

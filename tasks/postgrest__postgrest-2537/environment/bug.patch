@@ -1,0 +1,445 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 94666072..c8363c46 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,15 +22,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2343, Return status code 200 for PATCH requests which don't affect any rows - @wolfgangwalther
+  - #2481, Treat computed relationships not marked SETOF as M2O/O2O relationship - @wolfgangwalther
+  - #2534, Fix embedding a computed relationship with a normal relationship - @steve-chavez
+- - #2362, Fix error message when [] is used inside select - @wolfgangwalther
+- - #2475, Disallow !inner on computed columns - @wolfgangwalther
+- - #2285, Ignore leading and trailing spaces in column names when parsing the query string - @wolfgangwalther
+ 
+ ### Changed
+ 
+  - #2444, Removed `db-pool-timeout` option, because this was removed upstream in hasql-pool. - @robx
+  - #2343, PATCH requests that don't affect any rows no longer return 404 - @wolfgangwalther
+- - #2537, Stricter parsing of query string. Instead of silently ignoring, the parser now throws on invalid syntax like json paths for embeddings, hints for regular columns, empty casts or fts languages, etc. - @wolfgangwalther
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index dba5486a..b2c79343 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -51,8 +51,7 @@ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferTransaction (..))
+ import PostgREST.ApiRequest.QueryParams  (QueryParams (..))
+ import PostgREST.ApiRequest.Types        (ApiRequestError (..),
+-                                          RangeError (..),
+-                                          SelectItem (..))
++                                          RangeError (..), SelectItem)
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+ import PostgREST.MediaType               (MTPlanAttrs (..),
+@@ -529,6 +528,6 @@ binaryField AppConfig{configRawMediaTypes} acceptMediaType target QueryParams{qs
+     returnsScalar _                   = False
+ 
+     fstFieldName :: [Tree SelectItem] -> Maybe FieldName
+-    fstFieldName [Node SelectField{selField=("*", _)} []] = Nothing
+-    fstFieldName [Node SelectField{selField=(fld, _)} []] = Just fld
+-    fstFieldName _                                        = Nothing
++    fstFieldName [Node (("*", _), Nothing, Nothing, Nothing, Nothing) []] = Nothing
++    fstFieldName [Node ((fld, _), Nothing, Nothing, Nothing, Nothing) []] = Just fld
++    fstFieldName _                           = Nothing
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 01a1e289..fb13ae1b 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -53,7 +53,7 @@ import PostgREST.ApiRequest.Types (EmbedParam (..), EmbedPath, Field,
+                                    Operation (..),
+                                    OrderDirection (..),
+                                    OrderNulls (..), OrderTerm (..),
+-                                   QPError (..), SelectItem (..),
++                                   QPError (..), SelectItem,
+                                    SimpleOperator (..), SingleVal,
+                                    TrileanVal (..))
+ 
+@@ -73,7 +73,6 @@ import Protolude hiding (try)
+ -- >>> deriving instance Show JsonOperation
+ -- >>> deriving instance Show Filter
+ -- >>> deriving instance Show JoinType
+--- >>> deriving instance Show SelectItem
+ 
+ data QueryParams =
+   QueryParams
+@@ -114,7 +113,7 @@ data QueryParams =
+ -- 'select' is a reserved parameter that selects the fields to be returned:
+ --
+ -- >>> qsSelect <$> parse "select=name,location"
+--- Right [Node {rootLabel = SelectField {selField = ("name",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectField {selField = ("location",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]
++-- Right [Node {rootLabel = (("name",[]),Nothing,Nothing,Nothing,Nothing), subForest = []},Node {rootLabel = (("location",[]),Nothing,Nothing,Nothing,Nothing), subForest = []}]
+ --
+ -- Filters are parameters whose value contains an operator, separated by a '.' from its value:
+ --
+@@ -302,22 +301,6 @@ pTreePath = do
+   jp <- P.option [] pJsonPath
+   return (init p, (last p, jp))
+ 
+--- |
+--- Parse select= into a Forest of SelectItems
+---
+--- >>> P.parse pFieldForest "" "id"
+--- Right [Node {rootLabel = SelectField {selField = ("id",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]
+---
+--- >>> P.parse pFieldForest "" "client(id)"
+--- Right [Node {rootLabel = SelectRelation {selRelation = "client", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("id",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]
+---
+--- >>> P.parse pFieldForest "" "*,client(*,nested(*))"
+--- Right [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectRelation {selRelation = "client", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectRelation {selRelation = "nested", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]}]
+---
+--- >>> P.parse pFieldForest "" "id,clients(name[])"
+--- Left (line 1, column 16):
+--- unexpected '['
+--- expecting letter, digit, "-", "!", "(", "->>", "->", "::", ")", "," or end of input
+ pFieldForest :: Parser [Tree SelectItem]
+ pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
+   where
+@@ -328,45 +311,11 @@ pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
+ pStar :: Parser Text
+ pStar = string "*" $> "*"
+ 
+--- |
+--- Parse field names
+---
+--- >>> P.parse pFieldName "" "identifier"
+--- Right "identifier"
+---
+--- >>> P.parse pFieldName "" "identifier with spaces"
+--- Right "identifier with spaces"
+---
+--- >>> P.parse pFieldName "" "identifier-with-dashes"
+--- Right "identifier-with-dashes"
+---
+--- >>> P.parse pFieldName "" "123"
+--- Right "123"
+---
+--- >>> P.parse pFieldName "" "_"
+--- Right "_"
+---
+--- >>> P.parse pFieldName "" "$"
+--- Right "$"
+---
+--- >>> P.parse pFieldName "" ":"
+--- Left (line 1, column 1):
+--- unexpected ":"
+--- expecting field name (* or [a..z0..9_$])
+---
+--- >>> P.parse pFieldName "" "\":\""
+--- Right ":"
+---
+--- >>> P.parse pFieldName "" " no leading or trailing spaces "
+--- Right "no leading or trailing spaces"
+---
+--- >>> P.parse pFieldName "" "\" leading and trailing spaces \""
+--- Right " leading and trailing spaces "
+ pFieldName :: Parser Text
+ pFieldName =
+   pQuotedValue <|>
+-  T.intercalate "-" . map toS <$> (pIdentifier `sepBy1` dash) <?>
+-  "field name (* or [a..z0..9_$])"
++  T.intercalate "-" . map toS <$> (many1 pIdentifierChar `sepBy1` dash) <?>
++  "field name (* or [a..z0..9_])"
+   where
+     isDash :: GenParser Char st ()
+     isDash = try ( char '-' >> notFollowedBy (char '>') )
+@@ -419,42 +368,13 @@ pField = lexeme $ (,) <$> pFieldName <*> P.option [] pJsonPath
+ aliasSeparator :: Parser ()
+ aliasSeparator = char ':' >> notFollowedBy (char ':')
+ 
+--- |
+--- Parse regular fields in select
+---
+--- >>> P.parse pRelationSelect "" "rel(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing})
+---
+--- >>> P.parse pRelationSelect "" "alias:rel(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Just "alias", selHint = Nothing, selJoinType = Nothing})
+---
+--- >>> P.parse pRelationSelect "" "rel!hint(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Nothing, selHint = Just "hint", selJoinType = Nothing})
+---
+--- >>> P.parse pRelationSelect "" "rel!inner(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Nothing, selHint = Nothing, selJoinType = Just JTInner})
+---
+--- >>> P.parse pRelationSelect "" "rel!hint!inner(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Nothing, selHint = Just "hint", selJoinType = Just JTInner})
+---
+--- >>> P.parse pRelationSelect "" "alias:rel!inner!hint(*)"
+--- Right (SelectRelation {selRelation = "rel", selAlias = Just "alias", selHint = Just "hint", selJoinType = Just JTInner})
+---
+--- >>> P.parse pRelationSelect "" "rel->jsonpath(*)"
+--- Left (line 1, column 6):
+--- unexpected '>'
+---
+--- >>> P.parse pRelationSelect "" "rel->jsonpath!hint(*)"
+--- Left (line 1, column 6):
+--- unexpected '>'
+ pRelationSelect :: Parser SelectItem
+ pRelationSelect = lexeme $ try ( do
+     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+-    name <- pFieldName
++    fld <- pField
+     prm1 <- optionMaybe pEmbedParam
+     prm2 <- optionMaybe pEmbedParam
+-    try (void $ lookAhead (string "("))
+-    return $ SelectRelation name alias (embedParamHint prm1 <|> embedParamHint prm2) (embedParamJoin prm1 <|> embedParamJoin prm2)
++    return (fld, Nothing, alias, embedParamHint prm1 <|> embedParamHint prm2, embedParamJoin prm1 <|> embedParamJoin prm2)
+   )
+   where
+     pEmbedParam :: Parser EmbedParam
+@@ -470,66 +390,19 @@ pRelationSelect = lexeme $ try ( do
+       Just (EPJoinType jt) -> Just jt
+       _                    -> Nothing
+ 
+--- |
+--- Parse regular fields in select
+---
+--- >>> P.parse pFieldSelect "" "name"
+--- Right (SelectField {selField = ("name",[]), selCast = Nothing, selAlias = Nothing})
+---
+--- >>> P.parse pFieldSelect "" "name->jsonpath"
+--- Right (SelectField {selField = ("name",[JArrow {jOp = JKey {jVal = "jsonpath"}}]), selCast = Nothing, selAlias = Nothing})
+---
+--- >>> P.parse pFieldSelect "" "name::cast"
+--- Right (SelectField {selField = ("name",[]), selCast = Just "cast", selAlias = Nothing})
+---
+--- >>> P.parse pFieldSelect "" "alias:name"
+--- Right (SelectField {selField = ("name",[]), selCast = Nothing, selAlias = Just "alias"})
+---
+--- >>> P.parse pFieldSelect "" "alias:name->jsonpath::cast"
+--- Right (SelectField {selField = ("name",[JArrow {jOp = JKey {jVal = "jsonpath"}}]), selCast = Just "cast", selAlias = Just "alias"})
+---
+--- >>> P.parse pFieldSelect "" "*"
+--- Right (SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing})
+---
+--- >>> P.parse pFieldSelect "" "name!hint"
+--- Left (line 1, column 5):
+--- unexpected '!'
+--- expecting letter, digit, "-", "->>", "->", "::", ")", "," or end of input
+---
+--- >>> P.parse pFieldSelect "" "*!hint"
+--- Left (line 1, column 2):
+--- unexpected '!'
+--- expecting ")", "," or end of input
+---
+--- >>> P.parse pFieldSelect "" "name::"
+--- Left (line 1, column 7):
+--- unexpected end of input
+--- expecting letter or digit
+ pFieldSelect :: Parser SelectItem
+ pFieldSelect = lexeme $
+   try (
+     do
+       alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+       fld <- pField
+-      cast' <- optionMaybe (string "::" *> pIdentifier)
+-      pEnd
+-      return $ SelectField fld (toS <$> cast') alias
++      cast' <- optionMaybe (string "::" *> many pIdentifierChar)
++      return (fld, toS <$> cast', alias, Nothing, Nothing)
+   )
+   <|> do
+     s <- pStar
+-    pEnd
+-    return $ SelectField (s, []) Nothing Nothing
+-  where
+-    pEnd = try (void $ lookAhead (string ")")) <|>
+-           try (void $ lookAhead (string ",")) <|>
+-           try eof
++    return ((s, []), Nothing, Nothing, Nothing, Nothing)
+ 
+--- |
+--- Parse operator expression used in horizontal filtering
+---
+--- >>> P.parse (pOpExpr pSingleVal) "" "fts().value"
+--- Left (line 1, column 7):
+--- unknown single value operator fts()
+ pOpExpr :: Parser SingleVal -> Parser OpExpr
+ pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)) <|> OpExpr False <$> pOperation
+   where
+@@ -553,7 +426,7 @@ pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)
+     pFts = do
+       opStr <- try (P.many (noneOf ".("))
+       op <- parseMaybe ("unknown fts operator " <> opStr) . ftsOperator $ toS opStr
+-      lang <- optionMaybe $ try (between (char '(') (char ')') pIdentifier)
++      lang <- optionMaybe $ try (between (char '(') (char ')') $ many pIdentifierChar)
+       pDelimiter >> Fts op (toS <$> lang) <$> pSVal
+ 
+     parseMaybe :: [Char] -> Maybe a -> Parser a
+@@ -636,9 +509,6 @@ pLogicPath = do
+ pColumns :: Parser [FieldName]
+ pColumns = pFieldName `sepBy1` lexeme (char ',')
+ 
+-pIdentifier :: Parser Text
+-pIdentifier = T.strip . toS <$> many1 pIdentifierChar
+-
+ pIdentifierChar :: Parser Char
+ pIdentifierChar = letter <|> digit <|> oneOf "_ $"
+ 
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 0fbcbe53..d66e4f87 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -28,7 +28,7 @@ module PostgREST.ApiRequest.Types
+   , TrileanVal(..)
+   , SimpleOperator(..)
+   , FtsOperator(..)
+-  , SelectItem(..)
++  , SelectItem
+   ) where
+ 
+ import PostgREST.MediaType                (MediaType (..))
+@@ -39,19 +39,7 @@ import PostgREST.SchemaCache.Relationship (Relationship)
+ import Protolude
+ 
+ -- | The select value in `/tbl?select=alias:field::cast`
+-data SelectItem
+-  = SelectField
+-    { selField :: Field
+-    , selCast  :: Maybe Cast
+-    , selAlias :: Maybe Alias
+-    }
+-  | SelectRelation
+-    { selRelation :: FieldName
+-    , selAlias    :: Maybe Alias
+-    , selHint     :: Maybe Hint
+-    , selJoinType :: Maybe JoinType
+-    }
+-  deriving (Eq)
++type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe Hint, Maybe JoinType)
+ 
+ data ApiRequestError
+   = AmbiguousRelBetween Text Text [Relationship]
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 78241d36..fd598299 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -109,13 +109,14 @@ initReadRequest qi@QualifiedIdentifier{..} =
+     rootDepth = 0
+     defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing mempty Nothing Nothing rootDepth
+     treeEntry :: Depth -> Tree SelectItem -> ReadPlanTree -> ReadPlanTree
+-    treeEntry depth (Node SelectRelation{..} fldForest) (Node q rForest) =
++    treeEntry depth (Node fld@((fldName, _),_,alias, hint, joinType) fldForest) (Node q rForest) =
+       let nxtDepth = succ depth in
+-        Node q $
+-          foldr (treeEntry nxtDepth)
+-          (Node defReadPlan{from=QualifiedIdentifier qiSchema selRelation, relName=selRelation, relAlias=selAlias, relHint=selHint, relJoinType=selJoinType, depth=nxtDepth} [])
+-          fldForest:rForest
+-    treeEntry _ (Node SelectField{..} _) (Node q rForest) = Node q{select=(selField, selCast, selAlias):select q} rForest
++      case fldForest of
++        [] -> Node q{select=fld:select q} rForest
++        _  -> Node q $
++              foldr (treeEntry nxtDepth)
++              (Node defReadPlan{from=QualifiedIdentifier qiSchema fldName, relName=fldName, relAlias=alias, relHint=hint, relJoinType=joinType, depth=nxtDepth} [])
++              fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+ treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index 95566576..05082328 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -8,9 +8,10 @@ module PostgREST.Plan.ReadPlan
+ 
+ import Data.Tree (Tree (..))
+ 
+-import PostgREST.ApiRequest.Types         (Alias, Cast, Depth, Field,
+-                                           Hint, JoinType, LogicTree,
+-                                           NodeName, OrderTerm)
++import PostgREST.ApiRequest.Types         (Alias, Depth, Hint,
++                                           JoinType, LogicTree,
++                                           NodeName, OrderTerm,
++                                           SelectItem)
+ import PostgREST.RangeQuery               (NonnegRange)
+ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            QualifiedIdentifier)
+@@ -28,7 +29,7 @@ data JoinCondition =
+   deriving (Eq)
+ 
+ data ReadPlan = ReadPlan
+-  { select       :: [(Field, Maybe Cast, Maybe Alias)]
++  { select       :: [SelectItem]
+   , from         :: QualifiedIdentifier
+   , fromAlias    :: Maybe Alias
+   , where_       :: [LogicTree]
+@@ -49,4 +50,4 @@ data ReadPlan = ReadPlan
+ -- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
+ fstFieldNames :: ReadPlanTree -> [FieldName]
+ fstFieldNames (Node ReadPlan{select} _) =
+-  fst . (\(f, _, _) -> f) <$> select
++  fst . (\(f, _, _, _, _) -> f) <$> select
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 24eb20e6..7525df6f 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -1,6 +1,5 @@
+-{-# LANGUAGE LambdaCase     #-}
+-{-# LANGUAGE NamedFieldPuns #-}
+-{-# LANGUAGE QuasiQuotes    #-}
++{-# LANGUAGE LambdaCase  #-}
++{-# LANGUAGE QuasiQuotes #-}
+ {-|
+ Module      : PostgREST.Query.SqlFragment
+ Description : Helper functions for PostgREST.QueryBuilder.
+@@ -57,8 +56,7 @@ import Control.Arrow ((***))
+ import Data.Foldable                 (foldr1)
+ import Text.InterpolatedString.Perl6 (qc)
+ 
+-import PostgREST.ApiRequest.Types        (Alias, Cast, Field,
+-                                          Filter (..),
++import PostgREST.ApiRequest.Types        (Alias, Field, Filter (..),
+                                           FtsOperator (..),
+                                           JsonOperand (..),
+                                           JsonOperation (..),
+@@ -68,7 +66,7 @@ import PostgREST.ApiRequest.Types        (Alias, Cast, Field,
+                                           Operation (..),
+                                           OrderDirection (..),
+                                           OrderNulls (..),
+-                                          OrderTerm (..),
++                                          OrderTerm (..), SelectItem,
+                                           SimpleOperator (..),
+                                           TrileanVal (..))
+ import PostgREST.MediaType               (MTPlanFormat (..),
+@@ -235,12 +233,12 @@ pgFmtField table (c, []) = SQL.sql (pgFmtColumn table c)
+ -- "operator does not exist: json = unknown"
+ pgFmtField table (c, jp) = SQL.sql ("to_jsonb(" <> pgFmtColumn table c <> ")") <> pgFmtJsonPath jp
+ 
+-pgFmtSelectItem :: QualifiedIdentifier -> (Field, Maybe Cast, Maybe Alias) -> SQL.Snippet
+-pgFmtSelectItem table (f@(fName, jp), Nothing, alias) = pgFmtField table f <> SQL.sql (pgFmtAs fName jp alias)
++pgFmtSelectItem :: QualifiedIdentifier -> SelectItem -> SQL.Snippet
++pgFmtSelectItem table (f@(fName, jp), Nothing, alias, _, _) = pgFmtField table f <> SQL.sql (pgFmtAs fName jp alias)
+ -- Ideally we'd quote the cast with "pgFmtIdent cast". However, that would invalidate common casts such as "int", "bigint", etc.
+ -- Try doing: `select 1::"bigint"` - it'll err, using "int8" will work though. There's some parser magic that pg does that's invalidated when quoting.
+ -- Not quoting should be fine, we validate the input on Parsers.
+-pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField table f <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> SQL.sql (pgFmtAs fName jp alias)
++pgFmtSelectItem table (f@(fName, jp), Just cast, alias, _, _) = "CAST (" <> pgFmtField table f <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> SQL.sql (pgFmtAs fName jp alias)
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+diff --git a/test/spec/Feature/Query/AndOrParamsSpec.hs b/test/spec/Feature/Query/AndOrParamsSpec.hs
+index 917e2fae..0048458d 100644
+--- a/test/spec/Feature/Query/AndOrParamsSpec.hs
++++ b/test/spec/Feature/Query/AndOrParamsSpec.hs
+@@ -200,7 +200,7 @@ spec actualPgVersion =
+         it "cannot have zero conditions" $
+           get "/entities?or=()" `shouldRespondWith`
+             [json|{
+-              "details": "unexpected \")\" expecting field name (* or [a..z0..9_$]), negation operator (not) or logic operator (and, or)",
++              "details": "unexpected \")\" expecting field name (* or [a..z0..9_]), negation operator (not) or logic operator (and, or)",
+               "message": "\"failed to parse logic tree (())\" (line 1, column 4)",
+               "code": "PGRST100",
+               "hint": null
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index d14fd92d..3392a13d 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -415,7 +415,7 @@ spec actualPgVersion = do
+             {"id": 204, "body": "yyy"},
+             {"id": 205, "body": "zzz"}]|]
+           `shouldRespondWith`
+-          [json|  {"details":"unexpected end of input expecting field name (* or [a..z0..9_$])","message":"\"failed to parse columns parameter ()\" (line 1, column 1)","code":"PGRST100","hint":null} |]
++          [json|  {"details":"unexpected end of input expecting field name (* or [a..z0..9_])","message":"\"failed to parse columns parameter ()\" (line 1, column 1)","code":"PGRST100","hint":null} |]
+           { matchStatus  = 400
+           , matchHeaders = []
+           }

@@ -1,0 +1,282 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ac956f53..e034ee21 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,7 +19,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2799, Add timezone in Prefer header - @taimoorzaeem
+  - #3001, Add `statement_timeout` set on functions - @taimoorzaeem
+  - #3045, Apply superuser settings on impersonated roles if they have PostgreSQL 15 `GRANT SET ON PARAMETER` privilege - @steve-chavez
+- - #3062, Add config for enabling the `Server-Timing` header - @develop7
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index b4a75b77..cd23c59b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -159,7 +159,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf req body sCache
+ 
+-  let jwtTiming = (SMJwt, if configServerTimingEnabled then Auth.getJwtDur req else Nothing)
++  let jwtTiming = (SMJwt, if configDbPlanEnabled then Auth.getJwtDur req else Nothing)
+   handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtTiming
+ 
+ runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+@@ -256,9 +256,9 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+         query
+ 
+     pgrstResponse :: ServerTimingData -> Response.PgrstResponse -> Wai.Response
+-    pgrstResponse timings (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([renderServerTimingHeader timings | configServerTimingEnabled conf])) bod
++    pgrstResponse timings (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([renderServerTimingHeader timings | configDbPlanEnabled conf])) bod
+ 
+-    withTiming f = if configServerTimingEnabled conf
++    withTiming f = if configDbPlanEnabled conf
+         then do
+           (t, r) <- timeItT f
+           pure (Just t, r)
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index ec309507..35096e13 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -109,7 +109,7 @@ middleware appState app req respond = do
+ 
+ -- If DbPlanEnabled       -> calculate JWT validation time
+ -- If JwtCacheMaxLifetime -> cache JWT validation result
+-  req' <- case (configServerTimingEnabled conf, configJwtCacheMaxLifetime conf) of
++  req' <- case (configDbPlanEnabled conf, configJwtCacheMaxLifetime conf) of
+     (True, 0)            -> do
+           (dur, authResult) <- timeItT parseJwt
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult & Vault.insert jwtDurKey dur }
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index af1238d7..8e20719f 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -104,7 +104,6 @@ data AppConfig = AppConfig
+   , configServerHost               :: Text
+   , configServerPort               :: Int
+   , configServerTraceHeader        :: Maybe (CI.CI BS.ByteString)
+-  , configServerTimingEnabled      :: Bool
+   , configServerUnixSocket         :: Maybe FilePath
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
+@@ -170,7 +169,6 @@ toText conf =
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
+       ,("server-trace-header",       q . T.decodeUtf8 . maybe mempty CI.original . configServerTraceHeader)
+-      ,("server-timing-enabled",         T.toLower . show . configServerTimingEnabled)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
+       ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
+@@ -274,7 +272,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
+-    <*> (fromMaybe False <$> optBool "server-timing-enabled")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 4672289f..4624d47d 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -64,7 +64,6 @@ dbSettingsNames =
+   ,"openapi_server_proxy_uri"
+   ,"raw_media_types"
+   ,"server_trace_header"
+-  ,"server_timing_enabled"
+   ]
+ 
+ queryPgVersion :: Bool -> Session PgVersion
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index bb67b296..7182a898 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+-server-timing-enabled = false
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+ admin-server-port = ""
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index 9bd66476..1c931a50 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+-server-timing-enabled = false
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+ admin-server-port = ""
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index 9bd66476..1c931a50 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+-server-timing-enabled = false
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+ admin-server-port = ""
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index 30168ee1..76ca1a26 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+-server-timing-enabled = false
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+ admin-server-port = ""
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index e7837011..9fd08d0f 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "traceparent"
+-server-timing-enabled = true
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+ admin-server-port = 3001
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index ac4d87ef..ccb10564 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "CF-Ray"
+-server-timing-enabled = true
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+ admin-server-port = 3001
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index 09dda558..ca09c08c 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "X-Request-Id"
+-server-timing-enabled = true
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+ admin-server-port = 3001
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index d7d64293..ef698ba1 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+-server-timing-enabled = false
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+ admin-server-port = ""
+diff --git a/test/io/configs/no-defaults-env.yaml b/test/io/configs/no-defaults-env.yaml
+index 709a149d..a46a6b8f 100644
+--- a/test/io/configs/no-defaults-env.yaml
++++ b/test/io/configs/no-defaults-env.yaml
+@@ -33,7 +33,6 @@ PGRST_SERVER_CORS_ALLOWED_ORIGINS: "http://example.com"
+ PGRST_SERVER_HOST: 0.0.0.0
+ PGRST_SERVER_PORT: 80
+ PGRST_SERVER_TRACE_HEADER: X-Request-Id
+-PGRST_SERVER_TIMING_ENABLED: true
+ PGRST_SERVER_UNIX_SOCKET: /tmp/pgrst_io_test.sock
+ PGRST_SERVER_UNIX_SOCKET_MODE: 777
+ PGRST_ADMIN_SERVER_PORT: 3001
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index dbd18aee..e859d0e2 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -30,7 +30,6 @@ server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "X-Request-Id"
+-server-timing-enabled = true
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+ admin-server-port = 3001
+diff --git a/test/io/db_config.sql b/test/io/db_config.sql
+index 78bcd0ae..8f08dee8 100644
+--- a/test/io/db_config.sql
++++ b/test/io/db_config.sql
+@@ -19,7 +19,6 @@ ALTER ROLE db_config_authenticator SET pgrst.db_extra_search_path = 'public, ext
+ ALTER ROLE db_config_authenticator SET pgrst.not_existing = 'should be ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.server_cors_allowed_origins = 'http://example.com';
+ ALTER ROLE db_config_authenticator SET pgrst.server_trace_header = 'CF-Ray';
+-ALTER ROLE db_config_authenticator SET pgrst.server_timing_enabled = 'true';
+ 
+ -- override with database specific setting
+ ALTER ROLE db_config_authenticator IN DATABASE :DBNAME SET pgrst.jwt_secret = 'OVERRIDE=REALLY=REALLY=REALLY=REALLY=VERY=SAFE';
+@@ -65,7 +64,6 @@ ALTER ROLE other_authenticator SET pgrst.openapi_security_active = 'false';
+ ALTER ROLE other_authenticator SET pgrst.server_cors_allowed_origins = 'http://example.com';
+ ALTER ROLE other_authenticator SET pgrst.server_trace_header = 'traceparent';
+ ALTER ROLE other_authenticator SET pgrst.db_pre_config = 'postgrest.pre_config';
+-ALTER ROLE other_authenticator SET pgrst.server_timing_enabled = 'true';
+ 
+ create schema postgrest;
+ grant usage on schema postgrest to db_config_authenticator;
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 9209463d..b42d6620 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1120,7 +1120,7 @@ def test_server_timing_jwt_should_decrease_on_subsequent_requests(defaultenv):
+ 
+     env = {
+         **defaultenv,
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
++        "PGRST_DB_PLAN_ENABLED": "true",
+         "PGRST_JWT_CACHE_MAX_LIFETIME": "86400",
+         "PGRST_JWT_SECRET": "@/dev/stdin",
+         "PGRST_DB_CONFIG": "false",
+@@ -1158,7 +1158,7 @@ def test_jwt_caching_works_with_db_plan_disabled(defaultenv):
+ 
+     env = {
+         **defaultenv,
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
++        "PGRST_DB_PLAN_ENABLED": "false",
+         "PGRST_JWT_CACHE_MAX_LIFETIME": "86400",
+         "PGRST_JWT_SECRET": "@/dev/stdin",
+         "PGRST_DB_CONFIG": "false",
+@@ -1180,7 +1180,7 @@ def test_server_timing_jwt_should_not_decrease_when_caching_disabled(defaultenv)
+ 
+     env = {
+         **defaultenv,
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
++        "PGRST_DB_PLAN_ENABLED": "true",
+         "PGRST_JWT_CACHE_MAX_LIFETIME": "0",  # cache disabled
+         "PGRST_JWT_SECRET": "@/dev/stdin",
+         "PGRST_DB_CONFIG": "false",
+@@ -1210,7 +1210,7 @@ def test_jwt_cache_with_no_exp_claim(defaultenv):
+ 
+     env = {
+         **defaultenv,
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
++        "PGRST_DB_PLAN_ENABLED": "true",
+         "PGRST_JWT_CACHE_MAX_LIFETIME": "86400",
+         "PGRST_JWT_SECRET": "@/dev/stdin",
+         "PGRST_DB_CONFIG": "false",
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 5deba3f0..9d4661f1 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -139,7 +139,6 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configRoleSettings              = mempty
+   , configRoleIsoLvl                = mempty
+   , configInternalSCSleep           = Nothing
+-  , configServerTimingEnabled       = True
+   }
+ 
+ testCfg :: AppConfig

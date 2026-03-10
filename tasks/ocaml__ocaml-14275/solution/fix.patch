@@ -1,0 +1,321 @@
+diff --git a/Changes b/Changes
+index 9c4f24c552..dab4a52baf 100644
+--- a/Changes
++++ b/Changes
+@@ -72,6 +72,14 @@ Working version
+   (Guillaume Munch-Maccagnoni, review by Gabriel Scherer, B. Szilvasy,
+    Miod Vallat)
+ 
++- #14275: Add function caml_c_thread_register_in_domain, which makes it
++  possible to register "C threads" in another domain than 0 (which is
++  what caml_c_thread_register does). The function takes a domain unique
++  ID in which to register the thread. The domain must be running
++  when the function is called.
++  (Jack Nørskov Jørgensen, review by Gabriel Scherer,
++   Guillaume Munch-Maccagnoni)
++
+ ### Code generation and optimizations:
+ 
+ ### Standard library:
+diff --git a/manual/src/cmds/intf-c.etex b/manual/src/cmds/intf-c.etex
+index 826da07d2b..b680f58e6b 100644
+--- a/manual/src/cmds/intf-c.etex
++++ b/manual/src/cmds/intf-c.etex
+@@ -2619,6 +2619,14 @@ system.  The following functions are declared in the include file
+ run-time system.  Returns 1 on success, 0 on error.  Registering an
+ already-registered thread does nothing and returns 0.
+ \item
++"caml_c_thread_register_in_domain(uintnat dom_unique_id)" registers the
++calling thread with the OCaml run-time system in the domain with
++identifier "dom_unique_id" as provided by "Domain.self" and "Domain.get_id".
++The domain must be running when this function is called.  Registering an
++already-registered thread does nothing and returns 0, even if it was previously
++registered in another domain. It is an error to register in one domain,
++unregister, and then later register in another domain.
++\item
+ "caml_c_thread_unregister()"  must be called before the thread
+   terminates, to unregister it from the OCaml run-time system.
+ Returns 1 on success, 0 on error.  If the calling thread was not
+diff --git a/otherlibs/systhreads/caml/threads.h b/otherlibs/systhreads/caml/threads.h
+index 11da047170..b204283932 100644
+--- a/otherlibs/systhreads/caml/threads.h
++++ b/otherlibs/systhreads/caml/threads.h
+@@ -16,6 +16,8 @@
+ #ifndef CAML_THREADS_H
+ #define CAML_THREADS_H
+ 
++#include "caml/config.h"
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -51,17 +53,26 @@ CAMLextern void caml_leave_blocking_section (void);
+ */
+ 
+ CAMLextern int caml_c_thread_register(void);
++CAMLextern int caml_c_thread_register_in_domain(uintnat dom_unique_id);
+ CAMLextern int caml_c_thread_unregister(void);
+ 
+ /* If a thread is created by C code (instead of by OCaml itself),
+    it must be registered with the OCaml runtime system before
+    being able to call back into OCaml code or use other runtime system
+-   functions.  Just call [caml_c_thread_register] once. The domain lock
+-   is not held when [caml_c_thread_register] returns.
++   functions. Just call [caml_c_thread_register_in_domain] once. The domain lock
++   is not held when caml_c_thread_register_in_domain] returns.
+    Before the thread finishes, it must call [caml_c_thread_unregister]
+    (without holding the domain lock).
+    Both functions return 1 on success, 0 on error.
+-   Note that threads registered by C code belong to the domain 0.
++   Threads registered by [caml_c_thread_register_in_domain] belong to
++   the domain given by the unique id which must be running when calling this
++   function. It is an error to call [caml_c_thread_unregister] on a
++   thread registered in a domain and later call
++   [caml_c_thread_register_in_domain] to register it with a different
++   domain.
++   The function [caml_c_thread_register] is an alias for
++   [caml_c_thread_register_in_domain(0)] (where 0 is the identifier
++   of the main domain).
+ */
+ 
+ #ifdef __cplusplus
+diff --git a/otherlibs/systhreads/st_stubs.c b/otherlibs/systhreads/st_stubs.c
+index 09da8d214f..d903d6cb4e 100644
+--- a/otherlibs/systhreads/st_stubs.c
++++ b/otherlibs/systhreads/st_stubs.c
+@@ -82,8 +82,8 @@ SetThreadDescription(HANDLE hThread, PCWSTR lpThreadDescription);
+ #include "caml/memprof.h"
+ 
+ /* "caml/threads.h" is *not* included since it contains the _external_
+-   declarations for the caml_c_thread_register and caml_c_thread_unregister
+-   functions. */
++   declarations for the caml_c_thread_register, caml_c_thread_register_in_domain
++   and caml_c_thread_unregister functions. */
+ 
+ /* Max computation time before rescheduling, in milliseconds */
+ #define Thread_timeout_msec 50
+@@ -449,9 +449,12 @@ static caml_thread_t thread_alloc_and_add(void)
+    and free its resources. */
+ static void thread_remove_and_free(caml_thread_t th)
+ {
+-  if (th->next == th)
+-    reset_active(); /* last OCaml thread exiting */
+-  else if (Active_thread == th)
++  /* The main domain thread does not go through
++     [thread_remove_and_free]. There is always one more thread in
++     the chain at this point in time. */
++  CAMLassert(th->next != th);
++
++  if (Active_thread == th)
+     restore_runtime_state(th->next); /* PR#5295 */
+   th->next->prev = th->prev;
+   th->prev->next = th->next;
+@@ -533,6 +536,11 @@ static void caml_thread_domain_stop_hook(void) {
+       caml_thread_join(Active_thread->next->descr);
+     }
+ 
++    /* Note: The rest of this function must not release the domain/thread lock:
++     * The domain has joined with all active threads and no new ones
++     * may be allowed to register at this point.
++     */
++
+     /* another domain thread may be joining on this domain's descriptor */
+     caml_threadstatus_terminate(Terminated(Active_thread->descr));
+     /* Shut down the tick thread */
+@@ -668,10 +676,6 @@ static void thread_detach_from_runtime(void)
+ {
+   caml_thread_t th = This_thread;
+   CAMLassert(th == Active_thread);
+-  /* The main domain thread does not go through
+-     [thread_detach_from_runtime]. There is always one more thread in
+-     the chain at this point in time. */
+-  CAMLassert(th->next != th);
+   /* Signal that the thread has terminated */
+   caml_threadstatus_terminate(Terminated(th->descr));
+   /* Undo thread_init_current */
+@@ -830,22 +834,37 @@ CAMLprim value caml_thread_new(value clos)
+ 
+ /* Register a thread already created from C */
+ 
+-#define Dom_c_threads 0
+-
+-/* the thread lock is not held when entering */
+-CAMLexport int caml_c_thread_register(void)
++/* Once the domain/thread lock for the given domain index has been taken,
++ * the unique ID of that domain index will be compared to [expected_unique_id].
++ * If they are different, the function will return with error code 0. */
++/* The thread lock is not held when entering */
++int caml_c_thread_register_in_domain_index(uintnat domain_index,
++                                           uintnat expected_unique_id)
+ {
+   /* Systhreads initialized? */
+   if (!threads_initialized) return 0;
+   /* Already registered? */
+   if (This_thread != NULL) return 0;
++  /* Has the domain never been initialized? */
++  st_masterlock *m = Thread_lock(domain_index);
++  if (!m->init) return 0;
+ 
+   /* At this point we should not hold any domain lock */
+   CAMLassert(Caml_state_opt == NULL);
+ 
+   /* Acquire lock of domain */
+-  caml_init_domain_self(Dom_c_threads);
+-  thread_lock_acquire(Dom_c_threads);
++  caml_init_domain_self(domain_index);
++  thread_lock_acquire(domain_index);
++
++  /* Check that domain is currently active */
++  if (Active_thread == NULL) goto out_err;
++  /* Check that domain unique ID is as expected:
++     - We got the domain we requested (given the inherently racy
++       nature of [caml_find_index_of_running_domain]).
++     - We were not previously registered on a different domain (to
++       allow C programs to store domain-specific data in thread-local
++       storage) */
++  if (!caml_thread_running_on_expected_domain(expected_unique_id)) goto out_err;
+ 
+   /* Create tick thread if not already done */
+   st_retcode err = create_tick_thread();
+@@ -862,6 +881,8 @@ CAMLexport int caml_c_thread_register(void)
+   if (Is_exception_result(res)) goto out_err2;
+   th->descr = res;
+ 
++  caml_thread_record_domain_id(expected_unique_id);
++
+   /* Release the domain lock the regular way. Note: we cannot receive
+      an exception here. */
+   caml_enter_blocking_section_no_pending();
+@@ -871,13 +892,24 @@ CAMLexport int caml_c_thread_register(void)
+   thread_destroy_current(th);
+   thread_remove_and_free(th);
+  out_err:
+-  thread_lock_release(Dom_c_threads);
++  thread_lock_release(domain_index);
+   /* Note: we cannot raise an exception here. */
+   return 0;
+ }
+ 
++CAMLexport int caml_c_thread_register_in_domain(uintnat dom_unique_id) {
++  intnat domain_index = caml_find_index_of_running_domain(dom_unique_id);
++  if (domain_index < 0) return 0;
++
++  return caml_c_thread_register_in_domain_index(domain_index, dom_unique_id);
++}
++
++CAMLexport int caml_c_thread_register(void) {
++  return caml_c_thread_register_in_domain_index(0L, 0L);
++}
++
+ /* Unregister a thread that was created from C and registered with
+-   the function above */
++   the two functions above */
+ 
+ /* the thread lock is not held when entering */
+ CAMLexport int caml_c_thread_unregister(void)
+diff --git a/runtime/caml/domain.h b/runtime/caml/domain.h
+index 885c85051c..c32a6eab5d 100644
+--- a/runtime/caml/domain.h
++++ b/runtime/caml/domain.h
+@@ -26,6 +26,10 @@
+ #include "mlvalues.h"
+ #include "domain_state.h"
+ 
++/* See caml_c_thread_register_in_domain_index */
++CAMLextern bool caml_thread_running_on_expected_domain(uintnat);
++CAMLextern void caml_thread_record_domain_id(uintnat);
++
+ #ifdef ARCH_SIXTYFOUR
+ #define Max_domains_def 128
+ #else
+@@ -92,6 +96,11 @@ CAMLextern uintnat caml_minor_heap_max_wsz;
+ 
+ CAMLextern atomic_uintnat caml_num_domains_running;
+ 
++/*  Given domain unique id, return the index of the domain.
++ *  If the domain unique id is unknown, return -1.
++*/
++CAMLextern intnat caml_find_index_of_running_domain(uintnat dom_unique_id);
++
+ /* When [caml_domain_alone()] is true, there is a single domain
+    running. In particular, if the test passes while holding the domain
+    lock, then we know that no other domain is running concurrently,
+diff --git a/runtime/domain.c b/runtime/domain.c
+index 67b84c0c29..58c8436f8e 100644
+--- a/runtime/domain.c
++++ b/runtime/domain.c
+@@ -166,7 +166,8 @@ struct interruptor {
+   int running;
+   int terminating;
+   /* unlike the domain ID, this ID number is not reused */
+-  uintnat unique_id;
++  /* Synchronised with [caml_find_index_of_running_domain] */
++  atomic_uintnat unique_id;
+ 
+   /* indicates whether there is an interrupt pending */
+   atomic_uintnat interrupt_pending;
+@@ -366,6 +367,21 @@ CAMLexport caml_domain_state* caml_get_domain_state(void)
+ }
+ #endif
+ 
++static CAMLthread_local uintnat previous_domain_id = -1;
++
++CAMLexport
++bool caml_thread_running_on_expected_domain(uintnat expected_unique_id)
++{
++  return (Caml_state->unique_id == expected_unique_id &&
++          (previous_domain_id == -1 ||
++            previous_domain_id == expected_unique_id));
++}
++
++CAMLexport void caml_thread_record_domain_id(uintnat domain_id)
++{
++  previous_domain_id = domain_id;
++}
++
+ Caml_inline void interrupt_domain(struct interruptor* s)
+ {
+   atomic_uintnat * interrupt_word = atomic_load_relaxed(&s->interrupt_word);
+@@ -1958,6 +1974,29 @@ void caml_interrupt_all_signal_safe(void)
+   }
+ }
+ 
++/*  This function can be called from arbitrary code, possibly running
++    concurrently with the OCaml runtime, as long as it synchronized
++    with the runtime startup which initialized [all_domains] and
++    [caml_params].
++    Returns [-1] on failure -- if the provided unique id is
++    not assigned to a currently-running domain.
++*/
++intnat caml_find_index_of_running_domain(uintnat dom_unique_id)
++{
++  for (int i = 0; i < caml_params->max_domains; i++) {
++    dom_internal *d = &all_domains[i];
++
++    /* See [caml_interrupt_all_signal_safe] above for synchronization
++       and early-exit comments. */
++    atomic_uintnat * interrupt_word =
++      atomic_load_acquire(&d->interruptor.interrupt_word);
++    if (interrupt_word == NULL) return -1;
++
++    if (d->interruptor.unique_id == dom_unique_id) return i;
++  }
++  return -1;
++}
++
+ /* To avoid any risk of forgetting an action through a race,
+    [caml_reset_young_limit] is the only way (apart from setting
+    young_limit to -1 for immediate interruption) through which
+diff --git a/tools/ci/appveyor/appveyor_build.sh b/tools/ci/appveyor/appveyor_build.sh
+index 08f0c79689..2fc8426025 100755
+--- a/tools/ci/appveyor/appveyor_build.sh
++++ b/tools/ci/appveyor/appveyor_build.sh
+@@ -252,6 +252,8 @@ case "$1" in
+     esac
+     find "../$BUILD_PREFIX-$PORT" -type f \( -name \*.dll -o -name \*.so \) | \
+       xargs rebase -i "$ARG"
++    find "../$BUILD_PREFIX-$PORT" -type f \( -name \*.dll -o -name \*.so \) | \
++      xargs ldd
+ 
+     ;;
+ esac

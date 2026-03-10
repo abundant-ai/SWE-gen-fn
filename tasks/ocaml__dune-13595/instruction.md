@@ -1,0 +1,9 @@
+When using Dune package management with a workspace configured for `(pkg enabled)`, building a project that depends on a package which declares `extra-files` (e.g., a patch listed in `patches` and also present in `extra-files`) can fail during autolocking.
+
+This occurs specifically when no lockdir has been generated yet (i.e., the user has not run `dune pkg lock`) and the build triggers autolocking implicitly (for example via `dune build @pkg-install`). In this situation, Dune generates an internal lock directory as part of the build, but it incorrectly searches for package `extra-files` in the *source lock directory* rather than the *internal/generated lock directory*. As a result, Dune tries to apply a patch that it cannot find and the build fails with an error indicating the patch file is missing (e.g., “patch file not found”).
+
+Expected behavior: If `pkg` is enabled and autolocking happens automatically, packages that specify `extra-files` must be handled correctly without requiring the user to run `dune pkg lock` first. In particular, any declared extra files (including patch files) must be resolved from the internal lock directory produced by autolocking, so the build can proceed and the patch can be applied successfully.
+
+Actual behavior: Autolocking traverses/uses the lock directory *source* when resolving extra files, so the internal lock directory produced by autolocking does not contain the expected files at the location Dune is looking at, leading to a missing patch/extra-file error and a failed build.
+
+Fix the autolocking/extra-files resolution so that, during builds that trigger autolocking, Dune uses the internal/generated lock directory when locating and copying/applying `extra-files` (including patches).

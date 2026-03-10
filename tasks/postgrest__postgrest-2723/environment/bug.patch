@@ -1,0 +1,305 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f9fc86d1..f68f8d2f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + When the client sends the request header specified in the config it will be included in the response headers.
+  - #2694, Make `db-root-spec` stable. - @steve-chavez
+    + This can be used to override the OpenAPI spec with a custom database function
+- - #1567, On bulk inserts, missing values can get the column DEFAULT by using the `Prefer: missing=default` header - @steve-chavez
++ - #1567, On bulk inserts with `?columns`, undefined json keys can get columns' DEFAULT values by using the `Prefer: undefined-keys=apply-defaults` header - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index c21bdb55..c70fddfd 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -9,7 +9,7 @@
+ module PostgREST.ApiRequest.Preferences
+   ( Preferences(..)
+   , PreferCount(..)
+-  , PreferMissing(..)
++  , PreferUndefinedKeys(..)
+   , PreferParameters(..)
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+@@ -34,7 +34,7 @@ import Protolude
+ -- >>> deriving instance Show PreferParameters
+ -- >>> deriving instance Show PreferCount
+ -- >>> deriving instance Show PreferTransaction
+--- >>> deriving instance Show PreferMissing
++-- >>> deriving instance Show PreferUndefinedKeys
+ -- >>> deriving instance Show Preferences
+ 
+ -- | Preferences recognized by the application.
+@@ -45,7 +45,7 @@ data Preferences
+     , preferParameters     :: Maybe PreferParameters
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+-    , preferMissing        :: Maybe PreferMissing
++    , preferUndefinedKeys  :: Maybe PreferUndefinedKeys
+     }
+ 
+ -- |
+@@ -60,19 +60,19 @@ data Preferences
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferMissing = Nothing
++--     , preferUndefinedKeys = Nothing
+ --     }
+ --
+ -- Multiple headers can also be used:
+ --
+--- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
++-- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = None
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferMissing = Just ApplyNulls
++--     , preferUndefinedKeys = Nothing
+ --     }
+ --
+ -- If a preference is set more than once, only the first is used:
+@@ -97,14 +97,14 @@ data Preferences
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
++-- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , undefined-keys=apply-defaults")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Full
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+---     , preferMissing = Just ApplyDefaults
++--     , preferUndefinedKeys = Just ApplyDefaults
+ --     }
+ --
+ fromHeaders :: [HTTP.Header] -> Preferences
+@@ -115,7 +115,7 @@ fromHeaders headers =
+     , preferParameters = parsePrefs [SingleObject, MultipleObjects]
+     , preferCount = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction = parsePrefs [Commit, Rollback]
+-    , preferMissing = parsePrefs [ApplyDefaults, ApplyNulls]
++    , preferUndefinedKeys = parsePrefs [ApplyDefaults, IgnoreDefaults]
+     }
+   where
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+@@ -215,13 +215,13 @@ instance ToAppliedHeader PreferTransaction
+ -- |
+ -- How to handle the insertion/update when the keys specified in ?columns are not present
+ -- in the json body.
+-data PreferMissing
+-  = ApplyDefaults  -- ^ Use the default column value for missing values.
+-  | ApplyNulls     -- ^ Use the null value for missing values.
++data PreferUndefinedKeys
++  = ApplyDefaults  -- ^ Use the default column value for the unspecified keys.
++  | IgnoreDefaults -- ^ Inserts: null values / Updates: the keys are not SET to any value
+   deriving Eq
+ 
+-instance ToHeaderValue PreferMissing where
+-  toHeaderValue ApplyDefaults = "missing=default"
+-  toHeaderValue ApplyNulls    = "missing=null"
++instance ToHeaderValue PreferUndefinedKeys where
++  toHeaderValue ApplyDefaults  = "undefined-keys=apply-defaults"
++  toHeaderValue IgnoreDefaults = "undefined-keys=ignore-defaults"
+ 
+-instance ToAppliedHeader PreferMissing
++instance ToAppliedHeader PreferUndefinedKeys
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a1ae8753..e52fc72a 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -533,7 +533,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+     tbl = HM.lookup qi $ dbTables sCache
+     typedColumnsOrError = resolveOrError tbl `traverse` S.toList iColumns
+-    applyDefaults = preferences.preferMissing == Just ApplyDefaults
++    applyDefaults = preferences.preferUndefinedKeys == Just ApplyDefaults
+ 
+ resolveOrError :: Maybe Table -> FieldName -> Either ApiRequestError TypedField
+ resolveOrError Nothing _ = Left NotFound
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 398259bf..57f3ded0 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -109,7 +109,7 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+               Nothing
+             else
+               toAppliedHeader <$> preferResolution
+-          , toAppliedHeader <$> preferMissing
++          , toAppliedHeader <$> preferUndefinedKeys
+           ]
+ 
+     if preferRepresentation == Full then
+@@ -128,7 +128,7 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferMissing]
++      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferUndefinedKeys]
+ 
+     if preferRepresentation == Full then
+         response HTTP.status200
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 598990be..f1f17f01 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -451,11 +451,11 @@ spec actualPgVersion = do
+             "asdf",
+             {"id": 205, "body": "zzz"}]|] `shouldRespondWith` 400
+ 
+-      context "apply defaults on missing values" $ do
++      context "apply defaults on undefined keys" $ do
+         -- inserting the array fails on pg 9.6, but the feature should work normally
+         when (actualPgVersion >= pgVersion100) $
+           it "inserts table default values(field-with_sep) when json keys are undefined" $
+-            request methodPost "/complex_items?columns=id,name,field-with_sep,arr_data" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++            request methodPost "/complex_items?columns=id,name,field-with_sep,arr_data" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+                 [json|[
+                   {"id": 4, "name": "Vier"},
+                   {"id": 5, "name": "Funf", "arr_data": null},
+@@ -468,11 +468,11 @@ spec actualPgVersion = do
+                   {"id": 6, "name": "Sechs", "field-with_sep": 6, "settings":null,"arr_data":[1,2,3]}
+                 ]|]
+                 { matchStatus  = 201
+-                , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++                , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+                 }
+ 
+         it "inserts view default values(field-with_sep) when json keys are undefined" $
+-          request methodPost "/complex_items_view?columns=id,name" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++          request methodPost "/complex_items_view?columns=id,name" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+               [json|[
+                 {"id": 7, "name": "Sieben"},
+                 {"id": 8}
+@@ -483,16 +483,16 @@ spec actualPgVersion = do
+                 {"id": 8, "name": "Default", "field-with_sep": 1, "settings":null,"arr_data":null}
+               ]|]
+               { matchStatus  = 201
+-              , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++              , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+               }
+ 
+         it "doesn't insert json duplicate keys(since it uses jsonb)" $
+-          request methodPost "/tbl_w_json?columns=id,data" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++          request methodPost "/tbl_w_json?columns=id,data" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+               [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+             `shouldRespondWith`
+               [json| [ { "data": { "a": 2 }, "id": 3 } ] |]
+               { matchStatus  = 201
+-              , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++              , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+               }
+ 
+     it "inserts json that has duplicate keys" $ do
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index f839d42e..3f9eece2 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -347,23 +347,27 @@ spec actualPgVersion = do
+         liftIO $ planCost r `shouldSatisfy` (< 5.85)
+ 
+     context "function inlining" $ do
+-      it "should inline a zero argument function(the function won't appear in the plan tree)" $ do
++      it "should inline a zero argument function" $ do
+         r <- request methodGet "/rpc/getallusers?id=eq.1"
+                [(hAccept, "application/vnd.pgrst.plan")] ""
+ 
+         let resBody = simpleBody r
+ 
+         liftIO $ do
+-          resBody `shouldSatisfy` (\t -> not $ T.isInfixOf "getallusers" (decodeUtf8 $ BS.toStrict t))
++          resBody `shouldSatisfy` (
++            if actualPgVersion >= pgVersion120
++              then (\t -> T.isInfixOf "Index Scan using users_pkey on users" (decodeUtf8 $ BS.toStrict t))
++              else (\t -> T.isInfixOf "Seq Scan on users" (decodeUtf8 $ BS.toStrict t)))
+ 
+-      it "should inline a function with arguments(the function won't appear in the plan tree)" $ do
++      it "should inline a function with arguments" $ do
+         r <- request methodGet "/rpc/getitemrange?min=10&max=15"
+                [(hAccept, "application/vnd.pgrst.plan")] ""
+ 
+         let resBody = simpleBody r
+ 
+         liftIO $ do
+-          resBody `shouldSatisfy` (\t -> not $ T.isInfixOf "getitemrange" (decodeUtf8 $ BS.toStrict t))
++          -- a Seq Scan ensures the function is inlined as the plan uses the underlying table
++          resBody `shouldSatisfy` (\t -> T.isInfixOf "Seq Scan on items" (decodeUtf8 $ BS.toStrict t))
+ 
+ disabledSpec :: SpecWith ((), Application)
+ disabledSpec =
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 205a3602..4274ccf6 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -330,46 +330,46 @@ spec = do
+           , matchHeaders = []
+           }
+ 
+-      context "apply defaults on missing values" $ do
++      context "apply defaults on undefined keys" $ do
+         it "updates table using default values(field-with_sep) when json keys are undefined" $ do
+           request methodPatch "/complex_items?id=eq.3&columns=name,field-with_sep"
+-            [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+             [json|{"name": "Tres"}|]
+             `shouldRespondWith`
+             [json|[
+               {"id":3,"name":"Tres","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":1}
+             ]|]
+             { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+             }
+ 
+         it "updates with limit/offset using table default values(field-with_sep) when json keys are undefined" $ do
+           request methodPatch "/complex_items?select=id,name&columns=name,field-with_sep&limit=1&offset=2&order=id"
+-            [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+             [json|{"name": "Tres"}|]
+             `shouldRespondWith`
+             [json|[
+               {"id":3,"name":"Tres"}
+             ]|]
+             { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+             }
+ 
+         it "updates table default values(field-with_sep) when json keys are undefined" $ do
+           request methodPatch "/complex_items?id=eq.3&columns=name,field-with_sep"
+-            [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+             [json|{"name": "Tres"}|]
+             `shouldRespondWith`
+             [json|[
+               {"id":3,"name":"Tres","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":1}
+             ]|]
+             { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+             }
+ 
+         it "updates view default values(field-with_sep) when json keys are undefined" $
+           request methodPatch "/complex_items_view?id=eq.3&columns=arr_data,name"
+-            [("Prefer", "return=representation"), ("Prefer", "missing=default")]
++            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+             [json|
+               {"arr_data":null}
+             |]
+@@ -378,7 +378,7 @@ spec = do
+               {"id":3,"name":"Default","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":null,"field-with_sep":3}
+             ]|]
+             { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "missing=default"]
++            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+             }
+ 
+   context "tables with self reference foreign keys" $ do

@@ -1,0 +1,109 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ec757c4e..8cddd98c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3330, Incorrect admin server `/ready` response on slow schema cache loads - @steve-chavez
+  - #3327, Fix slow responses on schema cache reloads - @steve-chavez
+  - #3340, Log when the LISTEN channel gets a notification - @steve-chavez
++ - #3345, Fix in-database configuration values not loading for `pgrst.server_trace_header` and `pgrst.server_cors_allowed_origins` - @laurenceisla
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index d58a284c..614f8c15 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -9,7 +9,6 @@ Some of its functionality includes:
+ - Producing HTTP Headers according to RFCs.
+ - Content Negotiation
+ -}
+-{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.App
+   ( postgrest
+@@ -47,7 +46,7 @@ import PostgREST.ApiRequest           (Action (..), ApiRequest (..),
+                                        Mutation (..), Target (..))
+ import PostgREST.AppState             (AppState)
+ import PostgREST.Auth                 (AuthResult (..))
+-import PostgREST.Config               (AppConfig (..))
++import PostgREST.Config               (AppConfig (..), LogLevel (..))
+ import PostgREST.Config.PgVersion     (PgVersion (..))
+ import PostgREST.Error                (Error)
+ import PostgREST.Observation          (Observation (..))
+@@ -79,7 +78,7 @@ run appState observer = do
+ 
+   Admin.runAdmin conf appState (serverSettings conf) observer
+ 
+-  let app = postgrest conf appState (AppState.connectionWorker appState) observer
++  let app = postgrest configLogLevel appState (AppState.connectionWorker appState) observer
+ 
+   case configServerUnixSocket of
+     Just path -> do
+@@ -98,12 +97,12 @@ serverSettings AppConfig{..} =
+     & setServerName ("postgrest/" <> prettyVersion)
+ 
+ -- | PostgREST application
+-postgrest :: AppConfig -> AppState.AppState -> IO () -> (Observation -> IO ()) -> Wai.Application
+-postgrest conf appState connWorker observer =
+-  traceHeaderMiddleware conf .
+-  Cors.middleware (configServerCorsAllowedOrigins conf) .
++postgrest :: LogLevel -> AppState.AppState -> IO () -> (Observation -> IO ()) -> Wai.Application
++postgrest logLevel appState connWorker observer =
++  traceHeaderMiddleware appState .
++  Cors.middleware appState .
+   Auth.middleware appState .
+-  Logger.middleware (configLogLevel conf) $
++  Logger.middleware logLevel $
+     -- fromJust can be used, because the auth middleware will **always** add
+     -- some AuthResult to the vault.
+     \req respond -> case fromJust $ Auth.getResult req of
+@@ -253,9 +252,11 @@ calcTiming timingEnabled f = if timingEnabled
+       r <- f
+       pure (Nothing, r)
+ 
+-traceHeaderMiddleware :: AppConfig -> Wai.Middleware
+-traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
+-  case configServerTraceHeader of
++traceHeaderMiddleware :: AppState -> Wai.Middleware
++traceHeaderMiddleware appState app req respond = do
++  conf <- AppState.getConfig appState
++
++  case configServerTraceHeader conf of
+     Nothing -> app req respond
+     Just hdr ->
+       let hdrVal = L.lookup hdr $ Wai.requestHeaders req in
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 3792a48d..01bc0fa0 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -65,6 +65,7 @@ dbSettingsNames =
+   ,"openapi_security_active"
+   ,"openapi_server_proxy_uri"
+   ,"raw_media_types"
++  ,"server_cors_allowed_origins"
+   ,"server_trace_header"
+   ,"server_timing_enabled"
+   ]
+diff --git a/src/PostgREST/Cors.hs b/src/PostgREST/Cors.hs
+index fea3733d..1e4c34b3 100644
+--- a/src/PostgREST/Cors.hs
++++ b/src/PostgREST/Cors.hs
+@@ -15,10 +15,15 @@ import qualified Network.Wai.Middleware.Cors as Wai
+ 
+ import Data.List (lookup)
+ 
++import PostgREST.AppState (AppState, getConfig)
++import PostgREST.Config   (AppConfig (..))
++
+ import Protolude
+ 
+-middleware :: Maybe [Text] -> Wai.Middleware
+-middleware corsAllowedOrigins = Wai.cors $ corsPolicy corsAllowedOrigins
++middleware :: AppState -> Wai.Middleware
++middleware appState app req res = do
++  conf <- getConfig appState
++  Wai.cors (corsPolicy $ configServerCorsAllowedOrigins conf) app req res
+ 
+ -- | CORS policy to be used in by Wai Cors middleware
+ corsPolicy :: Maybe [Text] -> Wai.Request -> Maybe Wai.CorsResourcePolicy

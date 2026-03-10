@@ -1,0 +1,74 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5cbabb7d..fa672f0e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2348, Add `db-pool-acquisition-timeout` configuration option, time in seconds to wait to acquire a connection. - @robx
+  - #2428, Fix opening an empty transaction on failed resource embedding - @steve-chavez
+  - #2455, Fix embedding the same table multiple times - @steve-chavez
++ - #2518, Fix a regression when embedding views where base tables have a different column order for FK columns - @wolfgangwalther
++ - #2458, Fix a regression with the location header when inserting into views with PKs from multiple tables - @wolfgangwalther
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index aea2ebe5..e67f1d6e 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -428,8 +428,8 @@ addViewPrimaryKeys tabs keyDeps =
+     else tbl) <$> tabs
+   where
+     findViewPKCols sch vw =
+-      maybe [] (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
+-      find (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
++      concatMap (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
++      filter (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
+ 
+ allTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
+ allTables pgVer =
+@@ -679,9 +679,9 @@ allM2OandO2ORels pgVer =
+     FROM pg_constraint traint
+     JOIN LATERAL (
+       SELECT
+-        array_agg(row(cols.attname, refs.attname) order by cols.attnum) AS cols_and_fcols,
+-        jsonb_agg(cols.attname order by cols.attnum) AS cols
+-      FROM ( SELECT unnest(traint.conkey) AS col, unnest(traint.confkey) AS ref) _
++        array_agg(row(cols.attname, refs.attname) order by ord) AS cols_and_fcols,
++        jsonb_agg(cols.attname order by ord) AS cols
++      FROM unnest(traint.conkey, traint.confkey) WITH ORDINALITY AS _(col, ref, ord)
+       JOIN pg_attribute cols ON cols.attrelid = traint.conrelid AND cols.attnum = col
+       JOIN pg_attribute refs ON refs.attrelid = traint.confrelid AND refs.attnum = ref
+     ) AS column_info ON TRUE
+@@ -757,8 +757,10 @@ allViewsKeyDependencies =
+           contype::text as contype,
+           conname,
+           conrelid as resorigtbl,
+-          unnest(conkey) as resorigcol
++          col as resorigcol,
++          ord
+         from pg_constraint
++        left join lateral unnest(conkey) with ordinality as _(col, ord) on true
+         where contype IN ('p', 'f')
+         union
+         -- fk referenced col
+@@ -766,8 +768,10 @@ allViewsKeyDependencies =
+           concat(contype, '_ref') as contype,
+           conname,
+           confrelid,
+-          unnest(confkey)
++          col,
++          ord
+         from pg_constraint
++        left join lateral unnest(confkey) with ordinality as _(col, ord) on true
+         where contype='f'
+       ),
+       views as (
+@@ -897,7 +901,7 @@ allViewsKeyDependencies =
+         rec.view_name,
+         pks_fks.conname as constraint_name,
+         pks_fks.contype as constraint_type,
+-        array_agg(row(col.attname, vcol.attname) order by col.attnum) as column_dependencies
++        array_agg(row(col.attname, vcol.attname) order by pks_fks.ord) as column_dependencies
+       from recursion rec
+       join pg_class tbl on tbl.oid = rec.resorigtbl
+       join pg_attribute col on col.attrelid = tbl.oid and col.attnum = rec.resorigcol

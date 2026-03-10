@@ -1,0 +1,90 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e034ee21..ac956f53 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2799, Add timezone in Prefer header - @taimoorzaeem
+  - #3001, Add `statement_timeout` set on functions - @taimoorzaeem
+  - #3045, Apply superuser settings on impersonated roles if they have PostgreSQL 15 `GRANT SET ON PARAMETER` privilege - @steve-chavez
++ - #3062, Add config for enabling the `Server-Timing` header - @develop7
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index cd23c59b..b4a75b77 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -159,7 +159,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf req body sCache
+ 
+-  let jwtTiming = (SMJwt, if configDbPlanEnabled then Auth.getJwtDur req else Nothing)
++  let jwtTiming = (SMJwt, if configServerTimingEnabled then Auth.getJwtDur req else Nothing)
+   handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtTiming
+ 
+ runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+@@ -256,9 +256,9 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+         query
+ 
+     pgrstResponse :: ServerTimingData -> Response.PgrstResponse -> Wai.Response
+-    pgrstResponse timings (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([renderServerTimingHeader timings | configDbPlanEnabled conf])) bod
++    pgrstResponse timings (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([renderServerTimingHeader timings | configServerTimingEnabled conf])) bod
+ 
+-    withTiming f = if configDbPlanEnabled conf
++    withTiming f = if configServerTimingEnabled conf
+         then do
+           (t, r) <- timeItT f
+           pure (Just t, r)
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 35096e13..ec309507 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -109,7 +109,7 @@ middleware appState app req respond = do
+ 
+ -- If DbPlanEnabled       -> calculate JWT validation time
+ -- If JwtCacheMaxLifetime -> cache JWT validation result
+-  req' <- case (configDbPlanEnabled conf, configJwtCacheMaxLifetime conf) of
++  req' <- case (configServerTimingEnabled conf, configJwtCacheMaxLifetime conf) of
+     (True, 0)            -> do
+           (dur, authResult) <- timeItT parseJwt
+           return $ req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult & Vault.insert jwtDurKey dur }
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 8e20719f..af1238d7 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -104,6 +104,7 @@ data AppConfig = AppConfig
+   , configServerHost               :: Text
+   , configServerPort               :: Int
+   , configServerTraceHeader        :: Maybe (CI.CI BS.ByteString)
++  , configServerTimingEnabled      :: Bool
+   , configServerUnixSocket         :: Maybe FilePath
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
+@@ -169,6 +170,7 @@ toText conf =
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
+       ,("server-trace-header",       q . T.decodeUtf8 . maybe mempty CI.original . configServerTraceHeader)
++      ,("server-timing-enabled",         T.toLower . show . configServerTimingEnabled)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
+       ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
+@@ -272,6 +274,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
++    <*> (fromMaybe False <$> optBool "server-timing-enabled")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 4624d47d..4672289f 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -64,6 +64,7 @@ dbSettingsNames =
+   ,"openapi_server_proxy_uri"
+   ,"raw_media_types"
+   ,"server_trace_header"
++  ,"server_timing_enabled"
+   ]
+ 
+ queryPgVersion :: Bool -> Session PgVersion

@@ -1,0 +1,139 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b4278634..ffbf741f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -40,6 +40,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Can generate the plan for different media types using the `for` parameter: `Accept: application/vnd.pgrst.plan; for="application/vnd.pgrst.object"`
+    + Different options for the plan can be used with the `options` parameter: `Accept: application/vnd.pgrst.plan; options=analyze|verbose|settings|buffers|wal`
+    + The plan can be obtained in text or json by using different media type suffixes: `Accept: application/vnd.pgrst.plan+text` and `Accept: application/vnd.pgrst.plan+json`.
++   + Limited to generating the plan of a json representation(`application/json`) but can be extended later to allow other representations.
++   + The plan can be obtained in text(`Accept: application/vnd.pgrst.plan+text`) and json(`Accept: application/vnd.pgrst.plan+json` or `Accept: application/vnd.pgrst.plan`) format.
+  - #2397, Fix race conditions managing database connection helper - @robx
+ 
+ ### Fixed
+diff --git a/src/PostgREST/MediaType.hs b/src/PostgREST/MediaType.hs
+index 39840a80..e2a3af64 100644
+--- a/src/PostgREST/MediaType.hs
++++ b/src/PostgREST/MediaType.hs
+@@ -97,9 +97,9 @@ decodeMediaType mt =
+     "application/vnd.pgrst.object":_       -> MTSingularJSON
+     "application/x-www-form-urlencoded":_  -> MTUrlEncoded
+     "application/octet-stream":_           -> MTOctetStream
+-    "application/vnd.pgrst.plan":rest      -> getPlan PlanText rest
+-    "application/vnd.pgrst.plan+text":rest -> getPlan PlanText rest
++    "application/vnd.pgrst.plan":rest      -> getPlan PlanJSON rest
+     "application/vnd.pgrst.plan+json":rest -> getPlan PlanJSON rest
++    "application/vnd.pgrst.plan+text":rest -> getPlan PlanText rest
+     "*/*":_                                -> MTAny
+     other:_                                -> MTOther other
+     _                                      -> MTAny
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index 93aa4cd0..386b2618 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -24,7 +24,7 @@ spec actualPgVersion = do
+   describe "read table/view plan" $ do
+     it "outputs the total cost for a single filter on a table" $ do
+       r <- request methodGet "/projects?id=in.(1,2,3)"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+           resHeaders = simpleHeaders r
+@@ -156,7 +156,7 @@ spec actualPgVersion = do
+   describe "writes plans" $ do
+     it "outputs the total cost for an insert" $ do
+       r <- request methodPost "/projects"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") [json|{"id":100, "name": "Project 100"}|]
++             (acceptHdrs "application/vnd.pgrst.plan") [json|{"id":100, "name": "Project 100"}|]
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+           resHeaders = simpleHeaders r
+@@ -172,7 +172,7 @@ spec actualPgVersion = do
+ 
+     it "outputs the total cost for an update" $ do
+       r <- request methodPatch "/projects?id=eq.3"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") [json|{"name": "Patched Project"}|]
++             (acceptHdrs "application/vnd.pgrst.plan") [json|{"name": "Patched Project"}|]
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+           resHeaders = simpleHeaders r
+@@ -188,7 +188,7 @@ spec actualPgVersion = do
+ 
+     it "outputs the total cost for a delete" $ do
+       r <- request methodDelete "/projects?id=in.(1,2,3)"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+           resHeaders = simpleHeaders r
+@@ -201,7 +201,7 @@ spec actualPgVersion = do
+ 
+     it "outputs the total cost for a single upsert" $ do
+       r <- request methodPut "/tiobe_pls?name=eq.Go"
+-            (acceptHdrs "application/vnd.pgrst.plan+json")
++            (acceptHdrs "application/vnd.pgrst.plan")
+             [json| [ { "name": "Go", "rank": 19 } ]|]
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+@@ -230,7 +230,7 @@ spec actualPgVersion = do
+   describe "function plan" $ do
+     it "outputs the total cost for a function call" $ do
+       r <- request methodGet "/rpc/getallprojects?id=in.(1,2,3)"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+           resHeaders = simpleHeaders r
+@@ -252,7 +252,7 @@ spec actualPgVersion = do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"text/xml\"; options=verbose; charset=utf-8")
+         aggCol `shouldBe` Just [aesonQQ| "COALESCE(xmlagg(return_scalar_xml.pgrst_scalar), ''::xml)" |]
+ 
+-  describe "text format" $ do
++  describe "text format" $
+     it "outputs the total cost for a function call" $ do
+       r <- request methodGet "/projects?id=in.(1,2,3)"
+              (acceptHdrs "application/vnd.pgrst.plan+text") ""
+@@ -266,23 +266,10 @@ spec actualPgVersion = do
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         resBody `shouldSatisfy` (\t -> LBS.take 9 t == "Aggregate")
+ 
+-    it "outputs in text format by default" $ do
+-      r <- request methodGet "/projects?id=in.(1,2,3)"
+-             (acceptHdrs "application/vnd.pgrst.plan") ""
+-
+-      let resBody    = simpleBody r
+-          resHeaders = simpleHeaders r
+-          resStatus  = simpleStatus r
+-
+-      liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+text; charset=utf-8")
+-        resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        resBody `shouldSatisfy` (\t -> LBS.take 9 t == "Aggregate")
+-
+   describe "resource embedding costs" $ do
+     it "a one to many doesn't surpass a threshold" $ do
+       r <- request methodGet "/clients?select=*,projects(*)&id=eq.1"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+       liftIO $ totalCost `shouldBe`
+@@ -292,7 +279,7 @@ spec actualPgVersion = do
+ 
+     it "a many to one doesn't surpass a threshold" $ do
+       r <- request methodGet "/projects?select=*,clients(*)&id=eq.1"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+       liftIO $ totalCost `shouldBe`
+@@ -302,7 +289,7 @@ spec actualPgVersion = do
+ 
+     it "a many to many doesn't surpass a threshold" $ do
+       r <- request methodGet "/users?select=*,tasks(*)&id=eq.1"
+-             (acceptHdrs "application/vnd.pgrst.plan+json") ""
++             (acceptHdrs "application/vnd.pgrst.plan") ""
+ 
+       let totalCost  = simpleBody r ^? nth 0 . key "Plan" . key "Total Cost"
+       liftIO $ totalCost `shouldBe`

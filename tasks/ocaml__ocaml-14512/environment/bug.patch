@@ -1,0 +1,278 @@
+diff --git a/Changes b/Changes
+index 5ad0eb1122..d756c5c597 100644
+--- a/Changes
++++ b/Changes
+@@ -28,11 +28,6 @@ Working version
+   maximum benefit on AMD64, pass -mprfchw to the C compiler.
+   (Nick Barnes, review by Gabriel Scherer, Damien Doligez, and Antonin Décimo)
+ 
+-### Type system:
+-
+-- #14512: Improve check for warning 16 (unerasable-optional-argument)
+-  (Alistair O'Brien, review by Florian Angeletti, Gabriel Scherer)
+-
+ ### Code generation and optimizations:
+ 
+ * #13919: optimize `lazy v` when `v` is a structured constant
+diff --git a/testsuite/tests/typing-warnings/warning16.ml b/testsuite/tests/typing-warnings/warning16.ml
+index 0e68bfd8c9..0cfa2974cc 100644
+--- a/testsuite/tests/typing-warnings/warning16.ml
++++ b/testsuite/tests/typing-warnings/warning16.ml
+@@ -60,63 +60,3 @@ class foo ?x ~y () = object end
+ [%%expect{|
+ class foo : ?x:'a -> y:'b -> unit -> object  end
+ |}]
+-
+-let baz y =
+-  let foo ?x = y in
+-  ignore (y : unit);
+-  foo
+-[%%expect{|
+-Line 2, characters 11-12:
+-2 |   let foo ?x = y in
+-               ^
+-Warning 16 [unerasable-optional-argument]: this optional argument cannot be erased.
+-
+-val baz : unit -> ?x:'a -> unit = <fun>
+-|}]
+-
+-#rectypes
+-
+-let rec baz ?x = baz
+-[%%expect{|
+-Line 1, characters 13-14:
+-1 | let rec baz ?x = baz
+-                 ^
+-Warning 16 [unerasable-optional-argument]: this optional argument cannot be erased.
+-
+-val baz : ?x:'b -> 'a as 'a = <fun>
+-|}, Principal{|
+-Line 1, characters 13-14:
+-1 | let rec baz ?x = baz
+-                 ^
+-Warning 16 [unerasable-optional-argument]: this optional argument cannot be erased.
+-
+-val baz : ?x:'a -> (?x:'a -> 'b as 'b) = <fun>
+-|}]
+-
+-let rec baz (type a) ?x = baz
+-[%%expect{|
+-Line 1, characters 22-23:
+-1 | let rec baz (type a) ?x = baz
+-                          ^
+-Warning 16 [unerasable-optional-argument]: this optional argument cannot be erased.
+-
+-val baz : ?x:'b -> 'a as 'a = <fun>
+-|}]
+-
+-(* Test that warnings can preceed type errors, this tests the 'eager' path
+-   of the implementation for warning 16 in typecore.ml *)
+-let _ =
+-  let warn_me ?arg = () in
+-  warn_me + 0
+-[%%expect{|
+-Line 2, characters 15-18:
+-2 |   let warn_me ?arg = () in
+-                   ^^^
+-Warning 16 [unerasable-optional-argument]: this optional argument cannot be erased.
+-
+-Line 3, characters 2-9:
+-3 |   warn_me + 0
+-      ^^^^^^^
+-Error: The value "warn_me" has type "?arg:'a -> unit"
+-       but an expression was expected of type "int"
+-|}]
+diff --git a/typing/ctype.ml b/typing/ctype.ml
+index 9cb454438f..7b5e6c60d3 100644
+--- a/typing/ctype.ml
++++ b/typing/ctype.ml
+@@ -6220,33 +6220,6 @@ let rec normalize_type_rec mark ty =
+ let normalize_type ty =
+   with_type_mark (fun mark -> normalize_type_rec mark ty)
+ 
+-let arrow_spine env ty =
+-  let rec arrow_spine_rec ~mark labels ty_fun =
+-    let ty = expand_head env ty_fun in
+-    if try_mark_node mark ty
+-    then (
+-      match get_desc ty with
+-      | Tarrow (label, ty_arg, ty_ret, _commu) ->
+-        arrow_spine_rec ~mark ((label, ty_arg) :: labels) ty_ret
+-      | _ -> List.rev labels, `Return ty)
+-    else List.rev labels, `Cycle
+-  in
+-  let snap = snapshot () in
+-  let result =
+-    with_type_mark (fun mark ->
+-        wrap_trace_gadt_instances env (arrow_spine_rec ~mark []) ty)
+-  in
+-  backtrack snap;
+-  result
+-
+-let arrow_labels env ty =
+-  let label_tys, ret_ty_or_cycle = arrow_spine env ty in
+-  let is_ret_tvar =
+-    match ret_ty_or_cycle with
+-    | `Cycle -> false
+-    | `Return ty -> is_Tvar ty
+-  in
+-  List.map fst label_tys, ~is_ret_tvar
+ 
+                               (*************************)
+                               (*  Remove dependencies  *)
+diff --git a/typing/ctype.mli b/typing/ctype.mli
+index 2814612bf2..547d8d7e84 100644
+--- a/typing/ctype.mli
++++ b/typing/ctype.mli
+@@ -369,26 +369,6 @@ val is_really_poly : Env.t -> type_expr -> bool
+ val filter_method: Env.t -> string -> type_expr -> type_expr
+         (* A special case of unification (with {m : 'a; 'b}).  Raises
+            [Filter_method_failed] instead of [Unify]. *)
+-
+-(** [arrow_labels env ty] expands [ty] as an array type in [env] and
+-    returns its argument labels.
+-
+-    [is_ret_tvar] is [true] if the final return type is a type variable,
+-    indicating that the list of labels isn't necessarily exhaustive. *)
+-val arrow_labels : Env.t -> type_expr -> arg_label list * is_ret_tvar:bool
+-
+-(** [arrow_spine env ty] expands [ty] as a arrow type in [env] and returns
+-    its arrow spine.
+-
+-    If [ty] is [l1:ty1 -> ... -> ln:tyn -> rty], it returns
+-    [([(l1, ty1); ...; (ln, tyn)], `Return rty)].
+-
+-    If [ty] is a {e cyclic} arrow type, it returns [([...], `Cycle)]. *)
+-val arrow_spine
+-  :  Env.t
+-  -> type_expr
+-  -> (arg_label * type_expr) list * [ `Return of type_expr | `Cycle ]
+-
+ val occur_in: Env.t -> type_expr -> type_expr -> bool
+ val deep_occur: type_expr -> type_expr -> bool
+ val deep_occur_list: type_expr -> type_expr list -> bool
+diff --git a/typing/typecore.ml b/typing/typecore.ml
+index 85c9417003..b62269d076 100644
+--- a/typing/typecore.ml
++++ b/typing/typecore.ml
+@@ -2817,6 +2817,26 @@ let is_prim ~name funct =
+       prim_name = name
+   | _ -> false
+ 
++(* List labels in a function type, and whether return type is a variable *)
++let rec list_labels_aux env visited ls ty_fun =
++  let ty = expand_head env ty_fun in
++  if TypeSet.mem ty visited then
++    List.rev ls, false
++  else match get_desc ty with
++    | Tarrow (l, _, ty_res, _) ->
++        list_labels_aux env (TypeSet.add ty visited) (l::ls) ty_res
++    | _ ->
++        List.rev ls, is_Tvar ty
++
++let list_labels env ty =
++  let snap = Btype.snapshot () in
++  let result =
++    wrap_trace_gadt_instances env (list_labels_aux env TypeSet.empty []) ty
++  in
++  Btype.backtrack snap;
++  result
++
++
+ (* Collecting arguments for function applications. *)
+ 
+ type untyped_apply_arg =
+@@ -3033,8 +3053,8 @@ let collect_unknown_apply_args env funct ty_fun0 rev_args sargs =
+     || !Clflags.classic && arg = Nolabel && not (is_optional param)
+   in
+   let has_label l ty_fun =
+-    let ls, ~is_ret_tvar = arrow_labels env ty_fun in
+-    is_ret_tvar || List.mem l ls
++    let ls, tvar = list_labels env ty_fun in
++    tvar || List.mem l ls
+   in
+   let rec loop ty_fun rev_args sargs =
+     match sargs with
+@@ -5647,51 +5667,17 @@ and type_function
+          type for each parameter that's added. Now that functions are n-ary,
+          there might be an opportunity to improve this.
+       *)
+-      let only_labels_function_ret_tvar ty =
+-        (* [arrow_spine] does expansion and is potentially expensive;
+-           only call this when necessary. *)
+-        let label_tys, ret_ty_or_cycle = arrow_spine env ty in
+-        let is_spine_only_labels =
+-          List.for_all (fun (label, _ty) -> label <> Nolabel) label_tys
+-        in
+-        if is_spine_only_labels
+-        then (
+-          match ret_ty_or_cycle with
+-          | `Cycle -> Some `Not_tvar
+-          | `Return ty ->
+-              if is_Tvar ty
+-              then Some (`Tvar ty)
+-              else Some `Not_tvar )
+-        else None
+-      in
+-      (* An optional argument [?x] is only erasable if the function's return
+-         type eventually becomes an unlabelled arrow type ['a -> 'b].
+-
+-         If the return type [ty_ret] is not yet fully known, the check must be
+-         delayed to avoid reporting false negatives. For instance, with
+-         -rectypes in 5.4.0:
+-         {[
+-         # let rec f (type a) ?x = f;;
+-         val f : ?x:'b -> 'a as 'a = <fun>
+-         ]}
+-      *)
+-      let raise_unerasable_optional_argument () =
++      let not_nolabel_function ty =
++        (* [list_labels] does expansion and is potentially expensive; only
++           call this when necessary. *)
++        let ls, tvar = list_labels env ty in
++        List.for_all (( <> ) Nolabel) ls && not tvar
++      in
++      if is_optional arg_label && not_nolabel_function ty_ret
++      then
+         Location.prerr_warning
+           pat.pat_loc
+-          Warnings.Unerasable_optional_argument
+-      in
+-      if is_optional arg_label
+-      then (
+-        match only_labels_function_ret_tvar ty_ret with
+-        | Some (`Tvar ret_tvar) ->
+-          (* We don't necessarily know [ty] is a function with only labelled
+-             args since unification may change this. So we add
+-             a delayed check. *)
+-          add_delayed_check (fun () ->
+-              if Option.is_some (only_labels_function_ret_tvar ret_tvar)
+-              then raise_unerasable_optional_argument ())
+-        | Some `Not_tvar -> raise_unerasable_optional_argument ()
+-        | None -> ());
++          Warnings.Unerasable_optional_argument;
+       let fp_kind, fp_param =
+         match default_arg with
+         | None ->
+@@ -6215,8 +6201,8 @@ and type_label_exp create env loc ty_expected
+ and type_argument ?explanation ?recarg env sarg ty_expected' ty_expected =
+   (* ty_expected' may be generic *)
+   let no_labels ty =
+-    let ls, ~is_ret_tvar = arrow_labels env ty in
+-    not is_ret_tvar && List.for_all ((=) Nolabel) ls
++    let ls, tvar = list_labels env ty in
++    not tvar && List.for_all ((=) Nolabel) ls
+   in
+   let may_coerce =
+     if not (is_inferred sarg) then None else
+@@ -6420,8 +6406,8 @@ and type_application env app_loc funct sargs =
+       let ignore_labels =
+         !Clflags.classic ||
+         begin
+-          let ls, ~is_ret_tvar = arrow_labels env ty in
+-          not is_ret_tvar &&
++          let ls, tvar = list_labels env ty in
++          not tvar &&
+           let labels = List.filter (fun l -> not (is_optional l)) ls in
+           List.length labels = List.length sargs &&
+           List.for_all (fun (l,_) -> l = Nolabel) sargs &&

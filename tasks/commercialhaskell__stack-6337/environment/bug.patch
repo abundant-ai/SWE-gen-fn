@@ -1,0 +1,309 @@
+diff --git a/ChangeLog.md b/ChangeLog.md
+index 627e2b147..bef989bd6 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -21,7 +21,6 @@ Behavior changes:
+   `nix` executable is on the PATH. This usually indicates the Nix package
+   manager is available. In YAML configuration files, the `notify-if-nix-on-path`
+   key is introduced, to allow the notification to be muted if unwanted.
+-* Drop support for Intero (end of life in November 2019).
+ 
+ Other enhancements:
+ 
+diff --git a/doc/GUIDE.md b/doc/GUIDE.md
+index ea41782fb..e9456500c 100644
+--- a/doc/GUIDE.md
++++ b/doc/GUIDE.md
+@@ -1249,7 +1249,7 @@ the output of the command:
+ --compiler-exe           Compiler binary (e.g. ghc)
+ --compiler-bin           Directory containing the compiler binary (e.g. ghc)
+ --compiler-tools-bin     Directory containing binaries specific to a
+-                         particular compiler
++                         particular compiler (e.g. intero)
+ --local-bin              Directory where Stack installs executables (e.g.
+                          ~/.local/bin (Unix-like OSs) or %APPDATA%\local\bin
+                          (Windows))
+diff --git a/doc/editor_integration.md b/doc/editor_integration.md
+index 5cf8afd8b..ed68ad0a8 100644
+--- a/doc/editor_integration.md
++++ b/doc/editor_integration.md
+@@ -7,6 +7,12 @@
+ For further information, see the [Stack and Visual Code](Stack_and_VS_Code.md)
+ documentation.
+ 
++## The `intero` project
++
++For editor integration, Stack has a related project called
++[intero](https://github.com/commercialhaskell/intero). It is particularly well
++supported by Emacs, but some other editors have integration for it as well.
++
+ ## Shell auto-completion
+ 
+ Love tab-completion of commands? You're not alone. If you're on bash, just run
+diff --git a/src/Stack/Ghci.hs b/src/Stack/Ghci.hs
+index 38e194f3b..76630d1c1 100644
+--- a/src/Stack/Ghci.hs
++++ b/src/Stack/Ghci.hs
+@@ -21,13 +21,18 @@ import           Data.List.Extra ( (!?) )
+ import qualified Data.Map.Strict as M
+ import qualified Data.Set as S
+ import qualified Data.Text as T
++import qualified Data.Text.Lazy as TL
++import qualified Data.Text.Lazy.Encoding as TLE
+ import qualified Distribution.PackageDescription as C
+ import           Path ((</>), parent, parseRelFile )
+ import           Path.Extra ( forgivingResolveFile', toFilePathNoTrailingSep )
+ import           Path.IO
+                    ( XdgDirectory (..), doesFileExist, ensureDir, getXdgDir )
+ import           RIO.NonEmpty ( nonEmpty )
+-import           RIO.Process ( exec, withWorkingDir )
++import           RIO.Process
++                   ( HasProcessContext, exec, proc, readProcess_
++                   , withWorkingDir
++                   )
+ import           Stack.Build ( buildLocalTargets )
+ import           Stack.Build.Installed ( getInstalled, toInstallMap )
+ import           Stack.Build.Source
+@@ -39,7 +44,7 @@ import           Stack.Constants
+                    )
+ import           Stack.Constants.Config ( ghciDirL, objectInterfaceDirL )
+ import           Stack.Ghci.Script
+-                   ( GhciScript, ModuleName, cmdAdd, cmdModule
++                   ( GhciScript, ModuleName, cmdAdd, cmdCdGhc, cmdModule
+                    , scriptToLazyByteString
+                    )
+ import           Stack.Package
+@@ -556,6 +561,21 @@ runGhci GhciOpts{..} targets mainFile pkgs extraFiles exposePackages = do
+         case pkgs of
+           [pkg] -> withWorkingDir (toFilePath $ ghciPkgDir pkg)
+           _ -> id
++      -- TODO: Consider optimizing this check. Perhaps if no "with-ghc" is
++      -- specified, assume that it is not using intero.
++      checkIsIntero =
++        -- Optimization dependent on the behavior of renderScript - it doesn't
++        -- matter if it's intero or ghci when loading multiple packages.
++        case pkgs of
++          [_] -> do
++            menv <-
++              liftIO $ configProcessContextSettings config defaultEnvSettings
++            output <- withProcessContext menv $
++              runGrabFirstLine
++                (fromMaybe compilerExeName ghciGhcCommand)
++                ["--version"]
++            pure $ "Intero" `L.isPrefixOf` output
++          _ -> pure False
+   -- Since usage of 'exec' does not pure, we cannot do any cleanup on ghci exit.
+   -- So, instead leave the generated files. To make this more efficient and
+   -- avoid gratuitous generation of garbage, the file names are determined by
+@@ -571,10 +591,11 @@ runGhci GhciOpts{..} targets mainFile pkgs extraFiles exposePackages = do
+     then execGhci macrosOptions
+     else do
+       checkForDuplicateModules pkgs
++      isIntero <- checkIsIntero
+       scriptOptions <-
+         writeGhciScript
+           tmpDirectory
+-          (renderScript pkgs mainFile ghciOnlyMain extraFiles)
++          (renderScript isIntero pkgs mainFile ghciOnlyMain extraFiles)
+       execGhci (macrosOptions ++ scriptOptions)
+ 
+ writeMacrosFile ::
+@@ -624,24 +645,31 @@ writeHashedFile outputDirectory relFile contents = do
+   pure outFile
+ 
+ renderScript ::
+-     [GhciPkgInfo]
++     Bool
++  -> [GhciPkgInfo]
+   -> Maybe (Path Abs File)
+   -> Bool
+   -> [Path Abs File]
+   -> GhciScript
+-renderScript pkgs mainFile onlyMain extraFiles = do
+-  let addPhase = cmdAdd $ S.fromList (map Left allModules ++ addMain)
+-      addMain = maybe [] (L.singleton . Right) mainFile
++renderScript isIntero pkgs mainFile onlyMain extraFiles = do
++  let cdPhase = case (isIntero, pkgs) of
++        -- If only loading one package, set the cwd properly. Otherwise don't
++        -- try. See https://github.com/commercialhaskell/stack/issues/3309
++        (True, [pkg]) -> cmdCdGhc (ghciPkgDir pkg)
++        _ -> mempty
++      addPhase = cmdAdd $ S.fromList (map Left allModules ++ addMain)
++      addMain = case mainFile of
++        Just path -> [Right path]
++        _ -> []
+       modulePhase = cmdModule $ S.fromList allModules
+       allModules = nubOrd $ concatMap (M.keys . ghciPkgModules) pkgs
+   case getFileTargets pkgs <> extraFiles of
+     [] ->
+       if onlyMain
+         then
+-          if isJust mainFile
+-            then cmdAdd (S.fromList addMain)
+-            else mempty
+-        else addPhase <> modulePhase
++             cdPhase
++          <> if isJust mainFile then cmdAdd (S.fromList addMain) else mempty
++        else cdPhase <> addPhase <> modulePhase
+     fileTargets -> cmdAdd (S.fromList (map Right fileTargets))
+ 
+ -- Hacky check if module / main phase should be omitted. This should be
+@@ -1199,3 +1227,21 @@ hasLocalComp p t = case t of
+   TargetComps s -> any p (S.toList s)
+   TargetAll PTProject -> True
+   _ -> False
++
++-- | Run a command and grab the first line of stdout, dropping
++-- stderr's contexts completely.
++runGrabFirstLine ::
++     (HasProcessContext env, HasLogFunc env)
++  => String
++  -> [String]
++  -> RIO env String
++runGrabFirstLine cmd0 args =
++  proc cmd0 args $ \pc -> do
++    (out, _err) <- readProcess_ pc
++    pure
++      $ TL.unpack
++      $ TL.filter (/= '\r')
++      $ TL.concat
++      $ take 1
++      $ TL.lines
++      $ TLE.decodeUtf8With lenientDecode out
+diff --git a/src/Stack/Ghci/Script.hs b/src/Stack/Ghci/Script.hs
+index d30f42fc2..417d4cac3 100644
+--- a/src/Stack/Ghci/Script.hs
++++ b/src/Stack/Ghci/Script.hs
+@@ -5,6 +5,7 @@ module Stack.Ghci.Script
+   ( GhciScript
+   , ModuleName
+   , cmdAdd
++  , cmdCdGhc
+   , cmdModule
+   , scriptToLazyByteString
+   , scriptToBuilder
+@@ -29,12 +30,16 @@ instance Monoid GhciScript where
+ 
+ data GhciCommand
+   = AddCmd (Set (Either ModuleName (Path Abs File)))
++  | CdGhcCmd (Path Abs Dir)
+   | ModuleCmd (Set ModuleName)
+   deriving Show
+ 
+ cmdAdd :: Set (Either ModuleName (Path Abs File)) -> GhciScript
+ cmdAdd = GhciScript . (:[]) . AddCmd
+ 
++cmdCdGhc :: Path Abs Dir -> GhciScript
++cmdCdGhc = GhciScript . (:[]) . CdGhcCmd
++
+ cmdModule :: Set ModuleName -> GhciScript
+ cmdModule = GhciScript . (:[]) . ModuleCmd
+ 
+@@ -74,6 +79,9 @@ commandToBuilder (AddCmd modules)
+          )
+     <> "\n"
+ 
++commandToBuilder (CdGhcCmd path) =
++  ":cd-ghc " <> fromString (quoteFileName (toFilePath path)) <> "\n"
++
+ commandToBuilder (ModuleCmd modules)
+   | S.null modules = ":module +\n"
+   | otherwise      =
+diff --git a/src/Stack/Path.hs b/src/Stack/Path.hs
+index e2f3b5b82..c1685e296 100644
+--- a/src/Stack/Path.hs
++++ b/src/Stack/Path.hs
+@@ -197,7 +197,7 @@ paths =
+   , ( "Directory containing the compiler binary (e.g. ghc)"
+     , "compiler-bin"
+     , WithoutHaddocks $ T.pack . toFilePathNoTrailingSep . parent . piCompiler )
+-  , ( "Directory containing binaries specific to a particular compiler"
++  , ( "Directory containing binaries specific to a particular compiler (e.g. intero)"
+     , "compiler-tools-bin"
+     , WithoutHaddocks $ T.pack . toFilePathNoTrailingSep . piToolsDir )
+   , ( "Directory where Stack installs executables (e.g. ~/.local/bin (Unix-like OSs) or %APPDATA%\\local\\bin (Windows))"
+diff --git a/tests/integration/tests/3685-config-yaml-for-allow-newer/Main.hs b/tests/integration/tests/3685-config-yaml-for-allow-newer/Main.hs
+index ac5122c7d..1fbadf781 100644
+--- a/tests/integration/tests/3685-config-yaml-for-allow-newer/Main.hs
++++ b/tests/integration/tests/3685-config-yaml-for-allow-newer/Main.hs
+@@ -10,7 +10,6 @@ main :: IO ()
+ main = do
+   removeFileIgnore "stack.yaml"
+   stack ["init", defaultResolverArg]
+-  -- intero-0.1.23 chosen because it depends on ghc >=7.8 && <8.2.2.
+   stackErrStderr ["install", "intero-0.1.23"] (expectMessage planRecommendation)
+ 
+ expectMessage :: String -> String -> IO ()
+diff --git a/tests/integration/tests/3685-config-yaml-for-allow-newer/files/files.cabal b/tests/integration/tests/3685-config-yaml-for-allow-newer/files/files.cabal
+new file mode 100644
+index 000000000..917c8f3f4
+--- /dev/null
++++ b/tests/integration/tests/3685-config-yaml-for-allow-newer/files/files.cabal
+@@ -0,0 +1,10 @@
++name:           files
++version:        0.1.0.0
++build-type:     Simple
++cabal-version:  >= 2.0
++
++library
++  exposed-modules: Src
++  hs-source-dirs: src
++  build-depends: base
++  default-language: Haskell2010
+diff --git a/tests/integration/tests/3685-config-yaml-for-allow-newer/files/src/Src.hs b/tests/integration/tests/3685-config-yaml-for-allow-newer/files/src/Src.hs
+new file mode 100644
+index 000000000..0f8db7fb7
+--- /dev/null
++++ b/tests/integration/tests/3685-config-yaml-for-allow-newer/files/src/Src.hs
+@@ -0,0 +1,5 @@
++module Src where
++
++-- | A function of the main library
++funMainLib :: Int -> Int
++funMainLib = succ
+diff --git a/tests/unit/Stack/Ghci/ScriptSpec.hs b/tests/unit/Stack/Ghci/ScriptSpec.hs
+index 8515f38ff..28f758518 100644
+--- a/tests/unit/Stack/Ghci/ScriptSpec.hs
++++ b/tests/unit/Stack/Ghci/ScriptSpec.hs
+@@ -25,10 +25,11 @@ spec = do
+ 
+       describe "script" $ do
+         it "should separate commands with a newline" $ do
+-          let script =    cmdAdd [Left (fromString "Lib.A")]
+-                       <> cmdAdd [Left (fromString "Lib.B")]
++          let dir = $(mkAbsDir $ defaultDrive FP.</> "src" FP.</> "package-a")
++              script = cmdCdGhc dir
++                    <> cmdAdd [Left (fromString "Lib.A")]
+           scriptToLazyByteString script `shouldBe`
+-            ":add Lib.A\n:add Lib.B\n"
++            ":cd-ghc " <> pathToLazyByteString dir <> "\n:add Lib.A\n"
+ 
+       describe ":add" $ do
+         it "should not render empty add commands" $ do
+@@ -46,6 +47,13 @@ spec = do
+           scriptToLazyByteString script `shouldBe`
+             ":add " <> pathToLazyByteString file <> "\n"
+ 
++      describe ":cd-ghc" $ do
++        it "should render a full absolute path" $ do
++          let dir = $(mkAbsDir $ defaultDrive FP.</> "Users" FP.</> "someone" FP.</> "src" FP.</> "project" FP.</> "package-a")
++              script = cmdCdGhc dir
++          scriptToLazyByteString script `shouldBe`
++            ":cd-ghc " <> pathToLazyByteString dir <> "\n"
++
+       describe ":module" $ do
+         it "should render empty module as ':module +'" $ do
+           let script = cmdModule []
+diff --git a/tests/unit/Stack/GhciSpec.hs b/tests/unit/Stack/GhciSpec.hs
+index 021740dc9..7638952e2 100644
+--- a/tests/unit/Stack/GhciSpec.hs
++++ b/tests/unit/Stack/GhciSpec.hs
+@@ -2,7 +2,7 @@
+ -- {-# LANGUAGE QuasiQuotes #-}
+ -- {-# LANGUAGE TemplateHaskell #-}
+ 
+--- | Test suite for GHCi-like applications including GHCi.
++-- | Test suite for GHCi like applications including both GHCi and Intero.
+ module Stack.GhciSpec
+   ( spec
+   ) where

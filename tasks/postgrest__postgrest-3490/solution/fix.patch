@@ -1,0 +1,135 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f437ac62..3cbd8343 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -42,6 +42,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3404, Clarify the `PGRST121` (could not parse RAISE 'PGRST') error message - @laurenceisla
+  - #3267, Fix wrong `503 Service Unavailable` on pg error `53400` - @taimoorzaeem
+  - #2985, Fix not adding `application_name` on all connection strings - @steve-chavez
++ - #3424, Admin `/live` and `/ready` now differentiates a failure as 500 status - @steve-chavez
++    + 503 status is still given when postgREST is in a recovering state
+ 
+ ### Deprecated
+ 
+diff --git a/docs/references/admin_server.rst b/docs/references/admin_server.rst
+index df9161f4..e06b7272 100644
+--- a/docs/references/admin_server.rst
++++ b/docs/references/admin_server.rst
+@@ -3,7 +3,7 @@
+ Admin Server
+ ############
+ 
+-PostgREST provides an admin server that can be enabled by setting :ref:`admin-server-port` to the port number of your preference.
++PostgREST provides an admin server that can be enabled by setting :ref:`admin-server-port`.
+ 
+ .. _health_check:
+ 
+@@ -23,7 +23,7 @@ Two endpoints ``live`` and ``ready`` will then be available.
+ Live
+ ----
+ 
+-The ``live`` endpoint verifies if PostgREST is running on its configured port. A request will return ``200 OK`` if PostgREST is alive or ``503`` otherwise.
++The ``live`` endpoint verifies if PostgREST is running on its configured port. A request will return ``200 OK`` if PostgREST is alive or ``500`` otherwise.
+ 
+ For instance, to verify if PostgREST is running while the ``admin-server-port`` is set to ``3001``:
+ 
+@@ -38,7 +38,7 @@ For instance, to verify if PostgREST is running while the ``admin-server-port``
+ Ready
+ -----
+ 
+-In addition, the ``ready`` endpoint checks the state of the :ref:`connection_pool` and the :ref:`schema_cache`. A request will return ``200 OK`` if both are good or ``503`` if not.
++Additionally to the ``live`` check, the ``ready`` endpoint checks the state of the :ref:`connection_pool` and the :ref:`schema_cache`. A request will return ``200 OK`` if both are good or ``503`` if not.
+ 
+ .. code-block:: bash
+ 
+@@ -48,6 +48,8 @@ In addition, the ``ready`` endpoint checks the state of the :ref:`connection_poo
+ 
+   HTTP/1.1 200 OK
+ 
++PostgREST will try to recover from the ``503`` state with :ref:`automatic_recovery`.
++
+ Metrics
+ =======
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 8c347dad..95514e1c 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -161,7 +161,7 @@ admin-server-port
+   **In-Database** `n/a`
+   =============== =======================
+ 
+-  Specifies the port for the :ref:`health_check` endpoints.
++  Specifies the port for the :ref:`admin_server`.
+ 
+ .. _app.settings.*:
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 40b87243..325e95c0 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -42,12 +42,19 @@ admin :: AppState.AppState -> Wai.Application
+ admin appState req respond  = do
+   isMainAppReachable  <- isRight <$> reachMainApp (AppState.getSocketREST appState)
+   isLoaded <- AppState.isLoaded appState
++  isPending <- AppState.isPending appState
+ 
+   case Wai.pathInfo req of
+-    ["ready"] ->
+-      respond $ Wai.responseLBS (if isMainAppReachable && isLoaded then HTTP.status200 else HTTP.status503) [] mempty
+     ["live"] ->
+-      respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
++      respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status500) [] mempty
++    ["ready"] ->
++      let
++        status | not isMainAppReachable = HTTP.status500
++               | isPending              = HTTP.status503
++               | isLoaded               = HTTP.status200
++               | otherwise              = HTTP.status500
++      in
++      respond $ Wai.responseLBS status [] mempty
+     ["config"] -> do
+       config <- AppState.getConfig appState
+       respond $ Wai.responseLBS HTTP.status200 [] (LBS.fromStrict $ encodeUtf8 $ Config.toText config)
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 3fad53ed..d5abd958 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -27,6 +27,7 @@ module PostgREST.AppState
+   , runListener
+   , getObserver
+   , isLoaded
++  , isPending
+   ) where
+ 
+ import qualified Data.Aeson                 as JSON
+@@ -315,6 +316,12 @@ isLoaded x = do
+   connEstablished <- isConnEstablished x
+   return $ scacheStatus == SCLoaded && connEstablished
+ 
++isPending :: AppState -> IO Bool
++isPending x = do
++  scacheStatus <- readIORef $ stateSCacheStatus x
++  connStatus <- readIORef $ stateConnStatus x
++  return $ scacheStatus == SCPending || connStatus == ConnPending
++
+ putSCacheStatus :: AppState -> SchemaCacheStatus -> IO ()
+ putSCacheStatus = atomicWriteIORef . stateSCacheStatus
+ 
+@@ -338,12 +345,15 @@ loadSchemaCache appState@AppState{stateObserver=observer} = do
+           observer $ SchemaCacheFatalErrorObs e hint
+           return SCFatalFail
+         Nothing -> do
++          putSCacheStatus appState SCPending
+           putSchemaCache appState Nothing
+           observer $ SchemaCacheNormalErrorObs e
+-          putSCacheStatus appState SCPending
+           return SCPending
+ 
+     Right sCache -> do
++      -- IMPORTANT: While the pending schema cache state starts from running the above querySchemaCache, only at this stage we block API requests due to the usage of an
++      -- IORef on putSchemaCache. This is why SCacheStatus is put at SCPending here to signal the Admin server (using isPending) that we're on a recovery state.
++      putSCacheStatus appState SCPending
+       putSchemaCache appState $ Just sCache
+       observer $ SchemaCacheQueriedObs resultTime
+       (t, _) <- timeItT $ observer $ SchemaCacheSummaryObs $ showSummary sCache

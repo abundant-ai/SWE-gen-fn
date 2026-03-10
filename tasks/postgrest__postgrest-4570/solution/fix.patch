@@ -1,0 +1,143 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 221f1959..af126128 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file. From versio
+ - Fix regression where the `PGRST103` error response was truncated by @laurenceisla in #4455
+   + Happened when an `offset` was greater than the rows requested and `Prefer: count=exact` was sent.
+ - Fix not returning `Content-Length` on empty HTTP `201` responses by @laurenceisla in #4518
++- Fix inaccurate Server-Timing header durations by @steve-chavez in #4522
++- Fix inaccurate "Schema cache queried" logs by @steve-chavez in #4522
+ 
+ ## [14.1] - 2025-11-05
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index d7dfc7da..20465b61 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -94,6 +94,7 @@ library
+                       PostgREST.Response.OpenAPI
+                       PostgREST.Response.GucHeader
+                       PostgREST.Response.Performance
++                      PostgREST.TimeIt
+                       PostgREST.Version
+   build-depends:      base                      >= 4.9 && < 4.20
+                     , HTTP                      >= 4000.3.7 && < 4000.5
+@@ -139,7 +140,6 @@ library
+                     , swagger2                  >= 2.4 && < 2.9
+                     , text                      >= 1.2.2 && < 2.2
+                     , time                      >= 1.6 && < 1.13
+-                    , timeit                    >= 2.0 && < 2.1
+                     , unordered-containers      >= 0.2.8 && < 0.3
+                     , unix-compat               >= 0.5.4 && < 0.8
+                     , vault                     >= 0.3.1.5 && < 0.4
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 5387c692..411694fd 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -51,13 +51,13 @@ import PostgREST.Observation          (Observation (..))
+ import PostgREST.Response.Performance (ServerTiming (..),
+                                        serverTimingHeader)
+ import PostgREST.SchemaCache          (SchemaCache (..))
++import PostgREST.TimeIt               (timeItT)
+ import PostgREST.Version              (docsVersion, prettyVersion)
+ 
+ import qualified Data.ByteString.Char8 as BS
+ import qualified Data.List             as L
+ import qualified Network.HTTP.Types    as HTTP
+ import           Protolude             hiding (Handler)
+-import           System.TimeIt         (timeItT)
+ 
+ type Handler = ExceptT Error
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index f231a4e9..fe07451a 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -44,8 +44,8 @@ import qualified PostgREST.Error            as Error
+ import qualified PostgREST.Logger           as Logger
+ import qualified PostgREST.Metrics          as Metrics
+ import           PostgREST.Observation
++import           PostgREST.TimeIt           (timeItT)
+ import           PostgREST.Version          (prettyVersion)
+-import           System.TimeIt              (timeItT)
+ 
+ import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                            updateAction)
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 7b5b9bd2..92a20d2d 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -25,8 +25,8 @@ import qualified Network.Wai                     as Wai
+ import qualified Network.Wai.Middleware.HttpAuth as Wai
+ 
+ import Data.List        (lookup)
++import PostgREST.TimeIt (timeItT)
+ import System.IO.Unsafe (unsafePerformIO)
+-import System.TimeIt    (timeItT)
+ 
+ import PostgREST.AppState      (AppState, getConfig, getJwtCacheState,
+                                 getTime)
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 42a16c77..af7a6bca 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -156,7 +156,7 @@ observationMessage = \case
+     "Evicted entry from JWT cache"
+   where
+     showMillis :: Double -> Text
+-    showMillis x = toS $ showFFloat (Just 1) (x * 1000) ""
++    showMillis x = toS $ showFFloat (Just 1) x ""
+ 
+     jsonMessage err = T.decodeUtf8 . LBS.toStrict . Error.errorPayload $ Error.PgError False err
+ 
+diff --git a/src/PostgREST/Response/Performance.hs b/src/PostgREST/Response/Performance.hs
+index e86875b3..17bfe894 100644
+--- a/src/PostgREST/Response/Performance.hs
++++ b/src/PostgREST/Response/Performance.hs
+@@ -1,4 +1,3 @@
+-{-# LANGUAGE NumericUnderscores #-}
+ module PostgREST.Response.Performance
+   ( ServerTiming (..)
+   , serverTimingHeader
+@@ -24,12 +23,12 @@ data ServerTiming =
+ -- The duration precision is milliseconds, per the docs
+ --
+ -- >>> serverTimingHeader ServerTiming { plan=Just 0.1, transaction=Just 0.2, response=Just 0.3, jwt=Just 0.4, parse=Just 0.5}
+--- ("Server-Timing","jwt;dur=400.0, parse;dur=500.0, plan;dur=100.0, transaction;dur=200.0, response;dur=300.0")
++-- ("Server-Timing","jwt;dur=0.4, parse;dur=0.5, plan;dur=0.1, transaction;dur=0.2, response;dur=0.3")
+ serverTimingHeader :: ServerTiming -> HTTP.Header
+ serverTimingHeader timing =
+   ("Server-Timing", renderTiming)
+   where
+-    renderMetric metric = maybe "" (\dur -> BS.concat [metric, BS.pack $ ";dur=" <> showFFloat (Just 1) (dur * 1_000) ""])
++    renderMetric metric = maybe "" (\dur -> BS.concat [metric, BS.pack $ ";dur=" <> showFFloat (Just 1) dur ""])
+     renderTiming = BS.intercalate ", " $ (\(k, v) -> renderMetric k (v timing)) <$>
+       [ ("jwt", jwt)
+       , ("parse", parse)
+diff --git a/src/PostgREST/TimeIt.hs b/src/PostgREST/TimeIt.hs
+new file mode 100644
+index 00000000..0895bd2f
+--- /dev/null
++++ b/src/PostgREST/TimeIt.hs
+@@ -0,0 +1,20 @@
++module PostgREST.TimeIt
++  ( timeItT
++  ) where
++
++import GHC.Clock
++import Protolude
++
++{-
++ - The signature is the same as https://hackage.haskell.org/package/timeit-2.0/docs/src/System-TimeIt.html#timeIt,
++ - we vendor this functionality because it gave errors as shown on https://github.com/PostgREST/postgrest/issues/4522 plus
++ - the function is small enough. This vendored function is different in that the result is in milliseconds.
++ -}
++timeItT :: MonadIO m => m a -> m (Double, a)
++timeItT p = do
++  s <- liftIO getMonotonicTime
++  x <- p
++  e <- liftIO getMonotonicTime
++  let time = (e - s) * 1000
++  return (time, x)
++

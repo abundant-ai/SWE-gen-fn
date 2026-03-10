@@ -1,0 +1,406 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aeb82df0..5cbabb7d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #2401, #2444, Fix SIGUSR1 to fully flush connections pool, remove `db-pool-timeout`. - @robx
+  - #2348, Add `db-pool-acquisition-timeout` configuration option, time in seconds to wait to acquire a connection. - @robx
++ - #2428, Fix opening an empty transaction on failed resource embedding - @steve-chavez
++ - #2455, Fix embedding the same table multiple times - @steve-chavez
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 5d561ac1..d66e4f87 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -9,7 +9,6 @@ module PostgREST.ApiRequest.Types
+   , Field
+   , Filter(..)
+   , Hint
+-  , JoinCondition(..)
+   , JoinType(..)
+   , JsonOperand(..)
+   , JsonOperation(..)
+@@ -33,8 +32,7 @@ module PostgREST.ApiRequest.Types
+   ) where
+ 
+ import PostgREST.MediaType                (MediaType (..))
+-import PostgREST.SchemaCache.Identifiers  (FieldName,
+-                                           QualifiedIdentifier)
++import PostgREST.SchemaCache.Identifiers  (FieldName)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..))
+ import PostgREST.SchemaCache.Relationship (Relationship)
+ 
+@@ -72,12 +70,6 @@ data RangeError
+ type NodeName = Text
+ type Depth = Integer
+ 
+-data JoinCondition =
+-  JoinCondition
+-    (QualifiedIdentifier, FieldName)
+-    (QualifiedIdentifier, FieldName)
+-  deriving (Eq)
+-
+ data OrderTerm = OrderTerm
+   { otTerm      :: Field
+   , otDirection :: Maybe OrderDirection
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a0396308..62a07253 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -95,38 +95,27 @@ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Eit
+ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-  augmentRequestWithJoin qiSchema dbRelationships =<<
++  addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+   addOrders apiRequest =<<
+-  addFilters apiRequest (initReadRequest rootName rootAlias qsSelect)
+-  where
+-    QueryParams.QueryParams{..} = iQueryParams apiRequest
+-    (rootName, rootAlias) = case iAction apiRequest of
+-      ActionRead _ -> (qi, Nothing)
+-      -- the CTE we use for non-read cases has a sourceCTEName(see Statements.hs) as the WITH name so we use the table name as an alias so findRel can find the right relationship
+-      _ -> (QualifiedIdentifier mempty $ decodeUtf8 sourceCTEName, Just qiName)
+-
+--- Build the initial tree with a Depth attribute so when a self join occurs we
+--- can differentiate the parent and child tables by having an alias like
+--- "table_depth", this is related to
+--- http://github.com/PostgREST/postgrest/issues/987.
+-initReadRequest :: QualifiedIdentifier -> Maybe Alias -> [Tree SelectItem] -> ReadPlanTree
+-initReadRequest rootQi rootAlias =
+-  foldr (treeEntry rootDepth) initial
++  addFilters apiRequest (initReadRequest qi $ QueryParams.qsSelect $ iQueryParams apiRequest)
++
++-- Build the initial read plan tree
++initReadRequest :: QualifiedIdentifier -> [Tree SelectItem] -> ReadPlanTree
++initReadRequest qi@QualifiedIdentifier{..} =
++  foldr (treeEntry rootDepth) $ Node defReadPlan{from=qi, relName=qiName, depth=rootDepth} []
+   where
+     rootDepth = 0
+-    rootSchema = qiSchema rootQi
+-    rootName = qiName rootQi
+-    initial = Node (ReadPlan [] rootQi rootAlias [] [] [] allRange rootName Nothing Nothing Nothing Nothing rootDepth) []
++    defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing Nothing Nothing rootDepth
+     treeEntry :: Depth -> Tree SelectItem -> ReadPlanTree -> ReadPlanTree
+-    treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node q rForest) =
++    treeEntry depth (Node fld@((fldName, _),_,alias, hint, joinType) fldForest) (Node q rForest) =
+       let nxtDepth = succ depth in
+       case fldForest of
+         [] -> Node q{select=fld:select q} rForest
+         _  -> Node q $
+               foldr (treeEntry nxtDepth)
+-              (Node (ReadPlan [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] allRange fn Nothing alias hint joinType nxtDepth) [])
++              (Node defReadPlan{from=QualifiedIdentifier qiSchema fldName, relName=fldName, relAlias=alias, relHint=hint, relJoinType=joinType, depth=nxtDepth} [])
+               fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+@@ -137,51 +126,57 @@ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> reque
+     nodeRestrictRange :: Maybe Integer -> ReadPlan -> ReadPlan
+     nodeRestrictRange m q@ReadPlan{range_=r} = q{range_=restrictRange m r }
+ 
+-augmentRequestWithJoin :: Schema -> RelationshipsMap -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-augmentRequestWithJoin schema allRels request =
+- addJoinConditions Nothing <$> addRels schema allRels Nothing request
+-
+-addRels :: Schema -> RelationshipsMap -> Maybe ReadPlanTree -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addRels schema allRels parentNode (Node query@ReadPlan{from=tbl,nodeName,nodeHint,nodeDepth} forest) =
++-- add relationships to the nodes of the tree by traversing the forest while keeping track of the parentNode, also adds aliasing
++addRels :: Schema -> Action -> RelationshipsMap -> Maybe ReadPlanTree -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addRels schema action allRels parentNode (Node rPlan@ReadPlan{relName,relHint,depth} forest) =
+   case parentNode of
+-    Just (Node ReadPlan{from=parentNodeQi, fromAlias=aliasQi} _) ->
+-      let newFrom r = if qiName tbl == nodeName then relForeignTable r else tbl
+-          newReadPlan = (\r ->
+-            if not $ relIsSelf r -- add alias if self rel TODO consolidate aliasing in another function
+-              then query{from=newFrom r, nodeRel=Just r}
+-              else query{from=newFrom r, nodeRel=Just r, fromAlias=Just (qiName (newFrom r) <> "_" <> show nodeDepth)}
+-            ) <$> rel
+-          origin = if nodeDepth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
+-            then fromMaybe (qiName parentNodeQi) aliasQi
+-            else qiName parentNodeQi
+-          rel = findRel schema allRels origin nodeName nodeHint
++    Just (Node ReadPlan{from=parentNodeQi, fromAlias} _) ->
++      let
++        newReadPlan = (\r ->
++          let newAlias = Just (qiName (relForeignTable r) <> "_" <> show depth) in
++          case r of
++            Relationship{relCardinality=M2M _} ->
++              rPlan{from=relForeignTable r, relToParent=Just r, relJoinConds=getJoinConditions Nothing fromAlias r}
++            _ ->
++              rPlan{from=relForeignTable r, relToParent=Just r, fromAlias=newAlias, relJoinConds=getJoinConditions newAlias fromAlias r}
++          ) <$> rel
++        origin = if depth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
++          then fromMaybe (qiName parentNodeQi) fromAlias
++          else qiName parentNodeQi
++        rel = findRel schema allRels origin relName relHint
+       in
+       Node <$> newReadPlan <*> (updateForest . hush $ Node <$> newReadPlan <*> pure forest)
+-    _ ->
+-      Node query <$> updateForest (Just $ Node query forest)
++    Nothing -> -- root case
++      let
++        newFrom  = QualifiedIdentifier mempty $ decodeUtf8 sourceCTEName
++        newAlias = Just (qiName $ from rPlan)
++        newReadPlan = case action of
++          -- the CTE for mutations/rpc is used as WITH sourceCTEName .. SELECT .. FROM sourceCTEName as alias,
++          -- we use the table name as an alias so findRel can find the right relationship.
++          ActionMutate _ -> rPlan{from=newFrom, fromAlias=newAlias}
++          ActionInvoke _ -> rPlan{from=newFrom, fromAlias=newAlias}
++          _              -> rPlan
++      in
++      Node newReadPlan <$> updateForest (Just $ Node newReadPlan forest)
+   where
+     updateForest :: Maybe ReadPlanTree -> Either ApiRequestError [ReadPlanTree]
+-    updateForest rq = addRels schema allRels rq `traverse` forest
+-
+--- applies aliasing to join conditions TODO refactor, this should go into the querybuilder module
+-addJoinConditions :: Maybe Alias -> ReadPlanTree -> ReadPlanTree
+-addJoinConditions _ (Node node@ReadPlan{fromAlias=tblAlias, nodeRel=Nothing} forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions _ (Node node@ReadPlan{fromAlias=tblAlias, nodeRel=Just ComputedRelationship{}} forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions previousAlias (Node query@ReadPlan{fromAlias=tblAlias, nodeRel=Just Relationship{relTable=qi,relForeignTable=fQi,relCardinality=card}} forest) =
+-  Node query{joinConditions=joinConds} (addJoinConditions tblAlias <$> forest)
++    updateForest rq = addRels schema action allRels rq `traverse` forest
++
++getJoinConditions :: Maybe Alias -> Maybe Alias -> Relationship -> [JoinCondition]
++getJoinConditions _ _ ComputedRelationship{} = []
++getJoinConditions tblAlias parentAlias Relationship{relTable=qi,relForeignTable=fQi,relCardinality=card} =
++  case card of
++    M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
++      (toJoinCondition Nothing Nothing ftN jtn <$> jcols2) ++ (toJoinCondition parentAlias tblAlias tN jtn <$> jcols1)
++    O2M _ cols ->
++      toJoinCondition parentAlias tblAlias tN ftN <$> cols
++    M2O _ cols ->
++      toJoinCondition parentAlias tblAlias tN ftN <$> cols
++    O2O _ cols ->
++      toJoinCondition parentAlias tblAlias tN ftN <$> cols
+   where
+     QualifiedIdentifier{qiSchema=tSchema, qiName=tN} = qi
+     QualifiedIdentifier{qiName=ftN} = fQi
+-    joinConds =
+-      case card of
+-        M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
+-           (toJoinCondition Nothing Nothing ftN jtn <$> jcols2) ++ (toJoinCondition previousAlias tblAlias tN jtn <$> jcols1)
+-        O2M _ cols ->
+-          toJoinCondition previousAlias tblAlias tN ftN <$> cols
+-        M2O _ cols ->
+-          toJoinCondition previousAlias tblAlias tN ftN <$> cols
+-        O2O _ cols ->
+-          toJoinCondition previousAlias tblAlias tN ftN <$> cols
+     toJoinCondition :: Maybe Alias -> Maybe Alias -> Text -> Text -> (FieldName, FieldName) -> JoinCondition
+     toJoinCondition prAl newAl tb ftb (c, fc) =
+       let qi1 = QualifiedIdentifier tSchema ftb
+@@ -333,7 +328,7 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+       updateNode f (remainingPath, a) (Right target)
+   where
+     findNode :: Maybe ReadPlanTree
+-    findNode = find (\(Node ReadPlan{nodeName, nodeAlias} _) -> nodeName == targetNodeName || nodeAlias == Just targetNodeName) forest
++    findNode = find (\(Node ReadPlan{relName, relAlias} _) -> relName == targetNodeName || relAlias == Just targetNodeName) forest
+ 
+ mutatePlan :: Mutation -> QualifiedIdentifier -> ApiRequest -> SchemaCache -> ReadPlanTree -> Either Error MutatePlan
+ mutatePlan mutation qi ApiRequest{..} sCache readReq = mapLeft ApiRequestError $
+@@ -398,21 +393,21 @@ returningCols rr@(Node _ forest) pkCols
+     -- projects.  So this adds the foreign key columns to ensure the embedding
+     -- succeeds, result would be `RETURNING name, client_id`.
+     fkCols = concat $ mapMaybe (\case
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=O2M _ cols}} _ ->
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=O2M _ cols}} _ ->
+           Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=M2O _ cols}} _ ->
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2O _ cols}} _ ->
+           Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=O2O _ cols}} _ ->
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=O2O _ cols}} _ ->
+           Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}} _ ->
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}} _ ->
+           Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
+-        Node ReadPlan{nodeRel=Just ComputedRelationship{}} _ ->
++        Node ReadPlan{relToParent=Just ComputedRelationship{}} _ ->
+           Nothing
+-        Node ReadPlan{nodeRel=Nothing} _ ->
++        Node ReadPlan{relToParent=Nothing} _ ->
+           Nothing
+       ) forest
+     hasComputedRel = isJust $ find (\case
+-      Node ReadPlan{nodeRel=Just ComputedRelationship{}} _ -> True
++      Node ReadPlan{relToParent=Just ComputedRelationship{}} _ -> True
+       _                                                    -> False
+       ) forest
+     -- However if the "client_id" is present, e.g. mutatePlan to
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index fb8d86e8..cc23f7a6 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -3,14 +3,15 @@ module PostgREST.Plan.ReadPlan
+   ( ReadPlanTree
+   , ReadPlan(..)
+   , fstFieldNames
++  , JoinCondition(..)
+   ) where
+ 
+ import Data.Tree (Tree (..))
+ 
+ import PostgREST.ApiRequest.Types         (Alias, Depth, Hint,
+-                                           JoinCondition, JoinType,
+-                                           LogicTree, NodeName,
+-                                           OrderTerm, SelectItem)
++                                           JoinType, LogicTree,
++                                           NodeName, OrderTerm,
++                                           SelectItem)
+ import PostgREST.RangeQuery               (NonnegRange)
+ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            QualifiedIdentifier)
+@@ -21,21 +22,29 @@ import Protolude
+ 
+ type ReadPlanTree = Tree ReadPlan
+ 
++data JoinCondition =
++  JoinCondition
++    (QualifiedIdentifier, FieldName)
++    (QualifiedIdentifier, FieldName)
++  deriving (Eq)
++
+ data ReadPlan = ReadPlan
+-  { select         :: [SelectItem]
+-  , from           :: QualifiedIdentifier
+-  , fromAlias      :: Maybe Alias
+-  -- ^ A table alias is used in case of self joins
+-  , where_         :: [LogicTree]
+-  , joinConditions :: [JoinCondition]
+-  , order          :: [OrderTerm]
+-  , range_         :: NonnegRange
+-  , nodeName       :: NodeName
+-  , nodeRel        :: Maybe Relationship
+-  , nodeAlias      :: Maybe Alias
+-  , nodeHint       :: Maybe Hint
+-  , nodeJoinType   :: Maybe JoinType
+-  , nodeDepth      :: Depth
++  { select       :: [SelectItem]
++  , from         :: QualifiedIdentifier
++  , fromAlias    :: Maybe Alias
++  , where_       :: [LogicTree]
++  , order        :: [OrderTerm]
++  , range_       :: NonnegRange
++  , relName      :: NodeName
++  , relToParent  :: Maybe Relationship
++  , relJoinConds :: [JoinCondition]
++  , relAlias     :: Maybe Alias
++  , relHint      :: Maybe Hint
++  , relJoinType  :: Maybe JoinType
++  , depth        :: Depth
++  -- depth is used bc when a self join occurs we
++  -- need to differentiate the parent from the child tables by having an alias like
++  -- "table_depth". See http://github.com/PostgREST/postgrest/issues/987.
+   }
+   deriving (Eq)
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 7352677b..38884057 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -39,30 +39,28 @@ import PostgREST.RangeQuery        (allRange)
+ import Protolude
+ 
+ readPlanToQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,joinConditions, order, range_=readRange, nodeRel} forest) =
++readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
+   "SELECT " <>
+   intercalateSnippet ", " ((pgFmtSelectItem qi <$> select) ++ selects) <> " " <>
+   fromFrag <> " " <>
+   intercalateSnippet " " joins <> " " <>
+-  (if null logicForest && null joinConditions
++  (if null logicForest && null relJoinConds
+     then mempty
+-    else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition joinConditions)) <> " " <>
++    else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition relJoinConds)) <> " " <>
+   orderF qi order <> " " <>
+   limitOffsetF readRange
+   where
+-    fromFrag = fromF nodeRel mainQi fromAlias
+-    qi = getQualifiedIdentifier nodeRel mainQi fromAlias
++    fromFrag = fromF relToParent mainQi fromAlias
++    qi = getQualifiedIdentifier relToParent mainQi fromAlias
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+-getSelectsJoins (Node ReadPlan{nodeRel=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{nodeName=name, nodeRel=Just rel, nodeAlias=alias, nodeJoinType=joinType} _) (selects,joins) =
++getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
++getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAlias, relJoinType=joinType, depth} _) (selects,joins) =
+   let
+     subquery = readPlanToQuery rr
+-    aliasOrName = fromMaybe name alias
+-    locTblName = qiName (relTable rel) <> "_" <> aliasOrName
+-    localTableName = pgFmtIdent locTblName
+-    internalTableName = pgFmtIdent $ "_" <> locTblName
++    aliasOrName = fromMaybe relName relAlias
++    localTableName = pgFmtIdent $ qiName (relTable rel) <> "_" <> aliasOrName <> "_" <> show depth
+     correlatedSubquery sub al cond =
+       (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+     isToOne = case rel of
+@@ -75,10 +73,10 @@ getSelectsJoins rr@(Node ReadPlan{nodeName=name, nodeRel=Just rel, nodeAlias=ali
+         ( SQL.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
+         , correlatedSubquery subquery localTableName "TRUE")
+       else
+-        ( SQL.sql $ "COALESCE( " <> localTableName <> "." <> internalTableName <> ", '[]') AS " <> pgFmtIdent aliasOrName
++        ( SQL.sql $ "COALESCE( " <> localTableName <> "." <> localTableName <> ", '[]') AS " <> pgFmtIdent aliasOrName
+         , correlatedSubquery (
+-            "SELECT json_agg(" <> SQL.sql internalTableName <> ") AS " <> SQL.sql internalTableName <>
+-            "FROM (" <> subquery <> " ) AS " <> SQL.sql internalTableName
++            "SELECT json_agg(" <> SQL.sql localTableName <> ") AS " <> SQL.sql localTableName <>
++            "FROM (" <> subquery <> " ) AS " <> SQL.sql localTableName
+           ) localTableName $ if joinType == Just JTInner then SQL.sql localTableName <> " IS NOT NULL" else "TRUE")
+   in
+   (sel:selects, joi:joins)
+@@ -225,14 +223,14 @@ callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnin
+ -- See https://github.com/PostgREST/postgrest/issues/2009#issuecomment-977473031
+ -- Only for the nodes that have an INNER JOIN linked to the root level.
+ readPlanToCountQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToCountQuery (Node ReadPlan{from=mainQi, fromAlias=tblAlias, where_=logicForest, joinConditions=joinConditions_, nodeRel=rel} forest) =
++readPlanToCountQuery (Node ReadPlan{from=mainQi, fromAlias=tblAlias, where_=logicForest, relToParent=rel, relJoinConds} forest) =
+   "SELECT 1 " <> fromFrag <>
+-  (if null logicForest && null joinConditions_ && null subQueries
++  (if null logicForest && null relJoinConds && null subQueries
+     then mempty
+     else " WHERE " ) <>
+   intercalateSnippet " AND " (
+     map (pgFmtLogicTree qi) logicForest ++
+-    map pgFmtJoinCondition joinConditions_ ++
++    map pgFmtJoinCondition relJoinConds ++
+     subQueries
+   )
+   where
+@@ -240,7 +238,7 @@ readPlanToCountQuery (Node ReadPlan{from=mainQi, fromAlias=tblAlias, where_=logi
+     fromFrag = fromF rel mainQi tblAlias
+     subQueries = foldr existsSubquery [] forest
+     existsSubquery :: ReadPlanTree -> [SQL.Snippet] -> [SQL.Snippet]
+-    existsSubquery readReq@(Node ReadPlan{nodeJoinType=joinType} _) rest =
++    existsSubquery readReq@(Node ReadPlan{relJoinType=joinType} _) rest =
+       if joinType == Just JTInner
+         then ("EXISTS (" <> readPlanToCountQuery readReq <> " )"):rest
+         else rest
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index d8dd1a85..7525df6f 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -58,7 +58,6 @@ import Text.InterpolatedString.Perl6 (qc)
+ 
+ import PostgREST.ApiRequest.Types        (Alias, Field, Filter (..),
+                                           FtsOperator (..),
+-                                          JoinCondition (..),
+                                           JsonOperand (..),
+                                           JsonOperation (..),
+                                           JsonPath,
+@@ -72,6 +71,7 @@ import PostgREST.ApiRequest.Types        (Alias, Field, Filter (..),
+                                           TrileanVal (..))
+ import PostgREST.MediaType               (MTPlanFormat (..),
+                                           MTPlanOption (..))
++import PostgREST.Plan.ReadPlan           (JoinCondition (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeLimit, rangeOffset)
+ import PostgREST.SchemaCache.Identifiers (FieldName,

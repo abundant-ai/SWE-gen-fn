@@ -1,0 +1,464 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fa672f0e..5cbabb7d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,8 +11,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2348, Add `db-pool-acquisition-timeout` configuration option, time in seconds to wait to acquire a connection. - @robx
+  - #2428, Fix opening an empty transaction on failed resource embedding - @steve-chavez
+  - #2455, Fix embedding the same table multiple times - @steve-chavez
+- - #2518, Fix a regression when embedding views where base tables have a different column order for FK columns - @wolfgangwalther
+- - #2458, Fix a regression with the location header when inserting into views with PKs from multiple tables - @wolfgangwalther
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index e67f1d6e..aea2ebe5 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -428,8 +428,8 @@ addViewPrimaryKeys tabs keyDeps =
+     else tbl) <$> tabs
+   where
+     findViewPKCols sch vw =
+-      concatMap (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
+-      filter (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
++      maybe [] (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
++      find (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
+ 
+ allTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
+ allTables pgVer =
+@@ -679,9 +679,9 @@ allM2OandO2ORels pgVer =
+     FROM pg_constraint traint
+     JOIN LATERAL (
+       SELECT
+-        array_agg(row(cols.attname, refs.attname) order by ord) AS cols_and_fcols,
+-        jsonb_agg(cols.attname order by ord) AS cols
+-      FROM unnest(traint.conkey, traint.confkey) WITH ORDINALITY AS _(col, ref, ord)
++        array_agg(row(cols.attname, refs.attname) order by cols.attnum) AS cols_and_fcols,
++        jsonb_agg(cols.attname order by cols.attnum) AS cols
++      FROM ( SELECT unnest(traint.conkey) AS col, unnest(traint.confkey) AS ref) _
+       JOIN pg_attribute cols ON cols.attrelid = traint.conrelid AND cols.attnum = col
+       JOIN pg_attribute refs ON refs.attrelid = traint.confrelid AND refs.attnum = ref
+     ) AS column_info ON TRUE
+@@ -757,10 +757,8 @@ allViewsKeyDependencies =
+           contype::text as contype,
+           conname,
+           conrelid as resorigtbl,
+-          col as resorigcol,
+-          ord
++          unnest(conkey) as resorigcol
+         from pg_constraint
+-        left join lateral unnest(conkey) with ordinality as _(col, ord) on true
+         where contype IN ('p', 'f')
+         union
+         -- fk referenced col
+@@ -768,10 +766,8 @@ allViewsKeyDependencies =
+           concat(contype, '_ref') as contype,
+           conname,
+           confrelid,
+-          col,
+-          ord
++          unnest(confkey)
+         from pg_constraint
+-        left join lateral unnest(confkey) with ordinality as _(col, ord) on true
+         where contype='f'
+       ),
+       views as (
+@@ -901,7 +897,7 @@ allViewsKeyDependencies =
+         rec.view_name,
+         pks_fks.conname as constraint_name,
+         pks_fks.contype as constraint_type,
+-        array_agg(row(col.attname, vcol.attname) order by pks_fks.ord) as column_dependencies
++        array_agg(row(col.attname, vcol.attname) order by col.attnum) as column_dependencies
+       from recursion rec
+       join pg_class tbl on tbl.oid = rec.resorigtbl
+       join pg_attribute col on col.attrelid = tbl.oid and col.attnum = rec.resorigcol
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 3392a13d..970cea89 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -591,7 +591,7 @@ spec actualPgVersion = do
+           }
+ 
+   describe "Inserting into VIEWs" $ do
+-    context "requesting no representation" $ do
++    context "requesting no representation" $
+       it "succeeds with 201" $
+         post "/compound_pk_view"
+             [json|{"k1":1,"k2":"test","extra":2}|]
+@@ -602,17 +602,6 @@ spec actualPgVersion = do
+                              , matchHeaderAbsent hLocation ]
+             }
+ 
+-      it "returns a location header with pks from both tables" $
+-        request methodPost "/with_multiple_pks" [("Prefer", "return=headers-only")]
+-            [json|{"pk1":1,"pk2":2}|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/with_multiple_pks?pk1=eq.1&pk2=eq.2"
+-                             , "Content-Range" <:> "*/*" ]
+-            }
+-
+     context "requesting header only representation" $ do
+       it "returns a location header with a composite PK col" $
+         request methodPost "/compound_pk_view" [("Prefer", "return=headers-only")]
+@@ -625,13 +614,13 @@ spec actualPgVersion = do
+                              , "Content-Range" <:> "*/*" ]
+             }
+ 
+-      it "should not throw and return location header when a PK is null" $
++      it "returns location header with a single PK col" $
+         request methodPost "/test_null_pk_competitors_sponsors" [("Prefer", "return=headers-only")]
+             [json|{"id":1}|]
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 201
+             , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/test_null_pk_competitors_sponsors?id=eq.1&sponsor_id=is.null"
++                             , "Location" <:> "/test_null_pk_competitors_sponsors?id=eq.1"
+                              , "Content-Range" <:> "*/*" ]
+             }
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 8cc2b23d..c63d8c02 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -739,9 +739,6 @@ spec actualPgVersion = do
+              {"tournament":"tournament_3","player_view":{"first_name":"first_name_3"}}] |]
+           { matchHeaders = [matchContentTypeJson] }
+ 
+-      it "works when embedding two views that refer to tables with different column ordering" $
+-        get "/v1?select=v2(*)" `shouldRespondWith` 200
+-
+       it "can embed a view that has group by" $
+         get "/projects_count_grouped_by?select=number_of_projects,client:clients(name)&order=number_of_projects" `shouldRespondWith`
+           [json|
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index 6e2277ec..95dcdfab 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -1,35 +1,221 @@
+ -- Privileges for anonymous
+ GRANT USAGE ON SCHEMA
+-      "EXTRA ""@/\#~_-"
+-    , "SPECIAL ""@/\#~_-"
+-    , "تست"
+-    , extensions
++      postgrest
++    , test
+     , jwt
+-    , postgrest
+     , public
+-    , test
++    , "تست"
++    , extensions
+     , v1
+     , v2
++    , "SPECIAL ""@/\#~_-"
++    , "EXTRA ""@/\#~_-"
+ TO postgrest_test_anonymous;
+ 
+ -- Schema test objects
+ SET search_path = test, "تست", pg_catalog;
+ 
+-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA
+-      "SPECIAL ""@/\#~_-"
+-    , "تست"
++GRANT ALL ON TABLE
++    items
++    , items2
++    , items3
++    , "articleStars"
++    , articles
++    , arrays
++    , auto_incrementing_pk
++    , clients
++    , comments
++    , complex_items
++    , compound_pk
++    , compound_pk_view
++    , deferrable_unique_constraint
++    , empty_table
++    , fav_numbers
++    , has_count_column
++    , has_fk
++    , insertable_view_with_join
++    , json_table
++    , materialized_view
++    , menagerie
++    , no_pk
++    , nullable_integer
++    , projects
++    , projects_view
++    , projects_view_alt
++    , test_null_pk_competitors_sponsors
++    , simple_pk
++    , simple_pk2
++    , tasks
++    , filtered_tasks
++    , tsearch
++    , users
++    , users_projects
++    , users_tasks
++    , files
++    , touched_files
++    , "Escap3e;"
++    , "ghostBusters"
++    , "withUnique"
++    , "clashing_column"
++    , "موارد"
++    , addresses
++    , orders
++    , public.public_consumers
++    , public.public_orders
++    , consumers_view
++    , consumers_view_view
++    , consumers_extra_view
++    , orders_view
++    , images
++    , images_base64
++    , w_or_wo_comma_names
++    , items_with_different_col_types
++    , entities
++    , child_entities
++    , grandchild_entities
++    , ranges
++    , being
++    , descendant
++    , being_part
++    , part
++    , leak
++    , perf_articles
++    , employees
++    , tiobe_pls
++    , single_unique
++    , compound_unique
++    , only_pk
++    , family_tree
++    , managers
++    , organizations
++    , authors
++    , publishers
++    , books
++    , forties_books
++    , fifties_books
++    , sixties_books
++    , person
++    , message
++    , person_detail
++    , space
++    , zone
++    , projects_dump
++    , "UnitTest"
++    , json_arr
++    , jsonb_test
++    , authors_books_number
++    , authors_have_book_in_decade
++    , authors_have_book_in_decade2
++    , forties_and_fifties_books
++    , odd_years_publications
++    , foos
++    , bars
++    , materialized_projects
++    , contract
++    , player_view
++    , contract_view
++    , ltree_sample
++    , isn_sample
++    , projects_count_grouped_by
++    , "Server Today"
++    , pgrst_reserved_chars
++    , authors_w_entities
++    , openapi_types
++    , openapi_defaults
++    , getallprojects_view
++    , get_projects_above_view
++    , web_content
++    , pages
++    , referrals
++    , big_projects
++    , sites
++    , jobs
++    , main_jobs
++    , whatev_projects
++    , whatev_sites
++    , whatev_jobs
++    , agents
++    , departments
++    , schedules
++    , activities
++    , unit_workdays
++    , unit_workdays_fst_shift
++    , stuff
++    , loc_test
++    , v1.parents
++    , v2.parents
++    , v2.another_table
++    , v1.children
++    , v2.children
++    , screens
++    , labels
++    , label_screen
++    , actors
++    , films
++    , personnages
++    , end_1
++    , end_2
++    , schauspieler
++    , filme
++    , rollen
++    , products
++    , suppliers
++    , products_suppliers
++    , trade_unions
++    , suppliers_trade_unions
++    , client
++    , clientinfo
++    , contact
++    , chores
++    , limited_update_items
++    , limited_update_items_cpk
++    , limited_update_items_no_pk
++    , limited_update_items_view
++    , limited_update_items_wnonuniq_view
++    , limited_delete_items
++    , limited_delete_items_cpk
++    , limited_delete_items_no_pk
++    , limited_delete_items_view
++    , plate
++    , well
++    , limited_delete_items_wnonuniq_view
++    , limited_delete_items_cpk_view
++    , limited_update_items_cpk_view
++    , xmltest
++    , oid_test
++    , job
++    , series
++    , adaptation_notifications
++    , series_popularity
+     , test
+-    , v1
+-    , v2
++    , view_test
++    , shops
++    , shop_bles
++    , "SPECIAL ""@/\#~_-".languages
++    , "SPECIAL ""@/\#~_-".names
++    , do$llar$s
++    , safe_update_items
++    , safe_delete_items
++    , unsafe_update_items
++    , unsafe_delete_items
++    , videogames
++    , designers
++    , students
++    , students_info
++    , students_view
++    , students_info_view
++    , country
++    , capital
++    , first
++    , second
++    , first_1
++    , second_1
++    , fee
++    , baz
++    , janedoe
++    , johnsmith
+ TO postgrest_test_anonymous;
+ 
+-REVOKE ALL PRIVILEGES ON TABLE
+-      app_users
+-    , authors_only
+-    , insertonly
+-    , limited_article_stars
+-FROM postgrest_test_anonymous;
+-
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+ 
+ GRANT USAGE ON SEQUENCE
+@@ -57,3 +243,29 @@ REVOKE EXECUTE ON FUNCTION privileged_hello(text) FROM PUBLIC; -- All functions
+ GRANT EXECUTE ON FUNCTION privileged_hello(text) TO postgrest_test_author;
+ 
+ GRANT USAGE ON SCHEMA test TO postgrest_test_default_role;
++
++
++DO $do$BEGIN
++  IF (SELECT current_setting('server_version_num')::INT >= 100000) THEN
++    GRANT ALL ON TABLE test.car_models TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_models_2021 TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_models_default TO postgrest_test_anonymous;
++  END IF;
++
++  IF (SELECT current_setting('server_version_num')::INT >= 110000) THEN
++    GRANT ALL ON TABLE test.car_brands TO postgrest_test_anonymous;
++  END IF;
++
++  IF (SELECT current_setting('server_version_num')::INT >= 120000) THEN
++    GRANT ALL ON TABLE test.car_model_sales TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_model_sales_202101 TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_model_sales_default TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_racers TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_dealers TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_dealers_springfield TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_dealers_default TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_models_car_dealers TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_models_car_dealers_10to20 TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.car_models_car_dealers_default TO postgrest_test_anonymous;
++  END IF;
++END$do$;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 1a47915c..113aeb97 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2478,6 +2478,9 @@ CREATE AGGREGATE test.unsupported_agg (*) (
+   STYPE = int
+ );
+ 
++create view no_pk_view as
++select * from no_pk;
++
+ create table limited_update_items(
+   id int primary key
+ , name text
+@@ -2859,40 +2862,3 @@ create or replace function jsbaz(fee) returns setof baz as $$
+     join johnsmith js on js.baz_id = b.baz_id
+     where js.fee_id = $1.fee_id
+ $$ stable language sql;
+-
+-
+--- issue https://github.com/PostgREST/postgrest/issues/2518
+-create table a (
+-  primary key (c1, c2),
+-  c1 int,
+-  c2 bool
+-);
+-
+-create table b (
+-  c2 bool,
+-  c1 int,
+-  foreign key (c1, c2) references a
+-);
+-
+-create view test.v1 as table test.a;
+-
+-create view test.v2 as table test.b;
+-
+--- issue https://github.com/PostgREST/postgrest/issues/2458
+-create table with_pk1 (pk1 int primary key);
+-create table with_pk2 (pk2 int primary key);
+-
+-create view with_multiple_pks as
+-  select * from with_pk1, with_pk2;
+-
+-create function with_multiple_pks_insert() returns trigger
+-language plpgsql as $$
+-begin
+-  insert into with_pk1 values (new.pk1) on conflict do nothing;
+-  insert into with_pk2 values (new.pk2) on conflict do nothing;
+-  return new;
+-end
+-$$;
+-
+-create trigger ins instead of insert on with_multiple_pks
+-  for each row execute procedure with_multiple_pks_insert();

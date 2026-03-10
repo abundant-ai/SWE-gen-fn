@@ -1,0 +1,84 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c5e05855..32c8cda5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,8 +23,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2939, Fix `count=exact` not being included in `Preference-Applied` - @steve-chavez
+  - #2800, Fix not including to-one embed resources that had a `NULL` value in any of the selected fields when doing null filtering on them - @laurenceisla
+  - #2846, Fix error when requesting `Prefer: count=<type>` and doing null filtering on embedded resources - @laurenceisla
+- - #2959, Fix setting `default_transaction_isolation` unnecessarily - @steve-chavez
+- - #2929, Fix arrow filtering on RPC returning dynamic TABLE with composite type - @steve-chavez
++ - #2846, Fix setting `default_transaction_isolation` unnecessarily - @steve-chavez
+ 
+ ## [11.2.0] - 2023-08-10
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index fc5cdc0f..f996c394 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -245,19 +245,22 @@ resolveTableFieldName table fieldName =
+   fromMaybe (unknownField fieldName []) $ HMI.lookup fieldName (tableColumns table) >>=
+     Just . resolveColumnField
+ 
+--- | Resolve a type within the context based on the given field name and JSON path. Although there are situations where failure to resolve a field is considered an error (see `resolveOrError`), there are also situations where we allow it (RPC calls). If it should be an error and `resolveOrError` doesn't fit, ensure to check the `cfIRType` isn't empty.
+-resolveTypeOrUnknown :: ResolverContext -> Field -> CoercibleField
+-resolveTypeOrUnknown ResolverContext{..} (fn, jp) =
+-  case res of
++resolveTableField :: Table -> Field -> CoercibleField
++resolveTableField table (fieldName, []) = resolveTableFieldName table fieldName
++resolveTableField table (fieldName, jp) =
++  case resolveTableFieldName table fieldName of
+     -- types that are already json/jsonb don't need to be converted with `to_jsonb` for using arrow operators `data->attr`
+     -- this prevents indexes not applying https://github.com/PostgREST/postgrest/issues/2594
+-    cf@CoercibleField{cfIRType="json"}  -> cf{cfJsonPath=jp, cfToJson=False}
+-    cf@CoercibleField{cfIRType="jsonb"} -> cf{cfJsonPath=jp, cfToJson=False}
+-    -- other types will get converted `to_jsonb(col)->attr`, even unknown types
++    cf@CoercibleField{cfIRType="json"}  -> cf{cfJsonPath=jp}
++    cf@CoercibleField{cfIRType="jsonb"} -> cf{cfJsonPath=jp}
++    -- other types will get converted `to_jsonb(col)->attr`
+     cf                                  -> cf{cfJsonPath=jp, cfToJson=True}
+-  where
+-    res = fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
+-          Just . flip resolveTableFieldName fn
++
++-- | Resolve a type within the context based on the given field name and JSON path. Although there are situations where failure to resolve a field is considered an error (see `resolveOrError`), there are also situations where we allow it (RPC calls). If it should be an error and `resolveOrError` doesn't fit, ensure to check the `cfIRType` isn't empty.
++resolveTypeOrUnknown :: ResolverContext -> Field -> CoercibleField
++resolveTypeOrUnknown ResolverContext{..} field@(fn, jp) =
++  fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
++    Just . flip resolveTableField field
+ 
+ -- | Install any pre-defined data representation from source to target to coerce this reference.
+ --
+diff --git a/test/spec/Feature/Query/JsonOperatorSpec.hs b/test/spec/Feature/Query/JsonOperatorSpec.hs
+index ce1e16c2..bff1394d 100644
+--- a/test/spec/Feature/Query/JsonOperatorSpec.hs
++++ b/test/spec/Feature/Query/JsonOperatorSpec.hs
+@@ -300,11 +300,3 @@ spec actualPgVersion = describe "json and jsonb operators" $ do
+          "code": "PGRST100",
+          "hint": null} |]
+       { matchStatus = 400, matchHeaders = [matchContentTypeJson] }
+-
+-  it "works when an RPC returns a dynamic TABLE with a composite type" $
+-    get "/rpc/returns_complex?select=val->r&val->i=gt.0.5&order=val->>i.desc" `shouldRespondWith`
+-      [json|[
+-        {"r":0.3},
+-        {"r":0.2}
+-      ]|]
+-      { matchStatus = 200, matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index f3a39202..9a0fa2fd 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3447,12 +3447,3 @@ create table table_b (
+   table_a_id int references table_a(id),
+   name text
+ );
+-
+-create or replace function test.returns_complex()
+-returns table(id int, val complex) as $$
+-  select 1, row(0.1, 0.5)::complex as val
+-  union
+-  select 2, row(0.2, 0.6)::complex as val
+-  union
+-  select 3, row(0.3, 0.7)::complex as val;
+-$$ language sql;

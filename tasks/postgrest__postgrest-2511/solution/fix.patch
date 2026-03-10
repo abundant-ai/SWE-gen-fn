@@ -1,0 +1,327 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a01cd795..cf30d6b6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Added
++
++ - #1414, Add related orders - @steve-chavez
++  + On a many-to-one or one-to-one relationship, you can order a parent by a child column `/projects?select=*,clients(*)&order=clients(name).desc.nullsfirst`
++
++### Fixed
++
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 1e4deecc..06c99a7d 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -209,6 +209,7 @@ test-suite spec
+                       Feature.Query.QuerySpec
+                       Feature.Query.RangeSpec
+                       Feature.Query.RawOutputTypesSpec
++                      Feature.Query.RelatedQueriesSpec
+                       Feature.Query.RpcSpec
+                       Feature.Query.SingularSpec
+                       Feature.Query.UnicodeSpec
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 01a1e289..54cdcb2b 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -74,6 +74,9 @@ import Protolude hiding (try)
+ -- >>> deriving instance Show Filter
+ -- >>> deriving instance Show JoinType
+ -- >>> deriving instance Show SelectItem
++-- >>> deriving instance Show OrderDirection
++-- >>> deriving instance Show OrderNulls
++-- >>> deriving instance Show OrderTerm
+ 
+ data QueryParams =
+   QueryParams
+@@ -583,23 +586,51 @@ pQuotedValue = toS <$> (char '"' *> many pCharsOrSlashed <* char '"')
+ pDelimiter :: Parser Char
+ pDelimiter = char '.' <?> "delimiter (.)"
+ 
++-- |
++-- Parses the elements in the order query parameter
++--
++-- >>> P.parse pOrder "" "name.desc.nullsfirst"
++-- Right [OrderTerm {otTerm = ("name",[]), otDirection = Just OrderDesc, otNullOrder = Just OrderNullsFirst}]
++--
++-- >>> P.parse pOrder "" "json_col->key.asc.nullslast"
++-- Right [OrderTerm {otTerm = ("json_col",[JArrow {jOp = JKey {jVal = "key"}}]), otDirection = Just OrderAsc, otNullOrder = Just OrderNullsLast}]
++--
++-- >>> P.parse pOrder "" "clients(json_col->key).desc.nullsfirst"
++-- Right [OrderRelationTerm {otRelation = "clients", otRelTerm = ("json_col",[JArrow {jOp = JKey {jVal = "key"}}]), otDirection = Just OrderDesc, otNullOrder = Just OrderNullsFirst}]
++--
++-- >>> P.parse pOrder "" "clients(name,id)"
++-- Left (line 1, column 8):
++-- unexpected '('
++-- expecting letter, digit, "-", "->>", "->", delimiter (.), "," or end of input
++--
++-- >>> P.parse pOrder "" "name,clients(name),id"
++-- Right [OrderTerm {otTerm = ("name",[]), otDirection = Nothing, otNullOrder = Nothing},OrderRelationTerm {otRelation = "clients", otRelTerm = ("name",[]), otDirection = Nothing, otNullOrder = Nothing},OrderTerm {otTerm = ("id",[]), otDirection = Nothing, otNullOrder = Nothing}]
+ pOrder :: Parser [OrderTerm]
+-pOrder = lexeme pOrderTerm `sepBy1` char ','
+-
+-pOrderTerm :: Parser OrderTerm
+-pOrderTerm = do
+-  fld <- pField
+-  dir <- optionMaybe $
+-         try (pDelimiter *> string "asc" $> OrderAsc) <|>
+-         try (pDelimiter *> string "desc" $> OrderDesc)
+-  nls <- optionMaybe pNulls <* pEnd <|>
+-         pEnd $> Nothing
+-  return $ OrderTerm fld dir nls
++pOrder = lexeme (try pOrderRelationTerm <|> pOrderTerm) `sepBy1` char ','
+   where
++    pOrderTerm = do
++      fld <- pField
++      dir <- optionMaybe pOrdDir
++      nls <- optionMaybe pNulls <* pEnd <|>
++             pEnd $> Nothing
++      return $ OrderTerm fld dir nls
++
++    pOrderRelationTerm = do
++      nam <- pFieldName
++      fld <- between (char '(') (char ')') pField
++      dir <- optionMaybe pOrdDir
++      nls <- optionMaybe pNulls <* pEnd <|> pEnd $> Nothing
++      return $ OrderRelationTerm nam fld dir nls
++
++    pNulls :: Parser OrderNulls
+     pNulls = try (pDelimiter *> string "nullsfirst" $> OrderNullsFirst) <|>
+              try (pDelimiter *> string "nullslast"  $> OrderNullsLast)
+-    pEnd = try (void $ lookAhead (char ',')) <|>
+-           try eof
++
++    pOrdDir :: Parser OrderDirection
++    pOrdDir = try (pDelimiter *> string "asc" $> OrderAsc) <|>
++              try (pDelimiter *> string "desc" $> OrderDesc)
++
++    pEnd = try (void $ lookAhead (char ',')) <|> try eof
+ 
+ pLogicTree :: Parser LogicTree
+ pLogicTree = Stmnt <$> try pLogicFilter
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 0fbcbe53..cc1a17ac 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -64,6 +64,7 @@ data ApiRequestError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
++  | NotToOne Text Text
+   | NoRelBetween Text Text Text
+   | NoRpc Text Text [Text] Bool MediaType Bool
+   | NotEmbedded Text
+@@ -82,12 +83,19 @@ data RangeError
+ type NodeName = Text
+ type Depth = Integer
+ 
+-data OrderTerm = OrderTerm
+-  { otTerm      :: Field
+-  , otDirection :: Maybe OrderDirection
+-  , otNullOrder :: Maybe OrderNulls
+-  }
+-  deriving (Eq)
++data OrderTerm
++  = OrderTerm
++    { otTerm      :: Field
++    , otDirection :: Maybe OrderDirection
++    , otNullOrder :: Maybe OrderNulls
++    }
++  | OrderRelationTerm
++    { otRelation  :: FieldName
++    , otRelTerm   :: Field
++    , otDirection :: Maybe OrderDirection
++    , otNullOrder :: Maybe OrderNulls
++    }
++  deriving Eq
+ 
+ data OrderDirection
+   = OrderAsc
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 14e1cb87..d7aaeb00 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -64,6 +64,8 @@ instance PgrstError ApiRequestError where
+   status InvalidRpcMethod{}      = HTTP.status405
+   status InvalidRange{}          = HTTP.status416
+   status NotFound                = HTTP.status404
++  status NotToOne{}              = HTTP.status400
++
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+   status NotEmbedded{}           = HTTP.status400
+@@ -123,7 +125,7 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON NotFound = JSON.object []
+   toJSON (NotEmbedded resource) = JSON.object [
+     "code"    .= ApiRequestErrorCode08,
+-    "message" .= ("Cannot apply filter because '" <> resource <> "' is not an embedded resource in this request" :: Text),
++    "message" .= ("'" <> resource <> "' is not an embedded resource in this request" :: Text),
+     "details" .= JSON.Null,
+     "hint"    .= ("Verify that '" <> resource <> "' is included in the 'select' query parameter." :: Text)]
+ 
+@@ -151,11 +153,18 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
++  toJSON (NotToOne origin target) = JSON.object [
++    "code"    .= ApiRequestErrorCode18,
++    "message" .= ("'" <> origin <> "' and '" <> target <> "' do not form a many-to-one or one-to-one relationship" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+     "details" .= JSON.Null,
+     "hint"    .= ("Verify that '" <> parent <> "' and '" <> child <> "' exist in the schema '" <> schema <> "' and that there is a foreign key relationship between them. If a new relationship was created, try reloading the schema cache." :: Text)]
++
+   toJSON (AmbiguousRelBetween parent child rels) = JSON.object [
+     "code"    .= SchemaCacheErrorCode01,
+     "message" .= ("Could not embed because more than one relationship was found for '" <> parent <> "' and '" <> child <> "'" :: Text),
+@@ -461,6 +470,7 @@ data ErrorCode
+   | ApiRequestErrorCode15
+   | ApiRequestErrorCode16
+   | ApiRequestErrorCode17
++  | ApiRequestErrorCode18
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -502,6 +512,7 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode15  -> "115"
+   ApiRequestErrorCode16  -> "116"
+   ApiRequestErrorCode17  -> "117"
++  ApiRequestErrorCode18  -> "118"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 851c707f..99c906d3 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -52,7 +52,8 @@ import PostgREST.SchemaCache.Proc         (ProcDescription (..),
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+                                            Relationship (..),
+-                                           RelationshipsMap)
++                                           RelationshipsMap,
++                                           relIsToOne)
+ import PostgREST.SchemaCache.Table        (tablePKCols)
+ 
+ import PostgREST.Plan.CallPlan
+@@ -96,6 +97,7 @@ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Eit
+ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
++  addRelatedOrders =<<
+   addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+@@ -299,6 +301,28 @@ addOrders ApiRequest{..} rReq =
+     addOrderToNode :: (EmbedPath, [OrderTerm]) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+     addOrderToNode = updateNode (\o (Node q f) -> Node q{order=o} f)
+ 
++-- Validates that the related resource on the order is an embedded resource,
++-- e.g. if `clients` is inside the `select` in /projects?order=clients(id)&select=*,clients(*),
++-- and if it's a to-one relationship, it adds the right alias to the OrderRelationTerm so the generated query can succeed.
++-- TODO might be clearer if there's an additional intermediate type
++addRelatedOrders :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
++  newOrder <- getRelOrder `traverse` order
++  Node rp{order=newOrder} <$> addRelatedOrders `traverse` forest
++  where
++    getRelOrder ot@OrderTerm{}                   = Right ot
++    getRelOrder ot@OrderRelationTerm{otRelation} =
++      let foundRP = rootLabel <$> find (\(Node ReadPlan{relName, relAlias} _) -> Just otRelation `elem` [Just relName, relAlias] ) forest in
++      case foundRP of
++        Just ReadPlan{relName,relAlias,relAggAlias,relToParent} ->
++          let isToOne = relIsToOne <$> relToParent
++              name    = fromMaybe relName relAlias in
++          if isToOne == Just True
++            then Right $ ot{otRelation=relAggAlias}
++            else Left $ NotToOne (qiName from) name
++        Nothing ->
++          Left $ NotEmbedded otRelation
++
+ addRanges :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addRanges ApiRequest{..} rReq =
+   case iAction of
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 0cacbdcf..c72ad451 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -27,7 +27,8 @@ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.SchemaCache.Proc         (ProcParam (..))
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+-                                           Relationship (..))
++                                           Relationship (..),
++                                           relIsToOne)
+ 
+ import PostgREST.ApiRequest.Types
+ import PostgREST.Plan.CallPlan
+@@ -63,12 +64,7 @@ getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, re
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+       (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+-    isToOne = case rel of
+-      Relationship{relCardinality=M2O _ _} -> True
+-      Relationship{relCardinality=O2O _ _} -> True
+-      ComputedRelationship{relToOne=True}  -> True
+-      _                                    -> False
+-    (sel, joi) = if isToOne
++    (sel, joi) = if relIsToOne rel
+       then
+         ( SQL.sql ("row_to_json(" <> aggAlias <> ".*) AS " <> aliasOrName)
+         , correlatedSubquery subquery aggAlias "TRUE")
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 24eb20e6..77ea8fb4 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -244,11 +244,15 @@ pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+-  pgFmtField qi (otTerm ot) <> " " <>
++  fmtOTerm ot <> " " <>
+   SQL.sql (BS.unwords [
+     maybe mempty direction $ otDirection ot,
+     maybe mempty nullOrder $ otNullOrder ot])
+   where
++    fmtOTerm = \case
++      OrderTerm{otTerm}                        -> pgFmtField qi otTerm
++      OrderRelationTerm{otRelation, otRelTerm} -> pgFmtField (QualifiedIdentifier mempty otRelation) otRelTerm
++
+     direction OrderAsc  = "ASC"
+     direction OrderDesc = "DESC"
+ 
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index 615eda2c..e8b18a64 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -6,6 +6,7 @@ module PostgREST.SchemaCache.Relationship
+   , Relationship(..)
+   , Junction(..)
+   , RelationshipsMap
++  , relIsToOne
+   ) where
+ 
+ import qualified Data.Aeson          as JSON
+@@ -62,3 +63,10 @@ data Junction = Junction
+ 
+ -- | Key based on the source table and the foreign table schema
+ type RelationshipsMap = HM.HashMap (QualifiedIdentifier, Schema)  [Relationship]
++
++relIsToOne :: Relationship -> Bool
++relIsToOne rel = case rel of
++  Relationship{relCardinality=M2O _ _} -> True
++  Relationship{relCardinality=O2O _ _} -> True
++  ComputedRelationship{relToOne=True}  -> True
++  _                                    -> False

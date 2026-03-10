@@ -1,0 +1,672 @@
+diff --git a/hledger-lib/Hledger/Data/AccountName.hs b/hledger-lib/Hledger/Data/AccountName.hs
+index fad36250b..245de2f76 100644
+--- a/hledger-lib/Hledger/Data/AccountName.hs
++++ b/hledger-lib/Hledger/Data/AccountName.hs
+@@ -21,7 +21,9 @@ module Hledger.Data.AccountName (
+   ,accountNameTreeFrom
+   ,accountSummarisedName
+   ,accountNameInferType
++  ,accountNameInferTypeExcept
+   ,accountNameType
++  ,defaultBaseConversionAccount
+   ,assetAccountRegex
+   ,cashAccountRegex
+   ,liabilityAccountRegex
+@@ -83,27 +85,9 @@ acctsepchar = ':'
+ acctsep :: Text
+ acctsep = T.pack [acctsepchar]
+ 
+--- accountNameComponents :: AccountName -> [String]
+--- accountNameComponents = splitAtElement acctsepchar
+-
+-accountNameComponents :: AccountName -> [Text]
+-accountNameComponents = T.splitOn acctsep
+-
+-accountNameFromComponents :: [Text] -> AccountName
+-accountNameFromComponents = T.intercalate acctsep
+-
+-accountLeafName :: AccountName -> Text
+-accountLeafName = last . accountNameComponents
+-
+--- | Truncate all account name components but the last to two characters.
+-accountSummarisedName :: AccountName -> Text
+-accountSummarisedName a
+-  --   length cs > 1 = take 2 (head cs) ++ ":" ++ a'
+-  | length cs > 1 = T.intercalate ":" (map (T.take 2) $ init cs) <> ":" <> a'
+-  | otherwise     = a'
+-    where
+-      cs = accountNameComponents a
+-      a' = accountLeafName a
++-- The base conversion account name used by --infer-equity,
++-- when no other account of type V/Conversion has been declared.
++defaultBaseConversionAccount = "equity:conversion"
+ 
+ -- | Regular expressions matching common English top-level account names,
+ -- used as a fallback when account types are not declared.
+@@ -111,7 +95,7 @@ assetAccountRegex      = toRegexCI' "^assets?(:|$)"
+ cashAccountRegex       = toRegexCI' "^assets?(:.+)?:(cash|bank|che(ck|que?)(ing)?|savings?|current)(:|$)"
+ liabilityAccountRegex  = toRegexCI' "^(debts?|liabilit(y|ies))(:|$)"
+ equityAccountRegex     = toRegexCI' "^equity(:|$)"
+-conversionAccountRegex = toRegexCI' "^equity:(trad(e|ing)|conversion)s?(:|$)"
++conversionAccountRegex = toRegexCI' "^equity:(trade|trades|trading|conversion)(:|$)"
+ revenueAccountRegex    = toRegexCI' "^(income|revenue)s?(:|$)"
+ expenseAccountRegex    = toRegexCI' "^expenses?(:|$)"
+ 
+@@ -128,6 +112,15 @@ accountNameInferType a
+   | regexMatchText expenseAccountRegex    a = Just Expense
+   | otherwise                               = Nothing
+ 
++-- | Like accountNameInferType, but exclude the provided types from the guesses.
++-- Used eg to prevent "equity:conversion" being inferred as Conversion when a different
++-- account has been declared with that type.
++accountNameInferTypeExcept :: [AccountType] -> AccountName -> Maybe AccountType
++accountNameInferTypeExcept excludedtypes a =
++  case accountNameInferType a of
++    Just t | not $ t `elem` excludedtypes -> Just t
++    _ -> Nothing
++
+ -- Extract the 'AccountType' of an 'AccountName' by looking it up in the
+ -- provided Map, traversing the parent accounts if necessary. If none of those
+ -- work, try 'accountNameInferType'.
+@@ -135,6 +128,28 @@ accountNameType :: M.Map AccountName AccountType -> AccountName -> Maybe Account
+ accountNameType atypes a = asum (map (`M.lookup` atypes) $ a : parentAccountNames a)
+                          <|> accountNameInferType a
+ 
++-- accountNameComponents :: AccountName -> [String]
++-- accountNameComponents = splitAtElement acctsepchar
++
++accountNameComponents :: AccountName -> [Text]
++accountNameComponents = T.splitOn acctsep
++
++accountNameFromComponents :: [Text] -> AccountName
++accountNameFromComponents = T.intercalate acctsep
++
++accountLeafName :: AccountName -> Text
++accountLeafName = last . accountNameComponents
++
++-- | Truncate all account name components but the last to two characters.
++accountSummarisedName :: AccountName -> Text
++accountSummarisedName a
++  --   length cs > 1 = take 2 (head cs) ++ ":" ++ a'
++  | length cs > 1 = T.intercalate ":" (map (T.take 2) $ init cs) <> ":" <> a'
++  | otherwise     = a'
++    where
++      cs = accountNameComponents a
++      a' = accountLeafName a
++
+ -- | The level (depth) of an account name.
+ --
+ -- >>> accountNameLevel ""  -- special case
+diff --git a/hledger-lib/Hledger/Data/Balancing.hs b/hledger-lib/Hledger/Data/Balancing.hs
+index ffc95e155..b3caf5966 100644
+--- a/hledger-lib/Hledger/Data/Balancing.hs
++++ b/hledger-lib/Hledger/Data/Balancing.hs
+@@ -102,10 +102,11 @@ transactionCheckBalanced BalancingOpts{commodity_styles_} t = errs
+             VirtualPosting         -> (l, r)
+ 
+     -- convert this posting's amount to cost,
+-    -- without getting confused by redundant costs/equity postings
++    -- unless it has been marked as a redundant cost (equivalent to some nearby equity conversion postings),
++    -- in which case ignore it.
+     postingBalancingAmount p
+-      | "_cost-matched" `elem` map fst (ptags p) = mixedAmountStripCosts $ pamount p
+-      | otherwise                                 = mixedAmountCost $ pamount p
++      | costPostingTagName `elem` map fst (ptags p) = mixedAmountStripCosts $ pamount p
++      | otherwise                                   = mixedAmountCost $ pamount p
+ 
+     -- transaction balancedness is checked at each commodity's display precision
+     lookszero = mixedAmountLooksZero . atdisplayprecision
+diff --git a/hledger-lib/Hledger/Data/Journal.hs b/hledger-lib/Hledger/Data/Journal.hs
+index f6d1d1631..efb9938d5 100644
+--- a/hledger-lib/Hledger/Data/Journal.hs
++++ b/hledger-lib/Hledger/Data/Journal.hs
+@@ -31,8 +31,7 @@ module Hledger.Data.Journal (
+   journalCommodityStylesWith,
+   journalToCost,
+   journalInferEquityFromCosts,
+-  journalInferCostsFromEquity,
+-  journalMarkRedundantCosts,
++  journalTagCostsAndEquityAndMaybeInferCosts,
+   journalReverse,
+   journalSetLastReadTime,
+   journalRenumberAccountDeclarations,
+@@ -96,11 +95,13 @@ module Hledger.Data.Journal (
+   journalAccountTypes,
+   journalAddAccountTypes,
+   journalPostingsAddAccountTags,
++  defaultBaseConversionAccount,
+   -- journalPrices,
+-  journalConversionAccount,
++  journalBaseConversionAccount,
+   journalConversionAccounts,
+   -- * Misc
+   canonicalStyleFrom,
++
+   nulljournal,
+   journalConcat,
+   journalNumberTransactions,
+@@ -153,6 +154,7 @@ import System.FilePath (takeFileName)
+ import Data.Ord (comparing)
+ import Hledger.Data.Dates (nulldate)
+ import Data.List (sort)
++import Data.Function ((&))
+ -- import Data.Function ((&))
+ 
+ 
+@@ -575,29 +577,34 @@ journalAccountType Journal{jaccounttypes} = accountNameType jaccounttypes
+ journalAddAccountTypes :: Journal -> Journal
+ journalAddAccountTypes j = j{jaccounttypes = journalAccountTypes j}
+ 
++-- | An account type inherited from the parent account(s),
++-- and whether it was originally declared by an account directive (true) or inferred from an account name (false).
++type ParentAccountType = (AccountType, Bool)
++
+ -- | Build a map of all known account types, explicitly declared
+ -- or inferred from the account's parent or name.
+ journalAccountTypes :: Journal -> M.Map AccountName AccountType
+ journalAccountTypes j = M.fromList [(a,acctType) | (a, Just (acctType,_)) <- flatten t']
+   where
+     t = accountNameTreeFrom $ journalAccountNames j :: Tree AccountName
+-    -- Map from the top of the account tree down to the leaves, propagating
+-    -- account types downward. Keep track of whether the account is declared
+-    -- (True), in which case the parent account should be preferred, or merely
+-    -- inferred (False), in which case the inferred type should be preferred.
+-    t' = settypes Nothing t :: Tree (AccountName, Maybe (AccountType, Bool))
++    -- Traverse downward through the account tree, applying any explicitly declared account types,
++    -- otherwise inferring account types from account names when possible, and propagating account types downward.
++    -- Declared account types (possibly inherited from parent) are preferred, inferred types are used as a fallback.
++    t' = setTypeHereAndBelow Nothing t :: Tree (AccountName, Maybe (AccountType, Bool))
+       where
+-        settypes :: Maybe (AccountType, Bool) -> Tree AccountName -> Tree (AccountName, Maybe (AccountType, Bool))
+-        settypes mparenttype (Node a subs) = Node (a, mtype) (map (settypes mtype) subs)
++        declaredtypes       = M.keys $ jdeclaredaccounttypes j
++        declaredtypesbyname = journalDeclaredAccountTypes j & fmap (,True)
++        setTypeHereAndBelow :: Maybe ParentAccountType -> Tree AccountName -> Tree (AccountName, Maybe ParentAccountType)
++        setTypeHereAndBelow mparenttype (Node a subs) = Node (a, mnewtype) (map (setTypeHereAndBelow mnewtype) subs)
+           where
+-            mtype = M.lookup a declaredtypes <|> minferred
+-              where 
+-                declaredtypes = (,True) <$> journalDeclaredAccountTypes j
+-                minferred = if maybe False snd mparenttype
+-                            then mparenttype
+-                            else (,False) <$> accountNameInferType a <|> mparenttype
+-
+--- | Build a map of the account types explicitly declared for each account.
++            mnewtype = mthisacctdeclaredtype <|> mparentacctdeclaredtype <|> mthisacctinferredtype <|> mparentacctinferredtype
++              where
++                mthisacctdeclaredtype   = M.lookup a declaredtypesbyname
++                mparentacctdeclaredtype = if       fromMaybe False $ snd <$> mparenttype then mparenttype else Nothing
++                mparentacctinferredtype = if not $ fromMaybe True  $ snd <$> mparenttype then mparenttype else Nothing
++                mthisacctinferredtype   = accountNameInferTypeExcept declaredtypes a & fmap (,False)  -- XXX not sure about this Except logic.. but for now, tests pass
++
++-- | Build a map from account names to explicitly declared account types.
+ journalDeclaredAccountTypes :: Journal -> M.Map AccountName AccountType
+ journalDeclaredAccountTypes Journal{jdeclaredaccounttypes} =
+   M.fromList $ concat [map (,t) as | (t,as) <- M.toList jdeclaredaccounttypes]
+@@ -609,18 +616,17 @@ journalPostingsAddAccountTags :: Journal -> Journal
+ journalPostingsAddAccountTags j = journalMapPostings addtags j
+   where addtags p = p `postingAddTags` (journalInheritedAccountTags j $ paccount p)
+ 
+--- | The account to use for automatically generated conversion postings in this journal:
+--- the first of the journalConversionAccounts.
+-journalConversionAccount :: Journal -> AccountName
+-journalConversionAccount = headDef defaultConversionAccount . journalConversionAccounts
++-- | The account name to use for conversion postings generated by --infer-equity.
++-- This is the first account declared with type V/Conversion,
++-- or otherwise the defaultBaseConversionAccount (equity:conversion).
++journalBaseConversionAccount :: Journal -> AccountName
++journalBaseConversionAccount = headDef defaultBaseConversionAccount . journalConversionAccounts
+ 
+--- | All the accounts declared or inferred as Conversion type in this journal.
++-- | All the accounts in this journal which are declared or inferred as V/Conversion type.
++-- This does not include new account names which might be generated by --infer-equity, currently.
+ journalConversionAccounts :: Journal -> [AccountName]
+ journalConversionAccounts = M.keys . M.filter (==Conversion) . jaccounttypes
+ 
+--- The fallback account to use for automatically generated conversion postings
+--- if no account is declared with the Conversion type.
+-defaultConversionAccount = "equity:conversion"
+ 
+ -- Various kinds of filtering on journals. We do it differently depending
+ -- on the command.
+@@ -985,32 +991,23 @@ journalInferMarketPricesFromTransactions j =
+ journalToCost :: ConversionOp -> Journal -> Journal
+ journalToCost cost j@Journal{jtxns=ts} = j{jtxns=map (transactionToCost cost) ts}
+ 
++-- | Identify and tag (1) equity conversion postings and (2) postings which have (or could have ?) redundant costs.
++-- And if the addcosts flag is true, also add any costs which can be inferred from equity conversion postings.
++-- This is always called before transaction balancing to tag the redundant-cost postings so they can be ignored.
++-- With --infer-costs, it is called again after transaction balancing (when it has more information to work with) to infer costs from equity postings.
++-- See transactionTagCostsAndEquityAndMaybeInferCosts for more details, and hledger manual > Cost reporting for more background.
++journalTagCostsAndEquityAndMaybeInferCosts :: Bool -> Journal -> Either String Journal
++journalTagCostsAndEquityAndMaybeInferCosts addcosts j = do
++  let conversionaccts = journalConversionAccounts j
++  ts <- mapM (transactionTagCostsAndEquityAndMaybeInferCosts addcosts conversionaccts) $ jtxns j
++  return j{jtxns=ts}
++
+ -- | Add equity postings inferred from costs, where needed and possible.
+ -- See hledger manual > Cost reporting.
+ journalInferEquityFromCosts :: Bool -> Journal -> Journal
+-journalInferEquityFromCosts verbosetags j = journalMapTransactions (transactionAddInferredEquityPostings verbosetags equityAcct) j
+-  where
+-    equityAcct = journalConversionAccount j
+-
+--- | Add costs inferred from equity conversion postings, where needed and possible.
+--- See hledger manual > Cost reporting.
+-journalInferCostsFromEquity :: Journal -> Either String Journal
+-journalInferCostsFromEquity j = do
+-  ts <- mapM (transactionInferCostsFromEquity False conversionaccts) $ jtxns j
+-  return j{jtxns=ts}
+-  where conversionaccts = journalConversionAccounts j
+-
+--- XXX duplication of the above
+--- | Do just the internal tagging that is normally done by journalInferCostsFromEquity,
+--- identifying equity conversion postings and, in particular, postings which have redundant costs.
+--- Tagging the latter is useful as it allows them to be ignored during transaction balancedness checking.
+--- And that allows journalInferCostsFromEquity to be postponed till after transaction balancing,
+--- when it will have more information (amounts) to work with.
+-journalMarkRedundantCosts :: Journal -> Either String Journal
+-journalMarkRedundantCosts j = do
+-  ts <- mapM (transactionInferCostsFromEquity True conversionaccts) $ jtxns j
+-  return j{jtxns=ts}
+-  where conversionaccts = journalConversionAccounts j
++journalInferEquityFromCosts verbosetags j =
++  journalMapTransactions (transactionInferEquityPostings verbosetags equityAcct) j
++  where equityAcct = journalBaseConversionAccount j
+ 
+ -- -- | Get this journal's unique, display-preference-canonicalised commodities, by symbol.
+ -- journalCanonicalCommodities :: Journal -> M.Map String CommoditySymbol
+diff --git a/hledger-lib/Hledger/Data/JournalChecks.hs b/hledger-lib/Hledger/Data/JournalChecks.hs
+index e361f82b9..e0edf7f96 100644
+--- a/hledger-lib/Hledger/Data/JournalChecks.hs
++++ b/hledger-lib/Hledger/Data/JournalChecks.hs
+@@ -33,7 +33,7 @@ import Hledger.Data.Errors
+ import Hledger.Data.Journal
+ import Hledger.Data.JournalChecks.Ordereddates
+ import Hledger.Data.JournalChecks.Uniqueleafnames
+-import Hledger.Data.Posting (isVirtual, postingDate, transactionAllTags)
++import Hledger.Data.Posting (isVirtual, postingDate, transactionAllTags, conversionPostingTagName, costPostingTagName)
+ import Hledger.Data.Types
+ import Hledger.Data.Amount (amountIsZero, amountsRaw, missingamt, amounts)
+ import Hledger.Data.Transaction (transactionPayee, showTransactionLineFirstPart, partitionAndCheckConversionPostings)
+@@ -214,7 +214,7 @@ journalCheckTags j = do
+       ,"tag %s"
+       ])
+ 
+--- | Tag names which have special significance to hledger.
++-- | Tag names which have special significance to hledger, and need not be declared for `hledger check tags`.
+ -- Keep synced with check-tags.test and hledger manual > Special tags.
+ builtinTags = [
+    "date"                   -- overrides a posting's date
+@@ -231,8 +231,8 @@ builtinTags = [
+   ,"_generated-transaction" -- always exists on generated periodic txns
+   ,"_generated-posting"     -- always exists on generated auto postings
+   ,"_modified"              -- always exists on txns which have had auto postings added
+-  ,"_conversion-matched"    -- marks postings with a cost which have been matched with a nearby pair of equity conversion postings
+-  ,"_cost-matched"          -- marks equity conversion postings which have been matched with a nearby posting with a cost
++  ,conversionPostingTagName -- marks costful postings which have been matched with a nearby pair of equity conversion postings
++  ,costPostingTagName       -- marks equity conversion postings which have been matched with a nearby costful posting
+   ]
+ 
+ -- | In each tranaction, check that any conversion postings occur in adjacent pairs.
+diff --git a/hledger-lib/Hledger/Data/Posting.hs b/hledger-lib/Hledger/Data/Posting.hs
+index b9230b88c..808bb006a 100644
+--- a/hledger-lib/Hledger/Data/Posting.hs
++++ b/hledger-lib/Hledger/Data/Posting.hs
+@@ -55,7 +55,10 @@ module Hledger.Data.Posting (
+   commentAddTag,
+   commentAddTagUnspaced,
+   commentAddTagNextLine,
+-  -- * arithmetic
++  conversionPostingTagName,
++  costPostingTagName,
++
++-- * arithmetic
+   sumPostings,
+   -- * rendering
+   showPosting,
+@@ -104,6 +107,23 @@ import Hledger.Data.Dates (nulldate, spanContainsDate)
+ import Hledger.Data.Valuation
+ 
+ 
++-- | These are hidden tags used internally to mark:
++-- (1) "matched conversion postings", which are to an account of Conversion type and have a nearby equivalent costful or potentially costful posting, and
++-- (2) "matched cost postings", which have or could have a cost that's equivalent to nearby conversion postings.
++--
++-- One or both of these tags are added during journal finalising:
++-- (1) before transaction balancing, to allow ignoring redundant costs
++-- (2) when inferring costs from equity conversion postings, and
++-- (3) when inferring equity conversion postings from costs.
++--
++-- These are hidden tags, mainly for internal use, and not visible in output. (XXX visibility would be useful for troubleshooting)
++-- But they are mentioned in docs and can be matched by user queries, which can be useful occasionally;
++-- so consider user impact before changing these names.
++--
++conversionPostingTagName, costPostingTagName :: TagName
++conversionPostingTagName = "_conversion-matched"
++costPostingTagName       = "_cost-matched"
++
+ instance HasAmounts BalanceAssertion where
+   styleAmounts styles ba@BalanceAssertion{baamount} = ba{baamount=styleAmounts styles baamount}
+ 
+@@ -456,39 +476,40 @@ postingApplyValuation priceoracle styles periodlast today v p =
+ postingToCost :: ConversionOp -> Posting -> Maybe Posting
+ postingToCost NoConversionOp p = Just p
+ postingToCost ToCost         p
+-  -- If this is a conversion posting with a matched transaction price posting, ignore it
+-  | "_conversion-matched" `elem` map fst (ptags p) && nocosts = Nothing
++  -- If this is an equity conversion posting with an associated cost nearby, ignore it
++  | conversionPostingTagName `elem` map fst (ptags p) && nocosts = Nothing
+   | otherwise = Just $ postingTransformAmount mixedAmountCost p
+   where
+     nocosts = (not . any (isJust . acost) . amountsRaw) $ pamount p
+ 
+--- | Generate inferred equity postings from a 'Posting''s costs.
+--- Make sure not to duplicate them when matching ones exist already.
++-- | Generate equity conversion postings corresponding to a 'Posting''s cost(s)
++-- (one pair of conversion postings per cost), wherever they don't already exist.
+ postingAddInferredEquityPostings :: Bool -> Text -> Posting -> [Posting]
+ postingAddInferredEquityPostings verbosetags equityAcct p
+-    | "_cost-matched" `elem` map fst (ptags p) = [p]
+-    | otherwise = taggedPosting : concatMap conversionPostings costs
++  -- this posting has no costs
++  | null costs = [p]
++  -- this posting is already tagged as having associated conversion postings
++  | costPostingTagName `elem` map fst (ptags p) = [p]
++  -- tag the posting, and for each of its costs, add an equivalent pair of conversion postings after it
++  | otherwise = p `postingAddTags` [(costPostingTagName,"")] : concatMap makeConversionPostings costs
+   where
+     costs = filter (isJust . acost) . amountsRaw $ pamount p
+-    taggedPosting
+-      | null costs = p
+-      | otherwise  = p{ ptags = ("_cost-matched","") : ptags p }
+-    conversionPostings amt = case acost amt of
+-        Nothing -> []
+-        Just _  -> [ cp{ paccount = accountPrefix <> amtCommodity
+-                       , pamount = mixedAmount . negate $ amountStripCost amt
+-                       }
+-                   , cp{ paccount = accountPrefix <> costCommodity
+-                       , pamount = mixedAmount cost
+-                       }
+-                   ]
++    makeConversionPostings amt = case acost amt of
++      Nothing -> []
++      Just _  -> [ cp{ paccount = accountPrefix <> amtCommodity
++                      , pamount = mixedAmount . negate $ amountStripCost amt
++                      }
++                  , cp{ paccount = accountPrefix <> costCommodity
++                      , pamount = mixedAmount cost
++                      }
++                  ]
+       where
+         cost = amountCost amt
+         amtCommodity  = commodity amt
+         costCommodity = commodity cost
+         cp = p{ pcomment = pcomment p & (if verbosetags then (`commentAddTag` ("generated-posting","conversion")) else id)
+               , ptags    =
+-                   ("_conversion-matched","") : -- implementation-specific internal tag, not for users
++                   (conversionPostingTagName,"") :
+                    ("_generated-posting","conversion") :
+                    (if verbosetags then [("generated-posting", "conversion")] else [])
+               , pbalanceassertion = Nothing
+diff --git a/hledger-lib/Hledger/Data/Transaction.hs b/hledger-lib/Hledger/Data/Transaction.hs
+index 8246afefb..17cbb6a1a 100644
+--- a/hledger-lib/Hledger/Data/Transaction.hs
++++ b/hledger-lib/Hledger/Data/Transaction.hs
+@@ -27,8 +27,8 @@ module Hledger.Data.Transaction
+ , transactionTransformPostings
+ , transactionApplyValuation
+ , transactionToCost
+-, transactionAddInferredEquityPostings
+-, transactionInferCostsFromEquity
++, transactionInferEquityPostings
++, transactionTagCostsAndEquityAndMaybeInferCosts
+ , transactionApplyAliases
+ , transactionMapPostings
+ , transactionMapPostingAmounts
+@@ -235,10 +235,11 @@ transactionApplyValuation priceoracle styles periodlast today v =
+ transactionToCost :: ConversionOp -> Transaction -> Transaction
+ transactionToCost cost t = t{tpostings = mapMaybe (postingToCost cost) $ tpostings t}
+ 
+--- | Add inferred equity postings to a 'Transaction' using transaction prices.
+-transactionAddInferredEquityPostings :: Bool -> AccountName -> Transaction -> Transaction
+-transactionAddInferredEquityPostings verbosetags equityAcct t =
+-    t{tpostings=concatMap (postingAddInferredEquityPostings verbosetags equityAcct) $ tpostings t}
++-- | For any costs in this 'Transaction' which don't have associated equity conversion postings,
++-- generate and add those.
++transactionInferEquityPostings :: Bool -> AccountName -> Transaction -> Transaction
++transactionInferEquityPostings verbosetags equityAcct t =
++  t{tpostings=concatMap (postingAddInferredEquityPostings verbosetags equityAcct) $ tpostings t}
+ 
+ type IdxPosting = (Int, Posting)
+ 
+@@ -248,17 +249,19 @@ type IdxPosting = (Int, Posting)
+ 
+ label s = ((s <> ": ")++)
+ 
+--- | Add costs inferred from equity postings in this transaction.
+--- The name(s) of conversion equity accounts should be provided.
+--- For every adjacent pair of conversion postings, it will first search the postings
+--- with costs to see if any match. If so, it will tag these as matched.
+--- If no postings with costs match, it will then search the postings without costs,
+--- and will match the first such posting which matches one of the conversion amounts.
+--- If it finds a match, it will add a cost and then tag it.
+--- If the first argument is true, do a dry run instead: identify and tag
+--- the costful and conversion postings, but don't add costs.
+-transactionInferCostsFromEquity :: Bool -> [AccountName] -> Transaction -> Either String Transaction
+-transactionInferCostsFromEquity dryrun conversionaccts t = first (annotateErrorWithTransaction t . T.unpack) $ do
++-- | Find, associate, and tag the corresponding equity conversion postings and costful or potentially costful postings in this transaction.
++-- With a true addcosts argument, also generate and add any equivalent costs that are missing.
++-- The (previously detected) names of all equity conversion accounts should be provided.
++--
++-- For every pair of adjacent conversion postings, this first searches for a posting with equivalent cost (1).
++-- If no such posting is found, it then searches the costless postings, for one matching one of the conversion amounts (2).
++-- If either of these found a candidate posting, it is tagged with costPostingTagName.
++-- Then if in addcosts mode, if a costless posting was found, a cost equivalent to the conversion amounts is added to it.
++--
++-- The name reflects the complexity of this and its helpers; clarification is ongoing.
++--
++transactionTagCostsAndEquityAndMaybeInferCosts :: Bool -> [AccountName] -> Transaction -> Either String Transaction
++transactionTagCostsAndEquityAndMaybeInferCosts addcosts conversionaccts t = first (annotateErrorWithTransaction t . T.unpack) $ do
+   -- number the postings
+   let npostings = zip [0..] $ tpostings t
+ 
+@@ -270,7 +273,7 @@ transactionInferCostsFromEquity dryrun conversionaccts t = first (annotateErrorW
+   -- 1. each pair of conversion postings, and the corresponding postings which balance them, are tagged for easy identification
+   -- 2. each pair of balancing postings which did't have an explicit cost, have had a cost calculated and added to one of them
+   -- 3. if any ambiguous situation was detected, an informative error is raised
+-  processposting <- transformIndexedPostingsF (addCostsToPostings dryrun) conversionPairs otherps
++  processposting <- transformIndexedPostingsF (tagAndMaybeAddCostsForEquityPostings addcosts) conversionPairs otherps
+ 
+   -- And if there was no error, use it to modify the transaction's postings.
+   return t{tpostings = map (snd . processposting) npostings}
+@@ -279,7 +282,7 @@ transactionInferCostsFromEquity dryrun conversionaccts t = first (annotateErrorW
+ 
+     -- Generate the tricksy processposting function,
+     -- which when applied to each posting in turn, rather magically has the effect of
+-    -- applying addCostsToPostings to each pair of conversion postings in the transaction,
++    -- applying tagAndMaybeAddCostsForEquityPostings to each pair of conversion postings in the transaction,
+     -- matching them with the other postings, tagging them and perhaps adding cost information to the other postings.
+     -- General type:
+     -- transformIndexedPostingsF :: (Monad m, Foldable t, Traversable t) =>
+@@ -289,45 +292,44 @@ transactionInferCostsFromEquity dryrun conversionaccts t = first (annotateErrorW
+     --   m (a1 -> a1)
+     -- Concrete type:
+     transformIndexedPostingsF ::
+-      ((IdxPosting, IdxPosting) -> StateT ([IdxPosting],[IdxPosting]) (Either Text) (IdxPosting -> IdxPosting)) ->  -- state update function (addCostsToPostings with the bool applied)
++      ((IdxPosting, IdxPosting) -> StateT ([IdxPosting],[IdxPosting]) (Either Text) (IdxPosting -> IdxPosting)) ->  -- state update function (tagAndMaybeAddCostsForEquityPostings with the bool applied)
+       [(IdxPosting, IdxPosting)] ->   -- initial state: the pairs of adjacent conversion postings in the transaction
+       ([IdxPosting],[IdxPosting]) ->  -- initial state: the other postings in the transaction, separated into costful and costless
+       (Either Text (IdxPosting -> IdxPosting))  -- returns an error message or a posting transform function
+     transformIndexedPostingsF updatefn = evalStateT . fmap (appEndo . foldMap Endo) . traverse (updatefn)
+ 
+     -- A tricksy state update helper for processposting/transformIndexedPostingsF.
+-    -- Approximately: given a pair of conversion postings to match,
++    -- Approximately: given a pair of equity conversion postings to match,
+     -- and lists of the remaining unmatched costful and costless other postings,
+-    -- 1. find (and consume) two other postings which match the two conversion postings
+-    -- 2. add identifying (hidden) tags to the four postings
+-    -- 3. add an explicit cost, if missing, to one of the matched other postings
+-    -- 4. or if there is a problem, raise an informative error or do nothing as appropriate.
+-    -- Or, if the first argument is true:
+-    -- do a dry run instead: find and consume, add tags, but don't add costs
+-    -- (and if there are no costful postings at all, do nothing).
+-    addCostsToPostings :: Bool -> (IdxPosting, IdxPosting) -> StateT ([IdxPosting], [IdxPosting]) (Either Text) (IdxPosting -> IdxPosting)
+-    addCostsToPostings dryrun' ((n1, cp1), (n2, cp2)) = StateT $ \(costps, otherps) -> do
++    -- 1. find (and consume) two other postings whose amounts/cost match the two conversion postings
++    -- 2. add hidden identifying tags to the conversion postings and the other posting which has (or could have) an equivalent cost
++    -- 3. if in add costs mode, and the potential equivalent-cost posting does not have that explicit cost, add it
++    -- 4. or if there is a problem, raise an informative error or do nothing, as appropriate.
++    -- Or if there are no costful postings at all, do nothing.
++    tagAndMaybeAddCostsForEquityPostings :: Bool -> (IdxPosting, IdxPosting) -> StateT ([IdxPosting], [IdxPosting]) (Either Text) (IdxPosting -> IdxPosting)
++    tagAndMaybeAddCostsForEquityPostings addcosts' ((n1, cp1), (n2, cp2)) = StateT $ \(costps, otherps) -> do
+       -- Get the two conversion posting amounts, if possible
+       ca1 <- conversionPostingAmountNoCost cp1
+       ca2 <- conversionPostingAmountNoCost cp2
+       let 
+-        -- All costful postings which match the conversion posting pair
+-        matchingCostPs =
++        -- All costful postings whose cost is equivalent to the conversion postings' amounts.
++        matchingCostfulPs =
+           dbg7With (label "matched costful postings".show.length) $ 
+           mapMaybe (mapM $ costfulPostingIfMatchesBothAmounts ca1 ca2) costps
+ 
+-        -- All other single-commodity postings whose amount matches at least one of the conversion postings,
+-        -- with an explicit cost added. Or in dry run mode, all other single-commodity postings.
+-        matchingOtherPs =
++        -- In dry run mode: all other costless, single-commodity postings.
++        -- In add costs mode: all other costless, single-commodity postings whose amount matches at least one of the conversion postings,
++        -- with the equivalent cost added to one of them. (?)
++        matchingCostlessPs =
+           dbg7With (label "matched costless postings".show.length) $
+-          if dryrun'
+-          then [(n,(p, a)) | (n,p) <- otherps, let Just a = postingSingleAmount p]
+-          else mapMaybe (mapM $ addCostIfMatchesOneAmount ca1 ca2) otherps
++          if addcosts'
++          then mapMaybe (mapM $ addCostIfMatchesOneAmount ca1 ca2) otherps
++          else [(n,(p, a)) | (n,p) <- otherps, let Just a = postingSingleAmount p]
+ 
+         -- A function that adds a cost and/or tag to a numbered posting if appropriate.
+         postingAddCostAndOrTag np costp (n,p) =
+-          (n, if | n == np            -> costp `postingAddTags` [("_cost-matched","")]        -- add this tag to the posting with a cost
+-                 | n == n1 || n == n2 -> p     `postingAddTags` [("_conversion-matched","")]  -- add this tag to the two equity conversion postings
++          (n, if | n == np            -> costp `postingAddTags` [(costPostingTagName,"")]        -- add this tag to the posting with a cost
++                 | n == n1 || n == n2 -> p     `postingAddTags` [(conversionPostingTagName,"")]  -- add this tag to the two equity conversion postings
+                  | otherwise          -> p)
+ 
+       -- Annotate any errors with the conversion posting pair
+@@ -337,20 +339,20 @@ transactionInferCostsFromEquity dryrun conversionaccts t = first (annotateErrorW
+           -- delete it from the list of costful postings in the state, delete the
+           -- first matching costless posting from the list of costless postings
+           -- in the state, and return the transformation function with the new state.
+-          | [(np, costp)] <- matchingCostPs
++          | [(np, costp)] <- matchingCostfulPs
+           , Just newcostps <- deleteIdx np costps
+-              -> Right (postingAddCostAndOrTag np costp, (if dryrun' then costps else newcostps, otherps))
++              -> Right (postingAddCostAndOrTag np costp, (if addcosts' then newcostps else costps, otherps))
+ 
+           -- If no costful postings match the conversion postings, but some
+           -- of the costless postings match, check that the first such posting has a
+           -- different amount from all the others, and if so add a cost to it,
+           -- then delete it from the list of costless postings in the state,
+           -- and return the transformation function with the new state.
+-          | [] <- matchingCostPs
+-          , (np, (costp, amt)):nps <- matchingOtherPs
++          | [] <- matchingCostfulPs
++          , (np, (costp, amt)):nps <- matchingCostlessPs
+           , not $ any (amountsMatch amt . snd . snd) nps
+           , Just newotherps <- deleteIdx np otherps
+-              -> Right (postingAddCostAndOrTag np costp, (costps, if dryrun' then otherps else newotherps))
++              -> Right (postingAddCostAndOrTag np costp, (costps, if addcosts' then newotherps else otherps))
+ 
+           -- Otherwise, do nothing, leaving the transaction unchanged.
+           -- We don't want to be over-zealous reporting problems here
+@@ -420,7 +422,7 @@ partitionAndCheckConversionPostings check conversionaccts =
+   -- Left fold processes postings in parse order, so that eg inferred costs
+   -- will be added to the first (top-most) posting, not the last one.
+   foldlM select (([], ([], [])), Nothing)
+-    -- The costless other postings are somehow reversed still; "second (second reverse" fixes that.
++    -- The costless other postings are somehow reversed still; "second (second reverse)" fixes that.
+     <&> fmap (second (second reverse) . fst)
+   where
+     select ((cs, others@(ps, os)), Nothing) np@(_, p)
+diff --git a/hledger-lib/Hledger/Read/Common.hs b/hledger-lib/Hledger/Read/Common.hs
+index 1b3f84c6d..72fd08e5a 100644
+--- a/hledger-lib/Hledger/Read/Common.hs
++++ b/hledger-lib/Hledger/Read/Common.hs
+@@ -346,12 +346,11 @@ journalFinalise iopts@InputOpts{auto_,balancingopts_,infer_costs_,infer_equity_,
+       &   journalAddFile (f, txt)                        -- save the main file's info
+       &   journalReverse                                 -- convert all lists to the order they were parsed
+       &   journalAddAccountTypes                         -- build a map of all known account types
++            -- XXX does not see conversion accounts generated by journalInferEquityFromCosts below, requiring a workaround in journalCheckAccounts. Do it later ?
+       &   journalStyleAmounts                            -- Infer and apply commodity styles (but don't round) - should be done early
+       <&> journalAddForecast verbose_tags_ (forecastPeriod iopts pj)   -- Add forecast transactions if enabled
+       <&> journalPostingsAddAccountTags                  -- Add account tags to postings, so they can be matched by auto postings.
+-      >>= journalMarkRedundantCosts                      -- Mark redundant costs, to help journalBalanceTransactions ignore them.
+-                                                         -- (Later, journalInferEquityFromCosts will do a similar pass, adding missing equity postings.)
+-
++      >>= journalTagCostsAndEquityAndMaybeInferCosts False   -- Tag equity conversion postings and redundant costs, to help journalBalanceTransactions ignore them.
+       >>= (if auto_ && not (null $ jtxnmodifiers pj)
+             then journalAddAutoPostings verbose_tags_ _ioDay balancingopts_  -- Add auto postings if enabled, and account tags if needed. Does preliminary transaction balancing.
+             else pure)
+@@ -365,8 +364,8 @@ journalFinalise iopts@InputOpts{auto_,balancingopts_,infer_costs_,infer_equity_,
+       -- <&> dbg9With (("journalFinalise amounts after styling, forecasting, auto postings, transaction balancing"<>).showJournalAmountsDebug)
+       >>= journalInferCommodityStyles                    -- infer commodity styles once more now that all posting amounts are present
+       -- >>= Right . dbg0With (pshow.journalCommodityStyles)
+-      >>= (if infer_costs_  then journalInferCostsFromEquity else pure)     -- Maybe infer costs from equity postings where possible
+-      <&> (if infer_equity_ then journalInferEquityFromCosts verbose_tags_ else id)  -- Maybe infer equity postings from costs where possible
++      >>= (if infer_costs_  then journalTagCostsAndEquityAndMaybeInferCosts True else pure)  -- With --infer-costs, infer costs from equity postings where possible
++      <&> (if infer_equity_ then journalInferEquityFromCosts verbose_tags_ else id)          -- With --infer-equity, infer equity postings from costs where possible
+       <&> dbg9With (lbl "amounts after equity-inferring".showJournalAmountsDebug)
+       <&> journalInferMarketPricesFromTransactions       -- infer market prices from commodity-exchanging transactions
+       -- <&> traceOrLogAt 6 fname  -- debug logging
+diff --git a/hledger-lib/Hledger/Utils/Regex.hs b/hledger-lib/Hledger/Utils/Regex.hs
+index 5d99b383b..052b1e5c6 100644
+--- a/hledger-lib/Hledger/Utils/Regex.hs
++++ b/hledger-lib/Hledger/Utils/Regex.hs
+@@ -167,8 +167,8 @@ regexMatch = matchTest
+ 
+ -- | Tests whether a Regexp matches a Text.
+ --
+--- This currently unpacks the Text to a String an works on that. This is due to
+--- a performance bug in regex-tdfa (#9), which may or may not be relevant here.
++-- This currently unpacks the Text to a String, to work around a performance bug
++-- in regex-tdfa (#9), which may or may not be relevant here.
+ regexMatchText :: Regexp -> Text -> Bool
+ regexMatchText r = matchTest r . T.unpack
+ 
+diff --git a/hledger/hledger.m4.md b/hledger/hledger.m4.md
+index 2e083743e..80e4de4f2 100644
+--- a/hledger/hledger.m4.md
++++ b/hledger/hledger.m4.md
+@@ -1881,17 +1881,26 @@ Tags hledger adds to indicate generated data:
+  generated-transaction  -- appears on generated periodic txns (with --verbose-tags)
+  generated-posting      -- appears on generated auto postings (with --verbose-tags)
+  modified               -- appears on txns which have had auto postings added (with --verbose-tags)
++```
+ 
+-Not displayed, but queryable:
++These similar tags are also provided; they are not displayed, but can be relied on for querying:
++```
+  _generated-transaction -- exists on generated periodic txns (always)
+  _generated-posting     -- exists on generated auto postings (always)
+  _modified              -- exists on txns which have had auto postings added (always)
+ ```
+ 
+-Other tags hledger uses internally:
++The following non-displayed tags are used internally by hledger,
++(1) to ignore redundant costs when balancing transactions,
++(2) when using --infer-costs, and
++(3) when using --infer-equity.
++Essentially they mark postings with costs which have corresponding equity conversion postings, and vice-versa.
++They are queryable, but you should not rely on them for your reports:
+ ```
+- _cost-matched          -- marks postings with a cost which have been matched with a nearby pair of equity conversion postings
+- _conversion-matched    -- marks equity conversion postings which have been matched with a nearby posting with a cost
++ _conversion-matched    -- marks "matched conversion postings", which are to a V/Conversion account
++                           and have a nearby equivalent costful or potentially costful posting
++ _cost-matched          -- marks "matched cost postings", which have or could have a cost
++                           that's equivalent to nearby conversion postings
+ ```
+ 
+ ### Tag values

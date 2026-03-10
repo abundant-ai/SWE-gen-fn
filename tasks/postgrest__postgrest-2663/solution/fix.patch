@@ -1,0 +1,188 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 697898c5..68575db4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + This can be used to override the OpenAPI spec with a custom database function
+  - #1567, On bulk inserts, missing values can get the column DEFAULT by using the `Prefer: missing=default` header - @steve-chavez
+  - #2501, Allow filtering by`IS DISTINCT FROM` using the `isdistinct` operator, e.g. `/people?alias=isdistinct.foo`
++ - #2663, Limit maximal postgresql connection lifetime - @robx
++   + New option `db-pool-max-lifetime` (default 30m)
++   + `db-pool-acquisition-timeout` is no longer optional and defaults to 10s
++   + Fixes postgresql resource leak with long-lived connections (#2638)
+ 
+ ### Fixed
+ 
+diff --git a/nix/overlays/haskell-packages.nix b/nix/overlays/haskell-packages.nix
+index c6ce85ed..f650278e 100644
+--- a/nix/overlays/haskell-packages.nix
++++ b/nix/overlays/haskell-packages.nix
+@@ -38,6 +38,24 @@ let
+             sha256 = "1wmyhldk0k14y8whp1p4akrkqxf5snh8qsbm7fv5f7kz95nyffd0";
+           })
+           { });
++
++      hasql-notifications = lib.dontCheck
++        (prev.callHackageDirect
++          {
++            pkg = "hasql-notifications";
++            ver = "0.2.0.4";
++            sha256 = "sha256-fm1xiDyvDkb5WLOJ73/s8wrWEW23XFS7luAv2brfr8I=";
++          }
++          { });
++
++      hasql-pool = lib.dontCheck
++        (prev.callHackageDirect
++          {
++            pkg = "hasql-pool";
++            ver = "0.9";
++            sha256 = "sha256-5UshbbaBVY8eJ/9VagNVVxonRwMcd7UmGqDc35pJNFY=";
++          }
++          { });
+     } // extraOverrides final prev;
+ in
+ {
+diff --git a/postgrest.cabal b/postgrest.cabal
+index cc35428c..c72bf042 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -91,7 +91,7 @@ library
+                     , hasql                     >= 1.6.1.1 && < 1.7
+                     , hasql-dynamic-statements  >= 0.3.1 && < 0.4
+                     , hasql-notifications       >= 0.1 && < 0.3
+-                    , hasql-pool                >= 0.8.0.6 && < 0.9
++                    , hasql-pool                >= 0.9 && < 0.10
+                     , hasql-transaction         >= 1.0.1 && < 1.1
+                     , heredoc                   >= 0.2 && < 0.3
+                     , http-types                >= 0.12.2 && < 0.13
+@@ -231,7 +231,7 @@ test-suite spec
+                     , bytestring        >= 0.10.8 && < 0.12
+                     , case-insensitive  >= 1.2 && < 1.3
+                     , containers        >= 0.5.7 && < 0.7
+-                    , hasql-pool        >= 0.8.0.2 && < 0.9
++                    , hasql-pool        >= 0.9 && < 0.10
+                     , hasql-transaction >= 1.0.1 && < 1.1
+                     , heredoc           >= 0.2 && < 0.3
+                     , hspec             >= 2.3 && < 2.10
+@@ -250,7 +250,7 @@ test-suite spec
+                     , transformers-base >= 0.4.4 && < 0.5
+                     , wai               >= 3.2.1 && < 3.3
+                     , wai-extra         >= 3.0.19 && < 3.2
+-  ghc-options:        -O0 -Werror -Wall -fwarn-identities
++  ghc-options:        -threaded -O0 -Werror -Wall -fwarn-identities
+                       -fno-spec-constr -optP-Wno-nonportable-include-path
+                       -fno-warn-missing-signatures
+                       -fwrite-ide-info
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 1a36a186..93372a94 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -111,10 +111,11 @@ destroy = destroyPool
+ 
+ initPool :: AppConfig -> IO SQL.Pool
+ initPool AppConfig{..} =
+-  SQL.acquire configDbPoolSize timeoutMicroseconds $ toUtf8 configDbUri
+-  where
+-    timeoutMicroseconds = (* oneSecond) <$> configDbPoolAcquisitionTimeout
+-    oneSecond = 1000000
++  SQL.acquire
++    configDbPoolSize
++    (fromIntegral configDbPoolAcquisitionTimeout)
++    (fromIntegral configDbPoolMaxLifetime)
++    (toUtf8 configDbUri)
+ 
+ -- | Run an action with a database connection.
+ usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index b447fb6f..30f59ea3 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -151,6 +151,9 @@ exampleConfigFile =
+       |## Time in seconds to wait to acquire a slot from the connection pool
+       |# db-pool-acquisition-timeout = 10
+       |
++      |## Time in seconds after which to recycle pool connections
++      |# db-pool-max-lifetime = 1800
++      |
+       |## Stored proc to exec immediately after auth
+       |# db-pre-request = "stored_proc_name"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 74c0032a..773745d9 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -71,7 +71,8 @@ data AppConfig = AppConfig
+   , configDbMaxRows                :: Maybe Integer
+   , configDbPlanEnabled            :: Bool
+   , configDbPoolSize               :: Int
+-  , configDbPoolAcquisitionTimeout :: Maybe Int
++  , configDbPoolAcquisitionTimeout :: Int
++  , configDbPoolMaxLifetime        :: Int
+   , configDbPreRequest             :: Maybe QualifiedIdentifier
+   , configDbPreparedStatements     :: Bool
+   , configDbRootSpec               :: Maybe QualifiedIdentifier
+@@ -132,7 +133,8 @@ toText conf =
+       ,("db-max-rows",                   maybe "\"\"" show . configDbMaxRows)
+       ,("db-plan-enabled",               T.toLower . show . configDbPlanEnabled)
+       ,("db-pool",                       show . configDbPoolSize)
+-      ,("db-pool-acquisition-timeout",   maybe "\"\"" show . configDbPoolAcquisitionTimeout)
++      ,("db-pool-acquisition-timeout",   show . configDbPoolAcquisitionTimeout)
++      ,("db-pool-max-lifetime",          show . configDbPoolMaxLifetime)
+       ,("db-pre-request",            q . maybe mempty dumpQi . configDbPreRequest)
+       ,("db-prepared-statements",        T.toLower . show . configDbPreparedStatements)
+       ,("db-root-spec",              q . maybe mempty dumpQi . configDbRootSpec)
+@@ -222,7 +224,8 @@ parser optPath env dbSettings =
+                      (optInt "max-rows")
+     <*> (fromMaybe False <$> optBool "db-plan-enabled")
+     <*> (fromMaybe 10 <$> optInt "db-pool")
+-    <*> optInt "db-pool-acquisition-timeout"
++    <*> (fromMaybe 10 <$> optInt "db-pool-acquisition-timeout")
++    <*> (fromMaybe 1800 <$> optInt "db-pool-max-lifetime")
+     <*> (fmap toQi <$> optWithAlias (optString "db-pre-request")
+                                     (optString "pre-request"))
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")
+@@ -359,7 +362,8 @@ parser optPath env dbSettings =
+           let dbSettingName = T.pack $ dashToUnderscore <$> toS key in
+           if dbSettingName `notElem` [
+             "server_host", "server_port", "server_unix_socket", "server_unix_socket_mode", "admin_server_port", "log_level",
+-            "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_acquisition_timeout", "db_config"]
++            "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_acquisition_timeout",
++            "db_pool_max_lifetime", "db_config"]
+           then lookup dbSettingName dbSettings
+           else Nothing
+ 
+diff --git a/stack.yaml b/stack.yaml
+index bf9ba9ef..f54257a8 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -12,3 +12,5 @@ nix:
+ extra-deps:
+   - git: https://github.com/PostgREST/postgresql-libpq.git
+     commit: 890a0a16cf57dd401420fdc6c7d576fb696003bc
++  - hasql-notifications-0.2.0.4
++  - hasql-pool-0.9
+diff --git a/stack.yaml.lock b/stack.yaml.lock
+index dabb9ea0..ef9eadf4 100644
+--- a/stack.yaml.lock
++++ b/stack.yaml.lock
+@@ -15,6 +15,20 @@ packages:
+   original:
+     commit: 890a0a16cf57dd401420fdc6c7d576fb696003bc
+     git: https://github.com/PostgREST/postgresql-libpq.git
++- completed:
++    hackage: hasql-notifications-0.2.0.4@sha256:9a09fa9b97feadd9492c8bd8bc6b9cffe0513510102f08374b0c45ecd479ed67,2028
++    pantry-tree:
++      sha256: 56f9e240728e7a65711dde45fa2e2075b914e32cd370424aaa4572392378a60e
++      size: 452
++  original:
++    hackage: hasql-notifications-0.2.0.4
++- completed:
++    hackage: hasql-pool-0.9@sha256:db7a37f6b3a922c37adc3c7ced47a7c10786d1f171e47a735a6e812a587ba44c,2111
++    pantry-tree:
++      sha256: 49b1181d28c6f5317e794671c2dae155754b834bdcfa30f7e5dbad28e4cf0249
++      size: 346
++  original:
++    hackage: hasql-pool-0.9
+ snapshots:
+ - completed:
+     sha256: 4905c93319aa94aa53da8f41d614d7bacdbfe6c63a8c6132d32e6e62f24a9af4

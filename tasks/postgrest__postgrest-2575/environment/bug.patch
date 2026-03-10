@@ -1,0 +1,285 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 2b679290..06c99a7d 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -85,7 +85,6 @@ library
+                     , contravariant-extras      >= 0.3.3 && < 0.4
+                     , cookie                    >= 0.4.2 && < 0.5
+                     , either                    >= 4.4.1 && < 5.1
+-                    , fuzzyset                  >= 0.2.3
+                     , gitrev                    >= 1.2 && < 1.4
+                     , hasql                     >= 1.6.1.1 && < 1.7
+                     , hasql-dynamic-statements  >= 0.3.1 && < 0.4
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 3dbce3d8..c2488a61 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -453,7 +453,7 @@ requestMediaTypes conf action path =
+ findProc :: QualifiedIdentifier -> S.Set Text -> Bool -> ProcsMap -> MediaType -> Bool -> Either ApiRequestError ProcDescription
+ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPost =
+   case matchProc of
+-    ([], [])     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) paramsAsSingleObject contentMediaType isInvPost (HM.keys allProcs) lookupProcName
++    ([], [])     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) paramsAsSingleObject contentMediaType isInvPost
+     -- If there are no functions with named arguments, fallback to the single unnamed argument function
+     ([], [proc]) -> Right proc
+     ([], procs)  -> Left $ AmbiguousRpc (toList procs)
+@@ -461,9 +461,7 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+     ([proc], _)  -> Right proc
+     (procs, _)   -> Left $ AmbiguousRpc (toList procs)
+   where
+-    matchProc = overloadedProcPartition lookupProcName
+-    -- First find the proc by name
+-    lookupProcName = HM.lookupDefault mempty qi allProcs
++    matchProc = overloadedProcPartition $ HM.lookupDefault mempty qi allProcs -- first find the proc by name
+     -- The partition obtained has the form (overloadedProcs,fallbackProcs)
+     -- where fallbackProcs are functions with a single unnamed parameter
+     overloadedProcPartition = foldr select ([],[])
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e5db175c..cc1a17ac 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -32,8 +32,7 @@ module PostgREST.ApiRequest.Types
+   ) where
+ 
+ import PostgREST.MediaType                (MediaType (..))
+-import PostgREST.SchemaCache.Identifiers  (FieldName,
+-                                           QualifiedIdentifier)
++import PostgREST.SchemaCache.Identifiers  (FieldName)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..))
+ import PostgREST.SchemaCache.Relationship (Relationship)
+ 
+@@ -67,7 +66,7 @@ data ApiRequestError
+   | NotFound
+   | NotToOne Text Text
+   | NoRelBetween Text Text Text
+-  | NoRpc Text Text [Text] Bool MediaType Bool [QualifiedIdentifier] [ProcDescription]
++  | NoRpc Text Text [Text] Bool MediaType Bool
+   | NotEmbedded Text
+   | ParseRequestError Text Text
+   | PutRangeNotAllowedError
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 3bb28179..d7aaeb00 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -17,7 +17,6 @@ module PostgREST.Error
+ 
+ import qualified Data.Aeson                as JSON
+ import qualified Data.ByteString.Char8     as BS
+-import qualified Data.FuzzySet             as Fuzzy
+ import qualified Data.Text                 as T
+ import qualified Data.Text.Encoding        as T
+ import qualified Data.Text.Encoding.Error  as T
+@@ -171,83 +170,26 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= ("Could not embed because more than one relationship was found for '" <> parent <> "' and '" <> child <> "'" :: Text),
+     "details" .= (compressedRel <$> rels),
+     "hint"    .= ("Try changing '" <> child <> "' to one of the following: " <> relHint rels <> ". Find the desired relationship in the 'details' key." :: Text)]
+-  toJSON (NoRpc schema procName argumentKeys hasPreferSingleObject contentType isInvPost allProcs overloadedProcs)  =
+-    let func = schema <> "." <> procName
+-        prms = "(" <> T.intercalate ", " argumentKeys <> ")"
+-        fmtParams =  if null argumentKeys then " function without parameters" else prms <> " function"
+-    in JSON.object [
++  toJSON (NoRpc schema procName argumentKeys hasPreferSingleObject contentType isInvPost)  =
++    let prms = "(" <> T.intercalate ", " argumentKeys <> ")" in JSON.object [
+     "code"    .= SchemaCacheErrorCode02,
+-    "message" .= ("Could not find the " <> func <>
++    "message" .= ("Could not find the " <> schema <> "." <> procName <>
+       (case (hasPreferSingleObject, isInvPost, contentType) of
+         (True, _, _)                 -> " function with a single json or jsonb parameter"
+         (_, True, MTTextPlain)       -> " function with a single unnamed text parameter"
+         (_, True, MTTextXML)         -> " function with a single unnamed xml parameter"
+         (_, True, MTOctetStream)     -> " function with a single unnamed bytea parameter"
+-        (_, True, MTApplicationJSON) -> fmtParams <> " or the " <> func <>" function with a single unnamed json or jsonb parameter"
+-        _                            -> fmtParams) <>
++        (_, True, MTApplicationJSON) -> prms <> " function or the " <> schema <> "." <> procName <>" function with a single unnamed json or jsonb parameter"
++        _                            -> prms <> " function") <>
+       " in the schema cache"),
+     "details" .= JSON.Null,
+-    -- The hint will be null in the case of single unnamed parameter functions
+-    "hint"    .= if hasPreferSingleObject || (isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream])
+-                 then Nothing
+-                 else noRpcHint schema procName argumentKeys allProcs overloadedProcs ]
++    "hint"    .= ("If a new function was created in the database with this name and parameters, try reloading the schema cache." :: Text)]
+   toJSON (AmbiguousRpc procs)  = JSON.object [
+     "code"    .= SchemaCacheErrorCode03,
+     "message" .= ("Could not choose the best candidate function between: " <> T.intercalate ", " [pdSchema p <> "." <> pdName p <> "(" <> T.intercalate ", " [ppName a <> " => " <> ppType a | a <- pdParams p] <> ")" | p <- procs]),
+     "details" .= JSON.Null,
+     "hint"    .= ("Try renaming the parameters or the function itself in the database so function overloading can be resolved" :: Text)]
+ 
+--- |
+--- If no function is found with the given name, it does a fuzzy search to all the functions
+--- in the same schema and shows the best match as hint.
+---
+--- >>> :set -Wno-missing-fields
+--- >>> let procs = [(QualifiedIdentifier "api" "test"), (QualifiedIdentifier "api" "another"), (QualifiedIdentifier "private" "other")]
+---
+--- >>> noRpcHint "api" "testt" ["val", "param", "name"] procs []
+--- Just "Perhaps you meant to call the function api.test"
+---
+--- >>> noRpcHint "api" "other" [] procs []
+--- Just "Perhaps you meant to call the function api.another"
+---
+--- >>> noRpcHint "api" "noclosealternative" [] procs []
+--- Nothing
+---
+--- If a function is found with the given name, but no params match, then it does a fuzzy search
+--- to all the overloaded functions' params using the form "param1, param2, param3, ..."
+--- and shows the best match as hint.
+---
+--- >>> let procsDesc = [ProcDescription {pdParams = [ProcParam {ppName="val"}, ProcParam {ppName="param"}, ProcParam {ppName="name"}]}, ProcDescription {pdParams = [ProcParam {ppName="id"}, ProcParam {ppName="attr"}]}]
+---
+--- >>> noRpcHint "api" "test" ["vall", "pqaram", "nam"] procs procsDesc
+--- Just "Perhaps you meant to call the function api.test(name, param, val)"
+---
+--- >>> noRpcHint "api" "test" ["val", "param"] procs procsDesc
+--- Just "Perhaps you meant to call the function api.test(name, param, val)"
+---
+--- >>> noRpcHint "api" "test" ["id", "attrs"] procs procsDesc
+--- Just "Perhaps you meant to call the function api.test(attr, id)"
+---
+--- >>> noRpcHint "api" "test" ["id"] procs procsDesc
+--- Just "Perhaps you meant to call the function api.test(attr, id)"
+---
+--- >>> noRpcHint "api" "test" ["noclosealternative"] procs procsDesc
+--- Nothing
+---
+-noRpcHint :: Text -> Text -> [Text] -> [QualifiedIdentifier] -> [ProcDescription] -> Maybe Text
+-noRpcHint schema procName params allProcs overloadedProcs =
+-  fmap (("Perhaps you meant to call the function " <> schema <> ".") <>) possibleProcs
+-  where
+-    fuzzySetOfProcs  = Fuzzy.fromList [qiName k | k <- allProcs, qiSchema k == schema]
+-    fuzzySetOfParams = Fuzzy.fromList $ listToText <$> [[ppName prm | prm <- pdParams ov] | ov <- overloadedProcs]
+-    -- Cannot do a fuzzy search like: Fuzzy.getOne [[Text]] [Text], where [[Text]] is the list of params for each
+-    -- overloaded function and [Text] the given params. This converts those lists to text to make fuzzy search possible.
+-    -- E.g. ["val", "param", "name"] into "(name, param, val)"
+-    listToText       = ("(" <>) . (<> ")") . T.intercalate ", " . sort
+-    possibleProcs
+-      | null overloadedProcs = Fuzzy.getOne fuzzySetOfProcs procName
+-      | otherwise            = (procName <>) <$> Fuzzy.getOne fuzzySetOfParams (listToText params)
+-
+ compressedRel :: Relationship -> JSON.Value
+ -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+ compressedRel ComputedRelationship{} = JSON.object mempty
+diff --git a/test/doc/Main.hs b/test/doc/Main.hs
+index 818a4986..a941730c 100644
+--- a/test/doc/Main.hs
++++ b/test/doc/Main.hs
+@@ -15,5 +15,4 @@ main =
+     , "src/PostgREST/Query/SqlFragment.hs"
+     , "src/PostgREST/ApiRequest/Preferences.hs"
+     , "src/PostgREST/ApiRequest/QueryParams.hs"
+-    , "src/PostgREST/Error.hs"
+     ]
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index acb858aa..66cb1b98 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -120,36 +120,14 @@ spec actualPgVersion =
+       it "should fail with 404 on unknown proc name" $
+         get "/rpc/fake" `shouldRespondWith` 404
+ 
+-      it "should fail with 404 and hint the closest proc on unknown proc name" $
+-        get "/rpc/sayhell" `shouldRespondWith`
+-          [json| {
+-            "hint":"Perhaps you meant to call the function test.sayhello",
+-            "message":"Could not find the test.sayhell function without parameters in the schema cache",
+-            "code":"PGRST202",
+-            "details":null} |]
+-          { matchStatus  = 404
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+       it "should fail with 404 on unknown proc args" $ do
+         get "/rpc/sayhello" `shouldRespondWith` 404
+         get "/rpc/sayhello?any_arg=value" `shouldRespondWith` 404
+ 
+-      it "should fail with 404 and hint the closest args on unknown proc args" $
+-        get "/rpc/sayhello?nam=Peter" `shouldRespondWith`
+-          [json| {
+-            "hint":"Perhaps you meant to call the function test.sayhello(name)",
+-            "message":"Could not find the test.sayhello(nam) function in the schema cache",
+-            "code":"PGRST202",
+-            "details":null} |]
+-          { matchStatus  = 404
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+       it "should not ignore unknown args and fail with 404" $
+         get "/rpc/add_them?a=1&b=2&smthelse=blabla" `shouldRespondWith`
+         [json| {
+-          "hint":"Perhaps you meant to call the function test.add_them(a, b)",
++          "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+           "message":"Could not find the test.add_them(a, b, smthelse) function in the schema cache",
+           "code":"PGRST202",
+           "details":null} |]
+@@ -163,7 +141,7 @@ spec actualPgVersion =
+           [json|{}|]
+         `shouldRespondWith`
+           [json| {
+-            "hint":null,
++            "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+             "message":"Could not find the test.sayhello function with a single json or jsonb parameter in the schema cache",
+             "code":"PGRST202",
+             "details":null} |]
+@@ -174,7 +152,7 @@ spec actualPgVersion =
+       it "should fail with 404 for overloaded functions with unknown args" $ do
+         get "/rpc/overloaded?wrong_arg=value" `shouldRespondWith`
+           [json| {
+-            "hint":null,
++            "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+             "message":"Could not find the test.overloaded(wrong_arg) function in the schema cache",
+             "code":"PGRST202",
+             "details":null} |]
+@@ -183,7 +161,7 @@ spec actualPgVersion =
+           }
+         get "/rpc/overloaded?a=1&b=2&wrong_arg=value" `shouldRespondWith`
+           [json| {
+-            "hint":"Perhaps you meant to call the function test.overloaded(a, b, c)",
++            "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+             "message":"Could not find the test.overloaded(a, b, wrong_arg) function in the schema cache",
+             "code":"PGRST202",
+             "details":null} |]
+@@ -1269,7 +1247,7 @@ spec actualPgVersion =
+               [json|{"x": 1, "y": 2}|]
+             `shouldRespondWith`
+               [json|{
+-                "hint": "Perhaps you meant to call the function test.unnamed_text_param",
++                "hint": "If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+                 "message": "Could not find the test.unnamed_int_param(x, y) function or the test.unnamed_int_param function with a single unnamed json or jsonb parameter in the schema cache",
+                 "code":"PGRST202",
+                 "details":null
+@@ -1284,7 +1262,7 @@ spec actualPgVersion =
+               [str|a simple text|]
+             `shouldRespondWith`
+               [json|{
+-                "hint": null,
++                "hint": "If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+                 "message": "Could not find the test.unnamed_int_param function with a single unnamed text parameter in the schema cache",
+                 "code":"PGRST202",
+                 "details":null
+@@ -1299,7 +1277,7 @@ spec actualPgVersion =
+               [str|a simple text|]
+             `shouldRespondWith`
+               [json|{
+-                "hint": null,
++                "hint": "If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+                 "message": "Could not find the test.unnamed_int_param function with a single unnamed xml parameter in the schema cache",
+                 "code":"PGRST202",
+                 "details":null
+@@ -1315,7 +1293,7 @@ spec actualPgVersion =
+               file
+           `shouldRespondWith`
+             [json|{
+-              "hint": null,
++              "hint": "If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+               "message": "Could not find the test.unnamed_int_param function with a single unnamed bytea parameter in the schema cache",
+               "code":"PGRST202",
+               "details":null
+@@ -1375,7 +1353,7 @@ spec actualPgVersion =
+               "a,b\n1,2\n4,6\n100,200"
+             `shouldRespondWith`
+               [json| {
+-                "hint":"Perhaps you meant to call the function test.overloaded_unnamed_param(x, y)",
++                "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+                 "message":"Could not find the test.overloaded_unnamed_param(a, b) function in the schema cache",
+                 "code":"PGRST202",
+                 "details":null

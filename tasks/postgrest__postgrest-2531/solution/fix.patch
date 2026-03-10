@@ -1,0 +1,187 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fa672f0e..1760f3a8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2455, Fix embedding the same table multiple times - @steve-chavez
+  - #2518, Fix a regression when embedding views where base tables have a different column order for FK columns - @wolfgangwalther
+  - #2458, Fix a regression with the location header when inserting into views with PKs from multiple tables - @wolfgangwalther
++ - #2356, Fix a regression in openapi output with mode follow-privileges - @wolfgangwalther
++ - #2283, Fix infinite recursion when loading schema cache with self-referencing view - @wolfgangwalther
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 2e4b1dab..022a3af3 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -18,6 +18,7 @@ import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
++import qualified Data.Set                          as S
+ import qualified Data.Text.Encoding                as T
+ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL (Snippet)
+@@ -177,11 +178,12 @@ invokeQuery proc CallReadPlan{crReadPlan, crCallPlan} apiReq@ApiRequest{..} conf
+ openApiQuery :: SchemaCache -> PgVersion -> AppConfig -> Schema -> DbHandler (Maybe (TablesMap, ProcsMap, Maybe Text))
+ openApiQuery sCache pgVer AppConfig{..} tSchema =
+   lift $ case configOpenApiMode of
+-    OAFollowPriv ->
++    OAFollowPriv -> do
++      tableAccess <- SQL.statement [tSchema] (SchemaCache.accessibleTables pgVer configDbPreparedStatements)
+       Just <$> ((,,)
+-         <$> SQL.statement [tSchema] (SchemaCache.accessibleTables pgVer configDbPreparedStatements)
+-         <*> SQL.statement tSchema (SchemaCache.accessibleProcs pgVer configDbPreparedStatements)
+-         <*> SQL.statement tSchema (SchemaCache.schemaDescription configDbPreparedStatements))
++            (HM.filterWithKey (\qi _ -> S.member qi tableAccess) $ SchemaCache.dbTables sCache)
++        <$> SQL.statement tSchema (SchemaCache.accessibleProcs pgVer configDbPreparedStatements)
++        <*> SQL.statement tSchema (SchemaCache.schemaDescription configDbPreparedStatements))
+     OAIgnorePriv ->
+       Just <$> ((,,)
+             (HM.filterWithKey (\(QualifiedIdentifier sch _) _ ->  sch == tSchema) $ SchemaCache.dbTables sCache)
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index e67f1d6e..84ef9c9c 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -40,7 +40,7 @@ import Text.InterpolatedString.Perl6 (q)
+ import PostgREST.Config.Database          (pgVersionStatement)
+ import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+                                            pgVersion110)
+-import PostgREST.SchemaCache.Identifiers  (FieldName,
++import PostgREST.SchemaCache.Identifiers  (AccessSet, FieldName,
+                                            QualifiedIdentifier (..),
+                                            Schema)
+ import PostgREST.SchemaCache.Proc         (PgType (..),
+@@ -136,6 +136,14 @@ removeInternal schemas dbStruct =
+       M2M Junction{junTable} -> qiSchema junTable `notElem` schemas
+       _                      -> False
+ 
++decodeAccessibleIdentifiers :: HD.Result AccessSet
++decodeAccessibleIdentifiers =
++ S.fromList <$> HD.rowList row
++ where
++  row = QualifiedIdentifier
++    <$> column HD.text
++    <*> column HD.text
++
+ decodeTables :: HD.Result TablesMap
+ decodeTables =
+  HM.fromList . map (\tbl@Table{tableSchema, tableName} -> (QualifiedIdentifier tableSchema tableName, tbl)) <$> HD.rowList tblRow
+@@ -331,11 +339,27 @@ schemaDescription =
+       where
+         n.nspname = $1 |]
+ 
+-accessibleTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
++accessibleTables :: PgVersion -> Bool -> SQL.Statement [Schema] AccessSet
+ accessibleTables pgVer =
+-  SQL.Statement sql (arrayParam HE.text) decodeTables
++  SQL.Statement sql (arrayParam HE.text) decodeAccessibleIdentifiers
+  where
+-  sql = tablesSqlQuery False pgVer
++  sql = [q|
++    SELECT
++      n.nspname AS table_schema,
++      c.relname AS table_name
++    FROM pg_class c
++    JOIN pg_namespace n ON n.oid = c.relnamespace
++    WHERE c.relkind IN ('v','r','m','f','p')
++    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
++    AND n.nspname = ANY($1)
++    AND (
++      pg_has_role(c.relowner, 'USAGE')
++      or has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
++      or has_any_column_privilege(c.oid, 'SELECT, INSERT, UPDATE, REFERENCES')
++    ) |] <>
++    relIsPartition <>
++    "ORDER BY table_schema, table_name"
++  relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+ 
+ {-
+ Adds M2O and O2O relationships for views to tables, tables to views, and views to views. The example below is taken from the test fixtures, but the views names/colnames were modified.
+@@ -435,11 +459,11 @@ allTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
+ allTables pgVer =
+   SQL.Statement sql (arrayParam HE.text) decodeTables
+   where
+-    sql = tablesSqlQuery True pgVer
++    sql = tablesSqlQuery pgVer
+ 
+ -- | Gets tables with their PK cols
+-tablesSqlQuery :: Bool -> PgVersion -> SqlQuery
+-tablesSqlQuery getAll pgVer =
++tablesSqlQuery :: PgVersion -> SqlQuery
++tablesSqlQuery pgVer =
+   -- the tbl_constraints/key_col_usage CTEs are based on the standard "information_schema.table_constraints"/"information_schema.key_column_usage" views,
+   -- we cannot use those directly as they include the following privilege filter:
+   -- (pg_has_role(ss.relowner, 'USAGE'::text) OR has_column_privilege(ss.roid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'::text));
+@@ -630,16 +654,8 @@ tablesSqlQuery getAll pgVer =
+   WHERE c.relkind IN ('v','r','m','f','p')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema') |] <>
+   relIsPartition <>
+-  fltTables <>
+   "ORDER BY table_schema, table_name"
+   where
+-    fltTables = if getAll then mempty else [q|
+-      AND n.nspname = ANY($1)
+-      AND (
+-        pg_has_role(c.relowner, 'USAGE')
+-        or has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+-        or has_any_column_privilege(c.oid, 'SELECT, INSERT, UPDATE, REFERENCES')
+-      )|]
+     relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+ 
+ 
+@@ -879,8 +895,13 @@ allViewsKeyDependencies =
+           (entry->>'resorigcol')::int as resorigcol
+         from target_entries
+       ),
+-      recursion as(
+-        select r.*
++      -- CYCLE detection according to PG docs: https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CYCLE
++      -- Can be replaced with CYCLE clause once PG v13 is EOL.
++      recursion(view_id, view_schema, view_name, view_column, resorigtbl, resorigcol, is_cycle, path) as(
++        select
++          r.*,
++          false,
++          ARRAY[resorigtbl]
+         from results r
+         where view_schema = ANY ($1)
+         union all
+@@ -890,9 +911,12 @@ allViewsKeyDependencies =
+           view.view_name,
+           view.view_column,
+           tab.resorigtbl,
+-          tab.resorigcol
++          tab.resorigcol,
++          tab.resorigtbl = ANY(path),
++          path || tab.resorigtbl
+         from recursion view
+         join results tab on view.resorigtbl=tab.view_id and view.resorigcol=tab.view_column
++        where not is_cycle
+       )
+       select
+         sch.nspname as table_schema,
+diff --git a/src/PostgREST/SchemaCache/Identifiers.hs b/src/PostgREST/SchemaCache/Identifiers.hs
+index 1992b42b..a1eee39a 100644
+--- a/src/PostgREST/SchemaCache/Identifiers.hs
++++ b/src/PostgREST/SchemaCache/Identifiers.hs
+@@ -6,11 +6,13 @@ module PostgREST.SchemaCache.Identifiers
+   , Schema
+   , TableName
+   , FieldName
++  , AccessSet
+   , dumpQi
+   , toQi
+   ) where
+ 
+ import qualified Data.Aeson as JSON
++import qualified Data.Set   as S
+ import qualified Data.Text  as T
+ 
+ import Protolude
+@@ -40,3 +42,5 @@ toQi txt = case T.drop 1 <$> T.breakOn "." txt of
+ type Schema = Text
+ type TableName = Text
+ type FieldName = Text
++
++type AccessSet = S.Set QualifiedIdentifier

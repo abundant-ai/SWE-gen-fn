@@ -1,0 +1,266 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bad4f519..d763b67a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2647, Allow to verify the PostgREST version in SQL: `select distinct application_name from pg_stat_activity`. - @laurenceisla
+  - #2856, Add the `--version` CLI option that prints the version information - @laurenceisla
+  - #1655, Improve `details` field of the singular error response - @taimoorzaeem
++ - #740, Add `Preference-Applied` in response for `Prefer: return=representation/headers-only/minimal` - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 302d7a00..b0846b2f 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -41,7 +41,7 @@ import Protolude
+ data Preferences
+   = Preferences
+     { preferResolution     :: Maybe PreferResolution
+-    , preferRepresentation :: PreferRepresentation
++    , preferRepresentation :: Maybe PreferRepresentation
+     , preferParameters     :: Maybe PreferParameters
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+@@ -56,7 +56,7 @@ data Preferences
+ -- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates, count=exact")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+---     , preferRepresentation = None
++--     , preferRepresentation = Nothing
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+@@ -68,7 +68,7 @@ data Preferences
+ -- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+---     , preferRepresentation = None
++--     , preferRepresentation = Nothing
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+@@ -100,7 +100,7 @@ data Preferences
+ -- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
+ -- Preferences
+ --     { preferResolution = Nothing
+---     , preferRepresentation = Full
++--     , preferRepresentation = Just Full
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+@@ -110,12 +110,12 @@ data Preferences
+ fromHeaders :: [HTTP.Header] -> Preferences
+ fromHeaders headers =
+   Preferences
+-    { preferResolution = parsePrefs [MergeDuplicates, IgnoreDuplicates]
+-    , preferRepresentation = fromMaybe None $ parsePrefs [Full, None, HeadersOnly]
+-    , preferParameters = parsePrefs [SingleObject]
+-    , preferCount = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+-    , preferTransaction = parsePrefs [Commit, Rollback]
+-    , preferMissing = parsePrefs [ApplyDefaults, ApplyNulls]
++    { preferResolution     = parsePrefs [MergeDuplicates, IgnoreDuplicates]
++    , preferRepresentation = parsePrefs [Full, None, HeadersOnly]
++    , preferParameters     = parsePrefs [SingleObject]
++    , preferCount          = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
++    , preferTransaction    = parsePrefs [Commit, Rollback]
++    , preferMissing        = parsePrefs [ApplyDefaults, ApplyNulls]
+     }
+   where
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+@@ -168,6 +168,8 @@ data PreferRepresentation
+   | None        -- ^ Return nothing from the mutated data.
+   deriving Eq
+ 
++instance ToAppliedHeader PreferRepresentation
++
+ instance ToHeaderValue PreferRepresentation where
+   toHeaderValue Full        = "return=representation"
+   toHeaderValue None        = "return=minimal"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a3586771..4c805ef9 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -722,7 +722,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+     returnings =
+-      if preferRepresentation == None
++      if preferRepresentation == Just None || isNothing preferRepresentation
+         then []
+         else inferColsEmbedNeeds readReq pkCols
+     tbl = HM.lookup qi dbTables
+@@ -866,7 +866,7 @@ mediaToAggregate mt binField apiReq@ApiRequest{iAction=act, iPreferences=Prefere
+     MTPlan media      _ _ -> mediaToAggregate media binField apiReq
+   where
+     noAgg = case act of
+-      ActionMutate _         -> rep == HeadersOnly || rep == None
++      ActionMutate _         -> rep == Just HeadersOnly || rep == Just None || isNothing rep
+       ActionRead _isHead     -> _isHead -- no need for an aggregate on HEAD https://github.com/PostgREST/postgrest/issues/2849
+       ActionInvoke invMethod -> invMethod == InvHead
+       _                      -> False
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 4fc2b768..634568fb 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -54,7 +54,7 @@ data ResultSet
+ 
+ 
+ prepareWrite :: SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> ResultAggregate ->
+-                PreferRepresentation -> [Text] -> Bool -> SQL.Statement () ResultSet
++                Maybe PreferRepresentation -> [Text] -> Bool -> SQL.Statement () ResultSet
+ prepareWrite selectQuery mutateQuery isInsert mt rAgg rep pKeys =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+  where
+@@ -70,7 +70,7 @@ prepareWrite selectQuery mutateQuery isInsert mt rAgg rep pKeys =
+     "FROM (" <> selectF <> ") _postgrest_t"
+ 
+   locF =
+-    if isInsert && rep == HeadersOnly
++    if isInsert && rep == Just HeadersOnly
+       then
+         "CASE WHEN pg_catalog.count(_postgrest_t) = 1 " <>
+           "THEN coalesce(" <> locationF pKeys <> ", " <> noLocationF <> ") " <>
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 39e084ec..160cb183 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -1,3 +1,7 @@
++{- |
++   Module      : PostgREST.Response
++   Description : Generate HTTP Response
++-}
+ {-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Response
+@@ -14,6 +18,8 @@ module PostgREST.Response
+   , addRetryHint
+   , isServiceUnavailable
+   , optionalRollback
++  , concatPrefAppsHeaders
++  , addPrefToHeaders
+   , traceHeaderMiddleware
+   ) where
+ 
+@@ -60,6 +66,7 @@ import qualified PostgREST.SchemaCache.Routine as Routine
+ import Protolude      hiding (Handler, toS)
+ import Protolude.Conv (toS)
+ 
++
+ readResponse :: Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
+ readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard{..} -> do
+@@ -111,14 +118,17 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+           , toAppliedHeader <$> preferMissing
+           ]
+ 
+-    if preferRepresentation == Full then
+-      response HTTP.status201 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+-    else
+-      response HTTP.status201 headers mempty
++    case preferRepresentation of
++      Just Full -> response HTTP.status201 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
++      Just None -> response HTTP.status201 (addPrefToHeaders headers None) mempty
++      Just HeadersOnly -> response HTTP.status201 (addPrefToHeaders headers HeadersOnly) mempty
++      Nothing -> response HTTP.status201 headers mempty
++
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+ 
++
+ updateResponse :: ApiRequest -> ResultSet -> Wai.Response
+ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard{..} -> do
+@@ -129,12 +139,11 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+       headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferMissing]
+ 
+-    if preferRepresentation == Full then
+-        response HTTP.status200
+-          (headers ++ contentTypeHeaders ctxApiRequest)
++    case preferRepresentation of
++        Just Full -> response HTTP.status200 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest)
+           (LBS.fromStrict rsBody)
+-      else
+-        response HTTP.status204 headers mempty
++        Just None -> response HTTP.status204 (addPrefToHeaders headers None) mempty
++        _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -145,10 +154,10 @@ singleUpsertResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resu
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+ 
+-    if preferRepresentation == Full then
+-      response HTTP.status200 (contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+-    else
+-      response HTTP.status204 [] mempty
++    case preferRepresentation of
++      Just Full -> response HTTP.status200 (contentTypeHeaders ctxApiRequest ++ [toAppliedHeader Full]) (LBS.fromStrict rsBody)
++      Just None -> response HTTP.status204 [toAppliedHeader None] mempty
++      _ -> response HTTP.status204 [] mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -163,12 +172,11 @@ deleteResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+       headers = [contentRangeHeader]
+ 
+-    if preferRepresentation == Full then
+-        response HTTP.status200
+-          (headers ++ contentTypeHeaders ctxApiRequest)
++    case preferRepresentation of
++        Just Full -> response HTTP.status200 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest)
+           (LBS.fromStrict rsBody)
+-      else
+-        response HTTP.status204 headers mempty
++        Just None -> response HTTP.status204 (addPrefToHeaders headers None) mempty
++        _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -292,9 +300,40 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} resp = d
+ -- | Add headers not already included to allow the user to override them instead of duplicating them
+ addHeadersIfNotIncluded :: [HTTP.Header] -> [HTTP.Header] -> [HTTP.Header]
+ addHeadersIfNotIncluded newHeaders initialHeaders =
+-  filter (\(nk, _) -> isNothing $ find (\(ik, _) -> ik == nk) initialHeaders) newHeaders ++
++  filter (\(nk, nv) -> isNothing $ find (\(ik, iv) -> ik == nk && nv == iv) initialHeaders) newHeaders ++
+   initialHeaders
+ 
++-- |  Filters out multiple Preference-Applied Headers from the list and concatenate them into a single Preference-Applied header:
++--
++-- >>> :{
++--  concatPrefAppsHeaders
++--     [("Content-Type","application/json")
++--     , ("Preference-Applied","tx=commit")
++--     , ("Preference-Applied","return=minimal")]
++-- :}
++-- [("Content-Type","application/json"),("Preference-Applied","tx=commit, return=minimal")]
++
++concatPrefAppsHeaders :: [HTTP.Header] -> [HTTP.Header]
++concatPrefAppsHeaders headers = otherHeaders ++ [(HTTP.hPreferenceApplied, combinedPrefApps)]
++  where
++  (prefApps, otherHeaders) = L.partition (\(k, _) -> k == HTTP.hPreferenceApplied) headers
++  prefAppsValues = [ v | (_,v) <- prefApps]
++  combinedPrefApps = BS.intercalate ", " prefAppsValues
++
++-- | Given response headers and a preferRepresentation value, add
++--   preferRepresentation to Preference-Applied
++--
++-- >>> :{
++--  addPrefToHeaders
++--      [("Content-Type", "application/json")
++--      , ("Preference-Applied", "tx=commit")]
++--      None
++-- :}
++-- [("Content-Type","application/json"),("Preference-Applied","tx=commit, return=minimal")]
++
++addPrefToHeaders :: [HTTP.Header] -> PreferRepresentation -> [HTTP.Header]
++addPrefToHeaders headers pref = concatPrefAppsHeaders (headers ++ [toAppliedHeader pref])
++
+ traceHeaderMiddleware :: AppConfig -> Wai.Middleware
+ traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
+   case configServerTraceHeader of

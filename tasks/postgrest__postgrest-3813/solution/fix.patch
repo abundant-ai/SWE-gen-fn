@@ -1,0 +1,306 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4141eb97..2e767eef 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
+  - #3560, Log resolved host in "Listening on ..." messages - @develop7
+  - #3727, Log maximum pool size - @steve-chavez
++ - #1536, Add string comparison feature for jwt-role-claim-key - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/postgrest.dict b/docs/postgrest.dict
+index ded55e89..78fefd3e 100644
+--- a/docs/postgrest.dict
++++ b/docs/postgrest.dict
+@@ -27,10 +27,12 @@ CSV
+ durations
+ DDL
+ DOM
++DSL
+ DevOps
+ dockerize
+ enum
+ Enums
++Entra
+ eq
+ ETH
+ Ethereum
+@@ -68,9 +70,11 @@ isdistinct
+ JS
+ js
+ JSON
++JSPath
+ JWK
+ JWT
+ jwt
++Keycloak
+ Kubernetes
+ localhost
+ login
+@@ -94,10 +98,11 @@ npm
+ nxl
+ nxr
+ OAuth
++ORM
+ Observability
++Okta
+ OpenAPI
+ openapi
+-ORM
+ ov
+ parametrized
+ passphrase
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index 2610c20a..cbfbd522 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -161,6 +161,43 @@ JWT Claims Validation
+ 
+ PostgREST honors the :code:`exp` claim for token expiration, rejecting expired tokens.
+ 
++.. _jwt_role_claim_key_extract:
++
++JWT Role Claim Key Extraction
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++A JSPath DSL that specifies the location of the :code:`role` key in the JWT claims. This can be used to consume a JWT provided by a third party service like Auth0, Okta, Microsoft Entra or Keycloak.
++
++The DSL follows the `JSONPath <https://goessner.net/articles/JsonPath/>`_ expression grammar with extended string comparison operators. Supported operators are:
++
++- ``==`` selects the first array element that exactly matches the right operand
++- ``!=`` selects the first array element that does not match the right operand
++- ``^==`` selects the first array element that starts with the right operand
++- ``==^`` selects the first array element that ends with the right operand
++- ``*==`` selects the first array element that contains the right operand
++
++Usage examples:
++
++  .. code:: bash
++
++    # {"postgrest":{"roles": ["other", "author"]}}
++    # the DSL accepts characters that are alphanumerical or one of "_$@" as keys
++    jwt-role-claim-key = ".postgrest.roles[1]"
++
++    # {"https://www.example.com/role": { "key": "author" }}
++    # non-alphanumerical characters can go inside quotes(escaped in the config value)
++    jwt-role-claim-key = ".\"https://www.example.com/role\".key"
++
++    # {"postgrest":{"roles": ["other", "author"]}}
++    # `@` represents the current element in the array
++    # all the these match the string "author"
++    jwt-role-claim-key = ".postgrest.roles[?(@ == \"author\")]"
++    jwt-role-claim-key = ".postgrest.roles[?(@ != \"other\")]"
++    jwt-role-claim-key = ".postgrest.roles[?(@ ^== \"aut\")]"
++    jwt-role-claim-key = ".postgrest.roles[?(@ ==^ \"hor\")]"
++    jwt-role-claim-key = ".postgrest.roles[?(@ *== \"utho\")]"
++
++
+ JWT Security
+ ~~~~~~~~~~~~
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 4237d55b..3d6c1d2b 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -620,17 +620,7 @@ jwt-role-claim-key
+ 
+   *For backwards compatibility, this config parameter is also available without prefix as "role-claim-key".*
+ 
+-  A JSPath DSL that specifies the location of the :code:`role` key in the JWT claims. This can be used to consume a JWT provided by a third party service like Auth0, Okta or Keycloak. Usage examples:
+-
+-  .. code:: bash
+-
+-    # {"postgrest":{"roles": ["other", "author"]}}
+-    # the DSL accepts characters that are alphanumerical or one of "_$@" as keys
+-    jwt-role-claim-key = ".postgrest.roles[1]"
+-
+-    # {"https://www.example.com/role": { "key": "author }}
+-    # non-alphanumerical characters can go inside quotes(escaped in the config value)
+-    jwt-role-claim-key = ".\"https://www.example.com/role\".key"
++  See :ref:`jwt_role_claim_key_extract` on how to specify key paths and usage examples.
+ 
+ .. _jwt-secret:
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 46afa801..c8c3b720 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -27,6 +27,7 @@ import qualified Data.ByteString                 as BS
+ import qualified Data.ByteString.Lazy.Char8      as LBS
+ import qualified Data.Cache                      as C
+ import qualified Data.Scientific                 as Sci
++import qualified Data.Text                       as T
+ import qualified Data.Vault.Lazy                 as Vault
+ import qualified Data.Vector                     as V
+ import qualified Jose.Jwk                        as JWT
+@@ -46,7 +47,8 @@ import System.TimeIt           (timeItT)
+ 
+ import PostgREST.AppState (AppState, AuthResult (..), getConfig,
+                            getJwtCache, getTime)
+-import PostgREST.Config   (AppConfig (..), JSPath, JSPathExp (..))
++import PostgREST.Config   (AppConfig (..), FilterExp (..), JSPath,
++                           JSPathExp (..))
+ import PostgREST.Error    (Error (..))
+ 
+ import Protolude
+@@ -121,8 +123,20 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+     walkJSPath x                      []                = x
+     walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (KM.lookup (K.fromText key) o) rest
+     walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
++    walkJSPath (Just (JSON.Array ar)) [JSPFilter (EqualsCond txt)] = findFirstMatch (==) txt ar
++    walkJSPath (Just (JSON.Array ar)) [JSPFilter (NotEqualsCond txt)] = findFirstMatch (/=) txt ar
++    walkJSPath (Just (JSON.Array ar)) [JSPFilter (StartsWithCond txt)] = findFirstMatch T.isPrefixOf txt ar
++    walkJSPath (Just (JSON.Array ar)) [JSPFilter (EndsWithCond txt)] = findFirstMatch T.isSuffixOf txt ar
++    walkJSPath (Just (JSON.Array ar)) [JSPFilter (ContainsCond txt)] = findFirstMatch T.isInfixOf txt ar
+     walkJSPath _                      _                 = Nothing
+ 
++    findFirstMatch matchWith pattern = foldr checkMatch Nothing
++      where
++        checkMatch (JSON.String txt) acc
++            | pattern `matchWith` txt = Just $ JSON.String txt
++            | otherwise = acc
++        checkMatch _ acc = acc
++
+     unquoted :: JSON.Value -> BS.ByteString
+     unquoted (JSON.String t) = encodeUtf8 t
+     unquoted v               = LBS.toStrict $ JSON.encode v
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 57276ef6..8f90f2b1 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -15,6 +15,7 @@ module PostgREST.Config
+   , Environment
+   , JSPath
+   , JSPathExp(..)
++  , FilterExp(..)
+   , LogLevel(..)
+   , OpenAPIMode(..)
+   , Proxy(..)
+@@ -54,8 +55,9 @@ import System.Posix.Types      (FileMode)
+ 
+ import PostgREST.Config.Database         (RoleIsolationLvl,
+                                           RoleSettings)
+-import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
+-                                          dumpJSPath, pRoleClaimKey)
++import PostgREST.Config.JSPath           (FilterExp (..), JSPath,
++                                          JSPathExp (..), dumpJSPath,
++                                          pRoleClaimKey)
+ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier, dumpQi,
+diff --git a/src/PostgREST/Config/JSPath.hs b/src/PostgREST/Config/JSPath.hs
+index 97405654..a0b2dadc 100644
+--- a/src/PostgREST/Config/JSPath.hs
++++ b/src/PostgREST/Config/JSPath.hs
+@@ -1,6 +1,8 @@
++{-# OPTIONS_GHC -Wno-unused-do-bind #-}
+ module PostgREST.Config.JSPath
+   ( JSPath
+   , JSPathExp(..)
++  , FilterExp(..)
+   , dumpJSPath
+   , pRoleClaimKey
+   ) where
+@@ -14,18 +16,37 @@ import Text.Read                     (read)
+ import Protolude
+ 
+ 
+--- | full jspath, e.g. .property[0].attr.detail
++-- | full jspath, e.g. .property[0].attr.detail[?(@ == "role1")]
+ type JSPath = [JSPathExp]
+ 
+--- | jspath expression, e.g. .property, .property[0] or ."property-dash"
++-- NOTE: We only accept one JSPFilter expr (at the end of input)
++-- | jspath expression
+ data JSPathExp
+-  = JSPKey Text
+-  | JSPIdx Int
++  = JSPKey Text         -- .property or ."property-dash"
++  | JSPIdx Int          -- [0]
++  | JSPFilter FilterExp -- [?(@ == "match")]
++
++data FilterExp
++  = EqualsCond Text
++  | NotEqualsCond Text
++  | StartsWithCond Text
++  | EndsWithCond Text
++  | ContainsCond Text
+ 
+ dumpJSPath :: JSPathExp -> Text
+ -- TODO: this needs to be quoted properly for special chars
+ dumpJSPath (JSPKey k) = "." <> show k
+ dumpJSPath (JSPIdx i) = "[" <> show i <> "]"
++dumpJSPath (JSPFilter cond) = "[?(@" <> expr <> ")]"
++  where
++    expr =
++      case cond of
++        EqualsCond text     -> " == " <> show text
++        NotEqualsCond text  -> " != " <> show text
++        StartsWithCond text -> " ^== " <> show text
++        EndsWithCond text   -> " ==^ " <> show text
++        ContainsCond text   -> " *== " <> show text
++
+ 
+ -- Used for the config value "role-claim-key"
+ pRoleClaimKey :: Text -> Either Text JSPath
+@@ -33,19 +54,47 @@ pRoleClaimKey selStr =
+   mapLeft show $ P.parse pJSPath ("failed to parse role-claim-key value (" <> toS selStr <> ")") (toS selStr)
+ 
+ pJSPath :: P.Parser JSPath
+-pJSPath = toJSPath <$> (period *> pPath `P.sepBy` period <* P.eof)
+-  where
+-    toJSPath :: [(Text, Maybe Int)] -> JSPath
+-    toJSPath = concatMap (\(key, idx) -> JSPKey key : maybeToList (JSPIdx <$> idx))
+-    period = P.char '.' <?> "period (.)"
+-    pPath :: P.Parser (Text, Maybe Int)
+-    pPath = (,) <$> pJSPKey <*> P.optionMaybe pJSPIdx
++pJSPath = P.many1 pJSPathExp <* P.eof
++
++pJSPathExp :: P.Parser JSPathExp
++pJSPathExp = pJSPKey <|> pJSPFilter <|> pJSPIdx
++
++pJSPKey :: P.Parser JSPathExp
++pJSPKey = do
++  P.char '.'
++  val <- toS <$> P.many1 (P.alphaNum <|> P.oneOf "_$@") <|> pQuotedValue
++  return (JSPKey val) <?> "pJSPKey: JSPath attribute key"
++
++pJSPIdx :: P.Parser JSPathExp
++pJSPIdx = do
++  P.char '['
++  num <- read <$> P.many1 P.digit
++  P.char ']'
++  return (JSPIdx num) <?> "pJSPIdx: JSPath array index"
+ 
+-pJSPKey :: P.Parser Text
+-pJSPKey = toS <$> P.many1 (P.alphaNum <|> P.oneOf "_$@") <|> pQuotedValue <?> "attribute name [a..z0..9_$@])"
++pJSPFilter :: P.Parser JSPathExp
++pJSPFilter = do
++  P.try $ P.string "[?("
++  condition <- pFilterConditionParser
++  P.char ')'
++  P.char ']'
++  P.eof -- this should be the last jspath expression
++  return (JSPFilter condition) <?> "pJSPFilter: JSPath filter exp"
+ 
+-pJSPIdx :: P.Parser Int
+-pJSPIdx = P.char '[' *> (read <$> P.many1 P.digit) <* P.char ']' <?> "array index [0..n]"
++pFilterConditionParser :: P.Parser FilterExp
++pFilterConditionParser = do
++  P.char '@'
++  P.spaces
++  filt <- matchOperator
++  P.spaces
++  filt <$> pQuotedValue
++    where
++      matchOperator =
++        P.try (P.string "==^" $> EndsWithCond)
++        <|> P.try (P.string "==" $> EqualsCond)
++        <|> P.try (P.string "!=" $> NotEqualsCond)
++        <|> P.try (P.string "^==" $> StartsWithCond)
++        <|> P.try (P.string "*==" $> ContainsCond)
+ 
+ pQuotedValue :: P.Parser Text
+ pQuotedValue = toS <$> (P.char '"' *> P.many (P.noneOf "\"") <* P.char '"')

@@ -1,0 +1,827 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 996cf661..ba82806b 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -53,7 +53,6 @@ library
+                       PostgREST.Error
+                       PostgREST.GucHeader
+                       PostgREST.Logger
+-                      PostgREST.Middleware
+                       PostgREST.MediaType
+                       PostgREST.Query
+                       PostgREST.Query.QueryBuilder
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index d2f0290b..1861ee3b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -26,7 +26,6 @@ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
+ import System.Posix.Types       (FileMode)
+ 
+-import qualified Data.HashMap.Strict        as HM
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.Wai                as Wai
+ import qualified Network.Wai.Handler.Warp   as Warp
+@@ -37,47 +36,26 @@ import qualified PostgREST.Auth               as Auth
+ import qualified PostgREST.Cors               as Cors
+ import qualified PostgREST.Error              as Error
+ import qualified PostgREST.Logger             as Logger
+-import qualified PostgREST.Middleware         as Middleware
+ import qualified PostgREST.Plan               as Plan
+ import qualified PostgREST.Query              as Query
+ import qualified PostgREST.Request.ApiRequest as ApiRequest
+ import qualified PostgREST.Request.Types      as ApiRequestTypes
+ import qualified PostgREST.Response           as Response
+ 
+-import PostgREST.AppState                (AppState)
+-import PostgREST.Auth                    (AuthResult (..))
+-import PostgREST.Config                  (AppConfig (..),
+-                                          LogLevel (..))
+-import PostgREST.Config.PgVersion        (PgVersion (..))
+-import PostgREST.DbStructure             (DbStructure (..))
+-import PostgREST.DbStructure.Identifiers (FieldName,
+-                                          QualifiedIdentifier (..),
+-                                          Schema)
+-import PostgREST.DbStructure.Proc        (ProcDescription (..))
+-import PostgREST.DbStructure.Table       (Table (..))
+-import PostgREST.Error                   (Error)
+-import PostgREST.Plan.MutatePlan         (MutatePlan)
+-import PostgREST.Plan.ReadPlan           (ReadPlanTree)
+-import PostgREST.Query                   (DbHandler)
+-import PostgREST.Request.ApiRequest      (Action (..),
+-                                          ApiRequest (..),
+-                                          InvokeMethod (..),
+-                                          Mutation (..), Target (..))
+-import PostgREST.Request.Preferences     (PreferRepresentation (..))
+-import PostgREST.Version                 (prettyVersion)
+-import PostgREST.Workers                 (connectionWorker, listener)
+-
+-import qualified PostgREST.DbStructure.Proc as Proc
++import PostgREST.AppState           (AppState)
++import PostgREST.Auth               (AuthResult (..))
++import PostgREST.Config             (AppConfig (..), LogLevel (..))
++import PostgREST.Config.PgVersion   (PgVersion (..))
++import PostgREST.DbStructure        (DbStructure (..))
++import PostgREST.Error              (Error)
++import PostgREST.Query              (DbHandler)
++import PostgREST.Request.ApiRequest (Action (..), ApiRequest (..),
++                                     Mutation (..), Target (..))
++import PostgREST.Version            (prettyVersion)
++import PostgREST.Workers            (connectionWorker, listener)
+ 
+ import Protolude hiding (Handler)
+ 
+-data RequestContext = RequestContext
+-  { ctxConfig      :: AppConfig
+-  , ctxDbStructure :: DbStructure
+-  , ctxApiRequest  :: ApiRequest
+-  , ctxPgVersion   :: PgVersion
+-  }
+-
+ type Handler = ExceptT Error
+ 
+ type SignalHandlerInstaller = AppState -> IO()
+@@ -163,7 +141,7 @@ postgrestResponse
+   -> AuthResult
+   -> Wai.Request
+   -> Handler IO Wai.Response
+-postgrestResponse appState conf@AppConfig{..} maybeDbStructure jsonDbS pgVer AuthResult{..} req = do
++postgrestResponse appState conf@AppConfig{..} maybeDbStructure jsonDbS pgVer authResult@AuthResult{..} req = do
+   dbStructure <-
+     case maybeDbStructure of
+       Just dbStructure ->
+@@ -177,15 +155,8 @@ postgrestResponse appState conf@AppConfig{..} maybeDbStructure jsonDbS pgVer Aut
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf dbStructure req body
+ 
+-  let ctx apiReq = RequestContext conf dbStructure apiReq pgVer
+-
+-  if iAction apiRequest == ActionInfo then
+-    pure $ Response.infoResponse (iTarget apiRequest) dbStructure
+-  else
+-    runDbHandler appState (Query.txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
+-      Middleware.optionalRollback conf apiRequest $ do
+-        Query.setPgLocals conf authClaims authRole apiRequest jsonDbS pgVer
+-        handleRequest (ctx apiRequest)
++  Response.optionalRollback conf apiRequest $
++    handleRequest authResult conf appState (Query.txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements jsonDbS pgVer apiRequest dbStructure
+ 
+ runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState mode authenticated prepared handler = do
+@@ -199,97 +170,52 @@ runDbHandler appState mode authenticated prepared handler = do
+ 
+   liftEither resp
+ 
+-handleRequest :: RequestContext -> DbHandler Wai.Response
+-handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
++handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> SQL.Mode -> Bool -> Bool -> ByteString -> PgVersion -> ApiRequest -> DbStructure -> Handler IO Wai.Response
++handleRequest AuthResult{..} conf appState mode authenticated prepared jsonDbS pgVer apiReq@ApiRequest{..} dbStructure =
+   case (iAction, iTarget) of
+-    (ActionRead headersOnly, TargetIdent identifier) ->
+-      handleRead headersOnly identifier context
+-    (ActionMutate MutationCreate, TargetIdent identifier) ->
+-      handleCreate identifier context
+-    (ActionMutate MutationUpdate, TargetIdent identifier) ->
+-      handleUpdate identifier context
+-    (ActionMutate MutationSingleUpsert, TargetIdent identifier) ->
+-      handleSingleUpsert identifier context
+-    (ActionMutate MutationDelete, TargetIdent identifier) ->
+-      handleDelete identifier context
+-    (ActionInvoke invMethod, TargetProc proc _) ->
+-      handleInvoke invMethod proc context
+-    (ActionInspect headersOnly, TargetDefaultSpec tSchema) ->
+-      handleOpenApi headersOnly tSchema context
++    (ActionRead headersOnly, TargetIdent identifier) -> do
++      rPlan <- liftEither $ Plan.readPlan identifier conf dbStructure apiReq
++      resultSet <- runQuery $ Query.readQuery rPlan conf apiReq
++      return $ Response.readResponse headersOnly identifier apiReq resultSet
++
++    (ActionMutate MutationCreate, TargetIdent identifier) -> do
++      mrPlan <- liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf dbStructure
++      resultSet <- runQuery $ Query.createQuery mrPlan apiReq conf
++      return $ Response.createResponse identifier mrPlan apiReq resultSet
++
++    (ActionMutate MutationUpdate, TargetIdent identifier) -> do
++      mrPlan <- liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf dbStructure
++      resultSet <- runQuery $ Query.updateQuery mrPlan apiReq conf
++      return $ Response.updateResponse apiReq resultSet
++
++    (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
++      mrPlan <- liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf dbStructure
++      resultSet <- runQuery $ Query.singleUpsertQuery mrPlan apiReq conf
++      return $ Response.singleUpsertResponse apiReq resultSet
++
++    (ActionMutate MutationDelete, TargetIdent identifier) -> do
++      mrPlan <- liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf dbStructure
++      resultSet <- runQuery $ Query.deleteQuery mrPlan apiReq conf
++      return $ Response.deleteResponse apiReq resultSet
++
++    (ActionInvoke invMethod, TargetProc proc _) -> do
++      cPlan <- liftEither $ Plan.callReadPlan proc conf dbStructure apiReq
++      resultSet <- runQuery $ Query.invokeQuery proc cPlan apiReq conf
++      return $ Response.invokeResponse invMethod proc apiReq resultSet
++
++    (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
++      oaiResult <- runQuery $ Query.openApiQuery dbStructure pgVer conf tSchema
++      return $ Response.openApiResponse headersOnly oaiResult conf dbStructure iSchema iNegotiatedByProfile
++
++    (ActionInfo, _) ->
++      return $ Response.infoResponse iTarget dbStructure
++
+     _ ->
+       -- This is unreachable as the ApiRequest.hs rejects it before
+       -- TODO Refactor the Action/Target types to remove this line
+       throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+-
+-handleRead :: Bool -> QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleRead headersOnly identifier context@RequestContext{..} = do
+-  req <- liftEither $ readPlan identifier context
+-
+-  (resultSet, total) <- Query.readQuery req ctxConfig ctxApiRequest
+-
+-  pure $ Response.readResponse headersOnly identifier ctxApiRequest total resultSet
+-
+-handleCreate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleCreate identifier context@RequestContext{..} = do
+-  let
+-    ApiRequest{..} = ctxApiRequest
+-    pkCols = if iPreferRepresentation /= None || isJust iPreferResolution
+-      then maybe mempty tablePKCols $ HM.lookup identifier $ dbTables ctxDbStructure
+-      else mempty
+-
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationCreate identifier context pkCols
+-
+-  resultSet <- Query.createQuery mutateReq readReq pkCols ctxApiRequest ctxConfig
+-
+-  pure $ Response.createResponse identifier pkCols ctxApiRequest resultSet
+-
+-handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@(RequestContext ctxConfig _ ctxApiRequest _) = do
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationUpdate identifier context mempty
+-  resultSet <- Query.updateQuery mutateReq readReq ctxApiRequest ctxConfig
+-  pure $ Response.updateResponse ctxApiRequest resultSet
+-
+-handleSingleUpsert :: QualifiedIdentifier -> RequestContext-> DbHandler Wai.Response
+-handleSingleUpsert identifier context@(RequestContext ctxConfig ctxDbStructure ctxApiRequest _) = do
+-  let pkCols = maybe mempty tablePKCols $ HM.lookup identifier $ dbTables ctxDbStructure
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationSingleUpsert identifier context pkCols
+-  resultSet <- Query.singleUpsertQuery mutateReq readReq ctxApiRequest ctxConfig
+-  pure $ Response.singleUpsertResponse ctxApiRequest resultSet
+-
+-handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleDelete identifier context@(RequestContext ctxConfig _ ctxApiRequest _) = do
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationDelete identifier context mempty
+-  resultSet <- Query.deleteQuery mutateReq readReq ctxApiRequest ctxConfig
+-  pure $ Response.deleteResponse ctxApiRequest resultSet
+-
+-handleInvoke :: InvokeMethod -> ProcDescription -> RequestContext -> DbHandler Wai.Response
+-handleInvoke invMethod proc context@RequestContext{..} = do
+-  let
+-    identifier =
+-      QualifiedIdentifier
+-        (pdSchema proc)
+-        (fromMaybe (pdName proc) $ Proc.procTableName proc)
+-
+-  readReq <- liftEither $ readPlan identifier context
+-  let callReq = Plan.callPlan proc ctxApiRequest readReq
+-
+-  resultSet <- Query.invokeQuery proc callReq readReq ctxApiRequest ctxConfig
+-
+-  pure $ Response.invokeResponse invMethod proc ctxApiRequest resultSet
+-
+-handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+-handleOpenApi headersOnly tSchema (RequestContext conf dbStructure apiRequest pgVer) = do
+-  oaiResult <- Query.openApiQuery dbStructure pgVer conf tSchema
+-  pure $ Response.openApiResponse headersOnly oaiResult conf dbStructure (iSchema apiRequest) (iNegotiatedByProfile apiRequest)
+-
+-mutatePlan :: Mutation -> QualifiedIdentifier -> RequestContext -> [FieldName] -> Either Error (MutatePlan, ReadPlanTree)
+-mutatePlan mutation identifier@QualifiedIdentifier{..} context@RequestContext{..} pkCols = do
+-  readReq <- readPlan identifier context
+-  mutateReq <- Plan.mutatePlan mutation qiSchema qiName ctxApiRequest pkCols readReq
+-  pure (mutateReq, readReq)
+-
+-readPlan :: QualifiedIdentifier -> RequestContext -> Either Error ReadPlanTree
+-readPlan QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
+-  Plan.readPlan qiSchema qiName configDbMaxRows
+-    (dbRelationships dbStructure)
+-    apiRequest
++  where
++    runQuery query =
++      runDbHandler appState mode authenticated prepared $ do
++        Query.setPgLocals conf authClaims authRole apiReq jsonDbS pgVer
++        query
+diff --git a/src/PostgREST/Middleware.hs b/src/PostgREST/Middleware.hs
+deleted file mode 100644
+index 858ea74e..00000000
+--- a/src/PostgREST/Middleware.hs
++++ /dev/null
+@@ -1,50 +0,0 @@
+-{-|
+-Module      : PostgREST.Middleware
+-Description : Sets CORS policy. Also the PostgreSQL GUCs, role, search_path and pre-request function.
+--}
+-{-# LANGUAGE BlockArguments  #-}
+-{-# LANGUAGE RecordWildCards #-}
+-module PostgREST.Middleware
+-  ( optionalRollback
+-  ) where
+-
+-import qualified Hasql.Transaction as SQL
+-import qualified Network.Wai       as Wai
+-
+-
+-import PostgREST.Config             (AppConfig (..))
+-import PostgREST.Error              (Error, errorResponseFor)
+-import PostgREST.GucHeader          (addHeadersIfNotIncluded)
+-import PostgREST.Request.ApiRequest (ApiRequest (..))
+-
+-import PostgREST.Request.Preferences
+-
+-import Protolude
+-
+--- | Set a transaction to eventually roll back if requested and set respective
+--- headers on the response.
+-optionalRollback
+-  :: AppConfig
+-  -> ApiRequest
+-  -> ExceptT Error SQL.Transaction Wai.Response
+-  -> ExceptT Error SQL.Transaction Wai.Response
+-optionalRollback AppConfig{..} ApiRequest{..} transaction = do
+-  resp <- catchError transaction $ return . errorResponseFor
+-  when (shouldRollback || (configDbTxRollbackAll && not shouldCommit)) $ lift do
+-    SQL.sql "SET CONSTRAINTS ALL IMMEDIATE"
+-    SQL.condemn
+-  return $ Wai.mapResponseHeaders preferenceApplied resp
+-  where
+-    shouldCommit =
+-      configDbTxAllowOverride && iPreferTransaction == Just Commit
+-    shouldRollback =
+-      configDbTxAllowOverride && iPreferTransaction == Just Rollback
+-    preferenceApplied
+-      | shouldCommit =
+-          addHeadersIfNotIncluded
+-            [toAppliedHeader Commit]
+-      | shouldRollback =
+-          addHeadersIfNotIncluded
+-            [toAppliedHeader Rollback]
+-      | otherwise =
+-          identity
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index a9cd76fd..b05a903d 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -17,20 +17,25 @@ resource.
+ 
+ module PostgREST.Plan
+   ( readPlan
+-  , mutatePlan
+-  , callPlan
++  , mutateReadPlan
++  , callReadPlan
++  , MutateReadPlan(..)
++  , CallReadPlan(..)
+   ) where
+ 
+-import qualified Data.HashMap.Strict as HM
+-import qualified Data.Set            as S
++import qualified Data.HashMap.Strict        as HM
++import qualified Data.Set                   as S
++import qualified PostgREST.DbStructure.Proc as Proc
+ 
+ import Data.Either.Combinators (mapLeft)
+ import Data.List               (delete)
+ import Data.Tree               (Tree (..))
+ 
++import PostgREST.Config                   (AppConfig (..))
++import PostgREST.DbStructure              (DbStructure (..))
+ import PostgREST.DbStructure.Identifiers  (FieldName,
+                                            QualifiedIdentifier (..),
+-                                           Schema, TableName)
++                                           Schema)
+ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+                                            ProcParam (..),
+                                            procReturnsScalar)
+@@ -38,6 +43,7 @@ import PostgREST.DbStructure.Relationship (Cardinality (..),
+                                            Junction (..),
+                                            Relationship (..),
+                                            RelationshipsMap)
++import PostgREST.DbStructure.Table        (tablePKCols)
+ import PostgREST.Error                    (Error (..))
+ import PostgREST.Query.SqlFragment        (sourceCTEName)
+ import PostgREST.RangeQuery               (NonnegRange, allRange,
+@@ -50,7 +56,8 @@ import PostgREST.Request.ApiRequest       (Action (..),
+ 
+ import PostgREST.Plan.CallPlan
+ import PostgREST.Plan.MutatePlan
+-import PostgREST.Plan.ReadPlan       as ReadPlan
++import PostgREST.Plan.ReadPlan   as ReadPlan
++
+ import PostgREST.Request.Preferences
+ import PostgREST.Request.Types
+ 
+@@ -58,14 +65,37 @@ import qualified PostgREST.Request.QueryParams as QueryParams
+ 
+ import Protolude hiding (from)
+ 
++data MutateReadPlan = MutateReadPlan {
++  mrReadPlan   :: ReadPlanTree
++, mrMutatePlan :: MutatePlan
++}
++
++data CallReadPlan = CallReadPlan {
++  crReadPlan :: ReadPlanTree
++, crCallPlan :: CallPlan
++}
++
++mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> DbStructure -> Either Error MutateReadPlan
++mutateReadPlan  mutation apiRequest identifier conf dbStructure = do
++  rPlan <- readPlan identifier conf dbStructure apiRequest
++  mPlan <- mutatePlan mutation identifier apiRequest dbStructure rPlan
++  return $ MutateReadPlan rPlan mPlan
++
++callReadPlan :: ProcDescription -> AppConfig -> DbStructure -> ApiRequest -> Either Error CallReadPlan
++callReadPlan proc conf dbStructure apiRequest = do
++  let identifier = QualifiedIdentifier (pdSchema proc) (fromMaybe (pdName proc) $ Proc.procTableName proc)
++  rPlan <- readPlan identifier conf dbStructure apiRequest
++  let cPlan = callPlan proc apiRequest rPlan
++  return $ CallReadPlan rPlan cPlan
++
+ -- | Builds the ReadPlan tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+-readPlan :: Schema -> TableName -> Maybe Integer -> RelationshipsMap -> ApiRequest -> Either Error ReadPlanTree
+-readPlan schema rootTableName maxRows allRels apiRequest  =
++readPlan :: QualifiedIdentifier -> AppConfig -> DbStructure -> ApiRequest -> Either Error ReadPlanTree
++readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} DbStructure{dbRelationships} apiRequest  =
+   mapLeft ApiRequestError $
+-  treeRestrictRange maxRows (iAction apiRequest) =<<
+-  augmentRequestWithJoin schema allRels =<<
++  treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
++  augmentRequestWithJoin qiSchema dbRelationships =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+   addOrders apiRequest =<<
+@@ -73,9 +103,9 @@ readPlan schema rootTableName maxRows allRels apiRequest  =
+   where
+     QueryParams.QueryParams{..} = iQueryParams apiRequest
+     (rootName, rootAlias) = case iAction apiRequest of
+-      ActionRead _ -> (QualifiedIdentifier schema rootTableName, Nothing)
++      ActionRead _ -> (qi, Nothing)
+       -- the CTE we use for non-read cases has a sourceCTEName(see Statements.hs) as the WITH name so we use the table name as an alias so findRel can find the right relationship
+-      _ -> (QualifiedIdentifier mempty $ decodeUtf8 sourceCTEName, Just rootTableName)
++      _ -> (QualifiedIdentifier mempty $ decodeUtf8 sourceCTEName, Just qiName)
+ 
+ -- Build the initial tree with a Depth attribute so when a self join occurs we
+ -- can differentiate the parent and child tables by having an alias like
+@@ -305,11 +335,11 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+     findNode :: Maybe ReadPlanTree
+     findNode = find (\(Node ReadPlan{nodeName, nodeAlias} _) -> nodeName == targetNodeName || nodeAlias == Just targetNodeName) forest
+ 
+-mutatePlan :: Mutation -> Schema -> TableName -> ApiRequest -> [FieldName] -> ReadPlanTree -> Either Error MutatePlan
+-mutatePlan mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
++mutatePlan :: Mutation -> QualifiedIdentifier -> ApiRequest -> DbStructure -> ReadPlanTree -> Either Error MutatePlan
++mutatePlan mutation qi ApiRequest{..} dbStructure readReq = mapLeft ApiRequestError $
+   case mutation of
+     MutationCreate ->
+-      Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
++      Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings pkCols
+     MutationUpdate -> Right $ Update qi iColumns body combinedLogic iTopLevelRange rootOrder returnings
+     MutationSingleUpsert ->
+         if null qsLogic &&
+@@ -318,18 +348,18 @@ mutatePlan mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequ
+            all (\case
+               Filter _ (OpExpr False (Op OpEqual _)) -> True
+               _                                      -> False) qsFiltersRoot
+-          then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
++          then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings mempty
+         else
+           Left InvalidFilters
+     MutationDelete -> Right $ Delete qi combinedLogic iTopLevelRange rootOrder returnings
+   where
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+-    qi = QualifiedIdentifier schema tName
+     returnings =
+       if iPreferRepresentation == None
+         then []
+         else returningCols readReq pkCols
++    pkCols = maybe mempty tablePKCols $ HM.lookup qi $ dbTables dbStructure
+     logic = map snd qsLogic
+     rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+     combinedLogic = foldr addFilterToLogicForest logic qsFiltersRoot
+diff --git a/src/PostgREST/Plan/MutatePlan.hs b/src/PostgREST/Plan/MutatePlan.hs
+index 395dd95f..1f935581 100644
+--- a/src/PostgREST/Plan/MutatePlan.hs
++++ b/src/PostgREST/Plan/MutatePlan.hs
+@@ -22,6 +22,7 @@ data MutatePlan
+       , onConflict :: Maybe (PreferResolution, [FieldName])
+       , where_     :: [LogicTree]
+       , returning  :: [FieldName]
++      , insPkCols  :: [FieldName]
+       }
+   | Update
+       { in_       :: QualifiedIdentifier
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 3d27e40d..c6c55b2a 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -1,3 +1,4 @@
++{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Query
+   ( createQuery
+@@ -38,8 +39,7 @@ import PostgREST.Config                  (AppConfig (..),
+ import PostgREST.Config.PgVersion        (PgVersion (..),
+                                           pgVersion140)
+ import PostgREST.DbStructure             (DbStructure (..))
+-import PostgREST.DbStructure.Identifiers (FieldName,
+-                                          QualifiedIdentifier (..),
++import PostgREST.DbStructure.Identifiers (QualifiedIdentifier (..),
+                                           Schema)
+ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+                                           ProcVolatility (..),
+@@ -47,8 +47,9 @@ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+ import PostgREST.DbStructure.Table       (TablesMap)
+ import PostgREST.Error                   (Error)
+ import PostgREST.MediaType               (MediaType (..))
+-import PostgREST.Plan.CallPlan           (CallPlan)
+-import PostgREST.Plan.MutatePlan         (MutatePlan)
++import PostgREST.Plan                    (CallReadPlan (..),
++                                          MutateReadPlan (..))
++import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Plan.ReadPlan           (ReadPlanTree)
+ import PostgREST.Query.SqlFragment       (fromQi, intercalateSnippet,
+                                           pgFmtIdentList,
+@@ -61,13 +62,14 @@ import PostgREST.Request.ApiRequest      (Action (..),
+                                           Target (..))
+ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferParameters (..),
++                                          PreferTransaction (..),
+                                           shouldCount)
+ 
+ import Protolude hiding (Handler)
+ 
+ type DbHandler = ExceptT Error SQL.Transaction
+ 
+-readQuery :: ReadPlanTree -> AppConfig -> ApiRequest -> DbHandler (ResultSet, Maybe Int64)
++readQuery :: ReadPlanTree -> AppConfig -> ApiRequest -> DbHandler ResultSet
+ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+   let countQuery = QueryBuilder.readPlanToCountQuery req
+   resultSet <-
+@@ -85,44 +87,51 @@ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+         iBinaryField
+         configDbPreparedStatements
+   failNotSingular iAcceptMediaType resultSet
+-  total <- readTotal conf apiReq resultSet countQuery
+-  pure (resultSet, total)
++  optionalRollback conf apiReq
++  resultSetWTotal conf apiReq resultSet countQuery
+ 
+-readTotal :: AppConfig -> ApiRequest -> ResultSet -> SQL.Snippet -> DbHandler (Maybe Int64)
+-readTotal _ _ RSPlan{} _ = pure Nothing
+-readTotal AppConfig{..} ApiRequest{..} RSStandard{rsTableTotal=tableTotal} countQuery =
++resultSetWTotal :: AppConfig -> ApiRequest -> ResultSet -> SQL.Snippet -> DbHandler ResultSet
++resultSetWTotal _ _ rs@RSPlan{} _ = return rs
++resultSetWTotal AppConfig{..} ApiRequest{..} rs@RSStandard{rsTableTotal=tableTotal} countQuery =
+   case iPreferCount of
+-    Just PlannedCount ->
+-      explain
++    Just PlannedCount -> do
++      total <- explain
++      return rs{rsTableTotal=total}
+     Just EstimatedCount ->
+-      if tableTotal > (fromIntegral <$> configDbMaxRows) then
+-        max tableTotal <$> explain
++      if tableTotal > (fromIntegral <$> configDbMaxRows) then do
++        total <- max tableTotal <$> explain
++        return rs{rsTableTotal=total}
+       else
+-        return tableTotal
+-    _ ->
+-      return tableTotal
++        return rs
++    Just ExactCount ->
++      return rs
++    Nothing ->
++      return rs
+   where
+     explain =
+       lift . SQL.statement mempty . Statements.preparePlanRows countQuery $
+         configDbPreparedStatements
+ 
+-createQuery :: MutatePlan -> ReadPlanTree -> [FieldName] -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-createQuery mutateReq readReq pkCols apiReq@ApiRequest{..} conf = do
+-  resultSet <- writeQuery mutateReq readReq True pkCols apiReq conf
++createQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++createQuery mrPlan apiReq@ApiRequest{..} conf = do
++  resultSet <- writeQuery mrPlan apiReq conf
+   failNotSingular iAcceptMediaType resultSet
++  optionalRollback conf apiReq
+   pure resultSet
+ 
+-updateQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-updateQuery mutateReq readReq apiReq@ApiRequest{..} conf = do
+-  resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
++updateQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++updateQuery mrPlan apiReq@ApiRequest{..} conf = do
++  resultSet <- writeQuery mrPlan apiReq conf
+   failNotSingular iAcceptMediaType resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
++  optionalRollback conf apiReq
+   pure resultSet
+ 
+-singleUpsertQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-singleUpsertQuery mutateReq readReq apiReq conf = do
+-  resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
++singleUpsertQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++singleUpsertQuery mrPlan apiReq conf = do
++  resultSet <- writeQuery mrPlan apiReq conf
+   failPut resultSet
++  optionalRollback conf apiReq
+   pure resultSet
+ 
+ -- Makes sure the querystring pk matches the payload pk
+@@ -137,29 +146,31 @@ failPut RSStandard{rsQueryTotal=queryTotal} =
+     lift SQL.condemn
+     throwError Error.PutMatchingPkError
+ 
+-deleteQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-deleteQuery mutateReq readReq apiReq@ApiRequest{..} conf = do
+-  resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
++deleteQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++deleteQuery mrPlan apiReq@ApiRequest{..} conf = do
++  resultSet <- writeQuery mrPlan apiReq conf
+   failNotSingular iAcceptMediaType resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
++  optionalRollback conf apiReq
+   pure resultSet
+ 
+-invokeQuery :: ProcDescription -> CallPlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
+-invokeQuery proc callReq readReq ApiRequest{..} AppConfig{..} = do
++invokeQuery :: ProcDescription -> CallReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
++invokeQuery proc CallReadPlan{crReadPlan, crCallPlan} apiReq@ApiRequest{..} conf@AppConfig{..} = do
+   resultSet <-
+     lift . SQL.statement mempty $
+       Statements.prepareCall
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingle proc)
+-        (QueryBuilder.callPlanToQuery callReq)
+-        (QueryBuilder.readPlanToQuery readReq)
+-        (QueryBuilder.readPlanToCountQuery readReq)
++        (QueryBuilder.callPlanToQuery crCallPlan)
++        (QueryBuilder.readPlanToQuery crReadPlan)
++        (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount iPreferCount)
+         iAcceptMediaType
+         (iPreferParameters == Just MultipleObjects)
+         iBinaryField
+         configDbPreparedStatements
+ 
++  optionalRollback conf apiReq
+   failNotSingular iAcceptMediaType resultSet
+   pure resultSet
+ 
+@@ -197,12 +208,15 @@ txMode ApiRequest{..} =
+     _ ->
+       SQL.Write
+ 
+-writeQuery :: MutatePlan -> ReadPlanTree -> Bool -> [Text] -> ApiRequest -> AppConfig  -> DbHandler ResultSet
+-writeQuery mutateReq readReq isInsert pkCols apiReq conf = do
++writeQuery :: MutateReadPlan -> ApiRequest -> AppConfig  -> DbHandler ResultSet
++writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq conf =
++  let
++    (isInsert, pkCols) = case mrMutatePlan of {Insert{insPkCols} -> (True, insPkCols); _ -> (False, mempty);}
++  in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+-      (QueryBuilder.readPlanToQuery readReq)
+-      (QueryBuilder.mutatePlanToQuery mutateReq)
++      (QueryBuilder.readPlanToQuery mrReadPlan)
++      (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+       (iAcceptMediaType apiReq)
+       (iPreferRepresentation apiReq)
+@@ -227,6 +241,18 @@ failsChangesOffLimits (Just maxChanges) RSStandard{rsQueryTotal=queryTotal} =
+     lift SQL.condemn
+     throwError $ Error.OffLimitsChangesError queryTotal maxChanges
+ 
++-- | Set a transaction to roll back if requested
++optionalRollback :: AppConfig -> ApiRequest -> DbHandler ()
++optionalRollback AppConfig{..} ApiRequest{..} = do
++  lift $ when (shouldRollback || (configDbTxRollbackAll && not shouldCommit)) $ do
++    SQL.sql "SET CONSTRAINTS ALL IMMEDIATE"
++    SQL.condemn
++  where
++    shouldCommit =
++      configDbTxAllowOverride && iPreferTransaction == Just Commit
++    shouldRollback =
++      configDbTxAllowOverride && iPreferTransaction == Just Rollback
++
+ -- | Runs local(transaction scoped) GUCs for every request, plus the pre-request function
+ setPgLocals :: AppConfig   -> KM.KeyMap JSON.Value -> Text ->
+                ApiRequest  -> ByteString -> PgVersion -> DbHandler ()
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 286993bb..20090faa 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -84,7 +84,7 @@ getSelectsJoins rr@(Node ReadPlan{nodeName=name, nodeRel=Just rel, nodeAlias=ali
+   (sel:selects, joi:joins)
+ 
+ mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+-mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
++mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _) =
+   "WITH " <> normalizedBody body <> " " <>
+   "INSERT INTO " <> SQL.sql (fromQi mainQi) <> SQL.sql (if S.null iCols then " " else "(" <> cols <> ") ") <>
+   "SELECT " <> SQL.sql cols <> " " <>
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index aea0d23c..737181f2 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -1,3 +1,4 @@
++{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Response
+   ( createResponse
+@@ -10,6 +11,7 @@ module PostgREST.Response
+   , updateResponse
+   , addRetryHint
+   , isServiceUnavailable
++  , optionalRollback
+   ) where
+ 
+ import qualified Data.Aeson                as JSON
+@@ -30,8 +32,7 @@ import qualified PostgREST.Response.OpenAPI as OpenAPI
+ 
+ import PostgREST.Config                  (AppConfig (..))
+ import PostgREST.DbStructure             (DbStructure (..))
+-import PostgREST.DbStructure.Identifiers (FieldName,
+-                                          QualifiedIdentifier (..),
++import PostgREST.DbStructure.Identifiers (QualifiedIdentifier (..),
+                                           Schema)
+ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+                                           ProcVolatility (..),
+@@ -41,11 +42,14 @@ import PostgREST.GucHeader               (GucHeader,
+                                           addHeadersIfNotIncluded,
+                                           unwrapGucHeader)
+ import PostgREST.MediaType               (MediaType (..))
++import PostgREST.Plan                    (MutateReadPlan (..))
++import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Query.Statements        (ResultSet (..))
+ import PostgREST.Request.ApiRequest      (ApiRequest (..),
+                                           InvokeMethod (..),
+                                           Target (..))
+ import PostgREST.Request.Preferences     (PreferRepresentation (..),
++                                          PreferTransaction (..),
+                                           shouldCount,
+                                           toAppliedHeader)
+ import PostgREST.Request.QueryParams     (QueryParams (..))
+@@ -56,12 +60,11 @@ import qualified PostgREST.Request.Types    as ApiRequestTypes
+ import Protolude      hiding (Handler, toS)
+ import Protolude.Conv (toS)
+ 
+-
+-readResponse :: Bool -> QualifiedIdentifier -> ApiRequest -> Maybe Int64 -> ResultSet -> Wai.Response
+-readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} total resultSet = case resultSet of
++readResponse :: Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
++readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+-      (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal total
++      (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+       response = gucResponse rsGucStatus rsGucHeaders
+       headers =
+         [ contentRange
+@@ -74,7 +77,7 @@ readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} total resultSet
+         ++ contentTypeHeaders ctxApiRequest
+       rsOrErrBody = if status == HTTP.status416
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+-          $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show total)
++          $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+ 
+     response status headers $ if headersOnly then mempty else rsOrErrBody
+@@ -82,10 +85,11 @@ readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} total resultSet
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+ 
+-createResponse :: QualifiedIdentifier -> [FieldName] -> ApiRequest -> ResultSet -> Wai.Response
+-createResponse QualifiedIdentifier{..} pkCols ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
++createResponse :: QualifiedIdentifier -> MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
++      pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+       response = gucResponse rsGucStatus rsGucHeaders
+       headers =
+         catMaybes
+@@ -128,11 +132,12 @@ updateResponse ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+       contentRangeHeader =
+         RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount iPreferCount then Just rsQueryTotal else Nothing
++      headers = [contentRangeHeader]
+ 
+     if fullRepr then
+-        response status (contentTypeHeaders ctxApiRequest ++ [contentRangeHeader]) (LBS.fromStrict rsBody)
++        response status (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+       else
+-        response status [contentRangeHeader] mempty
++        response status headers mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -159,13 +164,14 @@ deleteResponse ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+       contentRangeHeader =
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount iPreferCount then Just rsQueryTotal else Nothing
++      headers = [contentRangeHeader]
+ 
+     if iPreferRepresentation == Full then
+         response HTTP.status200
+-          (contentTypeHeaders ctxApiRequest ++ [contentRangeHeader])
++          (headers ++ contentTypeHeaders ctxApiRequest)
+           (LBS.fromStrict rsBody)
+       else
+-        response HTTP.status204 [contentRangeHeader] mempty
++        response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -204,12 +210,13 @@ invokeResponse invMethod proc ctxApiRequest@ApiRequest{..} resultSet = case resu
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
++      headers = [contentRange]
+ 
+     if Proc.procReturnsVoid proc then
+-        response HTTP.status204 [contentRange] mempty
++        response HTTP.status204 headers mempty
+       else
+         response status
+-          (contentTypeHeaders ctxApiRequest ++ [contentRange])
++          (headers ++ contentTypeHeaders ctxApiRequest)
+           (if invMethod == InvHead then mempty else rsOrErrBody)
+ 
+   RSPlan plan ->
+@@ -261,3 +268,22 @@ addRetryHint delay response = do
+ 
+ isServiceUnavailable :: Wai.Response -> Bool
+ isServiceUnavailable response = Wai.responseStatus response == HTTP.status503
++
++optionalRollback :: AppConfig -> ApiRequest -> ExceptT Error.Error IO Wai.Response -> ExceptT Error.Error IO Wai.Response
++optionalRollback AppConfig{..} ApiRequest{..} resp = do
++  newRes <- catchError resp $ return . Error.errorResponseFor
++  return $ Wai.mapResponseHeaders preferenceApplied newRes
++  where
++    shouldCommit =
++      configDbTxAllowOverride && iPreferTransaction == Just Commit
++    shouldRollback =
++      configDbTxAllowOverride && iPreferTransaction == Just Rollback
++    preferenceApplied
++      | shouldCommit =
++          addHeadersIfNotIncluded
++            [toAppliedHeader Commit]
++      | shouldRollback =
++          addHeadersIfNotIncluded
++            [toAppliedHeader Rollback]
++      | otherwise =
++          identity

@@ -1,0 +1,171 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ac819c31..a318b21e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Added
++
++ - #2786, Limit idle postgresql connection lifetime - @robx
++   + New option `db-pool-max-idletime` (default 30s).
++   + This is equivalent to the old option `db-pool-timeout`
++     of PostgREST 10.0.0.
++
+ ## [11.0.1] - 2023-04-27
+ 
+ ### Fixed
+diff --git a/nix/overlays/haskell-packages.nix b/nix/overlays/haskell-packages.nix
+index f650278e..c08a1a49 100644
+--- a/nix/overlays/haskell-packages.nix
++++ b/nix/overlays/haskell-packages.nix
+@@ -43,8 +43,8 @@ let
+         (prev.callHackageDirect
+           {
+             pkg = "hasql-notifications";
+-            ver = "0.2.0.4";
+-            sha256 = "sha256-fm1xiDyvDkb5WLOJ73/s8wrWEW23XFS7luAv2brfr8I=";
++            ver = "0.2.0.5";
++            sha256 = "sha256-KV36zs/RTgJh/oBBPZaNiQshusmakWnjYTcdoNa4JLA=";
+           }
+           { });
+ 
+@@ -52,8 +52,8 @@ let
+         (prev.callHackageDirect
+           {
+             pkg = "hasql-pool";
+-            ver = "0.9";
+-            sha256 = "sha256-5UshbbaBVY8eJ/9VagNVVxonRwMcd7UmGqDc35pJNFY=";
++            ver = "0.10";
++            sha256 = "sha256-kHzoqtNV9BFWnn1h560JRqMooQRwxokVKgDRBexamNI=";
+           }
+           { });
+     } // extraOverrides final prev;
+diff --git a/postgrest.cabal b/postgrest.cabal
+index b7e505c9..74371655 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -91,7 +91,7 @@ library
+                     , hasql                     >= 1.6.1.1 && < 1.7
+                     , hasql-dynamic-statements  >= 0.3.1 && < 0.4
+                     , hasql-notifications       >= 0.1 && < 0.3
+-                    , hasql-pool                >= 0.9 && < 0.10
++                    , hasql-pool                >= 0.10 && < 0.11
+                     , hasql-transaction         >= 1.0.1 && < 1.1
+                     , heredoc                   >= 0.2 && < 0.3
+                     , http-types                >= 0.12.2 && < 0.13
+@@ -232,7 +232,7 @@ test-suite spec
+                     , bytestring        >= 0.10.8 && < 0.12
+                     , case-insensitive  >= 1.2 && < 1.3
+                     , containers        >= 0.5.7 && < 0.7
+-                    , hasql-pool        >= 0.9 && < 0.10
++                    , hasql-pool        >= 0.10 && < 0.11
+                     , hasql-transaction >= 1.0.1 && < 1.1
+                     , heredoc           >= 0.2 && < 0.3
+                     , hspec             >= 2.3 && < 2.10
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 93372a94..950440db 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -115,6 +115,7 @@ initPool AppConfig{..} =
+     configDbPoolSize
+     (fromIntegral configDbPoolAcquisitionTimeout)
+     (fromIntegral configDbPoolMaxLifetime)
++    (fromIntegral configDbPoolMaxIdletime)
+     (toUtf8 configDbUri)
+ 
+ -- | Run an action with a database connection.
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 3443cd3a..57fcf27c 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -154,6 +154,9 @@ exampleConfigFile =
+       |## Time in seconds after which to recycle pool connections
+       |# db-pool-max-lifetime = 1800
+       |
++      |## Time in seconds after which to recycle unused pool connections
++      |# db-pool-max-idletime = 30
++      |
+       |## Stored proc to exec immediately after auth
+       |# db-pre-request = "stored_proc_name"
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 18e9825a..438dc6c4 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -74,6 +74,7 @@ data AppConfig = AppConfig
+   , configDbPoolSize               :: Int
+   , configDbPoolAcquisitionTimeout :: Int
+   , configDbPoolMaxLifetime        :: Int
++  , configDbPoolMaxIdletime        :: Int
+   , configDbPreRequest             :: Maybe QualifiedIdentifier
+   , configDbPreparedStatements     :: Bool
+   , configDbRootSpec               :: Maybe QualifiedIdentifier
+@@ -137,6 +138,7 @@ toText conf =
+       ,("db-pool",                       show . configDbPoolSize)
+       ,("db-pool-acquisition-timeout",   show . configDbPoolAcquisitionTimeout)
+       ,("db-pool-max-lifetime",          show . configDbPoolMaxLifetime)
++      ,("db-pool-max-idletime",          show . configDbPoolMaxIdletime)
+       ,("db-pre-request",            q . maybe mempty dumpQi . configDbPreRequest)
+       ,("db-prepared-statements",        T.toLower . show . configDbPreparedStatements)
+       ,("db-root-spec",              q . maybe mempty dumpQi . configDbRootSpec)
+@@ -228,6 +230,7 @@ parser optPath env dbSettings roleSettings =
+     <*> (fromMaybe 10 <$> optInt "db-pool")
+     <*> (fromMaybe 10 <$> optInt "db-pool-acquisition-timeout")
+     <*> (fromMaybe 1800 <$> optInt "db-pool-max-lifetime")
++    <*> (fromMaybe 30 <$> optInt "db-pool-max-idletime")
+     <*> (fmap toQi <$> optWithAlias (optString "db-pre-request")
+                                     (optString "pre-request"))
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")
+@@ -366,7 +369,7 @@ parser optPath env dbSettings roleSettings =
+           if dbSettingName `notElem` [
+             "server_host", "server_port", "server_unix_socket", "server_unix_socket_mode", "admin_server_port", "log_level",
+             "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_acquisition_timeout",
+-            "db_pool_max_lifetime", "db_config"]
++            "db_pool_max_lifetime", "db_pool_max_idletime", "db_config"]
+           then lookup dbSettingName dbSettings
+           else Nothing
+ 
+diff --git a/stack.yaml b/stack.yaml
+index f54257a8..0b768154 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -12,5 +12,5 @@ nix:
+ extra-deps:
+   - git: https://github.com/PostgREST/postgresql-libpq.git
+     commit: 890a0a16cf57dd401420fdc6c7d576fb696003bc
+-  - hasql-notifications-0.2.0.4
+-  - hasql-pool-0.9
++  - hasql-notifications-0.2.0.5
++  - hasql-pool-0.10
+diff --git a/stack.yaml.lock b/stack.yaml.lock
+index ef9eadf4..a5ffc139 100644
+--- a/stack.yaml.lock
++++ b/stack.yaml.lock
+@@ -16,19 +16,19 @@ packages:
+     commit: 890a0a16cf57dd401420fdc6c7d576fb696003bc
+     git: https://github.com/PostgREST/postgresql-libpq.git
+ - completed:
+-    hackage: hasql-notifications-0.2.0.4@sha256:9a09fa9b97feadd9492c8bd8bc6b9cffe0513510102f08374b0c45ecd479ed67,2028
++    hackage: hasql-notifications-0.2.0.5@sha256:6c67d2ee42e948162e89176a2f52a2c6bb562678b33688e96e048be9b3d74122,2028
+     pantry-tree:
+-      sha256: 56f9e240728e7a65711dde45fa2e2075b914e32cd370424aaa4572392378a60e
++      sha256: 8493755b0817a36b910a37d568769ca49ab715ef5dd935a0d09f0716aa39da51
+       size: 452
+   original:
+-    hackage: hasql-notifications-0.2.0.4
++    hackage: hasql-notifications-0.2.0.5
+ - completed:
+-    hackage: hasql-pool-0.9@sha256:db7a37f6b3a922c37adc3c7ced47a7c10786d1f171e47a735a6e812a587ba44c,2111
++    hackage: hasql-pool-0.10@sha256:912197a328acb85505f98bb9700d61f366b87659ca45126c5c2d636687b801c3,2112
+     pantry-tree:
+-      sha256: 49b1181d28c6f5317e794671c2dae155754b834bdcfa30f7e5dbad28e4cf0249
++      sha256: b655c540a49764a8d16b62941137e295b936b96edc0785eb9250972f0f92dc47
+       size: 346
+   original:
+-    hackage: hasql-pool-0.9
++    hackage: hasql-pool-0.10
+ snapshots:
+ - completed:
+     sha256: 4905c93319aa94aa53da8f41d614d7bacdbfe6c63a8c6132d32e6e62f24a9af4

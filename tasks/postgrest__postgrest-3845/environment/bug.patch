@@ -1,0 +1,827 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0b4c5b83..b6e98711 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,7 +14,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3727, Log maximum pool size - @steve-chavez
+  - #1536, Add string comparison feature for jwt-role-claim-key - @taimoorzaeem
+  - #3747, Allow `not_null` value for the `is` operator - @taimoorzaeem
+- - #2255, Apply `to_tsvector()` explicitly to the full-text search filtered column (excluding `tsvector` types) - @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/api/tables_views.rst b/docs/references/api/tables_views.rst
+index 9b433cee..519c3c0e 100644
+--- a/docs/references/api/tables_views.rst
++++ b/docs/references/api/tables_views.rst
+@@ -193,21 +193,7 @@ The :code:`fts` filter mentioned above has a number of options to support flexib
+ 
+   curl "http://localhost:3000/tsearch?my_tsv=not.wfts(french).amusant"
+ 
+-.. _fts_to_tsvector:
+-
+-Automatic ``tsvector`` conversion
+-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-
+-If the filtered column is not of type ``tsvector``, then it will be automatically converted using `to_tsvector() <https://www.postgresql.org/docs/current/functions-textsearch.html#TEXTSEARCH-FUNCTIONS-TABLE>`_.
+-This allows using ``fts`` on ``text`` and ``json`` types out of the box, for example.
+-
+-.. code-block:: bash
+-
+-  curl "http://localhost:3000/tsearch?my_text_column=fts(french).amusant"
+-
+-.. code-block:: bash
+-
+-  curl "http://localhost:3000/tsearch?my_json_column=not.phfts(english).The%20Fat%20Cats"
++Using `websearch_to_tsquery` requires PostgreSQL of version at least 11.0 and will raise an error in earlier versions of the database.
+ 
+ .. _v_filter:
+ 
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e1bdeea4..9bebcd2c 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -14,7 +14,6 @@ module PostgREST.ApiRequest.Types
+   , JsonOperand(..)
+   , JsonOperation(..)
+   , JsonPath
+-  , Language
+   , ListVal
+   , LogicOperator(..)
+   , LogicTree(..)
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 23ca5aef..3a31d72a 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -265,29 +265,27 @@ data ResolverContext = ResolverContext
+   , outputType      :: Text                 -- ^ The output type for the response payload; e.g. "csv", "json", "binary".
+   }
+ 
+-resolveColumnField :: Column -> Maybe ToTsVector -> CoercibleField
+-resolveColumnField col toTsV = CoercibleField (colName col) mempty False toTsV (colNominalType col) Nothing (colDefault col) False
++resolveColumnField :: Column -> CoercibleField
++resolveColumnField col = CoercibleField (colName col) mempty False (colNominalType col) Nothing (colDefault col) False
+ 
+-resolveTableFieldName :: Table -> FieldName -> Maybe ToTsVector -> CoercibleField
+-resolveTableFieldName table fieldName toTsV=
++resolveTableFieldName :: Table -> FieldName -> CoercibleField
++resolveTableFieldName table fieldName =
+   fromMaybe (unknownField fieldName []) $ HMI.lookup fieldName (tableColumns table) >>=
+-    Just . flip resolveColumnField toTsV
++    Just . resolveColumnField
+ 
+ -- | Resolve a type within the context based on the given field name and JSON path. Although there are situations where failure to resolve a field is considered an error (see `resolveOrError`), there are also situations where we allow it (RPC calls). If it should be an error and `resolveOrError` doesn't fit, ensure to check the `cfIRType` isn't empty.
+-resolveTypeOrUnknown :: ResolverContext -> Field -> Maybe ToTsVector -> CoercibleField
+-resolveTypeOrUnknown ResolverContext{..} (fn, jp) toTsV =
++resolveTypeOrUnknown :: ResolverContext -> Field -> CoercibleField
++resolveTypeOrUnknown ResolverContext{..} (fn, jp) =
+   case res of
+     -- types that are already json/jsonb don't need to be converted with `to_jsonb` for using arrow operators `data->attr`
+     -- this prevents indexes not applying https://github.com/PostgREST/postgrest/issues/2594
+-    cf@CoercibleField{cfIRType="json"}     -> cf{cfJsonPath=jp, cfToJson=False}
+-    cf@CoercibleField{cfIRType="jsonb"}    -> cf{cfJsonPath=jp, cfToJson=False}
+-    -- Do not apply to_tsvector to tsvector types
+-    cf@CoercibleField{cfIRType="tsvector"} -> cf{cfJsonPath=jp, cfToJson=True, cfToTsVector=Nothing}
++    cf@CoercibleField{cfIRType="json"}  -> cf{cfJsonPath=jp, cfToJson=False}
++    cf@CoercibleField{cfIRType="jsonb"} -> cf{cfJsonPath=jp, cfToJson=False}
+     -- other types will get converted `to_jsonb(col)->attr`, even unknown types
+-    cf                                     -> cf{cfJsonPath=jp, cfToJson=True}
++    cf                                  -> cf{cfJsonPath=jp, cfToJson=True}
+   where
+     res = fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
+-          Just . (\t -> resolveTableFieldName t fn toTsV)
++          Just . flip resolveTableFieldName fn
+ 
+ -- | Install any pre-defined data representation from source to target to coerce this reference.
+ --
+@@ -313,15 +311,11 @@ withJsonParse ctx field@CoercibleField{cfIRType} = withTransformer ctx "json" cf
+ 
+ -- | Map the intermediate representation type to the output type defined by the resolver context (normally json), if available.
+ resolveOutputField :: ResolverContext -> Field -> CoercibleField
+-resolveOutputField ctx field = withOutputFormat ctx $ resolveTypeOrUnknown ctx field Nothing
++resolveOutputField ctx field = withOutputFormat ctx $ resolveTypeOrUnknown ctx field
+ 
+ -- | Map the query string format of a value (text) into the intermediate representation type, if available.
+-resolveQueryInputField :: ResolverContext -> Field -> OpExpr -> CoercibleField
+-resolveQueryInputField ctx field opExpr = withTextParse ctx $ resolveTypeOrUnknown ctx field toTsVector
+-  where
+-    toTsVector = case opExpr of
+-      OpExpr _ (Fts _ lang _) -> Just $ ToTsVector lang
+-      _                       -> Nothing
++resolveQueryInputField :: ResolverContext -> Field -> CoercibleField
++resolveQueryInputField ctx field = withTextParse ctx $ resolveTypeOrUnknown ctx field
+ 
+ -- | Builds the ReadPlan tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+@@ -458,7 +452,7 @@ expandStarsForTable ctx@ResolverContext{representations, outputType} hasAgg rp@R
+ 
+     expandStarSelectField :: Bool -> [Column] -> CoercibleSelectField -> [CoercibleSelectField]
+     expandStarSelectField _ columns sel@CoercibleSelectField{csField=CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Nothing} =
+-      map (\col -> sel { csField = withOutputFormat ctx $ resolveColumnField col Nothing }) columns
++      map (\col -> sel { csField = withOutputFormat ctx $ resolveColumnField col }) columns
+     expandStarSelectField True _ sel@CoercibleSelectField{csField=fld@CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Just Count} =
+       [sel { csField = fld { cfFullRow = True } }]
+     expandStarSelectField _ _ selectField = [selectField]
+@@ -772,7 +766,7 @@ addOrders ctx ApiRequest{..} rReq =
+ 
+ resolveOrder :: ResolverContext -> OrderTerm -> CoercibleOrderTerm
+ resolveOrder _ (OrderRelationTerm a b c d) = CoercibleOrderRelationTerm a b c d
+-resolveOrder ctx (OrderTerm fld dir nulls) = CoercibleOrderTerm (resolveTypeOrUnknown ctx fld Nothing) dir nulls
++resolveOrder ctx (OrderTerm fld dir nulls) = CoercibleOrderTerm (resolveTypeOrUnknown ctx fld) dir nulls
+ 
+ -- Validates that the related resource on the order is an embedded resource,
+ -- e.g. if `clients` is inside the `select` in /projects?order=clients(id)&select=*,clients(*),
+@@ -837,7 +831,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --       where_ = [
+ --         CoercibleStmnt (
+ --           CoercibleFilter {
+---            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
++--            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
+ --            opExpr = op
+ --           }
+ --         )
+@@ -853,7 +847,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfToTsVector = Nothing, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -872,7 +866,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+     newNullFilters rPlans = \case
+       (CoercibleExpr b lOp trees) ->
+         CoercibleExpr b lOp <$> (newNullFilters rPlans `traverse` trees)
+-      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _ _) opExpr)) ->
++      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _) opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+           (Just ReadPlan{relAggAlias}, OpExpr b (Is IsNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+@@ -906,7 +900,7 @@ resolveLogicTree ctx (Stmnt flt) = CoercibleStmnt $ resolveFilter ctx flt
+ resolveLogicTree ctx (Expr b op lts) = CoercibleExpr b op (map (resolveLogicTree ctx) lts)
+ 
+ resolveFilter :: ResolverContext -> Filter -> CoercibleFilter
+-resolveFilter ctx (Filter fld opExpr) = CoercibleFilter{field=resolveQueryInputField ctx fld opExpr, opExpr=opExpr}
++resolveFilter ctx (Filter fld opExpr) = CoercibleFilter{field=resolveQueryInputField ctx fld, opExpr=opExpr}
+ 
+ -- Validates that spread embeds are only done on to-one relationships
+ validateSpreadEmbeds :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -969,7 +963,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+ resolveOrError :: ResolverContext -> Maybe Table -> FieldName -> Either ApiRequestError CoercibleField
+ resolveOrError _ Nothing _ = Left NotFound
+ resolveOrError ctx (Just table) field =
+-  case resolveTableFieldName table field Nothing of
++  case resolveTableFieldName table field of
+     CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+     cf                          -> Right $ withJsonParse ctx cf
+ 
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index afa7c60f..2d72c054 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -5,7 +5,6 @@ module PostgREST.Plan.Types
+   , CoercibleLogicTree(..)
+   , CoercibleFilter(..)
+   , TransformerProc
+-  , ToTsVector(..)
+   , CoercibleOrderTerm(..)
+   , RelSelectField(..)
+   , RelJsonEmbedMode(..)
+@@ -13,9 +12,8 @@ module PostgREST.Plan.Types
+   ) where
+ 
+ import PostgREST.ApiRequest.Types (AggregateFunction, Alias, Cast,
+-                                   Field, JsonPath, Language,
+-                                   LogicOperator, OpExpr,
+-                                   OrderDirection, OrderNulls)
++                                   Field, JsonPath, LogicOperator,
++                                   OpExpr, OrderDirection, OrderNulls)
+ 
+ import PostgREST.SchemaCache.Identifiers (FieldName)
+ 
+@@ -23,9 +21,6 @@ import Protolude
+ 
+ type TransformerProc = Text
+ 
+-newtype ToTsVector = ToTsVector (Maybe Language)
+-  deriving (Eq, Show)
+-
+ -- | A CoercibleField pairs the name of a query element with any type coercion information we need for some specific use case.
+ -- |
+ -- | As suggested by the name, it's often a reference to a field in a table but really it can be any nameable element (function parameter, calculation with an alias, etc) with a knowable type.
+@@ -38,18 +33,17 @@ newtype ToTsVector = ToTsVector (Maybe Language)
+ -- |
+ -- | The type value is allowed to be the empty string. The analog here is soft type checking in programming languages: sometimes we don't need a variable to have a specified type and things will work anyhow. So the empty type variant is valid when we don't know and *don't need to know* about the specific type in some context. Note that this variation should not be used if it guarantees failure: in that case you should instead raise an error at the planning stage and bail out. For example, we can't parse JSON with `json_to_recordset` without knowing the types of each recipient field, and so error out. Using the empty string for the type would be incorrect and futile. On the other hand we use the empty type for RPC calls since type resolution isn't implemented for RPC, but it's fine because the query still works with Postgres' implicit coercion. In the future, hopefully we will support data representations across the board and then the empty type may be permanently retired.
+ data CoercibleField = CoercibleField
+-  { cfName       :: FieldName
+-  , cfJsonPath   :: JsonPath
+-  , cfToJson     :: Bool
+-  , cfToTsVector :: Maybe ToTsVector      -- ^ If the field should be converted using to_tsvector(<language>, <field>)
+-  , cfIRType     :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
+-  , cfTransform  :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+-  , cfDefault    :: Maybe Text
+-  , cfFullRow    :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
++  { cfName      :: FieldName
++  , cfJsonPath  :: JsonPath
++  , cfToJson    :: Bool
++  , cfIRType    :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
++  , cfTransform :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
++  , cfDefault   :: Maybe Text
++  , cfFullRow   :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
+   } deriving (Eq, Show)
+ 
+ unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path False Nothing "" Nothing Nothing False
++unknownField name path = CoercibleField name path False "" Nothing Nothing False
+ 
+ -- | Like an API request LogicTree, but with coercible field information.
+ data CoercibleLogicTree
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 42372c19..602ae27e 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -206,7 +206,7 @@ callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScal
+       KeyParams []    -> "FROM " <> callIt mempty
+       KeyParams prms  -> case arguments of
+         DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
+-        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False Nothing (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index c16898e3..fa79a564 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -81,7 +81,6 @@ import PostgREST.Plan.Types              (CoercibleField (..),
+                                           CoercibleSelectField (..),
+                                           RelSelectField (..),
+                                           SpreadSelectField (..),
+-                                          ToTsVector (..),
+                                           unknownField)
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeLimit, rangeOffset)
+@@ -253,15 +252,10 @@ pgFmtCallUnary :: Text -> SQL.Snippet -> SQL.Snippet
+ pgFmtCallUnary f x = SQL.sql (encodeUtf8 f) <> "(" <> x <> ")"
+ 
+ pgFmtField :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
+-pgFmtField table cf = case cfToTsVector cf of
+-  Just (ToTsVector lang) -> "to_tsvector(" <> pgFmtFtsLang lang <> fmtFld <> ")"
+-  _                      -> fmtFld
+-  where
+-    fmtFld = case cf of
+-      CoercibleField{cfFullRow=True}                                          -> fromQi table
+-      CoercibleField{cfName=fn, cfJsonPath=[]}                                -> pgFmtColumn table fn
+-      CoercibleField{cfName=fn, cfToJson=doToJson, cfJsonPath=jp} | doToJson  -> "to_jsonb(" <> pgFmtColumn table fn <> ")" <> pgFmtJsonPath jp
+-                                                                  | otherwise -> pgFmtColumn table fn <> pgFmtJsonPath jp
++pgFmtField table CoercibleField{cfFullRow=True}                                          = fromQi table
++pgFmtField table CoercibleField{cfName=fn, cfJsonPath=[]}                                = pgFmtColumn table fn
++pgFmtField table CoercibleField{cfName=fn, cfToJson=doToJson, cfJsonPath=jp} | doToJson  = "to_jsonb(" <> pgFmtColumn table fn <> ")" <> pgFmtJsonPath jp
++                                                                             | otherwise = pgFmtColumn table fn <> pgFmtJsonPath jp
+ 
+ -- Select the value of a named element from a table, applying its optional coercion mapping if any.
+ pgFmtTableCoerce :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
+@@ -405,8 +399,9 @@ pgFmtFilter table (CoercibleFilter fld (OpExpr hasNot oper)) = notOp <> " " <> p
+       [""] -> "= ANY('{}') "
+       _    -> "= ANY (" <> pgFmtArrayLiteralForField vals fld <> ") "
+ 
+-   Fts op lang val -> " " <> ftsOperator op <> "(" <> pgFmtFtsLang lang <> unknownLiteral val <> ") "
++   Fts op lang val -> " " <> ftsOperator op <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
+  where
++   ftsLang = maybe mempty (\l -> unknownLiteral l <> ", ")
+    notOp = if hasNot then "NOT" else mempty
+    star c = if c == '*' then '%' else c
+    fmtQuant q val = case q of
+@@ -414,9 +409,6 @@ pgFmtFilter table (CoercibleFilter fld (OpExpr hasNot oper)) = notOp <> " " <> p
+     Just QuantAll -> "ALL(" <> val <> ")"
+     Nothing       -> val
+ 
+-pgFmtFtsLang :: Maybe Text -> SQL.Snippet
+-pgFmtFtsLang = maybe mempty (\l -> unknownLiteral l <> ", ")
+-
+ pgFmtJoinCondition :: JoinCondition -> SQL.Snippet
+ pgFmtJoinCondition (JoinCondition (qi1, col1) (qi2, col2)) =
+   pgFmtColumn qi1 col1 <> " = " <> pgFmtColumn qi2 col2
+diff --git a/test/spec/Feature/Query/AndOrParamsSpec.hs b/test/spec/Feature/Query/AndOrParamsSpec.hs
+index 0a206c99..f3a8882f 100644
+--- a/test/spec/Feature/Query/AndOrParamsSpec.hs
++++ b/test/spec/Feature/Query/AndOrParamsSpec.hs
+@@ -81,7 +81,7 @@ spec =
+         it "can handle is" $
+           get "/entities?and=(name.is.null,arr.is.null)&select=id" `shouldRespondWith`
+             [json|[{ "id": 4 }]|] { matchHeaders = [matchContentTypeJson] }
+-        it "can handle fts on tsvector columns" $ do
++        it "can handle fts" $ do
+           get "/entities?or=(text_search_vector.fts.bar,text_search_vector.fts.baz)&select=id" `shouldRespondWith`
+             [json|[{ "id": 1 }, { "id": 2 }]|] { matchHeaders = [matchContentTypeJson] }
+           get "/tsearch?or=(text_search_vector.plfts(german).Art%20Spass, text_search_vector.plfts(french).amusant%20impossible, text_search_vector.fts(english).impossible)" `shouldRespondWith`
+@@ -90,17 +90,6 @@ spec =
+               {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
+               {"text_search_vector": "'art':4 'spass':5 'unmog':7"}
+             ]|] { matchHeaders = [matchContentTypeJson] }
+-        it "can handle fts on text and json columns" $ do
+-          get "/grandchild_entities?or=(jsonb_col.fts.bar,jsonb_col.fts.foo)&select=jsonb_col" `shouldRespondWith`
+-            [json|[
+-              { "jsonb_col": {"a": {"b":"foo"}} },
+-              { "jsonb_col": {"b":"bar"} }]
+-            |] { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?and=(text_search.not.plfts(german).Art%20Spass, text_search.not.plfts(french).amusant%20impossible, text_search.not.fts(english).impossible)&select=text_search" `shouldRespondWith`
+-            [json|[
+-              { "text_search": "But also fun to do what is possible" },
+-              { "text_search": "Fat cats ate rats" }]
+-            |] { matchHeaders = [matchContentTypeJson] }
+         it "can handle isdistinct" $
+           get "/entities?and=(id.gte.2,arr.isdistinct.{1,2})&select=id" `shouldRespondWith`
+             [json|[{ "id": 3 }, { "id": 4 }]|] { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index c0bda5a6..be802fcf 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -167,318 +167,116 @@ spec = do
+       get "/simple_pk?k=not.imatch.^xy&order=extra.asc" `shouldRespondWith` "[]"
+ 
+     describe "Full text search operator" $ do
+-      context "tsvector columns" $ do
+-        it "finds matches with to_tsquery" $
+-          get "/tsearch?text_search_vector=fts.impossible" `shouldRespondWith`
+-            [json| [{"text_search_vector": "'fun':5 'imposs':9 'kind':3" }] |]
+-            { matchHeaders = [matchContentTypeJson] }
++      it "finds matches with to_tsquery" $
++        get "/tsearch?text_search_vector=fts.impossible" `shouldRespondWith`
++          [json| [{"text_search_vector": "'fun':5 'imposs':9 'kind':3" }] |]
++          { matchHeaders = [matchContentTypeJson] }
++
++      it "can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery" $ do
++        get "/tsearch?text_search_vector=fts.fun%26possible" `shouldRespondWith`
++          [json| [ {"text_search_vector": "'also':2 'fun':3 'possibl':8"}] |]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=fts.impossible%7Cpossible" `shouldRespondWith`
++          [json| [
++          {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
++          {"text_search_vector": "'also':2 'fun':3 'possibl':8"}] |]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=fts.fun%26!possible" `shouldRespondWith`
++          [json| [ {"text_search_vector": "'fun':5 'imposs':9 'kind':3"}] |]
++          { matchHeaders = [matchContentTypeJson] }
++
++      it "finds matches with plainto_tsquery" $
++        get "/tsearch?text_search_vector=plfts.The%20Fat%20Rats" `shouldRespondWith`
++          [json| [ {"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
++          { matchHeaders = [matchContentTypeJson] }
++
++      it "finds matches with websearch_to_tsquery" $
++          get "/tsearch?text_search_vector=wfts.The%20Fat%20Rats" `shouldRespondWith`
++              [json| [ {"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
++              { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery" $ do
+-          get "/tsearch?text_search_vector=fts.fun%26possible" `shouldRespondWith`
++      it "can use boolean operators(and, or, -) in websearch_to_tsquery" $ do
++        get "/tsearch?text_search_vector=wfts.fun%20and%20possible"
++          `shouldRespondWith`
+             [json| [ {"text_search_vector": "'also':2 'fun':3 'possibl':8"}] |]
+             { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=fts.impossible%7Cpossible" `shouldRespondWith`
++        get "/tsearch?text_search_vector=wfts.impossible%20or%20possible"
++          `shouldRespondWith`
+             [json| [
+-            {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
+-            {"text_search_vector": "'also':2 'fun':3 'possibl':8"}] |]
++              {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
++              {"text_search_vector": "'also':2 'fun':3 'possibl':8"}]
++                |]
+             { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=fts.fun%26!possible" `shouldRespondWith`
++        get "/tsearch?text_search_vector=wfts.fun%20and%20-possible"
++          `shouldRespondWith`
+             [json| [ {"text_search_vector": "'fun':5 'imposs':9 'kind':3"}] |]
+             { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "finds matches with plainto_tsquery" $
+-          get "/tsearch?text_search_vector=plfts.The%20Fat%20Rats" `shouldRespondWith`
+-            [json| [ {"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "finds matches with websearch_to_tsquery" $
+-            get "/tsearch?text_search_vector=wfts.The%20Fat%20Rats" `shouldRespondWith`
+-                [json| [ {"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
+-                { matchHeaders = [matchContentTypeJson] }
++      it "finds matches with different dictionaries" $ do
++        get "/tsearch?text_search_vector=fts(french).amusant" `shouldRespondWith`
++          [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=plfts(french).amusant%20impossible" `shouldRespondWith`
++          [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
++          { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "can use boolean operators(and, or, -) in websearch_to_tsquery" $ do
+-          get "/tsearch?text_search_vector=wfts.fun%20and%20possible"
++        get "/tsearch?text_search_vector=wfts(french).amusant%20impossible"
+             `shouldRespondWith`
+-              [json| [ {"text_search_vector": "'also':2 'fun':3 'possibl':8"}] |]
++              [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
+               { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=wfts.impossible%20or%20possible"
++
++      it "can be negated with not operator" $ do
++        get "/tsearch?text_search_vector=not.fts.impossible%7Cfat%7Cfun" `shouldRespondWith`
++          [json| [
++            {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
++            {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=not.fts(english).impossible%7Cfat%7Cfun" `shouldRespondWith`
++          [json| [
++            {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
++            {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=not.plfts.The%20Fat%20Rats" `shouldRespondWith`
++          [json| [
++            {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
++            {"text_search_vector": "'also':2 'fun':3 'possibl':8"},
++            {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
++            {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tsearch?text_search_vector=not.wfts(english).impossible%20or%20fat%20or%20fun"
+             `shouldRespondWith`
+               [json| [
+-                {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
+-                {"text_search_vector": "'also':2 'fun':3 'possibl':8"}]
+-                  |]
+-              { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=wfts.fun%20and%20-possible"
+-            `shouldRespondWith`
+-              [json| [ {"text_search_vector": "'fun':5 'imposs':9 'kind':3"}] |]
++                {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
++                {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "finds matches with different dictionaries" $ do
+-          get "/tsearch?text_search_vector=fts(french).amusant" `shouldRespondWith`
+-            [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
++      context "Use of the phraseto_tsquery function" $ do
++        it "finds matches" $
++          get "/tsearch?text_search_vector=phfts.The%20Fat%20Cats" `shouldRespondWith`
++            [json| [{"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
+             { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=plfts(french).amusant%20impossible" `shouldRespondWith`
+-            [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-          get "/tsearch?text_search_vector=wfts(french).amusant%20impossible"
+-              `shouldRespondWith`
+-                [json| [{"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" }] |]
+-                { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "can be negated with not operator" $ do
+-          get "/tsearch?text_search_vector=not.fts.impossible%7Cfat%7Cfun" `shouldRespondWith`
+-            [json| [
+-              {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
+-              {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=not.fts(english).impossible%7Cfat%7Cfun" `shouldRespondWith`
+-            [json| [
+-              {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
+-              {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
++        it "finds matches with different dictionaries" $
++          get "/tsearch?text_search_vector=phfts(german).Art%20Spass" `shouldRespondWith`
++            [json| [{"text_search_vector": "'art':4 'spass':5 'unmog':7" }] |]
+             { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=not.plfts.The%20Fat%20Rats" `shouldRespondWith`
++
++        it "can be negated with not operator" $
++          get "/tsearch?text_search_vector=not.phfts(english).The%20Fat%20Cats" `shouldRespondWith`
+             [json| [
+               {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
+               {"text_search_vector": "'also':2 'fun':3 'possibl':8"},
+               {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
+               {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
+             { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch?text_search_vector=not.wfts(english).impossible%20or%20fat%20or%20fun"
+-              `shouldRespondWith`
+-                [json| [
+-                  {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
+-                  {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
+-                { matchHeaders = [matchContentTypeJson] }
+-
+-        context "Use of the phraseto_tsquery function" $ do
+-          it "finds matches" $
+-            get "/tsearch?text_search_vector=phfts.The%20Fat%20Cats" `shouldRespondWith`
+-              [json| [{"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" }] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "finds matches with different dictionaries" $
+-            get "/tsearch?text_search_vector=phfts(german).Art%20Spass" `shouldRespondWith`
+-              [json| [{"text_search_vector": "'art':4 'spass':5 'unmog':7" }] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "can be negated with not operator" $
+-            get "/tsearch?text_search_vector=not.phfts(english).The%20Fat%20Cats" `shouldRespondWith`
+-              [json| [
+-                {"text_search_vector": "'fun':5 'imposs':9 'kind':3"},
+-                {"text_search_vector": "'also':2 'fun':3 'possibl':8"},
+-                {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4"},
+-                {"text_search_vector": "'art':4 'spass':5 'unmog':7"}]|]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "can be used with or query param" $
+-            get "/tsearch?or=(text_search_vector.phfts(german).Art%20Spass, text_search_vector.phfts(french).amusant, text_search_vector.fts(english).impossible)" `shouldRespondWith`
+-              [json|[
+-                {"text_search_vector": "'fun':5 'imposs':9 'kind':3" },
+-                {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
+-                {"text_search_vector": "'art':4 'spass':5 'unmog':7"}
+-              ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-          it "works with tsvector computed fields" $
+-            get "/tsearch_to_tsvector?select=text_search_vector&text_search_vector=fts(simple).of" `shouldRespondWith`
+-              [json| [
+-                {"text_search_vector":"'do':7 'fun':5 'impossible':9 'it':1 'kind':3 'of':4 's':2 'the':8 'to':6"}
+-              ]|]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-      context "text and json columns" $ do
+-        it "finds matches with to_tsquery" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=fts.impossible" `shouldRespondWith`
+-            [json| [
+-              {"text_search": "It's kind of fun to do the impossible"},
+-              {"text_search": "C'est un peu amusant de faire l'impossible"}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=fts.impossible" `shouldRespondWith`
+-            [json| [
+-              {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-              {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=fts.fun%26possible" `shouldRespondWith`
+-            [json| [{"text_search": "But also fun to do what is possible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=fts.fun%26possible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "But also fun to do what is possible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=fts.impossible%7Cpossible"  `shouldRespondWith`
+-            [json| [
+-              {"text_search": "It's kind of fun to do the impossible"},
+-              {"text_search": "But also fun to do what is possible"},
+-              {"text_search": "C'est un peu amusant de faire l'impossible"}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=fts.impossible%7Cpossible" `shouldRespondWith`
+-            [json| [
+-              {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-              {"jsonb_search" :{"text_search": "But also fun to do what is possible"}},
+-              {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=fts.fun%26!possible"  `shouldRespondWith`
+-            [json| [{"text_search": "It's kind of fun to do the impossible"}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=fts.fun%26!possible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "finds matches with plainto_tsquery" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=plfts.The%20Fat%20Rats"  `shouldRespondWith`
+-            [json| [{"text_search": "Fat cats ate rats"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=plfts.The%20Fat%20Rats" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "Fat cats ate rats"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "finds matches with websearch_to_tsquery" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=wfts.The%20Fat%20Rats"  `shouldRespondWith`
+-            [json| [{"text_search": "Fat cats ate rats"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=wfts.The%20Fat%20Rats" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "Fat cats ate rats"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "can use boolean operators(and, or, -) in websearch_to_tsquery" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=wfts.fun%20and%20possible" `shouldRespondWith`
+-            [json| [{"text_search": "But also fun to do what is possible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=wfts.fun%20and%20possible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "But also fun to do what is possible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=wfts.impossible%20or%20possible" `shouldRespondWith`
+-            [json| [
+-              {"text_search": "It's kind of fun to do the impossible"},
+-              {"text_search": "But also fun to do what is possible"},
+-              {"text_search": "C'est un peu amusant de faire l'impossible"}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=wfts.impossible%20or%20possible" `shouldRespondWith`
+-            [json| [
+-              {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-              {"jsonb_search" :{"text_search": "But also fun to do what is possible"}},
+-              {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=wfts.fun%20and%20-possible" `shouldRespondWith`
+-            [json| [{"text_search": "It's kind of fun to do the impossible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=wfts.fun%20and%20-possible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "finds matches with different dictionaries and uses them as configuration for to_tsvector()" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=fts(french).amusant"  `shouldRespondWith`
+-            [json| [{"text_search": "C'est un peu amusant de faire l'impossible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=fts(french).amusant" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=plfts(french).amusant%20impossible"  `shouldRespondWith`
+-            [json| [{"text_search": "C'est un peu amusant de faire l'impossible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=plfts(french).amusant%20impossible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=wfts(french).amusant%20impossible" `shouldRespondWith`
+-            [json| [{"text_search": "C'est un peu amusant de faire l'impossible"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=wfts(french).amusant%20impossible" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        it "can be negated with not operator" $ do
+-          get "/tsearch_to_tsvector?select=text_search&text_search=not.fts.impossible%7Cfat%7Cfun"  `shouldRespondWith`
+-            [json| [{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=not.fts.impossible%7Cfat%7Cfun" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=not.fts(english).impossible%7Cfat%7Cfun"  `shouldRespondWith`
+-            [json| [{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=not.fts(english).impossible%7Cfat%7Cfun" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=not.plfts.The%20Fat%20Rats"  `shouldRespondWith`
+-            [json| [
+-              {"text_search": "It's kind of fun to do the impossible"},
+-              {"text_search": "But also fun to do what is possible"},
+-              {"text_search": "C'est un peu amusant de faire l'impossible"},
+-              {"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=not.plfts.The%20Fat%20Rats" `shouldRespondWith`
+-            [json| [
+-              {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-              {"jsonb_search" :{"text_search": "But also fun to do what is possible"}},
+-              {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}},
+-              {"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}]
+-            |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=text_search&text_search=not.wfts(english).impossible%20or%20fat%20or%20fun" `shouldRespondWith`
+-            [json| [{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=not.wfts(english).impossible%20or%20fat%20or%20fun" `shouldRespondWith`
+-            [json| [{"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+-        context "Use of the phraseto_tsquery function" $ do
+-          it "finds matches" $ do
+-            get "/tsearch_to_tsvector?select=text_search&text_search=phfts.The%20Fat%20Cats"  `shouldRespondWith`
+-              [json| [{"text_search": "Fat cats ate rats"}] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-            get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=phfts.The%20Fat%20Cats" `shouldRespondWith`
+-              [json| [{"jsonb_search" :{"text_search": "Fat cats ate rats"}}] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "finds matches with different dictionaries and uses them as configuration for to_tsvector()" $ do
+-            get "/tsearch_to_tsvector?select=text_search&text_search=phfts(german).Art%20Spass"  `shouldRespondWith`
+-              [json| [{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-            get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=phfts(german).Art%20Spass" `shouldRespondWith`
+-              [json| [{"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}] |]
+-              { matchHeaders = [matchContentTypeJson] }
+-
+-          it "can be negated with not operator" $ do
+-            get "/tsearch_to_tsvector?select=text_search&text_search=not.phfts(english).The%20Fat%20Cats"  `shouldRespondWith`
+-              [json| [
+-                {"text_search": "It's kind of fun to do the impossible"},
+-                {"text_search": "But also fun to do what is possible"},
+-                {"text_search": "C'est un peu amusant de faire l'impossible"},
+-                {"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}]
+-              |]
+-              { matchHeaders = [matchContentTypeJson] }
+-            get "/tsearch_to_tsvector?select=jsonb_search&jsonb_search=not.phfts(english).The%20Fat%20Cats" `shouldRespondWith`
+-              [json| [
+-                {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-                {"jsonb_search" :{"text_search": "But also fun to do what is possible"}},
+-                {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}},
+-                {"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}]
+-              |]
+-              { matchHeaders = [matchContentTypeJson] }
+ 
+-          it "can be used with or query param" $ do
+-            get "/tsearch_to_tsvector?select=text_search&or=(text_search.phfts(german).Art%20Spass, text_search.phfts(french).amusant, text_search.fts(english).impossible)"  `shouldRespondWith`
+-              [json| [
+-                {"text_search": "It's kind of fun to do the impossible"},
+-                {"text_search": "C'est un peu amusant de faire l'impossible"},
+-                {"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}]
+-              |]
+-              { matchHeaders = [matchContentTypeJson] }
+-            get "/tsearch_to_tsvector?select=jsonb_search&or=(jsonb_search.phfts(german).Art%20Spass, jsonb_search.phfts(french).amusant, jsonb_search.fts(english).impossible)" `shouldRespondWith`
+-              [json| [
+-                {"jsonb_search" :{"text_search": "It's kind of fun to do the impossible"}},
+-                {"jsonb_search" :{"text_search": "C'est un peu amusant de faire l'impossible"}},
+-                {"jsonb_search" :{"text_search": "Es ist eine Art Spaß, das Unmögliche zu machen"}}]
+-              |]
+-              { matchHeaders = [matchContentTypeJson] }
++        it "can be used with or query param" $
++          get "/tsearch?or=(text_search_vector.phfts(german).Art%20Spass, text_search_vector.phfts(french).amusant, text_search_vector.fts(english).impossible)" `shouldRespondWith`
++            [json|[
++              {"text_search_vector": "'fun':5 'imposs':9 'kind':3" },
++              {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
++              {"text_search_vector": "'art':4 'spass':5 'unmog':7"}
++            ]|] { matchHeaders = [matchContentTypeJson] }
+ 
+     it "matches with computed column" $
+       get "/items?always_true=eq.true&order=id.asc" `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 7eef4513..3637c3aa 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -949,7 +949,7 @@ spec =
+           [json|[{ "id": 2 }, { "id": 4 }]|]
+           { matchHeaders = [matchContentTypeJson] }
+ 
+-      it "should work with filters that use the fts operator on tsvector columns" $ do
++      it "should work with filters that use the plain with language fts operator" $ do
+         get "/rpc/get_tsearch?text_search_vector=fts(english).impossible" `shouldRespondWith`
+           [json|[{"text_search_vector":"'fun':5 'imposs':9 'kind':3"}]|]
+           { matchHeaders = [matchContentTypeJson] }
+@@ -962,31 +962,6 @@ spec =
+         get "/rpc/get_tsearch?text_search_vector=wfts.impossible" `shouldRespondWith`
+           [json|[{"text_search_vector":"'fun':5 'imposs':9 'kind':3"}]|]
+           { matchHeaders = [matchContentTypeJson] }
+-      it "should work with filters that use the fts operator on text and json columns" $ do
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search&text_search=fts(english).impossible" `shouldRespondWith`
+-          [json|[
+-            {"text_search":"It's kind of fun to do the impossible"},
+-            {"text_search":"C'est un peu amusant de faire l'impossible"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search&text_search=plfts.impossible" `shouldRespondWith`
+-          [json|[
+-            {"text_search":"It's kind of fun to do the impossible"},
+-            {"text_search":"C'est un peu amusant de faire l'impossible"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search&text_search=not.fts(english).fun%7Crat" `shouldRespondWith`
+-          [json|[
+-            {"text_search":"C'est un peu amusant de faire l'impossible"},
+-            {"text_search":"Es ist eine Art Spaß, das Unmögliche zu machen"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/rpc/get_tsearch_to_tsvector?select=text_search&text_search=wfts.impossible" `shouldRespondWith`
+-          [json|[
+-            {"text_search":"It's kind of fun to do the impossible"},
+-            {"text_search":"C'est un peu amusant de faire l'impossible"}]
+-          |]
+-          { matchHeaders = [matchContentTypeJson] }
+ 
+       it "should work with the phraseto_tsquery function" $
+         get "/rpc/get_tsearch?text_search_vector=phfts(english).impossible" `shouldRespondWith`
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index f31b66b6..2f8cde46 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -930,12 +930,3 @@ INSERT INTO surr_serial_upsert(name, extra) VALUES ('value', 'existing value');
+ 
+ TRUNCATE TABLE surr_gen_default_upsert CASCADE;
+ INSERT INTO surr_gen_default_upsert(name, extra) VALUES ('value', 'existing value');
+-
+-TRUNCATE TABLE tsearch_to_tsvector CASCADE;
+-INSERT INTO tsearch_to_tsvector(text_search) VALUES ('It''s kind of fun to do the impossible');
+-INSERT INTO tsearch_to_tsvector(text_search) VALUES ('But also fun to do what is possible');
+-INSERT INTO tsearch_to_tsvector(text_search) VALUES ('Fat cats ate rats');
+-INSERT INTO tsearch_to_tsvector(text_search) VALUES ('C''est un peu amusant de faire l''impossible');
+-INSERT INTO tsearch_to_tsvector(text_search) VALUES ('Es ist eine Art Spaß, das Unmögliche zu machen');
+-
+-UPDATE tsearch_to_tsvector SET jsonb_search = jsonb_build_object('text_search', text_search);
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index ca3e4136..c29a68be 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3799,16 +3799,3 @@ create table surr_gen_default_upsert (
+   name text,
+   extra text
+ );
+-
+-create table tsearch_to_tsvector (
+-  text_search text,
+-  jsonb_search jsonb
+-);
+-
+-create function test.get_tsearch_to_tsvector() returns setof test.tsearch_to_tsvector AS $$
+-  select * from test.tsearch_to_tsvector;
+-$$ language sql;
+-
+-create function test.text_search_vector(test.tsearch_to_tsvector) returns tsvector AS $$
+-  select to_tsvector('simple', $1.text_search)
+-$$ language sql;

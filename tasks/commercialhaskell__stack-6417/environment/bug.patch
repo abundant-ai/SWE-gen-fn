@@ -1,0 +1,231 @@
+diff --git a/src/Stack/Config.hs b/src/Stack/Config.hs
+index bfa87c238..d24330f75 100644
+--- a/src/Stack/Config.hs
++++ b/src/Stack/Config.hs
+@@ -122,7 +122,7 @@ import           Stack.Types.Casa ( CasaOptsMonoid (..) )
+ import           Stack.Types.Docker ( DockerOptsMonoid (..), dockerEnable )
+ import           Stack.Types.DumpLogs ( DumpLogs (..) )
+ import           Stack.Types.GlobalOpts (  GlobalOpts (..) )
+-import           Stack.Types.Nix ( NixOpts (..) )
++import           Stack.Types.Nix ( nixEnable )
+ import           Stack.Types.Platform
+                    ( PlatformVariant (..), platformOnlyRelDir )
+ import           Stack.Types.Project ( Project (..) )
+@@ -331,13 +331,13 @@ configFromConfigMonoid
+       dockerOptsFromMonoid (fmap fst mproject) resolver configMonoid.configMonoidDockerOpts
+     nix <- nixOptsFromMonoid configMonoid.configMonoidNixOpts os
+     systemGHC <-
+-      case (getFirst configMonoid.configMonoidSystemGHC, nix.enable) of
++      case (getFirst configMonoid.configMonoidSystemGHC, nix.nixEnable) of
+         (Just False, True) ->
+           throwM NixRequiresSystemGhc
+         _ ->
+           pure
+             (fromFirst
+-              (docker.dockerEnable || nix.enable)
++              (docker.dockerEnable || nix.nixEnable)
+               configMonoid.configMonoidSystemGHC)
+     when (isJust ghcVariant && systemGHC) $
+       throwM ManualGHCVariantSettingsAreIncompatibleWithSystemGHC
+diff --git a/src/Stack/Config/Nix.hs b/src/Stack/Config/Nix.hs
+index 054d3b539..11bc32280 100644
+--- a/src/Stack/Config/Nix.hs
++++ b/src/Stack/Config/Nix.hs
+@@ -50,19 +50,19 @@ nixOptsFromMonoid nixMonoid os = do
+   let defaultPure = case os of
+         OSX -> False
+         _ -> True
+-      pureShell = fromFirst defaultPure nixMonoid.nixMonoidPureShell
+-      packages = fromFirst [] nixMonoid.nixMonoidPackages
+-      initFile = getFirst nixMonoid.nixMonoidInitFile
+-      shellOptions =
++      nixPureShell = fromFirst defaultPure nixMonoid.nixMonoidPureShell
++      nixPackages = fromFirst [] nixMonoid.nixMonoidPackages
++      nixInitFile = getFirst nixMonoid.nixMonoidInitFile
++      nixShellOptions =
+            fromFirst [] nixMonoid.nixMonoidShellOptions
+         ++ prefixAll (T.pack "-I") (fromFirst [] nixMonoid.nixMonoidPath)
+-      addGCRoots   = fromFirstFalse nixMonoid.nixMonoidAddGCRoots
++      nixAddGCRoots   = fromFirstFalse nixMonoid.nixMonoidAddGCRoots
+ 
+   -- Enable Nix-mode by default on NixOS, unless Docker-mode was specified
+   osIsNixOS <- isNixOS
+   let nixEnable0 = fromFirst osIsNixOS nixMonoid.nixMonoidEnable
+ 
+-  enable <-
++  nixEnable <-
+     if nixEnable0 && osIsWindows
+       then do
+         prettyNoteS
+@@ -70,15 +70,15 @@ nixOptsFromMonoid nixMonoid os = do
+         pure False
+       else pure nixEnable0
+ 
+-  when (not (null packages) && isJust initFile) $
++  when (not (null nixPackages) && isJust nixInitFile) $
+     throwIO NixCannotUseShellFileAndPackagesException
+   pure $ NixOpts
+-    { enable
+-    , pureShell
+-    , packages
+-    , initFile
+-    , shellOptions
+-    , addGCRoots
++    { nixEnable
++    , nixPureShell
++    , nixPackages
++    , nixInitFile
++    , nixShellOptions
++    , nixAddGCRoots
+     }
+  where
+   prefixAll p (x:xs) = p : x : prefixAll p xs
+diff --git a/src/Stack/Nix.hs b/src/Stack/Nix.hs
+index 9a2de6794..a7a21531f 100644
+--- a/src/Stack/Nix.hs
++++ b/src/Stack/Nix.hs
+@@ -58,7 +58,7 @@ runShellAndExit = do
+ 
+     mshellFile <- case configProjectRoot config of
+       Just projectRoot ->
+-        traverse (resolveFile projectRoot) config.nix.initFile
++        traverse (resolveFile projectRoot) config.nix.nixInitFile
+       Nothing -> pure Nothing
+ 
+     -- This will never result in double loading the build config, since:
+@@ -71,11 +71,11 @@ runShellAndExit = do
+ 
+     ghc <- either throwIO pure $ nixCompiler compilerVersion
+     ghcVersion <- either throwIO pure $ nixCompilerVersion compilerVersion
+-    let pkgsInConfig = config.nix.packages
++    let pkgsInConfig = config.nix.nixPackages
+         pkgs = pkgsInConfig ++ [ghc, "git", "gcc", "gmp"]
+         pkgsStr = "[" <> T.intercalate " " pkgs <> "]"
+-        pureShell = config.nix.pureShell
+-        addGCRoots = config.nix.addGCRoots
++        pureShell = config.nix.nixPureShell
++        addGCRoots = config.nix.nixAddGCRoots
+         nixopts = case mshellFile of
+           Just fp ->
+             [ toFilePath fp
+@@ -127,7 +127,7 @@ runShellAndExit = do
+                        F.</> "gc-root"
+                    ]
+               else []
+-          , map T.unpack config.nix.shellOptions
++          , map T.unpack config.nix.nixShellOptions
+           , nixopts
+           , ["--run", unwords (cmnd:"$STACK_IN_NIX_EXTRA_ARGS":args')]
+             -- Using --run instead of --command so we cannot end up in the
+diff --git a/src/Stack/Runners.hs b/src/Stack/Runners.hs
+index ee1caadd4..ba6a4824d 100644
+--- a/src/Stack/Runners.hs
++++ b/src/Stack/Runners.hs
+@@ -48,7 +48,7 @@ import           Stack.Types.ConfigMonoid ( ConfigMonoid (..) )
+ import           Stack.Types.Docker ( dockerEnable )
+ import           Stack.Types.EnvConfig ( EnvConfig )
+ import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
+-import           Stack.Types.Nix ( NixOpts (..) )
++import           Stack.Types.Nix ( nixEnable )
+ import           Stack.Types.Runner
+                    ( Runner (..), globalOptsL, reExecL, stackYamlLocL )
+ import           Stack.Types.StackYamlLoc ( StackYamlLoc (..) )
+@@ -146,7 +146,7 @@ withConfig shouldReexec inner =
+ -- action.
+ reexec :: RIO Config a -> RIO Config a
+ reexec inner = do
+-  nixEnable' <- asks $ (.nix.enable)
++  nixEnable' <- asks $ (.nix.nixEnable)
+   notifyIfNixOnPath <- asks (.notifyIfNixOnPath)
+   when (not nixEnable' && notifyIfNixOnPath) $ do
+     eNix <- findExecutable nixProgName
+diff --git a/src/Stack/Types/Nix.hs b/src/Stack/Types/Nix.hs
+index 309e3045e..dc08cabff 100644
+--- a/src/Stack/Types/Nix.hs
++++ b/src/Stack/Types/Nix.hs
+@@ -1,5 +1,4 @@
+ {-# LANGUAGE NoImplicitPrelude #-}
+-{-# LANGUAGE NoFieldSelectors  #-}
+ {-# LANGUAGE OverloadedStrings #-}
+ 
+ -- | Nix types.
+@@ -24,16 +23,16 @@ import           Stack.Prelude
+ -- | Nix configuration. Parameterize by resolver type to avoid cyclic
+ -- dependency.
+ data NixOpts = NixOpts
+-  { enable :: !Bool
+-  , pureShell :: !Bool
+-  , packages :: ![Text]
++  { nixEnable :: !Bool
++  , nixPureShell :: !Bool
++  , nixPackages :: ![Text]
+     -- ^ The system packages to be installed in the environment before it runs
+-  , initFile :: !(Maybe FilePath)
++  , nixInitFile :: !(Maybe FilePath)
+     -- ^ The path of a file containing preconfiguration of the environment
+     -- (e.g shell.nix)
+-  , shellOptions :: ![Text]
++  , nixShellOptions :: ![Text]
+     -- ^ Options to be given to the nix-shell command line
+-  , addGCRoots :: !Bool
++  , nixAddGCRoots :: !Bool
+     -- ^ Should we register gc roots so running nix-collect-garbage doesn't
+     -- remove nix dependencies
+   }
+diff --git a/tests/unit/Stack/NixSpec.hs b/tests/unit/Stack/NixSpec.hs
+index c38597bd0..c463dde1a 100644
+--- a/tests/unit/Stack/NixSpec.hs
++++ b/tests/unit/Stack/NixSpec.hs
+@@ -73,42 +73,42 @@ spec = beforeAll setup $ do
+   describe "nix disabled in config file" $
+     around_ (withStackDotYaml sampleConfigNixDisabled) $ do
+       it "sees that the nix shell is not enabled" $ loadConfig' mempty $ \config ->
+-         config.nix.enable `shouldBe` False
++         config.nix.nixEnable `shouldBe` False
+       describe "--nix given on command line" $
+         it "sees that the nix shell is enabled" $
+           loadConfig' (parseOpts ["--nix"]) $ \config ->
+-          config.nix.enable `shouldBe` trueOnNonWindows
++          config.nix.nixEnable `shouldBe` trueOnNonWindows
+       describe "--nix-pure given on command line" $
+         it "sees that the nix shell is enabled" $
+           loadConfig' (parseOpts ["--nix-pure"]) $ \config ->
+-          config.nix.enable `shouldBe` trueOnNonWindows
++          config.nix.nixEnable `shouldBe` trueOnNonWindows
+       describe "--no-nix given on command line" $
+         it "sees that the nix shell is not enabled" $
+           loadConfig' (parseOpts ["--no-nix"]) $ \config ->
+-          config.nix.enable `shouldBe` False
++          config.nix.nixEnable `shouldBe` False
+       describe "--no-nix-pure given on command line" $
+         it "sees that the nix shell is not enabled" $
+           loadConfig' (parseOpts ["--no-nix-pure"]) $ \config ->
+-          config.nix.enable `shouldBe` False
++          config.nix.nixEnable `shouldBe` False
+   describe "nix enabled in config file" $
+     around_ (withStackDotYaml sampleConfigNixEnabled) $ do
+       it "sees that the nix shell is enabled" $
+         loadConfig' mempty $ \config ->
+-        config.nix.enable `shouldBe` trueOnNonWindows
++        config.nix.nixEnable `shouldBe` trueOnNonWindows
+       describe "--no-nix given on command line" $
+         it "sees that the nix shell is not enabled" $
+           loadConfig' (parseOpts ["--no-nix"]) $ \config ->
+-          config.nix.enable `shouldBe` False
++          config.nix.nixEnable `shouldBe` False
+       describe "--nix-pure given on command line" $
+         it "sees that the nix shell is enabled" $
+           loadConfig' (parseOpts ["--nix-pure"]) $ \config ->
+-          config.nix.enable `shouldBe` trueOnNonWindows
++          config.nix.nixEnable `shouldBe` trueOnNonWindows
+       describe "--no-nix-pure given on command line" $
+         it "sees that the nix shell is enabled" $
+           loadConfig' (parseOpts ["--no-nix-pure"]) $ \config ->
+-          config.nix.enable `shouldBe` trueOnNonWindows
++          config.nix.nixEnable `shouldBe` trueOnNonWindows
+       it "sees that the only package asked for is glpk and asks for the correct GHC derivation" $ loadConfig' mempty $ \config -> do
+-        config.nix.packages `shouldBe` ["glpk"]
++        config.nix.nixPackages `shouldBe` ["glpk"]
+         v <- parseVersionThrowing "9.0.2"
+         ghc <- either throwIO pure $ nixCompiler (WCGhc v)
+         ghc `shouldBe` "haskell.compiler.ghc902"

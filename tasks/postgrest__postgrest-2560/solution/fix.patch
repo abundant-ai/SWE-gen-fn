@@ -1,0 +1,81 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3e701c70..54f2b1c2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+  - #2548, Fix regression when embedding views with partial references to multi column FKs - @wolfgangwalther
++ - #2558, Fix regression when requesting limit=0 and `db-max-row` is set - @laurenceisla
+ 
+ ## [10.1.0] - 2022-10-28
+ 
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index dba5486a..c2488a61 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -59,8 +59,8 @@ import PostgREST.MediaType               (MTPlanAttrs (..),
+                                           MTPlanFormat (..),
+                                           MediaType (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
++                                          convertToLimitZeroRange,
+                                           hasLimitZero,
+-                                          limitZeroRange,
+                                           rangeRequested)
+ import PostgREST.SchemaCache             (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers (FieldName,
+@@ -354,7 +354,7 @@ apiRequest conf sCache req reqBody queryparams@QueryParams{..} PathInfo{pathName
+ 
+   -- Bypass all the ranges and send only the limit zero range (0 <= x <= -1) if
+   -- limit=0 is present in the query params (not allowed for the Range header)
+-  ranges = HM.insert "limit" (if hasLimitZero limitRange then limitZeroRange else headerAndLimitRange) qsRanges
++  ranges = HM.insert "limit" (convertToLimitZeroRange limitRange headerAndLimitRange) qsRanges
+   -- The only emptyRange allowed is the limit zero range
+   isInvalidRange = topLevelRange == emptyRange && not (hasLimitZero limitRange)
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 78241d36..851c707f 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -40,6 +40,7 @@ import PostgREST.Config                   (AppConfig (..))
+ import PostgREST.Error                    (Error (..))
+ import PostgREST.Query.SqlFragment        (sourceCTEName)
+ import PostgREST.RangeQuery               (NonnegRange, allRange,
++                                           convertToLimitZeroRange,
+                                            restrictRange)
+ import PostgREST.SchemaCache              (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers  (FieldName,
+@@ -123,7 +124,7 @@ treeRestrictRange _ (ActionMutate _) request = Right request
+ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> request
+   where
+     nodeRestrictRange :: Maybe Integer -> ReadPlan -> ReadPlan
+-    nodeRestrictRange m q@ReadPlan{range_=r} = q{range_=restrictRange m r }
++    nodeRestrictRange m q@ReadPlan{range_=r} = q{range_= convertToLimitZeroRange r (restrictRange m r) }
+ 
+ -- add relationships to the nodes of the tree by traversing the forest while keeping track of the parentNode(https://stackoverflow.com/questions/22721064/get-the-parent-of-a-node-in-data-tree-haskell#comment34627048_22721064)
+ -- also adds aliasing
+diff --git a/src/PostgREST/RangeQuery.hs b/src/PostgREST/RangeQuery.hs
+index f37cfc39..a27a1af5 100644
+--- a/src/PostgREST/RangeQuery.hs
++++ b/src/PostgREST/RangeQuery.hs
+@@ -12,6 +12,7 @@ module PostgREST.RangeQuery (
+ , allRange
+ , limitZeroRange
+ , hasLimitZero
++, convertToLimitZeroRange
+ , NonnegRange
+ , rangeStatusHeader
+ , contentRangeH
+@@ -86,6 +87,12 @@ limitZeroRange = Range (BoundaryBelow 0) (BoundaryAbove (-1))
+ hasLimitZero :: Range Integer -> Bool
+ hasLimitZero r = rangeUpper r == rangeUpper limitZeroRange
+ 
++-- Used to convert a range into a special limitZeroRange if it has a
++-- limit=0 in order to bypass validations for empty ranges.
++convertToLimitZeroRange :: Range Integer -> Range Integer -> Range Integer
++convertToLimitZeroRange range fallbackRange =
++  if hasLimitZero range then limitZeroRange else fallbackRange
++
+ rangeStatusHeader :: NonnegRange -> Int64 -> Maybe Int64 -> (Status, Header)
+ rangeStatusHeader topLevelRange queryTotal tableTotal =
+   let lower = rangeOffset topLevelRange

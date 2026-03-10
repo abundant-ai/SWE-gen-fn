@@ -1,0 +1,498 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b9ccda12..4110f7f4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,12 +14,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2703, Add pre-config function - @steve-chavez
+     + New config option `db-pre-config`(empty by default)
+     + Allows using the in-database configuration without SUPERUSER
+- - #2781, Start automatic connection recovery when pool connections are closed with pg_terminate_backend - @steve-chavez
+ 
+ ### Fixed
+ 
+  - #2791, Fix dropping schema cache reload notifications  - @steve-chavez
+- - #2801, Stop retrying connection when "no password supplied" - @steve-chavez
+ 
+ ## [11.0.1] - 2023-04-27
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 05e9ae6a..59fda216 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -9,6 +9,7 @@ Some of its functionality includes:
+ - Producing HTTP Headers according to RFCs.
+ - Content Negotiation
+ -}
++{-# LANGUAGE LambdaCase      #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.App
+   ( SignalHandlerInstaller
+@@ -19,7 +20,7 @@ module PostgREST.App
+ 
+ 
+ import Control.Monad.Except     (liftEither)
+-import Data.Either.Combinators  (mapLeft)
++import Data.Either.Combinators  (mapLeft, whenLeft)
+ import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+@@ -27,6 +28,7 @@ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+ import System.Posix.Types       (FileMode)
+ 
+ import qualified Data.HashMap.Strict        as HM
++import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.Wai                as Wai
+ import qualified Network.Wai.Handler.Warp   as Warp
+@@ -152,17 +154,27 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+   Response.optionalRollback conf apiRequest $
+     handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
+ 
+-runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
++runDbHandler :: AppState.AppState -> Maybe Text -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState isoLvl mode authenticated prepared handler = do
+   dbResp <- lift $ do
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
+-    AppState.usePool appState . transaction isoLvl mode $ runExceptT handler
++    res <- AppState.usePool appState . transaction (toIsolationLevel isoLvl) mode $ runExceptT handler
++    whenLeft res (\case
++      SQL.AcquisitionTimeoutUsageError -> AppState.debounceLogAcquisitionTimeout appState -- this can happen rapidly for many requests, so we debounce
++      _ -> pure ())
++    return res
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+       mapLeft (Error.PgError authenticated) dbResp
+ 
+   liftEither resp
++  where
++    toIsolationLevel = \case
++      Nothing                -> SQL.ReadCommitted
++      Just "repeatable read" -> SQL.RepeatableRead
++      Just "serializable"    -> SQL.Serializable
++      _                      -> SQL.ReadCommitted
+ 
+ handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
+ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache =
+@@ -194,7 +206,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       cPlan <- liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+-      resultSet <- runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan))(Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
++      resultSet <- runQuery (roleIsoLvl <|> pdIsoLvl (Plan.crProc cPlan))(Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+       return $ Response.invokeResponse invMethod (Plan.crProc cPlan) apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+@@ -217,7 +229,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+       throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+     roleSettings = fromMaybe mempty (HM.lookup authRole $ configRoleSettings conf)
+-    roleIsoLvl = HM.findWithDefault SQL.ReadCommitted authRole $ configRoleIsoLvl conf
++    roleIsoLvl = decodeUtf8 <$> HM.lookup "default_transaction_isolation" roleSettings
+     runQuery isoLvl mode query =
+       runDbHandler appState isoLvl mode authenticated prepared $ do
+         Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq pgVer
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 6245f164..b51d09b2 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -18,15 +18,15 @@ module PostgREST.AppState
+   , putSchemaCache
+   , putPgVersion
+   , usePool
++  , debounceLogAcquisitionTimeout
+   , loadSchemaCache
+   , reReadConfig
+   , connectionWorker
+   , runListener
+   ) where
+ 
+-import qualified Data.ByteString.Char8      as BS
++import qualified Data.ByteString            as BS
+ import qualified Data.ByteString.Lazy       as LBS
+-import           Data.Either.Combinators    (whenLeft)
+ import qualified Data.Text.Encoding         as T
+ import           Hasql.Connection           (acquire)
+ import qualified Hasql.Notifications        as SQL
+@@ -140,12 +140,7 @@ initPool AppConfig{..} =
+ 
+ -- | Run an action with a database connection.
+ usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+-usePool AppState{..} x = do
+-  res <- SQL.use statePool x
+-  whenLeft res (\case
+-    SQL.AcquisitionTimeoutUsageError -> debounceLogAcquisitionTimeout -- this can happen rapidly for many requests, so we debounce
+-    _                                -> pure ())
+-  return res
++usePool AppState{..} = SQL.use statePool
+ 
+ -- | Flush the connection pool so that any future use of the pool will
+ -- use connections freshly established after this call.
+@@ -231,7 +226,7 @@ loadSchemaCache appState = do
+       querySchemaCache conf
+   case result of
+     Left e -> do
+-      case checkIsFatal e of
++      case Error.checkIsFatal e of
+         Just hint -> do
+           logWithZTime appState "A fatal error ocurred when loading the schema cache"
+           logPgrstError appState e
+@@ -326,7 +321,7 @@ establishConnection appState =
+       case pgVersion of
+         Left e -> do
+           logPgrstError appState e
+-          case checkIsFatal e of
++          case Error.checkIsFatal e of
+             Just reason ->
+               return $ FatalConnectionError reason
+             Nothing ->
+@@ -362,7 +357,7 @@ reReadConfig startingUp appState = do
+         Left e -> do
+           logWithZTime appState
+             "An error ocurred when trying to query database settings for the config parameters"
+-          case checkIsFatal e of
++          case Error.checkIsFatal e of
+             Just hint -> do
+               logPgrstError appState e
+               logWithZTime appState hint
+@@ -373,18 +368,18 @@ reReadConfig startingUp appState = do
+         Right x -> pure x
+     else
+       pure mempty
+-  (roleSettings, roleIsolationLvl) <-
++  roleSettings <-
+     if configDbConfig then do
+       rSettings <- usePool appState $ queryRoleSettings configDbPreparedStatements
+       case rSettings of
+         Left e -> do
+           logWithZTime appState "An error ocurred when trying to query the role settings"
+           logPgrstError appState e
+-          pure (mempty, mempty)
++          pure mempty
+         Right x -> pure x
+     else
+       pure mempty
+-  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings roleIsolationLvl >>= \case
++  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings >>= \case
+     Left err   ->
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up
+@@ -447,29 +442,3 @@ listener appState = do
+       -- reloads the schema cache + restarts pool connections
+       -- it's necessary to restart the pg connections because they cache the pg catalog(see #2620)
+       connectionWorker appState
+-
+-checkIsFatal :: SQL.UsageError -> Maybe Text
+-checkIsFatal (SQL.ConnectionUsageError e)
+-  | isAuthFailureMessage = Just $ toS failureMessage
+-  | otherwise = Nothing
+-  where isAuthFailureMessage =
+-          ("FATAL:  password authentication failed" `isInfixOf` failureMessage) ||
+-          ("no password supplied" `isInfixOf` failureMessage)
+-        failureMessage = BS.unpack $ fromMaybe mempty e
+-checkIsFatal(SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError serverError)))
+-  = case serverError of
+-      -- Check for a syntax error (42601 is the pg code). This would mean the error is on our part somehow, so we treat it as fatal.
+-      SQL.ServerError "42601" _ _ _ _
+-        -> Just "Hint: This is probably a bug in PostgREST, please report it at https://github.com/PostgREST/postgrest/issues"
+-      -- Check for a "prepared statement <name> already exists" error (Code 42P05: duplicate_prepared_statement).
+-      -- This would mean that a connection pooler in transaction mode is being used
+-      -- while prepared statements are enabled in the PostgREST configuration,
+-      -- both of which are incompatible with each other.
+-      SQL.ServerError "42P05" _ _ _ _
+-        -> Just "Hint: If you are using connection poolers in transaction mode, try setting db-prepared-statements to false."
+-      -- Check for a "transaction blocks not allowed in statement pooling mode" error (Code 08P01: protocol_violation).
+-      -- This would mean that a connection pooler in statement mode is being used which is not supported in PostgREST.
+-      SQL.ServerError "08P01" "transaction blocks not allowed in statement pooling mode" _ _ _
+-        -> Just "Hint: Connection poolers in statement mode are not supported."
+-      _ -> Nothing
+-checkIsFatal _ = Nothing
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 5508d985..f74c98a1 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -32,7 +32,7 @@ import Protolude hiding (hPutStrLn)
+ main :: App.SignalHandlerInstaller -> Maybe App.SocketRunner -> CLI -> IO ()
+ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+   conf@AppConfig{..} <-
+-    either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty mempty
++    either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty
+ 
+   -- Per https://github.com/PostgREST/postgrest/issues/268, we want to
+   -- explicitly close the connections to PostgreSQL on shutdown.
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 1b79d0ff..9de11e99 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -51,8 +51,7 @@ import Numeric                 (readOct, showOct)
+ import System.Environment      (getEnvironment)
+ import System.Posix.Types      (FileMode)
+ 
+-import PostgREST.Config.Database         (RoleIsolationLvl,
+-                                          RoleSettings)
++import PostgREST.Config.Database         (RoleSettings)
+ import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
+                                           dumpJSPath, pRoleClaimKey)
+ import PostgREST.Config.Proxy            (Proxy (..),
+@@ -104,7 +103,6 @@ data AppConfig = AppConfig
+   , configServerUnixSocketMode     :: FileMode
+   , configAdminServerPort          :: Maybe Int
+   , configRoleSettings             :: RoleSettings
+-  , configRoleIsoLvl               :: RoleIsolationLvl
+   , configInternalSCSleep          :: Maybe Int32
+   }
+ 
+@@ -200,13 +198,13 @@ instance JustIfMaybe a (Maybe a) where
+ 
+ -- | Reads and parses the config and overrides its parameters from env vars,
+ -- files or db settings.
+-readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> RoleIsolationLvl -> IO (Either Text AppConfig)
+-readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
++readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> IO (Either Text AppConfig)
++readAppConfig dbSettings optPath prevDbUri roleSettings = do
+   env <- readPGRSTEnvironment
+   -- if no filename provided, start with an empty map to read config from environment
+   conf <- maybe (return $ Right M.empty) loadConfig optPath
+ 
+-  case C.runParser (parser optPath env dbSettings roleSettings roleIsolationLvl) =<< mapLeft show conf of
++  case C.runParser (parser optPath env dbSettings roleSettings) =<< mapLeft show conf of
+     Left err ->
+       return . Left $ "Error in config " <> err
+     Right parsedConfig ->
+@@ -221,8 +219,8 @@ readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
+       decodeJWKS <$>
+         (decodeSecret =<< readSecretFile =<< readDbUriFile prevDbUri parsedConfig)
+ 
+-parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> RoleIsolationLvl -> C.Parser C.Config AppConfig
+-parser optPath env dbSettings roleSettings roleIsolationLvl =
++parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> C.Parser C.Config AppConfig
++parser optPath env dbSettings roleSettings =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+     <*> (fmap encodeUtf8 <$> optString "db-anon-role")
+@@ -270,7 +268,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> parseSocketFileMode "server-unix-socket-mode"
+     <*> optInt "admin-server-port"
+     <*> pure roleSettings
+-    <*> pure roleIsolationLvl
+     <*> optInt "internal-schema-cache-sleep"
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 9356cc4a..711fdc6c 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -6,8 +6,6 @@ module PostgREST.Config.Database
+   , queryRoleSettings
+   , queryPgVersion
+   , RoleSettings
+-  , RoleIsolationLvl
+-  , toIsolationLevel
+   ) where
+ 
+ import Control.Arrow ((***))
+@@ -27,14 +25,7 @@ import Text.InterpolatedString.Perl6 (q, qc)
+ 
+ import Protolude
+ 
+-type RoleSettings     = (HM.HashMap ByteString (HM.HashMap ByteString ByteString))
+-type RoleIsolationLvl = HM.HashMap ByteString SQL.IsolationLevel
+-
+-toIsolationLevel :: (Eq a, IsString a) => a -> SQL.IsolationLevel
+-toIsolationLevel a = case a of
+-  "repeatable read" -> SQL.RepeatableRead
+-  "serializable"    -> SQL.Serializable
+-  _                 -> SQL.ReadCommitted
++type RoleSettings = (HM.HashMap ByteString (HM.HashMap ByteString ByteString))
+ 
+ prefix :: Text
+ prefix = "pgrst."
+@@ -126,10 +117,13 @@ queryDbSettings preConfFunc prepared =
+       |]::Text
+     decodeSettings = HD.rowList $ (,) <$> column HD.text <*> column HD.text
+ 
+-queryRoleSettings :: Bool -> Session (RoleSettings, RoleIsolationLvl)
++queryRoleSettings :: Bool -> Session RoleSettings
+ queryRoleSettings prepared =
+   let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ SQL.Statement sql HE.noParams (processRows <$> rows) prepared
++  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ roleSettingsStatement prepared
++
++roleSettingsStatement :: Bool -> SQL.Statement () RoleSettings
++roleSettingsStatement = SQL.Statement sql HE.noParams decodeRoleSettings
+   where
+     sql = [q|
+       with
+@@ -145,40 +139,18 @@ queryRoleSettings prepared =
+           substr(setting, 1, strpos(setting, '=') - 1) as key,
+           lower(substr(setting, strpos(setting, '=') + 1)) as value
+         FROM role_setting
+-      ),
+-      iso_setting AS (
+-        SELECT rolname, value
+-        FROM kv_settings
+-        WHERE key = 'default_transaction_isolation'
+       )
+-      select
+-        kv.rolname,
+-        i.value as iso_lvl,
+-        array_agg(row(kv.key, kv.value)) filter (where key <> 'default_transation_isolation') as role_settings
+-      from kv_settings kv
+-      left join iso_setting i on i.rolname = kv.rolname
+-      group by kv.rolname, i.value;
++      select rolname, array_agg(row(key, value))
++      from kv_settings
++      group by rolname;
+     |]
+-
+-    processRows :: [(Text, Maybe Text, [(Text, Text)])] -> (RoleSettings, RoleIsolationLvl)
+-    processRows rs =
+-      let
+-        rowsWRoleSettings = [ (x, z) | (x, _, z) <- rs ]
+-        rowsWIsolation    = [ (x, y) | (x, Just y, _) <- rs ]
+-      in
+-      ( HM.fromList $ bimap encodeUtf8 (HM.fromList . ((encodeUtf8 *** encodeUtf8) <$>)) <$> rowsWRoleSettings
+-      , HM.fromList $ (encodeUtf8 *** toIsolationLevel) <$> rowsWIsolation
+-      )
+-
+-    rows :: HD.Result [(Text, Maybe Text, [(Text, Text)])]
+-    rows = HD.rowList $ (,,) <$> column HD.text <*> nullableColumn HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text)
++    decodeRoleSettings = HM.fromList . map (bimap encodeUtf8 (HM.fromList . ((encodeUtf8 *** encodeUtf8) <$>))) <$> HD.rowList aRow
++    aRow :: HD.Row (Text, [(Text, Text)])
++    aRow = (,) <$> column HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text)
+ 
+ column :: HD.Value a -> HD.Row a
+ column = HD.column . HD.nonNullable
+ 
+-nullableColumn :: HD.Value a -> HD.Row (Maybe a)
+-nullableColumn = HD.column . HD.nullable
+-
+ compositeField :: HD.Value a -> HD.Composite a
+ compositeField = HD.field . HD.nonNullable
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 6e0d72d6..810bf403 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -11,6 +11,7 @@ module PostgREST.Error
+   , PgError(..)
+   , Error(..)
+   , errorPayload
++  , checkIsFatal
+   , singularityError
+   ) where
+ 
+@@ -428,7 +429,6 @@ pgErrorStatus authed (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError
+         '5':'3':_ -> HTTP.status503 -- insufficient resources
+         '5':'4':_ -> HTTP.status413 -- too complex
+         '5':'5':_ -> HTTP.status500 -- obj not on prereq state
+-        '5':'7':'P':'0':'1':_ -> HTTP.status503 -- terminating connection due to administrator command
+         '5':'7':_ -> HTTP.status500 -- operator intervention
+         '5':'8':_ -> HTTP.status500 -- system error
+         'F':'0':_ -> HTTP.status500 -- conf file error
+@@ -446,6 +446,29 @@ pgErrorStatus authed (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError
+ 
+     _                       -> HTTP.status500
+ 
++checkIsFatal :: SQL.UsageError -> Maybe Text
++checkIsFatal (SQL.ConnectionUsageError e)
++  | isAuthFailureMessage = Just $ toS failureMessage
++  | otherwise = Nothing
++  where isAuthFailureMessage = "FATAL:  password authentication failed" `isInfixOf` failureMessage
++        failureMessage = BS.unpack $ fromMaybe mempty e
++checkIsFatal(SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError serverError)))
++  = case serverError of
++      -- Check for a syntax error (42601 is the pg code). This would mean the error is on our part somehow, so we treat it as fatal.
++      SQL.ServerError "42601" _ _ _ _
++        -> Just "Hint: This is probably a bug in PostgREST, please report it at https://github.com/PostgREST/postgrest/issues"
++      -- Check for a "prepared statement <name> already exists" error (Code 42P05: duplicate_prepared_statement).
++      -- This would mean that a connection pooler in transaction mode is being used
++      -- while prepared statements are enabled in the PostgREST configuration,
++      -- both of which are incompatible with each other.
++      SQL.ServerError "42P05" _ _ _ _
++        -> Just "Hint: If you are using connection poolers in transaction mode, try setting db-prepared-statements to false."
++      -- Check for a "transaction blocks not allowed in statement pooling mode" error (Code 08P01: protocol_violation).
++      -- This would mean that a connection pooler in statement mode is being used which is not supported in PostgREST.
++      SQL.ServerError "08P01" "transaction blocks not allowed in statement pooling mode" _ _ _
++        -> Just "Hint: Connection poolers in statement mode are not supported."
++      _ -> Nothing
++checkIsFatal _ = Nothing
+ 
+ 
+ data Error
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 8ec61e7d..be60b371 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -41,8 +41,7 @@ import Contravariant.Extras          (contrazip2)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+ import PostgREST.Config                   (AppConfig (..))
+-import PostgREST.Config.Database          (pgVersionStatement,
+-                                           toIsolationLevel)
++import PostgREST.Config.Database          (pgVersionStatement)
+ import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+                                            pgVersion110, pgVersion120)
+ import PostgREST.SchemaCache.Identifiers  (AccessSet, FieldName,
+@@ -260,7 +259,7 @@ decodeFuncs =
+                   <*> column HD.bool)
+               <*> (parseVolatility <$> column HD.char)
+               <*> column HD.bool
+-              <*> nullableColumn (toIsolationLevel <$> HD.text)
++              <*> nullableColumn HD.text
+ 
+     addKey :: Routine -> (QualifiedIdentifier, Routine)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+diff --git a/src/PostgREST/SchemaCache/Routine.hs b/src/PostgREST/SchemaCache/Routine.hs
+index b47dca40..caae214d 100644
+--- a/src/PostgREST/SchemaCache/Routine.hs
++++ b/src/PostgREST/SchemaCache/Routine.hs
+@@ -16,10 +16,8 @@ module PostgREST.SchemaCache.Routine
+   , funcReturnsCompositeAlias
+   ) where
+ 
+-import           Data.Aeson                 ((.=))
+-import qualified Data.Aeson                 as JSON
+-import qualified Data.HashMap.Strict        as HM
+-import qualified Hasql.Transaction.Sessions as SQL
++import qualified Data.Aeson          as JSON
++import qualified Data.HashMap.Strict as HM
+ 
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..),
+                                           Schema, TableName)
+@@ -50,21 +48,9 @@ data Routine = Function
+   , pdReturnType  :: RetType
+   , pdVolatility  :: FuncVolatility
+   , pdHasVariadic :: Bool
+-  , pdIsoLvl      :: Maybe SQL.IsolationLevel
++  , pdIsoLvl      :: Maybe Text
+   }
+-  deriving (Eq, Generic)
+--- need to define JSON manually bc SQL.IsolationLevel doesn't have a JSON instance(and we can't define one for that type without getting a compiler error)
+-instance JSON.ToJSON Routine where
+-  toJSON (Function sch nam desc params ret vol hasVar _) = JSON.object
+-    [
+-      "pdSchema"      .= sch
+-    , "pdName"        .= nam
+-    , "pdDescription" .= desc
+-    , "pdParams"      .= JSON.toJSON params
+-    , "pdReturnType"  .= JSON.toJSON ret
+-    , "pdVolatility"  .= JSON.toJSON vol
+-    , "pdHasVariadic" .= JSON.toJSON hasVar
+-    ]
++  deriving (Eq, Generic, JSON.ToJSON)
+ 
+ data RoutineParam = RoutineParam
+   { ppName :: Text
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index c5b1a383..c90425ee 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -113,7 +113,6 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbTxRollbackAll       = True
+   , configAdminServerPort       = Nothing
+   , configRoleSettings          = mempty
+-  , configRoleIsoLvl            = mempty
+   , configInternalSCSleep       = Nothing
+   }
+ 

@@ -1,0 +1,338 @@
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e09d57db..645d4d09 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -87,12 +87,6 @@ data ApiRequestError
+   | UnacceptableSchema [Text]
+   | UnsupportedMethod ByteString
+   | ColumnNotFound Text Text
+-  | GucHeadersError
+-  | GucStatusError
+-  | OffLimitsChangesError Int64 Integer
+-  | PutMatchingPkError
+-  | SingularityError Integer
+-  | PGRSTParseError
+   deriving Show
+ 
+ data QPError = QPError Text Text
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 5094b3b4..ff0b66d4 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -11,6 +11,7 @@ module PostgREST.Error
+   , PgError(..)
+   , Error(..)
+   , errorPayload
++  , singularityError
+   ) where
+ 
+ import qualified Data.Aeson                as JSON
+@@ -56,9 +57,7 @@ class (JSON.ToJSON a) => PgrstError a where
+   errorPayload = JSON.encode
+ 
+   errorResponseFor :: a -> Response
+-  errorResponseFor err =
+-    let baseHeader = MediaType.toContentType MTApplicationJSON in
+-    responseLBS (status err) (baseHeader : headers err) $ errorPayload err
++  errorResponseFor err = responseLBS (status err) (headers err) $ errorPayload err
+ 
+ instance PgrstError ApiRequestError where
+   status AmbiguousRelBetween{}   = HTTP.status300
+@@ -84,15 +83,8 @@ instance PgrstError ApiRequestError where
+   status UnsupportedMethod{}     = HTTP.status405
+   status LimitNoOrderError       = HTTP.status400
+   status ColumnNotFound{}        = HTTP.status400
+-  status GucHeadersError         = HTTP.status500
+-  status GucStatusError          = HTTP.status500
+-  status OffLimitsChangesError{} = HTTP.status400
+-  status PutMatchingPkError      = HTTP.status400
+-  status SingularityError{}      = HTTP.status406
+-  status PGRSTParseError         = HTTP.status500
+ 
+-  headers SingularityError{}     = [MediaType.toContentType $ MTSingularJSON False]
+-  headers _ = mempty
++  headers _ = [MediaType.toContentType MTApplicationJSON]
+ 
+ instance JSON.ToJSON ApiRequestError where
+   toJSON (QueryParamError (QPError message details)) = JSON.object [
+@@ -146,24 +138,6 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= ("Apply an 'order' using unique column(s)" :: Text)]
+ 
+-  toJSON (OffLimitsChangesError n maxs) = JSON.object [
+-      "code"    .= ApiRequestErrorCode10,
+-      "message" .= ("The maximum number of rows allowed to change was surpassed" :: Text),
+-      "details" .= T.unwords ["Results contain", show n, "rows changed but the maximum number allowed is", show maxs],
+-      "hint"    .= JSON.Null]
+-
+-  toJSON GucHeadersError = JSON.object [
+-    "code"    .= ApiRequestErrorCode11,
+-    "message" .= ("response.headers guc must be a JSON array composed of objects with a single key and a string value" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+-  toJSON GucStatusError = JSON.object [
+-    "code"    .= ApiRequestErrorCode12,
+-    "message" .= ("response.status guc must be a valid status code" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+   toJSON (BinaryFieldError ct) = JSON.object [
+     "code"    .= ApiRequestErrorCode13,
+     "message" .= ((T.decodeUtf8 (MediaType.toMime ct) <> " requested but more than one column was selected") :: Text),
+@@ -176,18 +150,6 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON PutMatchingPkError = JSON.object [
+-    "code"    .= ApiRequestErrorCode15,
+-    "message" .= ("Payload values do not match URL in primary key column(s)" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+-  toJSON (SingularityError n) = JSON.object [
+-    "code"    .= ApiRequestErrorCode16,
+-    "message" .= ("JSON object requested, multiple (or no) rows returned" :: Text),
+-    "details" .= T.unwords ["The result contains", show n, "rows"],
+-    "hint"    .= JSON.Null]
+-
+   toJSON (UnsupportedMethod method) = JSON.object [
+     "code"    .= ApiRequestErrorCode17,
+     "message" .= ("Unsupported HTTP method: " <> T.decodeUtf8 method),
+@@ -211,13 +173,6 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= ("Bad operator on the '" <> target <> "' embedded resource":: Text),
+     "details" .= ("Only is null or not is null filters are allowed on embedded resources":: Text),
+     "hint"    .= JSON.Null]
+-
+-  toJSON PGRSTParseError = JSON.object [
+-    "code"    .= ApiRequestErrorCode21,
+-    "message" .= ("The message and detail field of RAISE 'PGRST' error expects JSON" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+   toJSON (InvalidPreferences prefs) = JSON.object [
+     "code"    .= ApiRequestErrorCode22,
+     "message" .= ("Invalid preferences given with handling=strict" :: Text),
+@@ -414,15 +369,15 @@ instance PgrstError PgError where
+ 
+   headers (PgError _ (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError (SQL.ServerError "PGRST" m d _ _p))))) =
+     case (parseMessage m, parseDetails d) of
+-      (Just _, Just r) -> headers PGRSTParseError ++ map intoHeader (M.toList $ getHeaders r)
+-      _                -> headers PGRSTParseError
++      (Just _, Just r) -> headers JSONParseError ++ map intoHeader (M.toList $ getHeaders r)
++      _                -> headers JSONParseError
+     where
+       intoHeader (k,v) = (CI.mk $ T.encodeUtf8 k, T.encodeUtf8 v)
+ 
+   headers err =
+     if status err == HTTP.status401
+-       then [("WWW-Authenticate", "Bearer") :: Header]
+-       else mempty
++       then [MediaType.toContentType MTApplicationJSON, ("WWW-Authenticate", "Bearer") :: Header]
++       else [MediaType.toContentType MTApplicationJSON]
+ 
+ instance JSON.ToJSON PgError where
+   toJSON (PgError _ usageError) = JSON.toJSON usageError
+@@ -452,7 +407,7 @@ instance JSON.ToJSON SQL.CommandError where
+         "message"  .= getMessage r,
+         "details"  .= checkMaybe (getDetails r),
+         "hint"     .= checkMaybe (getHint r)]
+-      _ -> JSON.toJSON PGRSTParseError
++      _ -> JSON.toJSON JSONParseError
+     where
+       checkMaybe = maybe JSON.Null JSON.String
+ 
+@@ -516,7 +471,7 @@ pgErrorStatus authed (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError
+         "PGRST"   ->
+           case (parseMessage m, parseDetails d) of
+             (Just _, Just r) -> maybe (toEnum $ getStatus r) (HTTP.mkStatus (getStatus r) . T.encodeUtf8) (getStatusText r)
+-            _                -> status PGRSTParseError
++            _                -> status JSONParseError
+         _         -> HTTP.status400
+ 
+     _                       -> HTTP.status500
+@@ -524,25 +479,38 @@ pgErrorStatus authed (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError
+ 
+ data Error
+   = ApiRequestError ApiRequestError
++  | GucHeadersError
++  | GucStatusError
+   | JwtTokenInvalid Text
+   | JwtTokenMissing
+   | JwtTokenRequired
+   | NoSchemaCacheError
++  | OffLimitsChangesError Int64 Integer
+   | PgErr PgError
++  | PutMatchingPkError
++  | SingularityError Integer
++  | JSONParseError
+ 
+ instance PgrstError Error where
+-  status (ApiRequestError err) = status err
+-  status JwtTokenInvalid{}     = HTTP.unauthorized401
+-  status JwtTokenMissing       = HTTP.status500
+-  status JwtTokenRequired      = HTTP.unauthorized401
+-  status NoSchemaCacheError    = HTTP.status503
+-  status (PgErr err)           = status err
+-
+-  headers (ApiRequestError err) = headers err
+-  headers (JwtTokenInvalid m)   = [invalidTokenHeader m]
+-  headers JwtTokenRequired      = [requiredTokenHeader]
+-  headers (PgErr err)           = headers err
+-  headers _                     = mempty
++  status (ApiRequestError err)   = status err
++  status GucHeadersError         = HTTP.status500
++  status GucStatusError          = HTTP.status500
++  status JwtTokenInvalid{}       = HTTP.unauthorized401
++  status JwtTokenMissing         = HTTP.status500
++  status JwtTokenRequired        = HTTP.unauthorized401
++  status NoSchemaCacheError      = HTTP.status503
++  status OffLimitsChangesError{} = HTTP.status400
++  status (PgErr err)             = status err
++  status PutMatchingPkError      = HTTP.status400
++  status SingularityError{}      = HTTP.status406
++  status JSONParseError          = HTTP.status500
++
++  headers (ApiRequestError err)  = headers err
++  headers (JwtTokenInvalid m)    = [MediaType.toContentType MTApplicationJSON, invalidTokenHeader m]
++  headers JwtTokenRequired       = [MediaType.toContentType MTApplicationJSON, requiredTokenHeader]
++  headers (PgErr err)            = headers err
++  headers SingularityError{}     = [MediaType.toContentType (MTSingularJSON False)]
++  headers _                      = [MediaType.toContentType MTApplicationJSON]
+ 
+ instance JSON.ToJSON Error where
+   toJSON NoSchemaCacheError = JSON.object [
+@@ -567,6 +535,41 @@ instance JSON.ToJSON Error where
+       "details" .= JSON.Null,
+       "hint"    .= JSON.Null]
+ 
++  toJSON (OffLimitsChangesError n maxs) = JSON.object [
++      "code"    .= ApiRequestErrorCode10,
++      "message" .= ("The maximum number of rows allowed to change was surpassed" :: Text),
++      "details" .= T.unwords ["Results contain", show n, "rows changed but the maximum number allowed is", show maxs],
++      "hint"    .= JSON.Null]
++
++  toJSON GucHeadersError = JSON.object [
++    "code"    .= ApiRequestErrorCode11,
++    "message" .= ("response.headers guc must be a JSON array composed of objects with a single key and a string value" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++  toJSON GucStatusError = JSON.object [
++    "code"    .= ApiRequestErrorCode12,
++    "message" .= ("response.status guc must be a valid status code" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
++  toJSON PutMatchingPkError = JSON.object [
++    "code"    .= ApiRequestErrorCode15,
++    "message" .= ("Payload values do not match URL in primary key column(s)" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
++  toJSON (SingularityError n) = JSON.object [
++    "code"    .= ApiRequestErrorCode16,
++    "message" .= ("JSON object requested, multiple (or no) rows returned" :: Text),
++    "details" .= T.unwords ["The result contains", show n, "rows"],
++    "hint"    .= JSON.Null]
++
++  toJSON JSONParseError = JSON.object [
++    "code"    .= ApiRequestErrorCode21,
++    "message" .= ("The message and detail field of RAISE 'PGRST' error expects JSON" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+ 
+@@ -577,6 +580,9 @@ invalidTokenHeader m =
+ requiredTokenHeader :: Header
+ requiredTokenHeader = ("WWW-Authenticate", "Bearer")
+ 
++singularityError :: (Integral a) => a -> Error
++singularityError = SingularityError . toInteger
++
+ -- For parsing byteString to JSON Object, used for allowing full response control
+ data PgRaiseErrMessage = PgRaiseErrMessage {
+   getCode    :: Text,
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 79bbe5e6..cc8d2145 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -26,7 +26,6 @@ import qualified Hasql.DynamicStatements.Snippet   as SQL (Snippet)
+ import qualified Hasql.DynamicStatements.Statement as SQL
+ import qualified Hasql.Transaction                 as SQL
+ 
+-import qualified PostgREST.ApiRequest.Types   as ApiRequestTypes
+ import qualified PostgREST.Error              as Error
+ import qualified PostgREST.Query.QueryBuilder as QueryBuilder
+ import qualified PostgREST.Query.Statements   as Statements
+@@ -140,7 +139,7 @@ failPut RSPlan{} = pure ()
+ failPut RSStandard{rsQueryTotal=queryTotal} =
+   when (queryTotal /= 1) $ do
+     lift SQL.condemn
+-    throwError $ Error.ApiRequestError ApiRequestTypes.PutMatchingPkError
++    throwError Error.PutMatchingPkError
+ 
+ deleteQuery :: MutateReadPlan -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ deleteQuery mrPlan@MutateReadPlan{mrMedia} apiReq@ApiRequest{..} conf = do
+@@ -209,7 +208,7 @@ failNotSingular _ RSPlan{} = pure ()
+ failNotSingular mediaType RSStandard{rsQueryTotal=queryTotal} =
+   when (elem mediaType [MTSingularJSON True,MTSingularJSON False] && queryTotal /= 1) $ do
+     lift SQL.condemn
+-    throwError $ Error.ApiRequestError . ApiRequestTypes.SingularityError $ toInteger queryTotal
++    throwError $ Error.singularityError queryTotal
+ 
+ failsChangesOffLimits :: Maybe Integer -> ResultSet -> DbHandler ()
+ failsChangesOffLimits _ RSPlan{} = pure ()
+@@ -217,7 +216,7 @@ failsChangesOffLimits Nothing _  = pure ()
+ failsChangesOffLimits (Just maxChanges) RSStandard{rsQueryTotal=queryTotal} =
+   when (queryTotal > fromIntegral maxChanges) $ do
+     lift SQL.condemn
+-    throwError $ Error.ApiRequestError $ ApiRequestTypes.OffLimitsChangesError queryTotal maxChanges
++    throwError $ Error.OffLimitsChangesError queryTotal maxChanges
+ 
+ -- | Set a transaction to roll back if requested
+ optionalRollback :: AppConfig -> ApiRequest -> DbHandler ()
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 2134f566..24b3f548 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -279,11 +279,11 @@ overrideStatusHeaders rsGucStatus rsGucHeaders pgrstStatus pgrstHeaders = do
+ 
+ decodeGucHeaders :: Maybe BS.ByteString -> Either Error.Error [GucHeader]
+ decodeGucHeaders =
+-  maybe (Right []) $ first (const . Error.ApiRequestError $ ApiRequestTypes.GucHeadersError) . JSON.eitherDecode . LBS.fromStrict
++  maybe (Right []) $ first (const Error.GucHeadersError) . JSON.eitherDecode . LBS.fromStrict
+ 
+ decodeGucStatus :: Maybe Text -> Either Error.Error (Maybe HTTP.Status)
+ decodeGucStatus =
+-  maybe (Right Nothing) $ first (const . Error.ApiRequestError $ ApiRequestTypes.GucStatusError) . fmap (Just . toEnum . fst) . decimal
++  maybe (Right Nothing) $ first (const Error.GucStatusError) . fmap (Just . toEnum . fst) . decimal
+ 
+ contentTypeHeaders :: MediaType -> ApiRequest -> [HTTP.Header]
+ contentTypeHeaders mediaType ApiRequest{..} =
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index e9f98606..881f57cd 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -1537,17 +1537,17 @@ spec actualPgVersion =
+           resHeaders `shouldSatisfy` elem ("X-Header", "str")
+           resBody `shouldBe` [json|{"code":"123","message":"ABC","details":null,"hint":null}|]
+ 
+-      it "returns error for invalid JSON in RAISE Message field" $
++      it "returns JSONParseError for invalid JSON in RAISE Message field" $
+         get "/rpc/raise_sqlstate_invalid_json_message" `shouldRespondWith`
+           [json|{"code":"PGRST121","message":"The message and detail field of RAISE 'PGRST' error expects JSON","details":null,"hint":null}|]
+           { matchStatus = 500 }
+ 
+-      it "returns error for invalid JSON in RAISE Details field" $
++      it "returns JSONParseError for invalid JSON in RAISE Details field" $
+         get "/rpc/raise_sqlstate_invalid_json_details" `shouldRespondWith`
+           [json|{"code":"PGRST121","message":"The message and detail field of RAISE 'PGRST' error expects JSON","details":null,"hint":null}|]
+           { matchStatus = 500 }
+ 
+-      it "returns error for missing Details field in RAISE" $
++      it "returns JSONParseError for missing Details field in RAISE" $
+         get "/rpc/raise_sqlstate_missing_details" `shouldRespondWith`
+           [json|{"code":"PGRST121","message":"The message and detail field of RAISE 'PGRST' error expects JSON","details":null,"hint":null}|]
+           { matchStatus = 500 }

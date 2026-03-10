@@ -1,0 +1,12 @@
+RPC calls fail on PostgreSQL 11 and 12 when invoking certain functions that return a domain whose underlying type is a composite/table type (e.g., a domain created as `CREATE DOMAIN projects_domain AS projects`). A LATERAL-based SQL query introduced for RPC execution incorrectly handles the returned table/composite alias in these versions, causing the RPC response generation to break for functions returning that domain type.
+
+Reproduction scenario: define a composite/table type (or table) `projects`, then define a domain `projects_domain` based on `projects`, and create an RPC function that returns `SETOF projects_domain` (or otherwise returns that domain-wrapped composite). Calling the function via the RPC endpoint (e.g., `GET /rpc/<function>` or `POST /rpc/<function>`) should return the expected JSON rows, support pagination (`limit`/`offset` and `Range`), and optionally return total counts when `Prefer: count=exact` is used.
+
+Actual behavior on PostgreSQL 11/12: the RPC request errors due to the generated SQL referencing/handling the composite alias incorrectly for the domain-returning function. The error manifests as a server-side SQL failure during query execution (triggered specifically by the LATERAL invocation form).
+
+Expected behavior: RPC calls for functions that return a domain over a composite/table type must work on PostgreSQL 11 and 12 the same way they do on other supported PostgreSQL versions. In particular:
+- `GET /rpc/<fn>?limit=…&offset=…` and `POST /rpc/<fn>?limit=…&offset=…` must return the correct subset of rows.
+- Requests using `Range` headers must return correct `Content-Range` headers and status codes (200 vs 206 when total count is requested).
+- The behavior must remain unchanged for functions returning plain composite types, scalar types, or for PostgreSQL versions where the LATERAL query already works.
+
+Implement version-aware RPC SQL generation so that for PostgreSQL 11 and 12, functions returning a domain-over-composite are handled without triggering the alias bug. This requires using schema cache information to detect whether the function’s return type has a composite alias (i.e., the return type resolves to a composite/table structure behind a domain) and conditionally selecting the correct query shape for those versions.

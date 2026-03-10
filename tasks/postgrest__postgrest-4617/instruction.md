@@ -1,0 +1,7 @@
+Diagnosing LISTEN/NOTIFY problems is currently difficult because PostgREST’s listener connection logs don’t reveal which database host and port libpq actually connected to. In failover/read-replica setups, the configured connection string can resolve to a different server after DNS changes, restarts, or redirects, but the logs don’t show the resolved endpoint, making it hard to confirm whether PostgREST is listening on the intended primary.
+
+When PostgREST establishes the dedicated libpq connection used for handling channel notifications, it should log the actual remote endpoint (host and port) that libpq connected to, not just the configured value. This logged value must reflect the final connection target after any DNS resolution or failover behavior.
+
+Currently, starting PostgREST with a database URI that can resolve or fail over to different addresses does not emit a log line containing the listener’s real host:port, so operators cannot verify where the listener is connected.
+
+Update the listener connection startup logging so that, once the listener connection is successfully established, PostgREST logs a message including the actual host and port for that listener connection (in a stable, parseable `host:port` form). The logging should happen for normal startup and for any listener reconnection events, and it should not require enabling debug logging to be visible.

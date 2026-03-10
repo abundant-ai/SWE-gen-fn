@@ -1,0 +1,153 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 02c6b07c..d99466b3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,7 +12,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3061, Apply all function settings as transaction-scoped settings - @taimoorzaeem
+  - #3171, #3046, Log schema cache stats to stderr - @steve-chavez
+  - #3210, Dump schema cache through admin API - @taimoorzaeem
+- - #2676, Performance improvement on bulk json inserts, around 10% increase on requests per second by removing `json_typeof` from write queries - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index bc6e4836..cdf28558 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -300,17 +300,19 @@ fromJsonBodyF :: Maybe LBS.ByteString -> [CoercibleField] -> Bool -> Bool -> Boo
+ fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
+   (if includeSelect then "SELECT " <> namedCols <> " " else mempty) <>
+   "FROM (SELECT " <> jsonPlaceHolder <> " AS json_data) pgrst_payload, " <>
++  -- convert a json object into a json array, this way we can use json_to_recordset for all json payloads
++  -- Otherwise we'd have to use json_to_record for json objects and json_to_recordset for json arrays
++  -- We do this in SQL to avoid processing the JSON in application code
++  "LATERAL (SELECT CASE WHEN " <> jsonTypeofF <> "(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE " <> jsonBuildArrayF <> "(pgrst_payload.json_data) END AS val) pgrst_uniform_json, " <>
+   (if includeDefaults
+-    then if isJsonObject
+-      then "LATERAL (SELECT " <> defsJsonb <> " || pgrst_payload.json_data AS val) pgrst_json_defs, "
+-      else "LATERAL (SELECT jsonb_agg(" <> defsJsonb <> " || elem) AS val from jsonb_array_elements(pgrst_payload.json_data) elem) pgrst_json_defs, "
++    then "LATERAL (SELECT jsonb_agg(jsonb_build_object(" <> defsJsonb <> ") || elem) AS val from jsonb_array_elements(pgrst_uniform_json.val) elem) pgrst_json_defs, "
+     else mempty) <>
+   "LATERAL (SELECT " <> parsedCols <> " FROM " <>
+-    (if null fields -- when json keys are empty, e.g. when payload is `{}` or `[{}, {}]`
+-      then SQL.sql $
+-        if isJsonObject
+-          then "(values(1)) _ "                                  -- only 1 row for an empty json object '{}'
+-          else jsonArrayElementsF <> "(" <> finalBodyF <> ") _ " -- extract rows of a json array of empty objects `[{}, {}]`
++    (if null fields
++      -- When we are inserting no columns (e.g. using default values), we can't use our ordinary `json_to_recordset`
++      -- because it can't extract records with no columns (there's no valid syntax for the `AS (colName colType,...)`
++      -- part). But we still need to ensure as many rows are created as there are array elements.
++      then SQL.sql $ jsonArrayElementsF <> "(" <> finalBodyF <> ") _ "
+       else jsonToRecordsetF <> "(" <> SQL.sql finalBodyF <> ") AS _(" <> typedCols <> ") " <> if includeLimitOne then "LIMIT 1" else mempty
+     ) <>
+   ") pgrst_body "
+@@ -318,21 +320,16 @@ fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
+     namedCols = intercalateSnippet ", " $ fromQi  . QualifiedIdentifier "pgrst_body" . cfName <$> fields
+     parsedCols = intercalateSnippet ", " $ pgFmtCoerceNamed <$> fields
+     typedCols = intercalateSnippet ", " $ pgFmtIdent . cfName <> const " " <> SQL.sql . encodeUtf8 . cfIRType <$> fields
+-    defsJsonb = SQL.sql $ "jsonb_build_object(" <> BS.intercalate "," fieldsWDefaults <> ")"
++    defsJsonb = SQL.sql $ BS.intercalate "," fieldsWDefaults
+     fieldsWDefaults = mapMaybe (\case
+         CoercibleField{cfName=nam, cfDefault=Just def} -> Just $ encodeUtf8 (pgFmtLit nam <> ", " <> def)
+         CoercibleField{cfDefault=Nothing} -> Nothing
+       ) fields
+-    (finalBodyF, jsonArrayElementsF, jsonToRecordsetF) =
++    (finalBodyF, jsonTypeofF, jsonBuildArrayF, jsonArrayElementsF, jsonToRecordsetF) =
+       if includeDefaults
+-        then ("pgrst_json_defs.val", "jsonb_array_elements", if isJsonObject then "jsonb_to_record" else "jsonb_to_recordset")
+-        else ("pgrst_payload.json_data", "json_array_elements", if isJsonObject then "json_to_record" else "json_to_recordset")
++        then ("pgrst_json_defs.val", "jsonb_typeof", "jsonb_build_array", "jsonb_array_elements", "jsonb_to_recordset")
++        else ("pgrst_uniform_json.val", "json_typeof", "json_build_array", "json_array_elements", "json_to_recordset")
+     jsonPlaceHolder = SQL.encoderAndParam (HE.nullable $ if includeDefaults then HE.jsonbLazyBytes else HE.jsonLazyBytes) body
+-    isJsonObject = -- light validation as pg's json_to_record(set) already validates that the body is valid JSON. We just need to know whether the body looks like an object or not.
+-      let
+-        insignificantWhitespace = [32,9,10,13] --" \t\n\r" [32,9,10,13] https://datatracker.ietf.org/doc/html/rfc8259#section-2
+-      in
+-      LBS.take 1 (LBS.dropWhile (`elem` insignificantWhitespace) (fromMaybe mempty body)) == "{"
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> CoercibleOrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+diff --git a/test/pgbench/2676/new.sql b/test/pgbench/2676/new.sql
+deleted file mode 100644
+index 91350d6f..00000000
+--- a/test/pgbench/2676/new.sql
++++ /dev/null
+@@ -1,16 +0,0 @@
+-WITH pgrst_source AS (
+-  INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-  SELECT "pgrst_body"."arr_data", "pgrst_body"."field-with_sep", "pgrst_body"."id", "pgrst_body"."name"
+-  FROM (SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::json AS json_data) pgrst_payload,
+-  LATERAL (SELECT "arr_data", "field-with_sep", "id", "name" FROM json_to_recordset(pgrst_payload.json_data) AS _("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text) ) pgrst_body
+-  RETURNING "test"."complex_items".*
+-)
+-SELECT
+-  '' AS total_result_set,
+-  pg_catalog.count(_postgrest_t) AS page_total,
+-  array[]::text[] AS header,
+-  coalesce(json_agg(_postgrest_t), '[]') AS body,
+-  nullif(current_setting('response.headers', true), '') AS response_headers,
+-  nullif(current_setting('response.status', true), '') AS response_status,
+-  '' AS response_inserted
+-FROM (SELECT "complex_items".* FROM "pgrst_source" AS "complex_items") _postgrest_t;
+diff --git a/test/pgbench/2676/old.sql b/test/pgbench/2676/old.sql
+deleted file mode 100644
+index e215e9b7..00000000
+--- a/test/pgbench/2676/old.sql
++++ /dev/null
+@@ -1,17 +0,0 @@
+-WITH pgrst_source AS (
+-  INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-  SELECT "pgrst_body"."arr_data", "pgrst_body"."field-with_sep", "pgrst_body"."id", "pgrst_body"."name"
+-  FROM (SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::json AS json_data) pgrst_payload,
+-  LATERAL (SELECT CASE WHEN json_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE json_build_array(pgrst_payload.json_data) END AS val) pgrst_uniform_json,
+-  LATERAL (SELECT "arr_data", "field-with_sep", "id", "name" FROM json_to_recordset(pgrst_uniform_json.val) AS _("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text) ) pgrst_body
+-  RETURNING "test"."complex_items".*
+-)
+-SELECT
+-  '' AS total_result_set,
+-  pg_catalog.count(_postgrest_t) AS page_total,
+-  array[]::text[] AS header,
+-  coalesce(json_agg(_postgrest_t), '[]') AS body,
+-  nullif(current_setting('response.headers', true), '') AS response_headers,
+-  nullif(current_setting('response.status', true), '') AS response_status,
+-  '' AS response_inserted
+-FROM (SELECT "complex_items".* FROM "pgrst_source" AS "complex_items") _postgrest_t;
+diff --git a/test/pgbench/README.md b/test/pgbench/README.md
+index d0d6a71b..7b143f4e 100644
+--- a/test/pgbench/README.md
++++ b/test/pgbench/README.md
+@@ -3,9 +3,9 @@
+ Can be used as:
+ 
+ ```
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -U postgres -n -T 10 -f test/pgbench/1567/old.sql
++postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/1567/old.sql
+ 
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -U postgres -n -T 10 -f test/pgbench/1567/new.sql
++postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/1567/new.sql
+ ```
+ 
+ ## Directory structure
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index d9e78d77..de63dcce 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -152,7 +152,7 @@ spec actualPgVersion = do
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        totalCost `shouldBe` 0.06
++        totalCost `shouldBe` 3.27
+ 
+     it "outputs the total cost for an update" $ do
+       r <- request methodPatch "/projects?id=eq.3"
+@@ -165,7 +165,7 @@ spec actualPgVersion = do
+       liftIO $ do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; charset=utf-8")
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+-        totalCost `shouldBe` 8.23
++        totalCost `shouldBe` 12.45
+ 
+     it "outputs the total cost for a delete" $ do
+       r <- request methodDelete "/projects?id=in.(1,2,3)"

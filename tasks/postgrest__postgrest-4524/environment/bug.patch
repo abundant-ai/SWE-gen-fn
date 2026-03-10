@@ -1,0 +1,264 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 97ebdfb8..6417be37 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,8 +16,6 @@ All notable changes to this project will be documented in this file. From versio
+ - Ensure Listener connections are released by @mkleczek in #4614
+ - Fix incorrectly filtering the returned representation for PATCH requests when using `or/and` filters by @laurenceisla in #3707
+ - Fix listener running with exception masked after first failure #4615
+-- Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
+-  + Removed unnecessary double count when building the `Content-Range`.
+ 
+ ## [14.3] - 2026-01-03
+ 
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index b47abd89..69dcbe56 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -43,16 +43,16 @@ data MainQuery = MainQuery
+ 
+ mainQuery :: ActionPlan -> AppConfig -> ApiRequest -> AuthResult -> Maybe QualifiedIdentifier -> MainQuery
+ mainQuery (NoDb _) _ _ _ _ = MainQuery mempty Nothing mempty (mempty, mempty, mempty) mempty
+-mainQuery (Db plan) conf@AppConfig{..} apiReq@ApiRequest{iTopLevelRange=range, iPreferences=Preferences{..}} authRes preReq =
++mainQuery (Db plan) conf@AppConfig{..} apiReq@ApiRequest{iPreferences=Preferences{..}} authRes preReq =
+   let genQ = MainQuery (PreQuery.txVarQuery plan conf authRes apiReq) (PreQuery.preReqQuery <$> preReq) in
+   case plan of
+     DbCrud _ WrappedReadPlan{..} ->
+       let countQuery = QueryBuilder.readPlanToCountQuery wrReadPlan in
+-      genQ (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows range pMedia wrHandler) (mempty, mempty, mempty)
++      genQ (Statements.mainRead wrReadPlan countQuery preferCount configDbMaxRows pMedia wrHandler) (mempty, mempty, mempty)
+       (if shouldExplainCount preferCount then Just (Statements.postExplain countQuery) else Nothing)
+     DbCrud _ MutateReadPlan{..} ->
+       genQ (Statements.mainWrite mrReadPlan mrMutatePlan pMedia mrHandler preferRepresentation preferResolution) (mempty, mempty, mempty) mempty
+     DbCrud _ CallReadPlan{..} ->
+-      genQ (Statements.mainCall crProc crCallPlan crReadPlan preferCount configDbMaxRows range pMedia crHandler) (mempty, mempty, mempty) mempty
++      genQ (Statements.mainCall crProc crCallPlan crReadPlan preferCount pMedia crHandler) (mempty, mempty, mempty) mempty
+     MayUseDb InspectPlan{ipSchema=tSchema} ->
+       genQ mempty (SqlFragment.accessibleTables tSchema, SqlFragment.accessibleFuncs tSchema, SqlFragment.schemaDescription tSchema) mempty
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 75cb2982..461d4e82 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -23,7 +23,6 @@ module PostgREST.Query.SqlFragment
+   , locationF
+   , noLocationF
+   , orderF
+-  , pageCountSelectF
+   , pgFmtColumn
+   , pgFmtFilter
+   , pgFmtIdent
+@@ -97,7 +96,6 @@ import PostgREST.SchemaCache.Routine     (MediaHandler (..),
+                                           Routine (..),
+                                           funcReturnsScalar,
+                                           funcReturnsSetOfScalar,
+-                                          funcReturnsSingle,
+                                           funcReturnsSingleComposite)
+ 
+ import Protolude hiding (Sum, cast)
+@@ -487,21 +485,15 @@ pgFmtGroup _  CoercibleSelectField{csAggFunction=Just _} = Nothing
+ pgFmtGroup _  CoercibleSelectField{csAlias=Just alias, csAggFunction=Nothing} = Just $ pgFmtIdent alias
+ pgFmtGroup qi CoercibleSelectField{csField=fld, csAlias=Nothing, csAggFunction=Nothing} = Just $ pgFmtField qi fld
+ 
+-countF :: SQL.Snippet -> SQL.Snippet -> Bool -> Maybe Integer -> NonnegRange -> (SQL.Snippet, SQL.Snippet)
+-countF countQuery pageCountSelect shouldCount maxRows range
+-  | shouldCount = if isJust maxRows || range /= allRange
+-      then ( ", pgrst_source_count AS (" <> countQuery <> ")"
+-           , "(SELECT pg_catalog.count(*) FROM pgrst_source_count)" )
+-      -- When there are no db-max-rows and limits/offsets, the total count will be the same as the page count,
+-      -- so we use the same page count here to avoid doing a separate aggregated count.
+-      else ( mempty, pageCountSelect )
+-  | otherwise = ( mempty, "null::bigint" )
+-
+-pageCountSelectF :: Maybe Routine -> SQL.Snippet
+-pageCountSelectF rout =
+-  if maybe False funcReturnsSingle rout
+-    then "1"
+-    else "pg_catalog.count(_postgrest_t)"
++countF :: SQL.Snippet -> Bool -> (SQL.Snippet, SQL.Snippet)
++countF countQuery shouldCount =
++  if shouldCount
++    then (
++        ", pgrst_source_count AS (" <> countQuery <> ")"
++      , "(SELECT pg_catalog.count(*) FROM pgrst_source_count)" )
++    else (
++        mempty
++      , "null::bigint")
+ 
+ returningF :: QualifiedIdentifier -> [FieldName] -> SQL.Snippet
+ returningF qi returnings =
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 9dc967fd..e90611ae 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -20,8 +20,8 @@ import PostgREST.Plan.MutatePlan        as MTPlan
+ import PostgREST.Plan.ReadPlan
+ import PostgREST.Query.QueryBuilder
+ import PostgREST.Query.SqlFragment
+-import PostgREST.RangeQuery             (NonnegRange)
+-import PostgREST.SchemaCache.Routine    (MediaHandler (..), Routine)
++import PostgREST.SchemaCache.Routine    (MediaHandler (..), Routine,
++                                         funcReturnsSingle)
+ 
+ import Protolude
+ 
+@@ -64,24 +64,23 @@ mainWrite rPlan mtplan mt handler rep resolution = mtSnippet mt snippet
+     _ -> (False,False, mempty);
+ 
+ mainRead :: ReadPlanTree -> SQL.Snippet -> Maybe PreferCount -> Maybe Integer ->
+-            NonnegRange -> MediaType -> MediaHandler -> SQL.Snippet
+-mainRead rPlan countQuery pCount maxRows range mt handler = mtSnippet mt snippet
++            MediaType -> MediaHandler -> SQL.Snippet
++mainRead rPlan countQuery pCount maxRows mt handler = mtSnippet mt snippet
+  where
+   snippet =
+     "WITH " <> sourceCTE <> " AS ( " <> selectQuery <> " ) " <>
+     countCTEF <> " " <>
+     "SELECT " <>
+       countResultF <> " AS total_result_set, " <>
+-      pageCountSelect <> " AS page_total, " <>
++      "pg_catalog.count(_postgrest_t) AS page_total, " <>
+       handlerF Nothing handler <> " AS body, " <>
+       responseHeadersF <> " AS response_headers, " <>
+       responseStatusF <> " AS response_status, " <>
+       "''" <> " AS response_inserted " <>
+     "FROM ( SELECT * FROM " <> sourceCTE <> " ) _postgrest_t"
+ 
+-  (countCTEF, countResultF) = countF countQ pageCountSelect (shouldCount pCount) maxRows range
++  (countCTEF, countResultF) = countF countQ $ shouldCount pCount
+   selectQuery = readPlanToQuery rPlan
+-  pageCountSelect = pageCountSelectF Nothing
+   countQ =
+     if pCount == Just EstimatedCount then
+       -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+@@ -89,27 +88,28 @@ mainRead rPlan countQuery pCount maxRows range mt handler = mtSnippet mt snippet
+     else
+       countQuery
+ 
+-mainCall :: Routine -> CallPlan -> ReadPlanTree -> Maybe PreferCount -> Maybe Integer ->
+-            NonnegRange-> MediaType -> MediaHandler -> SQL.Snippet
+-mainCall rout cPlan rPlan pCount maxRows range mt handler = mtSnippet mt snippet
++mainCall :: Routine -> CallPlan -> ReadPlanTree -> Maybe PreferCount ->
++            MediaType -> MediaHandler -> SQL.Snippet
++mainCall rout cPlan rPlan pCount mt handler = mtSnippet mt snippet
+   where
+     snippet =
+       "WITH " <> sourceCTE <> " AS (" <> callProcQuery <> ") " <>
+       countCTEF <>
+       "SELECT " <>
+         countResultF <> " AS total_result_set, " <>
+-        pageCountSelect <> " AS page_total, " <>
++        (if funcReturnsSingle rout
++          then "1"
++          else "pg_catalog.count(_postgrest_t)") <> " AS page_total, " <>
+         handlerF (Just rout) handler <> " AS body, " <>
+         responseHeadersF <> " AS response_headers, " <>
+         responseStatusF <> " AS response_status, " <>
+         "''" <> " AS response_inserted " <>
+       "FROM (" <> selectQuery <> ") _postgrest_t"
+ 
+-    (countCTEF, countResultF) = countF countQuery pageCountSelect (shouldCount pCount) maxRows range
++    (countCTEF, countResultF) = countF countQuery $ shouldCount pCount
+     selectQuery = readPlanToQuery rPlan
+     callProcQuery = callPlanToQuery cPlan
+     countQuery = readPlanToCountQuery rPlan
+-    pageCountSelect = pageCountSelectF (Just rout)
+ 
+ -- This occurs after the main query runs, that's why it's prefixed with "post"
+ postExplain :: SQL.Snippet -> SQL.Snippet
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index ab468b78..f045c8aa 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -455,80 +455,6 @@ spec actualPgVersion = do
+         nextValSnip `shouldBe`
+           Just [aesonQQ| ["jsonb_agg((jsonb_build_object('id', nextval('\"Surr_Gen_Default_Upsert_id_seq\"'::regclass)) || elem.value))"] |]
+ 
+-  describe "count preference plan costs" $ do
+-    context "tables with count=exact" $ do
+-      it "shows only 1 count aggregate when no limits/max-rows are set" $ do
+-        _ <- request methodPost "/tiobe_pls"
+-              [("Prefer","resolution=merge-duplicates"), ("Accept","application/vnd.pgrst.plan+json")]
+-              (getInsertDataForTiobePlsTable 1000)
+-
+-        r <- request methodGet "/tiobe_pls"
+-          (("Prefer", "count=exact") : acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze;") ""
+-
+-        let resBody = simpleBody r
+-            resHeaders = simpleHeaders r
+-            totalCost = planCost r
+-            aggregateQty = subtract 1 $ length $ T.splitOn "Aggregate" (decodeUtf8 $ LBS.toStrict resBody)
+-
+-        liftIO $ do
+-          resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze; charset=utf-8")
+-          totalCost `shouldSatisfy` (< 33.0)
+-          aggregateQty `shouldBe` 1
+-
+-      it "shows relevant count aggregates when limits are set" $ do
+-        _ <- request methodPost "/tiobe_pls"
+-              [("Prefer","resolution=merge-duplicates"), ("Accept","application/vnd.pgrst.plan+json")]
+-              (getInsertDataForTiobePlsTable 1000)
+-
+-        r <- request methodGet "/tiobe_pls?limit=1000"
+-          (("Prefer", "count=exact") : acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze;") ""
+-
+-        let resBody = simpleBody r
+-            resHeaders = simpleHeaders r
+-            totalCost = planCost r
+-            aggregateQty = subtract 1 $ length $ T.splitOn "Aggregate" (decodeUtf8 $ LBS.toStrict resBody)
+-
+-        liftIO $ do
+-          resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze; charset=utf-8")
+-          totalCost `shouldSatisfy` (> 49.0)
+-          aggregateQty `shouldSatisfy` (> 1)
+-
+-    context "functions with count=exact" $ do
+-      it "shows only 1 count aggregate when no limits/max-rows are set" $ do
+-        _ <- request methodPost "/tiobe_pls"
+-              [("Prefer","resolution=merge-duplicates"), ("Accept","application/vnd.pgrst.plan+json"), ("Prefer", "return=representation")]
+-              (getInsertDataForTiobePlsTable 1000)
+-
+-        r <- request methodGet "/rpc/get_tiobe_pls"
+-          (("Prefer", "count=exact") : acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze;") ""
+-
+-        let resBody = simpleBody r
+-            resHeaders = simpleHeaders r
+-            totalCost = planCost r
+-            aggregateQty = subtract 1 $ length $ T.splitOn "Aggregate" (decodeUtf8 $ LBS.toStrict resBody)
+-
+-        liftIO $ do
+-          resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze; charset=utf-8")
+-          totalCost `shouldSatisfy` (< 38.0)
+-          aggregateQty `shouldBe` 1
+-
+-      it "shows relevant count aggregates when limits are set" $ do
+-        _ <- request methodPost "/tiobe_pls"
+-              [("Prefer","resolution=merge-duplicates"), ("Accept","application/vnd.pgrst.plan+json")]
+-              (getInsertDataForTiobePlsTable 1000)
+-
+-        r <- request methodGet "/rpc/get_tiobe_pls?limit=1000"
+-          (("Prefer", "count=exact") : acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze;") ""
+-
+-        let resBody = simpleBody r
+-            resHeaders = simpleHeaders r
+-            totalCost = planCost r
+-            aggregateQty = subtract 1 $ length $ T.splitOn "Aggregate" (decodeUtf8 $ LBS.toStrict resBody)
+-
+-        liftIO $ do
+-          resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze; charset=utf-8")
+-          totalCost `shouldSatisfy` (> 67.0)
+-          aggregateQty `shouldSatisfy` (> 1)
+ 
+ disabledSpec :: SpecWith ((), Application)
+ disabledSpec =
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 66c60993..1af8f521 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3851,7 +3851,3 @@ $$ language sql;
+ 
+ create function do_nothing() returns void as $_$
+ $_$ language sql;
+-
+-create or replace function test.get_tiobe_pls() returns setof test.tiobe_pls as $$
+-  select * from test.tiobe_pls;
+-$$ language sql;

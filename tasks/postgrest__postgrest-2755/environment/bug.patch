@@ -1,0 +1,500 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cfdd1ee6..9f52af40 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -37,9 +37,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+      `ALTER ROLE anon SET statement_timeout TO '5s'` will result in that `statement_timeout` getting applied for that role.
+    - Works when switching roles when a JWT is sent
+    - Settings can be reloaded with `NOTIFY pgrst, 'reload config'`.
+- - #2468, Configurable transaction isolation level with `default_transaction_isolation` - @steve-chavez
+-   - Can be set per function `create function .. set default_transaction_isolation = 'repeatable read'`
+-   - Or per role `alter role .. set default_transaction_isolation = 'serializable'`
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index f44192d7..c48dd033 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -27,7 +27,6 @@ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
+ import System.Posix.Types       (FileMode)
+ 
+-import qualified Data.HashMap.Strict        as HM
+ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.Wai                as Wai
+@@ -45,17 +44,16 @@ import qualified PostgREST.Query            as Query
+ import qualified PostgREST.Response         as Response
+ import qualified PostgREST.Workers          as Workers
+ 
+-import PostgREST.ApiRequest          (Action (..), ApiRequest (..),
+-                                      Mutation (..), Target (..))
+-import PostgREST.AppState            (AppState)
+-import PostgREST.Auth                (AuthResult (..))
+-import PostgREST.Config              (AppConfig (..))
+-import PostgREST.Config.PgVersion    (PgVersion (..))
+-import PostgREST.Error               (Error)
+-import PostgREST.Query               (DbHandler)
+-import PostgREST.SchemaCache         (SchemaCache (..))
+-import PostgREST.SchemaCache.Routine (Routine (..))
+-import PostgREST.Version             (prettyVersion)
++import PostgREST.ApiRequest       (Action (..), ApiRequest (..),
++                                   Mutation (..), Target (..))
++import PostgREST.AppState         (AppState)
++import PostgREST.Auth             (AuthResult (..))
++import PostgREST.Config           (AppConfig (..))
++import PostgREST.Config.PgVersion (PgVersion (..))
++import PostgREST.Error            (Error)
++import PostgREST.Query            (DbHandler)
++import PostgREST.SchemaCache      (SchemaCache (..))
++import PostgREST.Version          (prettyVersion)
+ 
+ import Protolude hiding (Handler)
+ 
+@@ -154,11 +152,11 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+   Response.optionalRollback conf apiRequest $
+     handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
+ 
+-runDbHandler :: AppState.AppState -> Maybe Text -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+-runDbHandler appState isoLvl mode authenticated prepared handler = do
++runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
++runDbHandler appState mode authenticated prepared handler = do
+   dbResp <- lift $ do
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
+-    res <- AppState.usePool appState . transaction (toIsolationLevel isoLvl) mode $ runExceptT handler
++    res <- AppState.usePool appState . transaction SQL.ReadCommitted mode $ runExceptT handler
+     whenLeft res (\case
+       SQL.AcquisitionTimeoutUsageError -> AppState.debounceLogAcquisitionTimeout appState -- this can happen rapidly for many requests, so we debounce
+       _ -> pure ())
+@@ -169,48 +167,42 @@ runDbHandler appState isoLvl mode authenticated prepared handler = do
+       mapLeft (Error.PgError authenticated) dbResp
+ 
+   liftEither resp
+-  where
+-    toIsolationLevel = \case
+-      Nothing                -> SQL.ReadCommitted
+-      Just "repeatable read" -> SQL.RepeatableRead
+-      Just "serializable"    -> SQL.Serializable
+-      _                      -> SQL.ReadCommitted
+ 
+ handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
+ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       wrPlan <- liftEither $ Plan.wrappedReadPlan identifier conf sCache apiReq
+-      resultSet <- runQuery roleIsoLvl (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
++      resultSet <- runQuery (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
+       return $ Response.readResponse headersOnly identifier apiReq resultSet
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+-      resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
+       return $ Response.createResponse identifier mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+-      resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+       return $ Response.updateResponse apiReq resultSet
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+-      resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+       return $ Response.singleUpsertResponse apiReq resultSet
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+-      resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
++      resultSet <- runQuery (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+       return $ Response.deleteResponse apiReq resultSet
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       cPlan <- liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+-      resultSet <- runQuery (roleIsoLvl <|> pdIsoLvl (Plan.crProc cPlan))(Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
++      resultSet <- runQuery (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+       return $ Response.invokeResponse invMethod (Plan.crProc cPlan) apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+-      oaiResult <- runQuery roleIsoLvl Plan.inspectPlanTxMode $ Query.openApiQuery sCache pgVer conf tSchema
++      oaiResult <- runQuery Plan.inspectPlanTxMode $ Query.openApiQuery sCache pgVer conf tSchema
+       return $ Response.openApiResponse headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
+ 
+     (ActionInfo, TargetIdent identifier) ->
+@@ -228,10 +220,8 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+       -- TODO Refactor the Action/Target types to remove this line
+       throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+-    roleSettings = fromMaybe mempty (HM.lookup authRole $ configRoleSettings conf)
+-    roleIsoLvl = decodeUtf8 <$> HM.lookup "default_transaction_isolation" roleSettings
+-    runQuery isoLvl mode query =
+-      runDbHandler appState isoLvl mode authenticated prepared $ do
+-        Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq pgVer
++    runQuery mode query =
++      runDbHandler appState mode authenticated prepared $ do
++        Query.setPgLocals conf authClaims authRole apiReq pgVer
+         Query.runPreReq conf
+         query
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 29521948..d14c50ff 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -23,8 +23,8 @@ import qualified Data.Aeson                      as JSON
+ import qualified Data.Aeson.Key                  as K
+ import qualified Data.Aeson.KeyMap               as KM
+ import qualified Data.Aeson.Types                as JSON
+-import qualified Data.ByteString                 as BS
+ import qualified Data.ByteString.Lazy.Char8      as LBS
++import qualified Data.Text.Encoding              as T
+ import qualified Data.Vault.Lazy                 as Vault
+ import qualified Data.Vector                     as V
+ import qualified Network.HTTP.Types.Header       as HTTP
+@@ -47,7 +47,7 @@ import Protolude
+ 
+ data AuthResult = AuthResult
+   { authClaims :: KM.KeyMap JSON.Value
+-  , authRole   :: BS.ByteString
++  , authRole   :: Text
+   }
+ 
+ -- | Receives the JWT secret and audience (from config) and a JWT and returns a
+@@ -79,7 +79,7 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+   role <- liftEither . maybeToRight JwtTokenRequired $
+     unquoted <$> walkJSPath (Just jclaims) configJwtRoleClaimKey <|> configDbAnonRole
+   return AuthResult
+-           { authClaims = mclaims & KM.insert "role" (JSON.toJSON $ decodeUtf8 role)
++           { authClaims = mclaims & KM.insert "role" (JSON.toJSON role)
+            , authRole = role
+            }
+   where
+@@ -89,9 +89,9 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+     walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
+     walkJSPath _                      _                 = Nothing
+ 
+-    unquoted :: JSON.Value -> BS.ByteString
+-    unquoted (JSON.String t) = encodeUtf8 t
+-    unquoted v               = LBS.toStrict $ JSON.encode v
++    unquoted :: JSON.Value -> Text
++    unquoted (JSON.String t) = t
++    unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
+ -- impossible case - just added to please -Wincomplete-patterns
+ parseClaims _ _ = return AuthResult { authClaims = KM.empty, authRole = mempty }
+ 
+@@ -117,5 +117,5 @@ authResultKey = unsafePerformIO Vault.newKey
+ getResult :: Wai.Request -> Maybe (Either Error AuthResult)
+ getResult = Vault.lookup authResultKey . Wai.vault
+ 
+-getRole :: Wai.Request -> Maybe BS.ByteString
++getRole :: Wai.Request -> Maybe Text
+ getRole req = authRole <$> (rightToMaybe =<< getResult req)
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 18e9825a..5bbffb30 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -65,7 +65,7 @@ import Protolude hiding (Proxy, toList)
+ 
+ data AppConfig = AppConfig
+   { configAppSettings              :: [(Text, Text)]
+-  , configDbAnonRole               :: Maybe BS.ByteString
++  , configDbAnonRole               :: Maybe Text
+   , configDbChannel                :: Text
+   , configDbChannelEnabled         :: Bool
+   , configDbExtraSearchPath        :: [Text]
+@@ -128,7 +128,7 @@ toText conf =
+   where
+     -- apply conf to all pgrst settings
+     pgrstSettings = (\(k, v) -> (k, v conf)) <$>
+-      [("db-anon-role",              q . T.decodeUtf8 . fromMaybe "" . configDbAnonRole)
++      [("db-anon-role",              q . fromMaybe "" . configDbAnonRole)
+       ,("db-channel",                q . configDbChannel)
+       ,("db-channel-enabled",            T.toLower . show . configDbChannelEnabled)
+       ,("db-extra-search-path",      q . T.intercalate "," . configDbExtraSearchPath)
+@@ -218,7 +218,7 @@ parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> C.P
+ parser optPath env dbSettings roleSettings =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+-    <*> (fmap encodeUtf8 <$> optString "db-anon-role")
++    <*> optString "db-anon-role"
+     <*> (fromMaybe "pgrst" <$> optString "db-channel")
+     <*> (fromMaybe True <$> optBool "db-channel-enabled")
+     <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 9f64f1d7..8a85c574 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -25,7 +25,7 @@ import Text.InterpolatedString.Perl6 (q)
+ 
+ import Protolude
+ 
+-type RoleSettings = (HM.HashMap ByteString (HM.HashMap ByteString ByteString))
++type RoleSettings = (HM.HashMap ByteString [(ByteString, ByteString)])
+ 
+ queryPgVersion :: Bool -> Session PgVersion
+ queryPgVersion prepared = statement mempty $ pgVersionStatement prepared
+@@ -75,7 +75,7 @@ queryRoleSettings prepared =
+   transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty $ roleSettingsStatement prepared
+ 
+ roleSettingsStatement :: Bool -> SQL.Statement () RoleSettings
+-roleSettingsStatement = SQL.Statement sql HE.noParams decodeRoleSettings
++roleSettingsStatement = SQL.Statement sql HE.noParams decodeSettings
+   where
+     sql = [q|
+       with
+@@ -89,14 +89,14 @@ roleSettingsStatement = SQL.Statement sql HE.noParams decodeRoleSettings
+         SELECT
+           rolname,
+           substr(setting, 1, strpos(setting, '=') - 1) as key,
+-          lower(substr(setting, strpos(setting, '=') + 1)) as value
++          substr(setting, strpos(setting, '=') + 1) as value
+         FROM role_setting
+       )
+       select rolname, array_agg(row(key, value))
+       from kv_settings
+       group by rolname;
+     |]
+-    decodeRoleSettings = HM.fromList . map (bimap encodeUtf8 (HM.fromList . ((encodeUtf8 *** encodeUtf8) <$>))) <$> HD.rowList aRow
++    decodeSettings = HM.fromList . map (bimap encodeUtf8 ((encodeUtf8 *** encodeUtf8) <$>)) <$> HD.rowList aRow
+     aRow :: HD.Row (Text, [(Text, Text)])
+     aRow = (,) <$> column HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text)
+ 
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index 08d43b2d..b5bac1cd 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -26,5 +26,5 @@ middleware logLevel = case logLevel of
+       { Wai.outputFormat = Wai.ApacheWithSettings $
+           Wai.defaultApacheSettings
+             & Wai.setApacheRequestFilter (\_ res -> filterStatus $ Wai.responseStatus res)
+-            & Wai.setApacheUserGetter Auth.getRole
++            & Wai.setApacheUserGetter (fmap encodeUtf8 . Auth.getRole)
+       }
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index b72a0c77..65a4164b 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -16,7 +16,6 @@ module PostgREST.Query
+ import qualified Data.Aeson                        as JSON
+ import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+-import qualified Data.ByteString                   as BS
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
+ import qualified Data.Set                          as S
+@@ -235,9 +234,9 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+       configDbTxAllowOverride && preferTransaction == Just Rollback
+ 
+ -- | Runs local (transaction scoped) GUCs for every request.
+-setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
++setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> Text ->
+                ApiRequest -> PgVersion -> DbHandler ()
+-setPgLocals AppConfig{..} claims role roleSettings req actualPgVersion = lift $
++setPgLocals AppConfig{..} claims role req actualPgVersion = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+     ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
+     HD.noResult configDbPreparedStatements
+@@ -253,8 +252,11 @@ setPgLocals AppConfig{..} claims role roleSettings req actualPgVersion = lift $
+     claimsSql = if usesLegacyGucs
+                   then setConfigLocal "request.jwt.claim." <$> [(toUtf8 $ K.toText c, toUtf8 $ unquoted v) | (c,v) <- KM.toList claims]
+                   else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+-    roleSql = [setConfigLocal mempty ("role", role)]
+-    roleSettingsSql = setConfigLocal mempty <$> roleSettings
++    roleBs = toUtf8 role
++    roleSql = [setConfigLocal mempty ("role", roleBs)]
++    roleSettingsSql = if null configRoleSettings
++      then mempty
++      else setConfigLocal mempty <$> fromMaybe mempty (HM.lookup roleBs configRoleSettings)
+     appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings)
+     searchPathSql =
+       let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath) in
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 9ac260d9..90f69e3f 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -250,7 +250,6 @@ decodeFuncs =
+                   <*> column HD.bool)
+               <*> (parseVolatility <$> column HD.char)
+               <*> column HD.bool
+-              <*> nullableColumn HD.text
+ 
+     addKey :: Routine -> (QualifiedIdentifier, Routine)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+@@ -340,8 +339,7 @@ funcsSqlQuery pgVer = [q|
+     ) AS rettype_is_composite,
+     bt.oid <> bt.base as rettype_is_composite_alias,
+     p.provolatile,
+-    p.provariadic > 0 as hasvariadic,
+-    lower((regexp_split_to_array((regexp_split_to_array(config, '='))[2], ','))[1]) AS transaction_isolation_level
++    p.provariadic > 0 as hasvariadic
+   FROM pg_proc p
+   LEFT JOIN arguments a ON a.oid = p.oid
+   JOIN pg_namespace pn ON pn.oid = p.pronamespace
+@@ -350,7 +348,6 @@ funcsSqlQuery pgVer = [q|
+   JOIN pg_namespace tn ON tn.oid = t.typnamespace
+   LEFT JOIN pg_class comp ON comp.oid = t.typrelid
+   LEFT JOIN pg_description as d ON d.objoid = p.oid
+-  LEFT JOIN LATERAL unnest(proconfig) config ON config like 'default_transaction_isolation%'
+   WHERE t.oid <> 'trigger'::regtype AND COALESCE(a.callable, true)
+ |] <> (if pgVer >= pgVersion110 then "AND prokind = 'f'" else "AND NOT (proisagg OR proiswindow)")
+ 
+diff --git a/src/PostgREST/SchemaCache/Routine.hs b/src/PostgREST/SchemaCache/Routine.hs
+index caae214d..568d734d 100644
+--- a/src/PostgREST/SchemaCache/Routine.hs
++++ b/src/PostgREST/SchemaCache/Routine.hs
+@@ -48,7 +48,6 @@ data Routine = Function
+   , pdReturnType  :: RetType
+   , pdVolatility  :: FuncVolatility
+   , pdHasVariadic :: Bool
+-  , pdIsoLvl      :: Maybe Text
+   }
+   deriving (Eq, Generic, JSON.ToJSON)
+ 
+@@ -62,10 +61,10 @@ data RoutineParam = RoutineParam
+ 
+ -- Order by least number of params in the case of overloaded functions
+ instance Ord Routine where
+-  Function schema1 name1 des1 prms1 rt1 vol1 hasVar1 iso1 `compare` Function schema2 name2 des2 prms2 rt2 vol2 hasVar2 iso2
++  Function schema1 name1 des1 prms1 rt1 vol1 hasVar1 `compare` Function schema2 name2 des2 prms2 rt2 vol2 hasVar2
+     | schema1 == schema2 && name1 == name2 && length prms1 < length prms2  = LT
+     | schema2 == schema2 && name1 == name2 && length prms1 > length prms2  = GT
+-    | otherwise = (schema1, name1, des1, prms1, rt1, vol1, hasVar1, iso1) `compare` (schema2, name2, des2, prms2, rt2, vol2, hasVar2, iso2)
++    | otherwise = (schema1, name1, des1, prms1, rt1, vol1, hasVar1) `compare` (schema2, name2, des2, prms2, rt2, vol2, hasVar2)
+ 
+ -- | A map of all procs, all of which can be overloaded(one entry will have more than one Routine).
+ -- | It uses a HashMap for a faster lookup.
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index f96237c7..3d66492e 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -8,13 +8,7 @@ ALTER ROLE :USER SET pgrst.db_anon_role = 'postgrest_test_anonymous';
+ 
+ CREATE ROLE postgrest_test_author;
+ 
+-CREATE ROLE postgrest_test_serializable;
+-alter role postgrest_test_serializable set default_transaction_isolation = 'serializable';
+-
+-CREATE ROLE postgrest_test_repeatable_read;
+-alter role postgrest_test_repeatable_read set default_transaction_isolation = 'REPEATABLE READ';
+-
+-GRANT postgrest_test_anonymous, postgrest_test_author, postgrest_test_serializable, postgrest_test_repeatable_read TO :USER;
++GRANT postgrest_test_anonymous, postgrest_test_author TO :USER;
+ 
+ CREATE SCHEMA v1;
+ GRANT USAGE ON SCHEMA v1 TO postgrest_test_anonymous;
+@@ -114,31 +108,3 @@ begin
+     alter role current_user set statement_timeout = %L;
+   $$, timeout);
+ end $_$ volatile language plpgsql ;
+-
+-create table items as select x as id from generate_series(1,5) x;
+-
+-create view items_w_isolation_level as
+-select
+-  id,
+-  current_setting('transaction_isolation', true) as isolation_level
+-from items;
+-
+-grant all on items_w_isolation_level to postgrest_test_anonymous, postgrest_test_repeatable_read, postgrest_test_serializable;
+-
+-create function default_isolation_level()
+-returns text as $$
+-  select current_setting('transaction_isolation', true);
+-$$
+-language sql;
+-
+-create function serializable_isolation_level()
+-returns text as $$
+-  select current_setting('transaction_isolation', true);
+-$$
+-language sql set default_transaction_isolation = 'serializable';
+-
+-create function repeatable_read_isolation_level()
+-returns text as $$
+-  select current_setting('transaction_isolation', true);
+-$$
+-language sql set default_transaction_isolation = 'REPEATABLE READ';
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index a6f49b28..b4a0c8e5 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -873,79 +873,6 @@ def test_role_settings(defaultenv):
+         assert response.text == '"10s"'
+ 
+ 
+-def test_isolation_level(defaultenv):
+-    "isolation_level should be set per role and per function"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_JWT_SECRET": SECRET,
+-    }
+-
+-    with run(env=env) as postgrest:
+-        # default isolation level for postgrest_test_anonymous
+-        response = postgrest.session.get(
+-            "/items_w_isolation_level?select=isolation_level&limit=1"
+-        )
+-        assert response.text == '[{"isolation_level":"read committed"}]'
+-
+-        # isolation level for postgrest_test_repeatable_read on GET
+-        headers = jwtauthheader({"role": "postgrest_test_repeatable_read"}, SECRET)
+-        response = postgrest.session.get(
+-            "/items_w_isolation_level?select=isolation_level&limit=1", headers=headers
+-        )
+-        assert response.text == '[{"isolation_level":"repeatable read"}]'
+-
+-        # isolation level for postgrest_test_serializable on POST
+-        headers = jwtauthheader({"role": "postgrest_test_serializable"}, SECRET)
+-        headers["Prefer"] = "return=representation"
+-        response = postgrest.session.post(
+-            "/items_w_isolation_level?select=isolation_level",
+-            json={"id": "666"},
+-            headers=headers,
+-        )
+-        assert response.text == '[{"isolation_level":"serializable"}]'
+-
+-        # isolation level for postgrest_test_serializable on PATCH
+-        headers = jwtauthheader({"role": "postgrest_test_serializable"}, SECRET)
+-        headers["Prefer"] = "return=representation"
+-        response = postgrest.session.patch(
+-            "/items_w_isolation_level?select=isolation_level&id=eq.666",
+-            json={"id": "666"},
+-            headers=headers,
+-        )
+-        assert response.text == '[{"isolation_level":"serializable"}]'
+-
+-        # isolation level for postgrest_test_serializable on DELETE
+-        headers = jwtauthheader({"role": "postgrest_test_serializable"}, SECRET)
+-        headers["Prefer"] = "return=representation"
+-        response = postgrest.session.delete(
+-            "/items_w_isolation_level?select=isolation_level&id=eq.666", headers=headers
+-        )
+-        assert response.text == '[{"isolation_level":"serializable"}]'
+-
+-        # default isolation level for function
+-        response = postgrest.session.get("/rpc/default_isolation_level")
+-        assert response.text == '"read committed"'
+-
+-        # changes with role isolation level
+-        headers = jwtauthheader({"role": "postgrest_test_repeatable_read"}, SECRET)
+-        response = postgrest.session.get(
+-            "/rpc/default_isolation_level", headers=headers
+-        )
+-        assert response.text == '"repeatable read"'
+-
+-        # isolation level can be set per function
+-        response = postgrest.session.get("/rpc/serializable_isolation_level")
+-        assert response.text == '"serializable"'
+-        response = postgrest.session.get("/rpc/repeatable_read_isolation_level")
+-        assert response.text == '"repeatable read"'
+-
+-        # isolation level for a function overrides the role isolation level
+-        headers = jwtauthheader({"role": "postgrest_test_repeatable_read"}, SECRET)
+-        response = postgrest.session.get("/rpc/serializable_isolation_level")
+-        assert response.text == '"serializable"'
+-
+-
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122
+ # The stack size of 1K(-with-rtsopts=-K1K) is not enough and this fails with "stack overflow"
+ # A stack size of 200K seems to be enough for succeess

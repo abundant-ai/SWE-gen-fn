@@ -1,0 +1,199 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0966bf16..7b6fb0e8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Allows including the join table columns when resource embedding
+    + Allows disambiguating a recursive m2m embed
+    + Allows disambiguating an embed that has a many-to-many relationship using two foreign keys on a junction
++ - #2340, Allow embedding without selecting any column - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 95e69907..9bc0a299 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -36,8 +36,8 @@ import Text.ParserCombinators.Parsec (GenParser, ParseError, Parser,
+                                       eof, errorPos, letter,
+                                       lookAhead, many1, noneOf,
+                                       notFollowedBy, oneOf,
+-                                      optionMaybe, sepBy1, string,
+-                                      try, (<?>))
++                                      optionMaybe, sepBy, sepBy1,
++                                      string, try, (<?>))
+ 
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeGeq, rangeLimit,
+@@ -323,26 +323,25 @@ pTreePath = do
+ -- >>> P.parse pFieldForest "" "*,..client(*),other(*)"
+ -- Right [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SpreadRelation {selRelation = "client", selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]},Node {rootLabel = SelectRelation {selRelation = "other", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]
+ --
++-- >>> P.parse pFieldForest "" ""
++-- Right []
++--
+ -- >>> P.parse pFieldForest "" "id,clients(name[])"
+ -- Left (line 1, column 16):
+ -- unexpected '['
+--- expecting letter, digit, "-", "!", "(", "->>", "->", "::", ")", "," or end of input
++-- expecting letter, digit, "-", "->>", "->", "::", ")", "," or end of input
+ --
+ -- >>> P.parse pFieldForest "" "data->>-78xy"
+ -- Left (line 1, column 11):
+ -- unexpected 'x'
+ -- expecting digit, "->", "::", ".", "," or end of input
+ pFieldForest :: Parser [Tree SelectItem]
+-pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
++pFieldForest = pFieldTree `sepBy` lexeme (char ',')
+   where
+-    pFieldTree :: Parser (Tree SelectItem)
+-    pFieldTree =  try (Node <$> pSpreadRelationSelect <*> between (char '(') (char ')') pFieldForest) <|>
+-                  try (Node <$> pRelationSelect       <*> between (char '(') (char ')') pFieldForest) <|>
++    pFieldTree =  Node <$> try pSpreadRelationSelect <*> between (char '(') (char ')') pFieldForest <|>
++                  Node <$> try pRelationSelect       <*> between (char '(') (char ')') pFieldForest <|>
+                   Node <$> pFieldSelect <*> pure []
+ 
+-pStar :: Parser Text
+-pStar = string "*" $> "*"
+-
+ -- |
+ -- Parse field names
+ --
+@@ -480,13 +479,12 @@ aliasSeparator = char ':' >> notFollowedBy (char ':')
+ -- Left (line 1, column 6):
+ -- unexpected '>'
+ pRelationSelect :: Parser SelectItem
+-pRelationSelect = lexeme $ try ( do
++pRelationSelect = lexeme $ do
+     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+     name <- pFieldName
+     (hint, jType) <- pEmbedParams
+     try (void $ lookAhead (string "("))
+     return $ SelectRelation name alias hint jType
+-  )
+ 
+ -- |
+ -- Parse regular fields in select
+@@ -524,23 +522,22 @@ pRelationSelect = lexeme $ try ( do
+ -- unexpected end of input
+ -- expecting letter or digit
+ pFieldSelect :: Parser SelectItem
+-pFieldSelect = lexeme $
+-  try (
+-    do
+-      alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+-      fld <- pField
+-      cast' <- optionMaybe (string "::" *> pIdentifier)
+-      pEnd
+-      return $ SelectField fld (toS <$> cast') alias
+-  )
+-  <|> do
++pFieldSelect = lexeme $ try (do
+     s <- pStar
+     pEnd
+-    return $ SelectField (s, []) Nothing Nothing
++    return $ SelectField (s, []) Nothing Nothing)
++  <|> do
++    alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
++    fld <- pField
++    cast' <- optionMaybe (string "::" *> pIdentifier)
++    pEnd
++    return $ SelectField fld (toS <$> cast') alias
+   where
+     pEnd = try (void $ lookAhead (string ")")) <|>
+            try (void $ lookAhead (string ",")) <|>
+            try eof
++    pStar = string "*" $> "*"
++
+ 
+ -- |
+ -- Parse spread relations in select
+@@ -565,12 +562,11 @@ pFieldSelect = lexeme $
+ -- Left (line 1, column 8):
+ -- unexpected '>'
+ pSpreadRelationSelect :: Parser SelectItem
+-pSpreadRelationSelect = lexeme $ try ( do
++pSpreadRelationSelect = lexeme $ do
+     name <- string ".." >> pFieldName
+     (hint, jType) <- pEmbedParams
+     try (void $ lookAhead (string "("))
+     return $ SpreadRelation name hint jType
+-  )
+ 
+ pEmbedParams :: Parser (Maybe Hint, Maybe JoinType)
+ pEmbedParams = do
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 022a3af3..edb98f63 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -76,7 +76,7 @@ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+   resultSet <-
+      lift . SQL.statement mempty $
+       Statements.prepareRead
+-        (QueryBuilder.readPlanToQuery req)
++        (QueryBuilder.readPlanToQuery True req)
+         (if iPreferCount == Just EstimatedCount then
+            -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+            QueryBuilder.limitedQuery countQuery ((+ 1) <$> configDbMaxRows)
+@@ -163,7 +163,7 @@ invokeQuery proc CallReadPlan{crReadPlan, crCallPlan} apiReq@ApiRequest{..} conf
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingle proc)
+         (QueryBuilder.callPlanToQuery crCallPlan)
+-        (QueryBuilder.readPlanToQuery crReadPlan)
++        (QueryBuilder.readPlanToQuery True crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount iPreferCount)
+         iAcceptMediaType
+@@ -217,7 +217,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq conf =
+   in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+-      (QueryBuilder.readPlanToQuery mrReadPlan)
++      (QueryBuilder.readPlanToQuery True mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+       (iAcceptMediaType apiReq)
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index fa8d624a..4fb689de 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -39,10 +39,10 @@ import PostgREST.RangeQuery        (allRange)
+ 
+ import Protolude
+ 
+-readPlanToQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
++readPlanToQuery :: Bool -> ReadPlanTree -> SQL.Snippet
++readPlanToQuery isRoot (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
+   "SELECT " <>
+-  intercalateSnippet ", " ((pgFmtSelectItem qi <$> select) ++ selects) <> " " <>
++  intercalateSnippet ", " ((pgFmtSelectItem qi <$> (if isRoot && null select && null forest then defRootSelect else select)) ++ selects) <> " " <>
+   fromFrag <> " " <>
+   intercalateSnippet " " joins <> " " <>
+   (if null logicForest && null relJoinConds
+@@ -53,13 +53,14 @@ readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,o
+   where
+     fromFrag = fromF relToParent mainQi fromAlias
+     qi = getQualifiedIdentifier relToParent mainQi fromAlias
++    defRootSelect = [(("*", []), Nothing, Nothing)] -- gets all columns in case an empty select, e.g. `/tbl?select=`, is done.
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+ getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} _) (selects,joins) =
++getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} forest) (selects,joins) =
+   let
+-    subquery = readPlanToQuery rr
++    subquery = readPlanToQuery False rr
+     aliasOrName = pgFmtIdent $ fromMaybe relName relAlias
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+@@ -77,7 +78,7 @@ getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, re
+             "FROM (" <> subquery <> " ) AS " <> SQL.sql aggAlias
+           ) aggAlias $ if relJoinType == Just JTInner then SQL.sql aggAlias <> " IS NOT NULL" else "TRUE")
+   in
+-  (sel:selects, joi:joins)
++  (if null select && null forest then selects else sel:selects, joi:joins)
+ 
+ mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _) =

@@ -1,0 +1,580 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8c9321a8..ac956f53 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,7 +30,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3019, Transaction-Scoped Settings are now shown clearly in the Postgres logs - @laurenceisla
+    + Shows `set_config('pgrst.setting_name', $1)` instead of `setconfig($1, $2)`
+    + Does not apply to role settings and `app.settings.*`
+- - #2420, Fix bogus message when listening on port 0 - @develop7
+ 
+ ### Changed
+ 
+diff --git a/main/Main.hs b/main/Main.hs
+index 4d231251..5d5e18a7 100644
+--- a/main/Main.hs
++++ b/main/Main.hs
+@@ -1,16 +1,37 @@
++{-# LANGUAGE CPP #-}
++
+ module Main (main) where
+ 
+ import System.IO (BufferMode (..), hSetBuffering)
+ 
++import qualified PostgREST.App as App
+ import qualified PostgREST.CLI as CLI
+ 
+ import Protolude
+ 
++#ifndef mingw32_HOST_OS
++import qualified PostgREST.Unix as Unix
++#endif
++
+ main :: IO ()
+ main = do
+   setBuffering
+   opts <- CLI.readCLIShowHelp
+-  CLI.main opts
++  CLI.main installSignalHandlers runAppInSocket opts
++
++installSignalHandlers :: App.SignalHandlerInstaller
++#ifndef mingw32_HOST_OS
++installSignalHandlers = Unix.installSignalHandlers
++#else
++installSignalHandlers _ = pass
++#endif
++
++runAppInSocket :: Maybe App.SocketRunner
++#ifndef mingw32_HOST_OS
++runAppInSocket = Just Unix.runAppWithSocket
++#else
++runAppInSocket = Nothing
++#endif
+ 
+ setBuffering :: IO ()
+ setBuffering = do
+diff --git a/postgrest.cabal b/postgrest.cabal
+index c2d692f0..80601ebf 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -64,7 +64,6 @@ library
+                       PostgREST.Plan.ReadPlan
+                       PostgREST.Plan.Types
+                       PostgREST.RangeQuery
+-                      PostgREST.Unix
+                       PostgREST.ApiRequest
+                       PostgREST.ApiRequest.Preferences
+                       PostgREST.ApiRequest.QueryParams
+@@ -90,7 +89,6 @@ library
+                     , containers                >= 0.5.7 && < 0.7
+                     , contravariant-extras      >= 0.3.3 && < 0.4
+                     , cookie                    >= 0.4.2 && < 0.5
+-                    , directory                 >= 1.2.6 && < 1.4
+                     , either                    >= 4.4.1 && < 5.1
+                     , extra                     >= 1.7.0 && < 2.0
+                     , fuzzyset                  >= 0.2.3
+@@ -116,13 +114,11 @@ library
+                     , regex-tdfa                >= 1.2.2 && < 1.4
+                     , retry                     >= 0.7.4 && < 0.10
+                     , scientific                >= 0.3.4 && < 0.4
+-                    , streaming-commons         >= 0.1.1 && < 0.3
+                     , swagger2                  >= 2.4 && < 2.9
+                     , text                      >= 1.2.2 && < 1.3
+                     , time                      >= 1.6 && < 1.12
+                     , timeit                    >= 2.0 && < 2.1
+                     , unordered-containers      >= 0.2.8 && < 0.3
+-                    , unix-compat               >= 0.5.4 && < 0.6
+                     , vault                     >= 0.3.1.5 && < 0.4
+                     , vector                    >= 0.11 && < 0.14
+                     , wai                       >= 3.2.1 && < 3.3
+@@ -152,6 +148,9 @@ library
+   if !os(windows)
+     build-depends:
+       unix
++      , directory >= 1.2.6 && < 1.4
++    exposed-modules:
++      PostgREST.Unix
+ 
+ executable postgrest
+   default-language:   Haskell2010
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index f7f8648e..ffc61cbf 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -1,9 +1,11 @@
+-{-# LANGUAGE NamedFieldPuns #-}
++{-# LANGUAGE NamedFieldPuns  #-}
++{-# LANGUAGE RecordWildCards #-}
+ 
+ module PostgREST.Admin
+   ( runAdmin
+   ) where
+ 
++import qualified Data.Text                 as T
+ import qualified Hasql.Session             as SQL
+ import qualified Network.HTTP.Types.Status as HTTP
+ import qualified Network.Wai               as Wai
+@@ -20,20 +22,19 @@ import PostgREST.Config   (AppConfig (..))
+ import qualified PostgREST.AppState as AppState
+ 
+ import Protolude
+-import Protolude.Partial (fromJust)
+ 
+ runAdmin :: AppConfig -> AppState -> Warp.Settings -> IO ()
+ runAdmin conf@AppConfig{configAdminServerPort} appState settings =
+-  whenJust (AppState.getSocketAdmin appState) $ \adminSocket -> do
+-    AppState.logWithZTime appState $ "Admin server listening on port " <> show (fromIntegral (fromJust configAdminServerPort) :: Integer)
+-    void . forkIO $ Warp.runSettingsSocket settings adminSocket adminApp
++  whenJust configAdminServerPort $ \adminPort -> do
++    AppState.logWithZTime appState $ "Admin server listening on port " <> show adminPort
++    void . forkIO $ Warp.runSettings (settings & Warp.setPort adminPort) adminApp
+   where
+     adminApp = admin appState conf
+ 
+ -- | PostgREST admin application
+ admin :: AppState.AppState -> AppConfig -> Wai.Application
+ admin appState appConfig req respond  = do
+-  isMainAppReachable  <- isRight <$> reachMainApp (AppState.getSocketREST appState)
++  isMainAppReachable  <- any isRight <$> reachMainApp appConfig
+   isSchemaCacheLoaded <- isJust <$> AppState.getSchemaCache appState
+   isConnectionUp      <-
+     if configDbChannelEnabled appConfig
+@@ -50,16 +51,37 @@ admin appState appConfig req respond  = do
+ 
+ -- Try to connect to the main app socket
+ -- Note that it doesn't even send a valid HTTP request, we just want to check that the main app is accepting connections
+-reachMainApp :: Socket -> IO (Either IOException ())
+-reachMainApp appSock = do
+-  sockAddr <- getSocketName appSock
+-  sock <- socket (addrFamily sockAddr) Stream defaultProtocol
+-  try $ do
+-    connect sock sockAddr
+-    withSocketsDo $ bracket (pure sock) close sendEmpty
++-- The code for resolving the "*4", "!4", "*6", "!6", "*" special values is taken from
++-- https://hackage.haskell.org/package/streaming-commons-0.2.2.4/docs/src/Data.Streaming.Network.html#bindPortGenEx
++reachMainApp :: AppConfig -> IO [Either IOException ()]
++reachMainApp AppConfig{..} =
++  case configServerUnixSocket of
++    Just path ->  do
++      sock <- socket AF_UNIX Stream 0
++      (:[]) <$> try (do
++        connect sock $ SockAddrUnix path
++        withSocketsDo $ bracket (pure sock) close sendEmpty)
++    Nothing -> do
++      let
++        host | configServerHost `elem` ["*4", "!4", "*6", "!6", "*"] = Nothing
++             | otherwise                                             = Just configServerHost
++        filterAddrs xs =
++          case configServerHost of
++              "*4" -> ipv4Addrs xs ++ ipv6Addrs xs
++              "!4" -> ipv4Addrs xs
++              "*6" -> ipv6Addrs xs ++ ipv4Addrs xs
++              "!6" -> ipv6Addrs xs
++              _    -> xs
++        ipv4Addrs = filter ((/=) AF_INET6 . addrFamily)
++        ipv6Addrs = filter ((==) AF_INET6 . addrFamily)
++
++      addrs <- getAddrInfo (Just $ defaultHints { addrSocketType = Stream }) (T.unpack <$> host) (Just . show $ configServerPort)
++      tryAddr `traverse` filterAddrs addrs
+   where
+     sendEmpty sock = void $ send sock mempty
+-    addrFamily (SockAddrInet _ _) = AF_INET
+-    addrFamily (SockAddrInet6 {}) = AF_INET6
+-    addrFamily (SockAddrUnix _)   = AF_UNIX
+-
++    tryAddr :: AddrInfo -> IO (Either IOException ())
++    tryAddr addr = do
++      sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
++      try $ do
++        connect sock $ addrAddress addr
++        withSocketsDo $ bracket (pure sock) close sendEmpty
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 93a055ab..b4a75b77 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -12,7 +12,9 @@ Some of its functionality includes:
+ {-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.App
+-  ( postgrest
++  ( SignalHandlerInstaller
++  , SocketRunner
++  , postgrest
+   , run
+   ) where
+ 
+@@ -23,6 +25,7 @@ import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
++import System.Posix.Types       (FileMode)
+ 
+ import qualified Data.HashMap.Strict        as HM
+ import qualified Data.Text.Encoding         as T
+@@ -41,7 +44,6 @@ import qualified PostgREST.Logger           as Logger
+ import qualified PostgREST.Plan             as Plan
+ import qualified PostgREST.Query            as Query
+ import qualified PostgREST.Response         as Response
+-import qualified PostgREST.Unix             as Unix (installSignalHandlers)
+ 
+ import PostgREST.ApiRequest           (Action (..), ApiRequest (..),
+                                        Mutation (..), Target (..))
+@@ -62,17 +64,20 @@ import qualified Data.ByteString.Char8 as BS
+ import qualified Data.List             as L
+ import qualified Data.Map              as Map (fromList)
+ import qualified Network.HTTP.Types    as HTTP
+-import qualified Network.Socket        as NS
+ import           Protolude             hiding (Handler)
+ import           System.TimeIt         (timeItT)
+ 
+ type Handler = ExceptT Error
+ 
+-run :: AppState -> IO ()
+-run appState = do
++type SignalHandlerInstaller = AppState -> IO()
++
++type SocketRunner = Warp.Settings -> Wai.Application -> FileMode -> FilePath -> IO()
++
++run :: SignalHandlerInstaller -> Maybe SocketRunner -> AppState -> IO ()
++run installHandlers maybeRunWithSocket appState = do
+   conf@AppConfig{..} <- AppState.getConfig appState
+   AppState.connectionWorker appState -- Loads the initial SchemaCache
+-  Unix.installSignalHandlers (AppState.getMainThreadId appState) (AppState.connectionWorker appState) (AppState.reReadConfig False appState)
++  installHandlers appState
+   -- reload schema cache + config on NOTIFY
+   AppState.runListener conf appState
+ 
+@@ -80,14 +85,19 @@ run appState = do
+ 
+   let app = postgrest conf appState (AppState.connectionWorker appState)
+ 
+-  what <- case configServerUnixSocket of
+-    Just path -> pure $ "unix socket " <> show path
+-    Nothing   -> do
+-      port <- NS.socketPort $ AppState.getSocketREST appState
+-      pure $ "port " <> show port
+-  AppState.logWithZTime appState $ "Listening on " <> what
+-
+-  Warp.runSettingsSocket (serverSettings conf) (AppState.getSocketREST appState) app
++  case configServerUnixSocket of
++    Just socket ->
++      -- run the postgrest application with user defined socket. Only for UNIX systems
++      case maybeRunWithSocket of
++        Just runWithSocket -> do
++          AppState.logWithZTime appState $ "Listening on unix socket " <> show socket
++          runWithSocket (serverSettings conf) app configServerUnixSocketMode socket
++        Nothing ->
++          panic "Cannot run with unix socket on non-unix platforms."
++    Nothing ->
++      do
++        AppState.logWithZTime appState $ "Listening on port " <> show configServerPort
++        Warp.runSettings (serverSettings conf) app
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+ serverSettings AppConfig{..} =
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 8fff8edc..3183da80 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -14,10 +14,7 @@ module PostgREST.AppState
+   , getRetryNextIn
+   , getTime
+   , getJwtCache
+-  , getSocketREST
+-  , getSocketAdmin
+   , init
+-  , initSockets
+   , initWithPool
+   , logWithZTime
+   , putSchemaCache
+@@ -35,14 +32,12 @@ import qualified Data.ByteString.Char8      as BS
+ import qualified Data.ByteString.Lazy       as LBS
+ import qualified Data.Cache                 as C
+ import           Data.Either.Combinators    (whenLeft)
+-import qualified Data.Text                  as T (unpack)
+ import qualified Data.Text.Encoding         as T
+ import           Hasql.Connection           (acquire)
+ import qualified Hasql.Notifications        as SQL
+ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Session              as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+-import qualified Network.Socket             as NS
+ import qualified PostgREST.Error            as Error
+ import           PostgREST.Version          (prettyVersion)
+ 
+@@ -68,12 +63,10 @@ import PostgREST.Config.PgVersion        (PgVersion (..),
+ import PostgREST.SchemaCache             (SchemaCache,
+                                           querySchemaCache)
+ import PostgREST.SchemaCache.Identifiers (dumpQi)
+-import PostgREST.Unix                    (createAndBindDomainSocket)
+ 
+-import Data.Streaming.Network (bindPortTCP, bindRandomPortTCP)
+-import Data.String            (IsString (..))
+ import Protolude
+ 
++
+ data AuthResult = AuthResult
+   { authClaims :: KM.KeyMap JSON.Value
+   , authRole   :: BS.ByteString
+@@ -106,23 +99,15 @@ data AppState = AppState
+   , debounceLogAcquisitionTimeout :: IO ()
+   -- | JWT Cache
+   , jwtCache                      :: C.Cache ByteString AuthResult
+-  -- | Network socket for REST API
+-  , stateSocketREST               :: NS.Socket
+-  -- | Network socket for the admin UI
+-  , stateSocketAdmin              :: Maybe NS.Socket
+   }
+ 
+-type AppSockets = (NS.Socket, Maybe NS.Socket)
+-
+ init :: AppConfig -> IO AppState
+ init conf = do
+   pool <- initPool conf
+-  (sock, adminSock) <- initSockets conf
+-  state' <- initWithPool (sock, adminSock) pool conf
+-  pure state' { stateSocketREST = sock, stateSocketAdmin = adminSock }
++  initWithPool pool conf
+ 
+-initWithPool :: AppSockets -> SQL.Pool -> AppConfig -> IO AppState
+-initWithPool (sock, adminSock) pool conf = do
++initWithPool :: SQL.Pool -> AppConfig -> IO AppState
++initWithPool pool conf = do
+   appState <- AppState pool
+     <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
+     <*> newIORef Nothing
+@@ -136,8 +121,6 @@ initWithPool (sock, adminSock) pool conf = do
+     <*> newIORef 0
+     <*> pure (pure ())
+     <*> C.newCache Nothing
+-    <*> pure sock
+-    <*> pure adminSock
+ 
+ 
+   debLogTimeout <-
+@@ -161,39 +144,6 @@ initWithPool (sock, adminSock) pool conf = do
+ destroy :: AppState -> IO ()
+ destroy = destroyPool
+ 
+-initSockets :: AppConfig -> IO AppSockets
+-initSockets AppConfig{..} = do
+-  let
+-    cfg'usp = configServerUnixSocket
+-    cfg'uspm = configServerUnixSocketMode
+-    cfg'host = configServerHost
+-    cfg'port = configServerPort
+-    cfg'adminport = configAdminServerPort
+-
+-  sock <- case cfg'usp of
+-    -- I'm not using `streaming-commons`' bindPath function here because it's not defined for Windows,
+-    -- but we need to have runtime error if we try to use it in Windows, not compile time error
+-    Just path -> createAndBindDomainSocket path cfg'uspm
+-    Nothing -> do
+-      (_, sock) <-
+-        if cfg'port /= 0
+-          then do
+-            sock <- bindPortTCP cfg'port (fromString $ T.unpack cfg'host)
+-            pure (cfg'port, sock)
+-          else do
+-            -- explicitly bind to a random port, returning bound port number
+-            (num, sock) <- bindRandomPortTCP (fromString $ T.unpack cfg'host)
+-            pure (num, sock)
+-      pure sock
+-
+-  adminSock <- case cfg'adminport of
+-    Just adminPort -> do
+-      adminSock <- bindPortTCP adminPort (fromString $ T.unpack cfg'host)
+-      pure $ Just adminSock
+-    Nothing -> pure Nothing
+-
+-  pure (sock, adminSock)
+-
+ initPool :: AppConfig -> IO SQL.Pool
+ initPool AppConfig{..} =
+   SQL.acquire
+@@ -254,12 +204,6 @@ getTime = stateGetTime
+ getJwtCache :: AppState -> C.Cache ByteString AuthResult
+ getJwtCache = jwtCache
+ 
+-getSocketREST :: AppState -> NS.Socket
+-getSocketREST = stateSocketREST
+-
+-getSocketAdmin :: AppState -> Maybe NS.Socket
+-getSocketAdmin = stateSocketAdmin
+-
+ -- | Log to stderr with local time
+ logWithZTime :: AppState -> Text -> IO ()
+ logWithZTime appState txt = do
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 39d4f49d..9120d3e5 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -29,8 +29,8 @@ import qualified PostgREST.Config   as Config
+ import Protolude hiding (hPutStrLn)
+ 
+ 
+-main :: CLI -> IO ()
+-main CLI{cliCommand, cliPath} = do
++main :: App.SignalHandlerInstaller -> Maybe App.SocketRunner -> CLI -> IO ()
++main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+   conf@AppConfig{..} <-
+     either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty mempty
+ 
+@@ -45,7 +45,7 @@ main CLI{cliCommand, cliPath} = do
+         when configDbConfig $ AppState.reReadConfig True appState
+         putStr . Config.toText =<< AppState.getConfig appState
+       CmdDumpSchema -> putStrLn =<< dumpSchema appState
+-      CmdRun -> App.run appState)
++      CmdRun -> App.run installSignalHandlers runAppWithSocket appState)
+ 
+ -- | Dump SchemaCache schema to JSON
+ dumpSchema :: AppState -> IO LBS.ByteString
+diff --git a/src/PostgREST/Unix.hs b/src/PostgREST/Unix.hs
+index 2027cac0..5cb09f72 100644
+--- a/src/PostgREST/Unix.hs
++++ b/src/PostgREST/Unix.hs
+@@ -1,53 +1,57 @@
+-{-# LANGUAGE CPP #-}
+-
+ module PostgREST.Unix
+-  ( installSignalHandlers
+-  , createAndBindDomainSocket
++  ( runAppWithSocket
++  , installSignalHandlers
+   ) where
+ 
+-#ifndef mingw32_HOST_OS
+-import qualified System.Posix.Signals as Signals
+-#endif
+-import System.Posix.Types       (FileMode)
+-import System.PosixCompat.Files (setFileMode)
++import qualified Network.Socket           as Socket
++import qualified Network.Wai.Handler.Warp as Warp
++import qualified System.Posix.Signals     as Signals
++
++import Network.Wai        (Application)
++import System.Directory   (removeFile)
++import System.IO.Error    (isDoesNotExistError)
++import System.Posix.Files (setFileMode)
++import System.Posix.Types (FileMode)
++
++import qualified PostgREST.AppState as AppState
+ 
+-import           Data.String      (String)
+-import qualified Network.Socket   as NS
+-import           Protolude
+-import           System.Directory (removeFile)
+-import           System.IO.Error  (isDoesNotExistError)
++import Protolude
++
++
++-- | Run the PostgREST application with user defined socket.
++runAppWithSocket :: Warp.Settings -> Application -> FileMode -> FilePath -> IO ()
++runAppWithSocket settings app socketFileMode socketFilePath =
++  bracket createAndBindSocket Socket.close $ \socket -> do
++    Socket.listen socket Socket.maxListenQueue
++    Warp.runSettingsSocket settings socket app
++  where
++    createAndBindSocket = do
++      deleteSocketFileIfExist socketFilePath
++      sock <- Socket.socket Socket.AF_UNIX Socket.Stream Socket.defaultProtocol
++      Socket.bind sock $ Socket.SockAddrUnix socketFilePath
++      setFileMode socketFilePath socketFileMode
++      return sock
++
++    deleteSocketFileIfExist path =
++      removeFile path `catch` handleDoesNotExist
++
++    handleDoesNotExist e
++      | isDoesNotExistError e = return ()
++      | otherwise = throwIO e
+ 
+ -- | Set signal handlers, only for systems with signals
+-installSignalHandlers :: ThreadId -> IO () -> IO () -> IO ()
+-#ifndef mingw32_HOST_OS
+-installSignalHandlers tid usr1 usr2 = do
+-  let interrupt = throwTo tid UserInterrupt
++installSignalHandlers :: AppState.AppState -> IO ()
++installSignalHandlers appState = do
++  let interrupt = throwTo (AppState.getMainThreadId appState) UserInterrupt
+   install Signals.sigINT interrupt
+   install Signals.sigTERM interrupt
+-  install Signals.sigUSR1 usr1
+-  install Signals.sigUSR2 usr2
++
++  -- The SIGUSR1 signal updates the internal 'SchemaCache' by running
++  -- 'connectionWorker' exactly as before.
++  install Signals.sigUSR1 $ AppState.connectionWorker appState
++
++  -- Re-read the config on SIGUSR2
++  install Signals.sigUSR2 $ AppState.reReadConfig False appState
+   where
+     install signal handler =
+       void $ Signals.installHandler signal (Signals.Catch handler) Nothing
+-#else
+-installSignalHandlers _ _ _ = pass
+-#endif
+-
+--- | Create a unix domain socket and bind it to the given path.
+--- | The socket file will be deleted if it already exists.
+-createAndBindDomainSocket :: String -> FileMode -> IO NS.Socket
+-createAndBindDomainSocket path mode = do
+-  unless NS.isUnixDomainSocketAvailable $
+-    panic "Cannot run with unix socket on non-unix platforms. Consider deleting the `server-unix-socket` config entry in order to continue."
+-  deleteSocketFileIfExist path
+-  sock <- NS.socket NS.AF_UNIX NS.Stream NS.defaultProtocol
+-  NS.bind sock $ NS.SockAddrUnix path
+-  NS.listen sock (max 2048 NS.maxListenQueue)
+-  setFileMode path mode
+-  return sock
+-  where
+-    deleteSocketFileIfExist path' =
+-      removeFile path' `catch` handleDoesNotExist
+-    handleDoesNotExist e
+-      | isDoesNotExistError e = return ()
+-      | otherwise = throwIO e
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 3993de75..9209463d 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -197,13 +197,6 @@ def test_flush_pool_no_interrupt(defaultenv):
+         t.join()
+ 
+ 
+-def test_random_port_bound(defaultenv):
+-    "PostgREST should bind to a random port when PGRST_SERVER_PORT is 0."
+-
+-    with run(env=defaultenv, port="0") as postgrest:
+-        assert True  # liveness check is done by run(), so we just need to check that it doesn't fail
+-
+-
+ def test_app_settings_reload(tmp_path, defaultenv):
+     "App settings should be reloaded from file when PostgREST is sent SIGUSR2."
+     config = (CONFIGSDIR / "sigusr2-settings.config").read_text()
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index db3a8830..86ced443 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -73,12 +73,11 @@ main = do
+ 
+   -- cached schema cache so most tests run fast
+   baseSchemaCache <- loadSchemaCache pool testCfg
+-  sockets <- AppState.initSockets testCfg
+ 
+   let
+     -- For tests that run with the same refSchemaCache
+     app config = do
+-      appState <- AppState.initWithPool sockets pool config
++      appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just baseSchemaCache)
+       return ((), postgrest config appState $ pure ())
+@@ -86,7 +85,7 @@ main = do
+     -- For tests that run with a different SchemaCache(depends on configSchemas)
+     appDbs config = do
+       customSchemaCache <- loadSchemaCache pool config
+-      appState <- AppState.initWithPool sockets pool config
++      appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just customSchemaCache)
+       return ((), postgrest config appState $ pure ())

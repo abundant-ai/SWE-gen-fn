@@ -1,0 +1,9 @@
+Observability instrumentation is currently wired by passing an "observer"/observation handler argument down into many functions that need to emit observations. This design is error-prone: some internal functions that should emit observations can end up being called without the observer (or with the wrong one), and it forces large portions of the call graph to accept and forward an observer parameter even when they don’t otherwise need it.
+
+Change the observability plumbing so that the observation handler is carried in the runtime configuration and is accessible anywhere an AppConfig is available. Specifically:
+
+When constructing and running the application via `postgrest`, the active `AppConfig` must contain the observation handler, and code paths that produce observations (e.g., the schema cache query path via `querySchemaCache`, and database metadata queries like `queryPgVersion`) must obtain and use the observer from `AppConfig` instead of requiring it as an explicit function argument.
+
+After this change, callers should no longer need to pass an observer argument to every function that emits observations. Observations should still be emitted under the same circumstances as before; moving the observer into `AppConfig` must not disable observability. As a result, application startup and request handling should be able to invoke the observer consistently, and there should be no missing-parameter compilation/runtime failures caused by the previous observer-threading approach.
+
+The expected behavior is that all application flows that rely on `AppConfig` (including app initialization and schema cache loading) can emit observations without any additional observer argument being threaded through their APIs, while producing the same observed events/metrics as before.

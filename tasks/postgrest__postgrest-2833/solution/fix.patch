@@ -1,0 +1,188 @@
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 3bc0231e..87858688 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -51,7 +51,8 @@ import PostgREST.ApiRequest.Types        (ApiRequestError (..),
+                                           RangeError (..))
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+-import PostgREST.MediaType               (MediaType (..))
++import PostgREST.MediaType               (MTPlanFormat (..),
++                                          MediaType (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           convertToLimitZeroRange,
+                                           hasLimitZero,
+@@ -363,9 +364,9 @@ producedMediaTypes conf action path =
+   case action of
+     ActionRead _    -> defaultMediaTypes ++ rawMediaTypes
+     ActionInvoke _  -> invokeMediaTypes
+-    ActionInspect _ -> [MTOpenAPI, MTApplicationJSON, MTAny]
+     ActionInfo      -> defaultMediaTypes
+     ActionMutate _  -> defaultMediaTypes
++    ActionInspect _ -> [MTOpenAPI, MTApplicationJSON, MTAny]
+   where
+     invokeMediaTypes =
+       defaultMediaTypes
+@@ -373,5 +374,5 @@ producedMediaTypes conf action path =
+         ++ [MTOpenAPI | pathIsRootSpec path]
+     defaultMediaTypes =
+       [MTApplicationJSON, MTSingularJSON, MTGeoJSON, MTTextCSV] ++
+-      [MTPlan Nothing Nothing mempty | configDbPlanEnabled conf] ++ [MTAny]
++      [MTPlan MTApplicationJSON PlanText mempty | configDbPlanEnabled conf] ++ [MTAny]
+     rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
+diff --git a/src/PostgREST/MediaType.hs b/src/PostgREST/MediaType.hs
+index 1704b758..0b1fbef9 100644
+--- a/src/PostgREST/MediaType.hs
++++ b/src/PostgREST/MediaType.hs
+@@ -12,7 +12,6 @@ module PostgREST.MediaType
+ 
+ import qualified Data.ByteString          as BS
+ import qualified Data.ByteString.Internal as BS (c2w)
+-import           Data.Maybe               (fromJust)
+ 
+ import Network.HTTP.Types.Header (Header, hContentType)
+ 
+@@ -39,7 +38,7 @@ data MediaType
+   | MTOctetStream
+   | MTAny
+   | MTOther ByteString
+-  | MTPlan (Maybe MediaType) (Maybe MTPlanFormat) [MTPlanOption]
++  | MTPlan MediaType MTPlanFormat [MTPlanOption]
+ instance Eq MediaType where
+   MTApplicationJSON == MTApplicationJSON = True
+   MTSingularJSON    == MTSingularJSON    = True
+@@ -84,8 +83,8 @@ toMime MTOctetStream     = "application/octet-stream"
+ toMime MTAny             = "*/*"
+ toMime (MTOther ct)      = ct
+ toMime (MTPlan mt fmt opts) =
+-  "application/vnd.pgrst.plan" <> maybe mempty (\x -> "+" <> toMimePlanFormat x) fmt <>
+-  (if isNothing mt then mempty else "; for=\"" <> toMime (fromJust mt) <> "\"") <>
++  "application/vnd.pgrst.plan+" <> toMimePlanFormat fmt <>
++  ("; for=\"" <> toMime mt <> "\"") <>
+   (if null opts then mempty else "; options=" <> BS.intercalate "|" (toMimePlanOption <$> opts))
+ 
+ toMimePlanOption :: MTPlanOption -> ByteString
+@@ -105,13 +104,13 @@ toMimePlanFormat PlanText = "text"
+ -- MTApplicationJSON
+ --
+ -- >>> decodeMediaType "application/vnd.pgrst.plan;"
+--- MTPlan Nothing Nothing []
++-- MTPlan MTApplicationJSON PlanText []
+ --
+ -- >>> decodeMediaType "application/vnd.pgrst.plan;for=\"application/json\""
+--- MTPlan (Just MTApplicationJSON) Nothing []
++-- MTPlan MTApplicationJSON PlanText []
+ --
+--- >>> decodeMediaType "application/vnd.pgrst.plan+text;for=\"text/csv\""
+--- MTPlan (Just MTTextCSV) (Just PlanText) []
++-- >>> decodeMediaType "application/vnd.pgrst.plan+json;for=\"text/csv\""
++-- MTPlan MTTextCSV PlanJSON []
+ decodeMediaType :: BS.ByteString -> MediaType
+ decodeMediaType mt =
+   case BS.split (BS.c2w ';') mt of
+@@ -125,28 +124,31 @@ decodeMediaType mt =
+     "application/vnd.pgrst.object":_       -> MTSingularJSON
+     "application/x-www-form-urlencoded":_  -> MTUrlEncoded
+     "application/octet-stream":_           -> MTOctetStream
+-    "application/vnd.pgrst.plan":rest      -> getPlan Nothing rest
+-    "application/vnd.pgrst.plan+text":rest -> getPlan (Just PlanText) rest
+-    "application/vnd.pgrst.plan+json":rest -> getPlan (Just PlanJSON) rest
++    "application/vnd.pgrst.plan":rest      -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+text":rest -> getPlan PlanText rest
++    "application/vnd.pgrst.plan+json":rest -> getPlan PlanJSON rest
+     "*/*":_                                -> MTAny
+     other:_                                -> MTOther other
+     _                                      -> MTAny
+   where
+     getPlan fmt rest =
+-     let
+-       opts         = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
+-       inOpts str   = str `elem` opts
+-       mtFor        = decodeMediaType . dropAround (== BS.c2w '"') <$> (BS.stripPrefix "for=" =<< find (BS.isPrefixOf "for=") rest)
+-       dropAround p = BS.dropWhile p . BS.dropWhileEnd p in
+-     MTPlan mtFor fmt $
+-      [PlanAnalyze  | inOpts "analyze" ] ++
+-      [PlanVerbose  | inOpts "verbose" ] ++
+-      [PlanSettings | inOpts "settings"] ++
+-      [PlanBuffers  | inOpts "buffers" ] ++
+-      [PlanWAL      | inOpts "wal"     ]
++      let
++        opts         = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
++        inOpts str   = str `elem` opts
++        dropAround p = BS.dropWhile p . BS.dropWhileEnd p
++        mtFor        = fromMaybe MTApplicationJSON $ do
++          foundFor    <- find (BS.isPrefixOf "for=") rest
++          strippedFor <- BS.stripPrefix "for=" foundFor
++          pure . decodeMediaType $ dropAround (== BS.c2w '"') strippedFor
++      in
++      MTPlan mtFor fmt $
++        [PlanAnalyze  | inOpts "analyze" ] ++
++        [PlanVerbose  | inOpts "verbose" ] ++
++        [PlanSettings | inOpts "settings"] ++
++        [PlanBuffers  | inOpts "buffers" ] ++
++        [PlanWAL      | inOpts "wal"     ]
+ 
+ getMediaType :: MediaType -> MediaType
+ getMediaType mt = case mt of
+-  MTPlan (Just mType) _ _ -> mType
+-  MTPlan Nothing _ _      -> MTApplicationJSON
+-  other                   -> other
++  MTPlan mType _ _ -> mType
++  other            -> other
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index b6d9abe0..9e802c91 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -633,10 +633,10 @@ binaryField AppConfig{configRawMediaTypes} acceptMediaType proc rpTree
+   where
+     isRawMediaType = acceptMediaType `elem` configRawMediaTypes `L.union` [MTOctetStream, MTTextPlain, MTTextXML] || isRawPlan acceptMediaType
+     isRawPlan mt = case mt of
+-      MTPlan (Just MTOctetStream) _ _ -> True
+-      MTPlan (Just MTTextPlain) _ _   -> True
+-      MTPlan (Just MTTextXML) _ _     -> True
+-      _                               -> False
++      MTPlan MTOctetStream _ _ -> True
++      MTPlan MTTextPlain _ _   -> True
++      MTPlan MTTextXML _ _     -> True
++      _                        -> False
+ 
+     fstFieldName :: ReadPlanTree -> Maybe FieldName
+     fstFieldName (Node ReadPlan{select=(("*", []), _, _):_} [])  = Nothing
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index ea150ec4..3834eec2 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -431,7 +431,7 @@ intercalateSnippet :: ByteString -> [SQL.Snippet] -> SQL.Snippet
+ intercalateSnippet _ [] = mempty
+ intercalateSnippet frag snippets = foldr1 (\a b -> a <> SQL.sql frag <> b) snippets
+ 
+-explainF :: Maybe MTPlanFormat -> [MTPlanOption] -> SQL.Snippet -> SQL.Snippet
++explainF :: MTPlanFormat -> [MTPlanOption] -> SQL.Snippet -> SQL.Snippet
+ explainF fmt opts snip =
+   "EXPLAIN (" <>
+     SQL.sql (BS.intercalate ", " (fmtPlanFmt fmt : (fmtPlanOpt <$> opts))) <>
+@@ -444,9 +444,8 @@ explainF fmt opts snip =
+     fmtPlanOpt PlanBuffers  = "BUFFERS"
+     fmtPlanOpt PlanWAL      = "WAL"
+ 
+-    fmtPlanFmt Nothing         = "FORMAT TEXT"
+-    fmtPlanFmt (Just PlanJSON) = "FORMAT JSON"
+-    fmtPlanFmt (Just PlanText) = "FORMAT TEXT"
++    fmtPlanFmt PlanText = "FORMAT TEXT"
++    fmtPlanFmt PlanJSON = "FORMAT JSON"
+ 
+ -- | Do a pg set_config(setting, value, true) call. This is equivalent to a SET LOCAL.
+ setConfigLocal :: ByteString -> (ByteString, ByteString) -> SQL.Snippet
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 03fff7fe..24840f46 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -167,7 +167,7 @@ preparePlanRows :: SQL.Snippet -> Bool -> SQL.Statement () (Maybe Int64)
+ preparePlanRows countQuery =
+   SQL.dynamicallyParameterized snippet decodeIt
+   where
+-    snippet = explainF (Just PlanJSON) mempty countQuery
++    snippet = explainF PlanJSON mempty countQuery
+     decodeIt :: HD.Result (Maybe Int64)
+     decodeIt =
+       let row = HD.singleRow $ column HD.bytea in

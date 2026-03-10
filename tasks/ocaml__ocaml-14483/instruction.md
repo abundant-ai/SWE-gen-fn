@@ -1,0 +1,15 @@
+When compiling multiple modules in a single `ocamlc -c` invocation, the compiler does not fully reset certain global/type-checker state between compilation units. As a result, compiling `ocamlc -c foo.ml bar.ml baz.ml` can produce different `.cmo` outputs (including debug-event payloads and, in some cases, marshalled data string-sharing behavior) compared to compiling each file in a separate `ocamlc -c` invocation.
+
+This non-determinism shows up in two main ways:
+
+1) Debug events can differ between the “single invocation” and “separate invocations” workflows because internal numeric counters leak into debug info. In particular, type identifiers allocated via `Types.new_id` and level-related counters used by `Ctype` are not reset between compilation units in the same process, causing later units to receive different IDs/levels than they would when compiled in a fresh process. Expected behavior is that debug events produced for a given module (compiled with `-g`) are identical regardless of whether earlier modules were compiled in the same `ocamlc` invocation.
+
+2) The pattern-matching compiler keeps lambda caches that are not reset between compilation units. If an earlier compilation unit forces either `Matching.code_force_lazy_block` or `Matching.code_force_lazy`, that forced state persists and can change later compilation results. This becomes observable when a later module refers to `CamlinternalLazy` and also uses these forced-lazy blocks: the physical string stored in the persistent environment can differ, which can be detected in the marshalled output (for example via differences consistent with a lack of string sharing). Expected behavior is that compilation results are deterministic across compilation strategies; forcing of lazy code paths in one unit must not affect compilation artifacts for subsequent units.
+
+Implement a full reset of the relevant type-checker/compiler state between compilation units within a single `ocamlc` process such that compiling modules together is equivalent to compiling them one-by-one in separate `ocamlc` runs. Concretely:
+
+- Ensure the type ID counter used by `Types.new_id` is reset appropriately between compilation units.
+- Ensure `Ctype` level state is reset appropriately between compilation units.
+- Ensure the pattern-match compiler’s lambda caches are reset between compilation units so that `Matching.code_force_lazy_block` / `Matching.code_force_lazy` forcing does not persist across units.
+
+After the fix, compiling a module with `-g` should produce `.cmo` output whose non-debug compilation-unit metadata is unchanged and whose debug-event section is identical regardless of whether the module is compiled alone or after compiling other modules in the same `ocamlc` invocation. Additionally, compilation should not show observable differences in marshalled output attributable to cross-unit persistence of forced lazy/matching caches.

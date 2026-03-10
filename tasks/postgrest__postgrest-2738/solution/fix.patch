@@ -1,0 +1,409 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 68575db4..1fb40bcf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,6 +30,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + New option `db-pool-max-lifetime` (default 30m)
+    + `db-pool-acquisition-timeout` is no longer optional and defaults to 10s
+    + Fixes postgresql resource leak with long-lived connections (#2638)
++ - #1569, Allow `any/all` modifiers on the `eq,like,ilike,gt,gte,lt,lte,match,imatch` operators, e.g. `/tbl?id=eq(any).{1,2,3}` - @steve-chavez
++   - This converts the input into an array type
+ 
+ ### Fixed
+ 
+@@ -42,7 +44,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2705, Fix bug when using the `Range` header on `PATCH/DELETE` - @laurenceisla
+    + Fix the`"message": "syntax error at or near \"RETURNING\""` error
+    + Fix doing a limited update/delete when an `order` query parameter was present
+-    
++
+ ### Changed
+ 
+  - #2705, The `Range` header is now only considered on `GET` requests and is ignored for any other method - @laurenceisla
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 6114307c..4719ba5f 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -30,7 +30,6 @@ import Data.Ranged.Ranges            (Range (..))
+ import Data.Tree                     (Tree (..))
+ import Text.Parsec.Error             (errorMessages,
+                                       showErrorMessages)
+-import Text.Parsec.Prim              (parserFail)
+ import Text.ParserCombinators.Parsec (GenParser, ParseError, Parser,
+                                       anyChar, between, char, digit,
+                                       eof, errorPos, letter,
+@@ -51,10 +50,11 @@ import PostgREST.ApiRequest.Types (EmbedParam (..), EmbedPath, Field,
+                                    JsonOperation (..), JsonPath,
+                                    ListVal, LogicOperator (..),
+                                    LogicTree (..), OpExpr (..),
+-                                   Operation (..),
++                                   OpQuantifier (..), Operation (..),
+                                    OrderDirection (..),
+                                    OrderNulls (..), OrderTerm (..),
+-                                   QPError (..), SelectItem (..),
++                                   QPError (..), QuantOperator (..),
++                                   SelectItem (..),
+                                    SimpleOperator (..), SingleVal,
+                                    TrileanVal (..))
+ 
+@@ -67,7 +67,9 @@ import Protolude hiding (try)
+ -- >>> deriving instance Show QPError
+ -- >>> deriving instance Show TrileanVal
+ -- >>> deriving instance Show FtsOperator
++-- >>> deriving instance Show QuantOperator
+ -- >>> deriving instance Show SimpleOperator
++-- >>> deriving instance Show OpQuantifier
+ -- >>> deriving instance Show Operation
+ -- >>> deriving instance Show OpExpr
+ -- >>> deriving instance Show JsonOperand
+@@ -125,12 +127,12 @@ data QueryParams =
+ -- Filters are parameters whose value contains an operator, separated by a '.' from its value:
+ --
+ -- >>> qsFilters <$> parse False "a.b=eq.0"
+--- Right [(["a"],Filter {field = ("b",[]), opExpr = OpExpr False (Op OpEqual "0")})]
++-- Right [(["a"],Filter {field = ("b",[]), opExpr = OpExpr False (OpQuant OpEqual Nothing "0")})]
+ --
+ -- If the operator specified in a filter does not exist, parsing the query string fails:
+ --
+ -- >>> qsFilters <$> parse False "a.b=noop.0"
+--- Left (QPError "\"failed to parse filter (noop.0)\" (line 1, column 6)" "expecting operator (eq, gt, ...) unknown single value operator noop")
++-- Left (QPError "\"failed to parse filter (noop.0)\" (line 1, column 1)" "unexpected \"o\" expecting \"not\" or operator (eq, gt, ...)")
+ parse :: Bool -> ByteString -> Either QPError QueryParams
+ parse isRpcGet qs = do
+   rOrd                      <- pRequestOrder `traverse` order
+@@ -200,29 +202,31 @@ parse isRpcGet qs = do
+         offsetParams =
+           HM.fromList [(k, maybe allRange rangeGeq (readMaybe v)) | (k,v) <- offsets]
+ 
+-operator :: Text -> Maybe SimpleOperator
+-operator = \case
+-  "eq"     -> Just OpEqual
+-  "gte"    -> Just OpGreaterThanEqual
+-  "gt"     -> Just OpGreaterThan
+-  "lte"    -> Just OpLessThanEqual
+-  "lt"     -> Just OpLessThan
+-  "neq"    -> Just OpNotEqual
+-  "like"   -> Just OpLike
+-  "ilike"  -> Just OpILike
+-  "cs"     -> Just OpContains
+-  "cd"     -> Just OpContained
+-  "ov"     -> Just OpOverlap
+-  "sl"     -> Just OpStrictlyLeft
+-  "sr"     -> Just OpStrictlyRight
+-  "nxr"    -> Just OpNotExtendsRight
+-  "nxl"    -> Just OpNotExtendsLeft
+-  "adj"    -> Just OpAdjacent
+-  "match"  -> Just OpMatch
+-  "imatch" -> Just OpIMatch
+-  _        -> Nothing
+-
+--- PARSERS
++simpleOperator :: Parser SimpleOperator
++simpleOperator =
++  try (string "neq" $> OpNotEqual) <|>
++  try (string "cs" $> OpContains) <|>
++  try (string "cd" $> OpContained) <|>
++  try (string "ov" $> OpOverlap) <|>
++  try (string "sl" $> OpStrictlyLeft) <|>
++  try (string "sr" $> OpStrictlyRight) <|>
++  try (string "nxr" $> OpNotExtendsRight) <|>
++  try (string "nxl" $> OpNotExtendsLeft) <|>
++  try (string "adj" $> OpAdjacent) <?>
++  "unknown single value operator"
++
++quantOperator :: Parser QuantOperator
++quantOperator =
++  try (string "eq" $> OpEqual) <|>
++  try (string "gte" $> OpGreaterThanEqual) <|>
++  try (string "gt" $> OpGreaterThan) <|>
++  try (string "lte" $> OpLessThanEqual) <|>
++  try (string "lt" $> OpLessThan) <|>
++  try (string "like" $> OpLike) <|>
++  try (string "ilike" $> OpILike) <|>
++  try (string "match" $> OpMatch) <|>
++  try (string "imatch" $> OpIMatch) <?>
++  "unknown single value operator"
+ 
+ pRequestSelect :: Text -> Either QPError [Tree SelectItem]
+ pRequestSelect selStr =
+@@ -236,10 +240,10 @@ pRequestOnConflict oncStr =
+ -- Parse `id=eq.1`(id, eq.1) into (EmbedPath, Filter)
+ --
+ -- >>> pRequestFilter False ("id", "eq.1")
+--- Right ([],Filter {field = ("id",[]), opExpr = OpExpr False (Op OpEqual "1")})
++-- Right ([],Filter {field = ("id",[]), opExpr = OpExpr False (OpQuant OpEqual Nothing "1")})
+ --
+ -- >>> pRequestFilter False ("id", "val")
+--- Left (QPError "\"failed to parse filter (val)\" (line 1, column 4)" "unexpected end of input expecting operator (eq, gt, ...)")
++-- Left (QPError "\"failed to parse filter (val)\" (line 1, column 1)" "unexpected \"v\" expecting \"not\" or operator (eq, gt, ...)")
+ --
+ -- >>> pRequestFilter True ("id", "val")
+ -- Right ([],Filter {field = ("id",[]), opExpr = NoOpExpr "val"})
+@@ -580,26 +584,54 @@ pEmbedParams = do
+ -- Parse operator expression used in horizontal filtering
+ --
+ -- >>> P.parse (pOpExpr pSingleVal) "" "fts().value"
+--- Left (line 1, column 7):
++-- Left (line 1, column 5):
++-- unexpected ")"
++-- expecting operator (eq, gt, ...)
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "eq(any).value"
++-- Right (OpExpr False (OpQuant OpEqual (Just QuantAny) "value"))
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "eq(all).value"
++-- Right (OpExpr False (OpQuant OpEqual (Just QuantAll) "value"))
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "not.eq(all).value"
++-- Right (OpExpr True (OpQuant OpEqual (Just QuantAll) "value"))
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "eq().value"
++-- Left (line 1, column 4):
++-- unexpected ")"
++-- expecting operator (eq, gt, ...)
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "is().value"
++-- Left (line 1, column 3):
++-- unexpected "("
++-- expecting operator (eq, gt, ...)
++--
++-- >>> P.parse (pOpExpr pSingleVal) "" "in().value"
++-- Left (line 1, column 3):
++-- unexpected "("
+ -- expecting operator (eq, gt, ...)
+--- unknown single value operator fts()
+ pOpExpr :: Parser SingleVal -> Parser OpExpr
+ pOpExpr pSVal = do
+   boolExpr <- try (string "not" *> pDelimiter $> True) <|> pure False
+   OpExpr boolExpr <$> pOperation
+   where
+     pOperation :: Parser Operation
+-    pOperation = pIn <|> pIs <|> pIsDist <|> try pFts <|> try pOp <?> "operator (eq, gt, ...)"
++    pOperation = pIn <|> pIs <|> pIsDist <|> try pFts <|> try pSimpleOp <|> try pQuantOp <?> "operator (eq, gt, ...)"
+ 
+     pIn = In <$> (try (string "in" *> pDelimiter) *> pListVal)
+     pIs = Is <$> (try (string "is" *> pDelimiter) *> pTriVal)
+ 
+     pIsDist = IsDistinctFrom <$> (try (string "isdistinct" *> pDelimiter) *> pSVal)
+ 
+-    pOp = do
+-      opStr <- try (P.manyTill anyChar (try pDelimiter))
+-      op <- parseMaybe ("unknown single value operator " <> opStr) . operator $ toS opStr
+-      Op op <$> pSVal
++    pSimpleOp = do
++      op <- simpleOperator
++      pDelimiter *> (Op op <$> pSVal)
++
++    pQuantOp = do
++      op <- quantOperator
++      quant <- optionMaybe $ try (between (char '(') (char ')') (try (string "any" $> QuantAny) <|> string "all" $> QuantAll))
++      pDelimiter *> (OpQuant op quant <$> pSVal)
+ 
+     pTriVal = try (ciString "null"    $> TriNull)
+           <|> try (ciString "unknown" $> TriUnknown)
+@@ -616,10 +648,6 @@ pOpExpr pSVal = do
+       lang <- optionMaybe $ try (between (char '(') (char ')') pIdentifier)
+       pDelimiter >> Fts op (toS <$> lang) <$> pSVal
+ 
+-    parseMaybe :: [Char] -> Maybe a -> Parser a
+-    parseMaybe err Nothing = parserFail err
+-    parseMaybe _ (Just x)  = pure x
+-
+     -- case insensitive char and string
+     ciChar :: Char -> GenParser Char state Char
+     ciChar c = char c <|> char (toUpper c)
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 207e773b..99436247 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -19,6 +19,7 @@ module PostgREST.ApiRequest.Types
+   , NodeName
+   , OpExpr(..)
+   , Operation (..)
++  , OpQuantifier(..)
+   , OrderDirection(..)
+   , OrderNulls(..)
+   , OrderTerm(..)
+@@ -27,6 +28,7 @@ module PostgREST.ApiRequest.Types
+   , SingleVal
+   , TrileanVal(..)
+   , SimpleOperator(..)
++  , QuantOperator(..)
+   , FtsOperator(..)
+   , SelectItem(..)
+   ) where
+@@ -187,8 +189,12 @@ data OpExpr
+   | NoOpExpr Text
+   deriving (Eq)
+ 
++data OpQuantifier = QuantAny | QuantAll
++  deriving Eq
++
+ data Operation
+   = Op SimpleOperator SingleVal
++  | OpQuant QuantOperator (Maybe OpQuantifier) SingleVal
+   | In ListVal
+   | Is TrileanVal
+   | IsDistinctFrom SingleVal
+@@ -211,15 +217,21 @@ data TrileanVal
+   | TriUnknown
+   deriving Eq
+ 
+-data SimpleOperator
++-- Operators that are quantifiable, i.e. they can be used with the any/all modifiers
++data QuantOperator
+   = OpEqual
+   | OpGreaterThanEqual
+   | OpGreaterThan
+   | OpLessThanEqual
+   | OpLessThan
+-  | OpNotEqual
+   | OpLike
+   | OpILike
++  | OpMatch
++  | OpIMatch
++  deriving Eq
++
++data SimpleOperator
++  = OpNotEqual
+   | OpContains
+   | OpContained
+   | OpOverlap
+@@ -228,10 +240,9 @@ data SimpleOperator
+   | OpNotExtendsRight
+   | OpNotExtendsLeft
+   | OpAdjacent
+-  | OpMatch
+-  | OpIMatch
+   deriving Eq
+ 
++--
+ -- | Operators for full text search operators
+ data FtsOperator
+   = FilterFts
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 15a65fa0..824f24b5 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -515,8 +515,8 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+            qsFilterFields == S.fromList pkCols &&
+            not (null (S.fromList pkCols)) &&
+            all (\case
+-              Filter _ (OpExpr False (Op OpEqual _)) -> True
+-              _                                      -> False) qsFiltersRoot
++              Filter _ (OpExpr False (OpQuant OpEqual Nothing _)) -> True
++              _                                                   -> False) qsFiltersRoot
+           then mapRight (\typedColumns -> Insert qi typedColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings mempty False) typedColumnsOrError
+         else
+           Left InvalidFilters
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index aef561a3..be0e475e 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -64,10 +64,12 @@ import PostgREST.ApiRequest.Types        (Alias, Cast, Field,
+                                           JsonPath,
+                                           LogicOperator (..),
+                                           LogicTree (..), OpExpr (..),
++                                          OpQuantifier (..),
+                                           Operation (..),
+                                           OrderDirection (..),
+                                           OrderNulls (..),
+                                           OrderTerm (..),
++                                          QuantOperator (..),
+                                           SimpleOperator (..),
+                                           TrileanVal (..))
+ import PostgREST.MediaType               (MTPlanFormat (..),
+@@ -91,24 +93,27 @@ noLocationF = "array[]::text[]"
+ sourceCTEName :: SqlFragment
+ sourceCTEName = "pgrst_source"
+ 
+-singleValOperator :: SimpleOperator -> SqlFragment
+-singleValOperator = \case
++simpleOperator :: SimpleOperator -> SqlFragment
++simpleOperator = \case
++  OpNotEqual        -> "<>"
++  OpContains        -> "@>"
++  OpContained       -> "<@"
++  OpOverlap         -> "&&"
++  OpStrictlyLeft    -> "<<"
++  OpStrictlyRight   -> ">>"
++  OpNotExtendsRight -> "&<"
++  OpNotExtendsLeft  -> "&>"
++  OpAdjacent        -> "-|-"
++
++quantOperator :: QuantOperator -> SqlFragment
++quantOperator = \case
+   OpEqual            -> "="
+   OpGreaterThanEqual -> ">="
+   OpGreaterThan      -> ">"
+   OpLessThanEqual    -> "<="
+   OpLessThan         -> "<"
+-  OpNotEqual         -> "<>"
+   OpLike             -> "like"
+   OpILike            -> "ilike"
+-  OpContains         -> "@>"
+-  OpContained        -> "<@"
+-  OpOverlap          -> "&&"
+-  OpStrictlyLeft     -> "<<"
+-  OpStrictlyRight    -> ">>"
+-  OpNotExtendsRight  -> "&<"
+-  OpNotExtendsLeft   -> "&>"
+-  OpAdjacent         -> "-|-"
+   OpMatch            -> "~"
+   OpIMatch           -> "~*"
+ 
+@@ -289,39 +294,42 @@ pgFmtOrderTerm qi ot =
+ pgFmtFilter :: QualifiedIdentifier -> Filter -> SQL.Snippet
+ pgFmtFilter _ (FilterNullEmbed hasNot fld) = SQL.sql (pgFmtIdent fld) <> " IS " <> (if hasNot then "NOT" else mempty) <> " NULL"
+ pgFmtFilter _ (Filter _ (NoOpExpr _)) = mempty -- TODO unreachable because NoOpExpr is filtered on QueryParams
+-pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper of
+-   Op op val  -> pgFmtFieldOp op <> " " <> case op of
+-     OpLike  -> unknownLiteral (T.map star val)
+-     OpILike -> unknownLiteral (T.map star val)
+-     _       -> unknownLiteral val
++pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> pgFmtField table fld <> case oper of
++   Op op val -> " " <> SQL.sql (simpleOperator op) <> " " <> unknownLiteral val
++
++   OpQuant op quant val -> " " <> SQL.sql (quantOperator op) <> " " <> case op of
++     OpLike  -> fmtQuant quant $ unknownLiteral (T.map star val)
++     OpILike -> fmtQuant quant $ unknownLiteral (T.map star val)
++     _       -> fmtQuant quant $ unknownLiteral val
+ 
+    -- IS cannot be prepared. `PREPARE boolplan AS SELECT * FROM projects where id IS $1` will give a syntax error.
+    -- The above can be fixed by using `PREPARE boolplan AS SELECT * FROM projects where id IS NOT DISTINCT FROM $1;`
+    -- However that would not accept the TRUE/FALSE/NULL/UNKNOWN keywords. See: https://stackoverflow.com/questions/6133525/proper-way-to-set-preparedstatement-parameter-to-null-under-postgres.
+    -- This is why `IS` operands are whitelisted at the Parsers.hs level
+-   Is triVal -> pgFmtField table fld <> " IS " <> case triVal of
++   Is triVal -> " IS " <> case triVal of
+      TriTrue    -> "TRUE"
+      TriFalse   -> "FALSE"
+      TriNull    -> "NULL"
+      TriUnknown -> "UNKNOWN"
+ 
+-   IsDistinctFrom val -> pgFmtField table fld <> " IS DISTINCT FROM " <> unknownLiteral val
++   IsDistinctFrom val -> " IS DISTINCT FROM " <> unknownLiteral val
+ 
+    -- We don't use "IN", we use "= ANY". IN has the following disadvantages:
+    -- + No way to use an empty value on IN: "col IN ()" is invalid syntax. With ANY we can do "= ANY('{}')"
+    -- + Can invalidate prepared statements: multiple parameters on an IN($1, $2, $3) will lead to using different prepared statements and not take advantage of caching.
+-   In vals -> pgFmtField table fld <> " " <> case vals of
++   In vals -> " " <> case vals of
+       [""] -> "= ANY('{}') "
+       _    -> "= ANY (" <> unknownLiteral (pgBuildArrayLiteral vals) <> ") "
+ 
+-   Fts op lang val ->
+-     pgFmtFieldFts op <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
++   Fts op lang val -> " " <> SQL.sql (ftsOperator op) <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
+  where
+    ftsLang = maybe mempty (\l -> unknownLiteral l <> ", ")
+-   pgFmtFieldOp op = pgFmtField table fld <> " " <> SQL.sql (singleValOperator op)
+-   pgFmtFieldFts op = pgFmtField table fld <> " " <> SQL.sql (ftsOperator op)
+    notOp = if hasNot then "NOT" else mempty
+    star c = if c == '*' then '%' else c
++   fmtQuant q val = case q of
++    Just QuantAny -> "ANY(" <> val <> ")"
++    Just QuantAll -> "ALL(" <> val <> ")"
++    Nothing       -> val
+ 
+ pgFmtJoinCondition :: JoinCondition -> SQL.Snippet
+ pgFmtJoinCondition (JoinCondition (qi1, col1) (qi2, col2)) =

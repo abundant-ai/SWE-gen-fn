@@ -1,0 +1,195 @@
+diff --git a/man/ocamlrun.1 b/man/ocamlrun.1
+index 64eb557680..7b2bfd7bf1 100644
+--- a/man/ocamlrun.1
++++ b/man/ocamlrun.1
+@@ -172,6 +172,11 @@ else in percents of the heap size).
+ .BR l " (stack_limit)"
+ The limit (in words) of the stack size.
+ .TP
++.BR L " (small_heap_limit)"
++The boundary between small-heap mode and normal mode for the major GC. See
++the
++.B Gc
++module documentation for details.
+ .BR m " (custom_minor_ratio)"
+ Bound on floating garbage for out-of-heap memory
+ held by custom values in the minor heap. A minor GC is triggered
+diff --git a/manual/src/cmds/runtime.etex b/manual/src/cmds/runtime.etex
+index 06b5f883c7..cc1fb793e8 100644
+--- a/manual/src/cmds/runtime.etex
++++ b/manual/src/cmds/runtime.etex
+@@ -138,6 +138,9 @@ The following environment variables are also consulted:
+   \item[l] ("stack_limit") The limit (in words) of the stack size. This is
+         relevant to both the byte-code runtime and the native code runtime:
+         OCaml always uses its own stack and not the operating system's stack.
++  \item[L] ("small_heap_limit") The boundary between small-heap mode and
++        normal mode for the major GC. See the Gc module documentation for
++        details.
+   \item[m] ("custom_minor_ratio") Bound on floating garbage for
+         out-of-heap memory
+         held by custom values in the minor heap. A minor GC is triggered
+diff --git a/runtime/caml/startup_aux.h b/runtime/caml/startup_aux.h
+index d0a44affbd..768495a31c 100644
+--- a/runtime/caml/startup_aux.h
++++ b/runtime/caml/startup_aux.h
+@@ -47,6 +47,7 @@ struct caml_params {
+   uintnat print_config;
+ 
+   uintnat init_percent_free;
++  uintnat init_small_heap_limit;
+   uintnat init_minor_heap_wsz;
+   uintnat init_custom_major_ratio;
+   uintnat init_custom_minor_ratio;
+diff --git a/runtime/gc_ctrl.c b/runtime/gc_ctrl.c
+index 71d13b1616..7402d09b23 100644
+--- a/runtime/gc_ctrl.c
++++ b/runtime/gc_ctrl.c
+@@ -129,7 +129,7 @@ CAMLprim value caml_gc_get(value v)
+   CAMLparam0 ();   /* v is ignored */
+   CAMLlocal1 (res);
+ 
+-  res = caml_alloc_tuple (11);
++  res = caml_alloc_tuple (12);
+   Store_field (res, 0, Val_long (Caml_state->minor_heap_wsz));          /* s */
+   Store_field (res, 2,
+     Val_long (atomic_load_relaxed(&caml_percent_free)));                /* o */
+@@ -141,6 +141,8 @@ CAMLprim value caml_gc_get(value v)
+     Val_long (atomic_load_relaxed(&caml_custom_minor_ratio)));          /* m */
+   Store_field (res, 10,
+     Val_long (atomic_load_relaxed(&caml_custom_minor_max_bsz)));        /* n */
++  Store_field (res, 11,
++    Val_long (atomic_load_relaxed(&caml_small_heap_limit)));            /* L */
+   CAMLreturn (res);
+ }
+ 
+@@ -202,6 +204,15 @@ CAMLprim value caml_gc_set(value v)
+                       caml_custom_minor_max_bsz);
+     }
+   }
++  /* This field was added in 5.5.0 */
++  if (Wosize_val (v) >= 12){
++    uintnat new_small_limit = Long_val (Field (v, 11));
++    if (new_small_limit != caml_small_heap_limit){
++      caml_small_heap_limit = new_small_limit;
++      CAML_GC_MESSAGE(PARAMS, "New small heap limit: %" CAML_PRIuNAT "%%\n",
++                      new_small_limit);
++    }
++  }
+ 
+   /* Minor heap size comes last because it will trigger a minor collection
+      (thus invalidating [v]) and it can raise [Out_of_memory]. */
+@@ -343,6 +354,7 @@ void caml_init_gc (void)
+   caml_fiber_wsz = (Stack_threshold * 2) / sizeof(value);
+   atomic_store_relaxed(&caml_percent_free,
+                        norm_pfree (caml_params->init_percent_free));
++  caml_small_heap_limit = caml_params->init_small_heap_limit;
+ 
+   atomic_store_relaxed(&caml_custom_major_ratio,
+                        norm_custom_maj (caml_params->init_custom_major_ratio));
+@@ -391,11 +403,11 @@ CAMLprim value caml_runtime_parameters (value unit)
+        /* b */ (int) Caml_state->backtrace_active,
+        /* c */ caml_params->cleanup_on_exit,
+        /* e */ caml_params->runtime_events_log_wsize,
+-       /* l */ caml_max_stack_wsize,
+-       /* M */ caml_custom_major_ratio,
+-       /* m */ caml_custom_minor_ratio,
+-       /* n */ caml_custom_minor_max_bsz,
+-       /* o */ caml_percent_free,
++       /* l */ atomic_load_relaxed (&caml_max_stack_wsize),
++       /* M */ atomic_load_relaxed (&caml_custom_major_ratio),
++       /* m */ atomic_load_relaxed (&caml_custom_minor_ratio),
++       /* n */ atomic_load_relaxed (&caml_custom_minor_max_bsz),
++       /* o */ atomic_load_relaxed (&caml_percent_free),
+        /* p */ Caml_state->parser_trace,
+        /* R */ /* missing */
+        /* s */ Caml_state->minor_heap_wsz,
+@@ -513,7 +525,6 @@ struct gc_tweak {
+ static struct gc_tweak gc_tweaks[] = {
+ #define TWEAK(v) { #v, &caml_##v, 0 }
+   TWEAK(mark_stack_prune_factor),
+-  TWEAK(small_heap_limit),
+ #undef TWEAK
+ };
+ enum {N_GC_TWEAKS = sizeof(gc_tweaks)/sizeof(gc_tweaks[0])};
+diff --git a/runtime/startup_aux.c b/runtime/startup_aux.c
+index 38eeafba34..c1390910bf 100644
+--- a/runtime/startup_aux.c
++++ b/runtime/startup_aux.c
+@@ -56,6 +56,7 @@ static void init_startup_params(void)
+ #endif
+ 
+   params.init_percent_free = Percent_free_def;
++  params.init_small_heap_limit = Small_heap_limit_def;
+   params.init_minor_heap_wsz = Minor_heap_def;
+   params.init_custom_major_ratio = Custom_major_ratio_def;
+   params.init_custom_minor_ratio = Custom_minor_ratio_def;
+@@ -112,6 +113,7 @@ void caml_parse_ocamlrunparam(void)
+       case 'c': scanmult (opt, &params.cleanup_on_exit); break;
+       case 'd': scanmult (opt, &params.max_domains); break;
+       case 'e': scanmult (opt, &params.runtime_events_log_wsize); break;
++      case 'L': scanmult (opt, &params.init_small_heap_limit); break;
+       case 'l': scanmult (opt, &params.init_max_stack_wsz); break;
+       case 'M': scanmult (opt, &params.init_custom_major_ratio); break;
+       case 'm': scanmult (opt, &params.init_custom_minor_ratio); break;
+diff --git a/stdlib/gc.ml b/stdlib/gc.ml
+index 9afa24e185..fa90b73674 100644
+--- a/stdlib/gc.ml
++++ b/stdlib/gc.ml
+@@ -47,6 +47,7 @@ type control = {
+   custom_major_ratio : int;
+   custom_minor_ratio : int;
+   custom_minor_max_size : int;
++  small_heap_limit : int;
+ }
+ 
+ external stat : unit -> stat = "caml_gc_stat"
+diff --git a/stdlib/gc.mli b/stdlib/gc.mli
+index 23bee3e8c0..6662cb5ac9 100644
+--- a/stdlib/gc.mli
++++ b/stdlib/gc.mli
+@@ -240,6 +240,17 @@ type control =
+         [caml_alloc_custom_mem] (e.g. bigarrays).
+         Default: 70000 bytes.
+         @since 4.08 *)
++
++    small_heap_limit : int;
++    (** Minimum amount of allocations that must occur during the
++        sweeping phase of the major GC. If this limit is not reached,
++        the GC inserts an idle phase.
++        This is done to reduce the time overhead of the GC at program
++        start-up and for programs with small amounts of live data.
++        This parameter is also an upper bound on the amount of overhead
++        added by the idle phase.
++        Default: 256k (words).
++        @since 5.5 *)
+   }
+ (** The GC parameters are given as a [control] record.  Note that
+     these parameters can also be initialised by setting the
+diff --git a/testsuite/tests/regression/pr9326/gc_set.ml b/testsuite/tests/regression/pr9326/gc_set.ml
+index 580b452af5..ec57edd6e1 100644
+--- a/testsuite/tests/regression/pr9326/gc_set.ml
++++ b/testsuite/tests/regression/pr9326/gc_set.ml
+@@ -4,6 +4,7 @@ open Gc
+ 
+ let min_heap_sz = 524288 (* 512k *)
+ let space_overhead = 70
++let small_heap_limit = min_heap_sz
+ let stack_limit = 4194304 (* 4M *)
+ let custom_major_ratio = 40
+ let custom_minor_ratio = 99
+@@ -24,6 +25,7 @@ let _ =
+            custom_major_ratio = custom_major_ratio;
+            custom_minor_ratio = custom_minor_ratio;
+            custom_minor_max_size = custom_minor_max_size;
++           small_heap_limit = small_heap_limit;
+          };
+   let g2 = Gc.get() in
+   assert (g2.minor_heap_size = min_heap_sz);
+@@ -35,4 +37,6 @@ let _ =
+   assert (g2.window_size = g1.window_size);
+   assert (g2.custom_major_ratio = custom_major_ratio);
+   assert (g2.custom_minor_ratio = custom_minor_ratio);
+-  assert (g2.custom_minor_max_size = custom_minor_max_size)
++  assert (g2.custom_minor_max_size = custom_minor_max_size);
++  assert (g2.small_heap_limit = small_heap_limit);
++  ()

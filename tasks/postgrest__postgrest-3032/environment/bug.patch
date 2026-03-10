@@ -1,0 +1,674 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d2999442..b4f603a2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,16 +23,12 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1070, Fix HTTP status responses for upserts - @taimoorzaeem
+    + `PUT` returns `201` instead of `200` when rows are inserted
+    + `POST` with `Prefer: resolution=merge-duplicates` returns `200` instead of `201` when no rows are inserted
+- - #3019, Transaction-Scoped Settings are now shown clearly in the Postgres logs - @laurenceisla
+-   + Shows `set_config('pgrst.setting_name', $1)` instead of `setconfig($1, $2)`
+-   + Does not apply to role settings and `app.settings.*`
+ 
+ ### Changed
+ 
+  - Removed [raw-media-types config](https://postgrest.org/en/v11.1/references/configuration.html#raw-media-types) - @steve-chavez
+  - Removed `application/octet-stream`, `text/plain`, `text/xml` [builtin support for scalar results](https://postgrest.org/en/v11.1/references/api/resource_representation.html#scalar-function-response-format) - @steve-chavez
+  - Removed default `application/openapi+json` media type for [db-root-spec](https://postgrest.org/en/v11.1/references/configuration.html#db-root-spec) - @steve-chavez
+- - Removed [db-use-legacy-gucs](https://postgrest.org/en/v11.2/references/configuration.html#db-use-legacy-gucs) - @laurenceisla
+ 
+ ## [11.2.2] - 2023-10-25
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 80601ebf..2d2f3a7b 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -192,6 +192,7 @@ test-suite spec
+                       Feature.ConcurrentSpec
+                       Feature.CorsSpec
+                       Feature.ExtraSearchPathSpec
++                      Feature.LegacyGucsSpec
+                       Feature.NoSuperuserSpec
+                       Feature.ObservabilitySpec
+                       Feature.OpenApi.DisabledOpenApiSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index d886a81c..aa175ff6 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -251,7 +251,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     roleIsoLvl = HM.findWithDefault SQL.ReadCommitted authRole $ configRoleIsoLvl conf
+     runQuery isoLvl mode query =
+       runDbHandler appState isoLvl mode authenticated prepared $ do
+-        Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq
++        Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq pgVer
+         Query.runPreReq conf
+         query
+ 
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 9120d3e5..268b9492 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -191,6 +191,10 @@ exampleConfigFile =
+       |## https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+       |db-uri = "postgresql://"
+       |
++      |## Determine if GUC request settings for headers, cookies and jwt claims use the legacy names (string with dashes, invalid starting from PostgreSQL v14) with text values instead of the new names (string without dashes, valid on all PostgreSQL versions) with json values.
++      |## For PostgreSQL v14 and up, this setting will be ignored.
++      |db-use-legacy-gucs = true
++      |
+       |# jwt-aud = "your_audience_claim"
+       |
+       |## Jspath to the role claim key
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 8e20719f..8c6aa24e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -89,6 +89,7 @@ data AppConfig = AppConfig
+   , configDbTxAllowOverride        :: Bool
+   , configDbTxRollbackAll          :: Bool
+   , configDbUri                    :: Text
++  , configDbUseLegacyGucs          :: Bool
+   , configFilePath                 :: Maybe FilePath
+   , configJWKS                     :: Maybe JWKSet
+   , configJwtAudience              :: Maybe StringOrURI
+@@ -156,6 +157,7 @@ toText conf =
+       ,("db-pre-config",             q . maybe mempty dumpQi . configDbPreConfig)
+       ,("db-tx-end",                 q . showTxEnd)
+       ,("db-uri",                    q . configDbUri)
++      ,("db-use-legacy-gucs",            T.toLower . show . configDbUseLegacyGucs)
+       ,("jwt-aud",                       T.decodeUtf8 . LBS.toStrict . JSON.encode . maybe "" toJSON . configJwtAudience)
+       ,("jwt-role-claim-key",        q . T.intercalate mempty . fmap dumpJSPath . configJwtRoleClaimKey)
+       ,("jwt-secret",                q . T.decodeUtf8 . showJwtSecret)
+@@ -255,6 +257,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+     <*> (fromMaybe "postgresql://" <$> optString "db-uri")
++    <*> (fromMaybe True <$> optBool "db-use-legacy-gucs")
+     <*> pure optPath
+     <*> pure Nothing
+     <*> parseJwtAudience "jwt-aud"
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 67dba009..ef0af795 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -53,6 +53,7 @@ dbSettingsNames =
+   ,"db_root_spec"
+   ,"db_schemas"
+   ,"db_tx_end"
++  ,"db_use_legacy_gucs"
+   ,"jwt_aud"
+   ,"jwt_role_claim_key"
+   ,"jwt_secret"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 16ed0c2a..1b154461 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -14,11 +14,13 @@ module PostgREST.Query
+   ) where
+ 
+ import qualified Data.Aeson                        as JSON
++import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+ import qualified Data.ByteString                   as BS
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
+ import qualified Data.Set                          as S
++import qualified Data.Text.Encoding                as T
+ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL (Snippet)
+ import qualified Hasql.DynamicStatements.Statement as SQL
+@@ -31,6 +33,8 @@ import qualified PostgREST.Query.Statements   as Statements
+ import qualified PostgREST.RangeQuery         as RangeQuery
+ import qualified PostgREST.SchemaCache        as SchemaCache
+ 
++import Data.Scientific (FPFormat (..), formatScientific, isInteger)
++
+ import PostgREST.ApiRequest              (ApiRequest (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferTransaction (..),
+@@ -38,7 +42,8 @@ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           shouldCount)
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+-import PostgREST.Config.PgVersion        (PgVersion (..))
++import PostgREST.Config.PgVersion        (PgVersion (..),
++                                          pgVersion140)
+ import PostgREST.Error                   (Error)
+ import PostgREST.MediaType               (MediaType (..))
+ import PostgREST.Plan                    (CallReadPlan (..),
+@@ -47,9 +52,8 @@ import PostgREST.Plan                    (CallReadPlan (..),
+ import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Query.SqlFragment       (escapeIdentList, fromQi,
+                                           intercalateSnippet,
+-                                          setConfigWithConstantName,
+-                                          setConfigWithConstantNameJSON,
+-                                          setConfigWithDynamicName)
++                                          setConfigLocal,
++                                          setConfigLocalJson)
+ import PostgREST.Query.Statements        (ResultSet (..))
+ import PostgREST.SchemaCache             (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..),
+@@ -234,23 +238,37 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+ 
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
+-               ApiRequest -> DbHandler ()
+-setPgLocals AppConfig{..} claims role roleSettings req = lift $
++               ApiRequest -> PgVersion -> DbHandler ()
++setPgLocals AppConfig{..} claims role roleSettings req actualPgVersion = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+     ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
+     HD.noResult configDbPreparedStatements
+   where
+-    methodSql = setConfigWithConstantName ("request.method", iMethod req)
+-    pathSql = setConfigWithConstantName ("request.path", iPath req)
+-    headersSql = setConfigWithConstantNameJSON "request.headers" (iHeaders req)
+-    cookiesSql = setConfigWithConstantNameJSON "request.cookies" (iCookies req)
+-    claimsSql = [setConfigWithConstantName ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+-    roleSql = [setConfigWithConstantName ("role", role)]
+-    roleSettingsSql = setConfigWithDynamicName <$> roleSettings
+-    appSettingsSql = setConfigWithDynamicName <$> (join bimap toUtf8 <$> configAppSettings)
++    methodSql = setConfigLocal mempty ("request.method", iMethod req)
++    pathSql = setConfigLocal mempty ("request.path", iPath req)
++    headersSql = if usesLegacyGucs
++                   then setConfigLocal "request.header." <$> iHeaders req
++                   else setConfigLocalJson "request.headers" (iHeaders req)
++    cookiesSql = if usesLegacyGucs
++                   then setConfigLocal "request.cookie." <$> iCookies req
++                   else setConfigLocalJson "request.cookies" (iCookies req)
++    claimsSql = if usesLegacyGucs
++                  then setConfigLocal "request.jwt.claim." <$> [(toUtf8 $ K.toText c, toUtf8 $ unquoted v) | (c,v) <- KM.toList claims]
++                  else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
++    roleSql = [setConfigLocal mempty ("role", role)]
++    roleSettingsSql = setConfigLocal mempty <$> roleSettings
++    appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings)
+     searchPathSql =
+       let schemas = escapeIdentList (iSchema req : configDbExtraSearchPath) in
+-      setConfigWithConstantName ("search_path", schemas)
++      setConfigLocal mempty ("search_path", schemas)
++    usesLegacyGucs = configDbUseLegacyGucs && actualPgVersion < pgVersion140
++
++    unquoted :: JSON.Value -> Text
++    unquoted (JSON.String t) = t
++    unquoted (JSON.Number n) =
++      toS $ formatScientific Fixed (if isInteger n then Just 0 else Nothing) n
++    unquoted (JSON.Bool b) = show b
++    unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
+ 
+ -- | Runs the pre-request function.
+ runPreReq :: AppConfig -> DbHandler ()
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 94cafa95..02abb947 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -33,9 +33,8 @@ module PostgREST.Query.SqlFragment
+   , unknownEncoder
+   , intercalateSnippet
+   , explainF
+-  , setConfigWithConstantName
+-  , setConfigWithDynamicName
+-  , setConfigWithConstantNameJSON
++  , setConfigLocal
++  , setConfigLocalJson
+   , escapeIdent
+   , escapeIdentList
+   ) where
+@@ -485,23 +484,14 @@ explainF fmt opts snip =
+     fmtPlanFmt PlanJSON = "FORMAT JSON"
+ 
+ -- | Do a pg set_config(setting, value, true) call. This is equivalent to a SET LOCAL.
+-setConfigLocal :: (SQL.Snippet, ByteString) -> SQL.Snippet
+-setConfigLocal (k, v) =
+-  "set_config(" <> k <> ", " <> unknownEncoder v <> ", true)"
+-
+--- | For when the settings are hardcoded and not parameterized
+-setConfigWithConstantName :: (SQL.Snippet, ByteString) -> SQL.Snippet
+-setConfigWithConstantName (k, v) = setConfigLocal ("'" <> k <> "'", v)
+-
+--- | For when the settings need to be parameterized
+-setConfigWithDynamicName :: (ByteString, ByteString) -> SQL.Snippet
+-setConfigWithDynamicName (k, v) =
+-  setConfigLocal (unknownEncoder k, v)
++setConfigLocal :: ByteString -> (ByteString, ByteString) -> SQL.Snippet
++setConfigLocal prefix (k, v) =
++  "set_config(" <> unknownEncoder (prefix <> k) <> ", " <> unknownEncoder v <> ", true)"
+ 
+ -- | Starting from PostgreSQL v14, some characters are not allowed for config names (mostly affecting headers with "-").
+ -- | A JSON format string is used to avoid this problem. See https://github.com/PostgREST/postgrest/issues/1857
+-setConfigWithConstantNameJSON :: SQL.Snippet -> [(ByteString, ByteString)] -> [SQL.Snippet]
+-setConfigWithConstantNameJSON prefix keyVals = [setConfigWithConstantName (prefix, gucJsonVal keyVals)]
++setConfigLocalJson :: ByteString -> [(ByteString, ByteString)] -> [SQL.Snippet]
++setConfigLocalJson prefix keyVals = [setConfigLocal mempty (prefix, gucJsonVal keyVals)]
+   where
+     gucJsonVal :: [(ByteString, ByteString)] -> ByteString
+     gucJsonVal = LBS.toStrict . JSON.encode . HM.fromList . arrayByteStringToText
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index 7182a898..4d01de42 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = ""
+ db-tx-end = "commit"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"aliased\""
+ jwt-secret = ""
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index 1c931a50..780665e4 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = ""
+ db-tx-end = "commit"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index 1c931a50..780665e4 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = ""
+ db-tx-end = "commit"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index 76ca1a26..5439924a 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -17,6 +17,7 @@ db-config = false
+ db-pre-config = ""
+ db-tx-end = "commit"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index 9fd08d0f..d2737e82 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = "postgrest.pre_config"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = false
+ jwt-aud = "https://otherexample.org"
+ jwt-role-claim-key = ".\"other\".\"pre_config_role\""
+ jwt-secret = "ODERREALLYREALLYREALLYREALLYVERYSAFE"
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index ccb10564..6820beff 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = "postgrest.preconf"
+ db-tx-end = "commit-allow-override"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = false
+ jwt-aud = "https://example.org"
+ jwt-role-claim-key = ".\"a\".\"role\""
+ jwt-secret = "OVERRIDE=REALLY=REALLY=REALLY=REALLY=VERY=SAFE"
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index ca09c08c..3cc7e311 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -17,6 +17,7 @@ db-config = false
+ db-pre-config = "postgrest.pre_config"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
++db-use-legacy-gucs = false
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".\"user\"[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index ef698ba1..69adadc5 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -17,6 +17,7 @@ db-config = true
+ db-pre-config = ""
+ db-tx-end = "commit"
+ db-uri = "postgresql://"
++db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index e859d0e2..866b795c 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -17,6 +17,7 @@ db-config = false
+ db-pre-config = "postgrest.pre_config"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
++db-use-legacy-gucs = false
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".user[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+diff --git a/test/spec/Feature/LegacyGucsSpec.hs b/test/spec/Feature/LegacyGucsSpec.hs
+new file mode 100644
+index 00000000..a6d06209
+--- /dev/null
++++ b/test/spec/Feature/LegacyGucsSpec.hs
+@@ -0,0 +1,68 @@
++module Feature.LegacyGucsSpec where
++
++import Network.Wai (Application)
++
++import Network.HTTP.Types
++import Test.Hspec          hiding (pendingWith)
++import Test.Hspec.Wai
++import Test.Hspec.Wai.JSON
++
++import Protolude  hiding (get)
++import SpecHelper
++
++spec :: SpecWith ((), Application)
++spec =
++  describe "remote procedure call with legacy gucs disabled" $ do
++    it "custom header is set" $
++      request methodPost "/rpc/get_guc_value" [("Custom-Header", "test")]
++        [json| { "prefix": "request.headers", "name": "custom-header" } |]
++          `shouldRespondWith`
++          [json|"test"|]
++          { matchStatus  = 200
++          , matchHeaders = [ matchContentTypeJson ]
++          }
++
++    it "standard header is set" $
++      request methodPost "/rpc/get_guc_value" [("Origin", "http://example.com")]
++        [json| { "prefix": "request.headers", "name": "origin" } |]
++          `shouldRespondWith`
++          [json|"http://example.com"|]
++          { matchStatus  = 200
++          , matchHeaders = [ matchContentTypeJson ]
++          }
++
++    it "current role is available as GUC claim" $
++      request methodPost "/rpc/get_guc_value" []
++        [json| { "prefix": "request.jwt.claims", "name": "role" } |]
++          `shouldRespondWith`
++          [json|"postgrest_test_anonymous"|]
++          { matchStatus  = 200
++          , matchHeaders = [ matchContentTypeJson ]
++          }
++
++    it "single cookie ends up as claims" $
++      request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue")]
++        [json| {"prefix": "request.cookies", "name":"acookie"} |]
++          `shouldRespondWith`
++          [json|"cookievalue"|]
++          { matchStatus = 200
++          , matchHeaders = []
++          }
++
++    it "multiple cookies ends up as claims" $
++      request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue;secondcookie=anothervalue")]
++        [json| {"prefix": "request.cookies", "name":"secondcookie"} |]
++          `shouldRespondWith`
++          [json|"anothervalue"|]
++          { matchStatus = 200
++          , matchHeaders = []
++          }
++
++    it "gets the Authorization value" $
++      request methodPost "/rpc/get_guc_value" [authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"]
++        [json| {"prefix": "request.headers", "name":"authorization"} |]
++          `shouldRespondWith`
++          [json|"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"|]
++          { matchStatus = 200
++          , matchHeaders = []
++          }
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index fc146157..9d4f690c 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -13,7 +13,8 @@ import Text.Heredoc
+ 
+ import PostgREST.Config.PgVersion (PgVersion, pgVersion100,
+                                    pgVersion109, pgVersion110,
+-                                   pgVersion112, pgVersion114)
++                                   pgVersion112, pgVersion114,
++                                   pgVersion140)
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
+@@ -973,7 +974,12 @@ spec actualPgVersion =
+       it "custom header is set" $
+         request methodPost "/rpc/get_guc_value"
+                   [("Custom-Header", "test")]
+-            [json| { "prefix": "request.headers", "name": "custom-header" } |]
++            (
++            if actualPgVersion >= pgVersion140 then
++              [json| { "prefix": "request.headers", "name": "custom-header" } |]
++            else
++              [json| { "name": "request.header.custom-header" } |]
++            )
+             `shouldRespondWith`
+             [json|"test"|]
+             { matchStatus  = 200
+@@ -982,7 +988,12 @@ spec actualPgVersion =
+       it "standard header is set" $
+         request methodPost "/rpc/get_guc_value"
+                   [("Origin", "http://example.com")]
+-            [json| { "prefix": "request.headers", "name": "origin" } |]
++            (
++            if actualPgVersion >= pgVersion140 then
++              [json| { "prefix": "request.headers", "name": "origin" } |]
++            else
++              [json| { "name": "request.header.origin" } |]
++            )
+             `shouldRespondWith`
+             [json|"http://example.com"|]
+             { matchStatus  = 200
+@@ -990,7 +1001,12 @@ spec actualPgVersion =
+             }
+       it "current role is available as GUC claim" $
+         request methodPost "/rpc/get_guc_value" []
+-            [json| { "prefix": "request.jwt.claims", "name": "role" } |]
++            (
++            if actualPgVersion >= pgVersion140 then
++              [json| { "prefix": "request.jwt.claims", "name": "role" } |]
++            else
++              [json| { "name": "request.jwt.claim.role" } |]
++            )
+             `shouldRespondWith`
+             [json|"postgrest_test_anonymous"|]
+             { matchStatus  = 200
+@@ -998,15 +1014,25 @@ spec actualPgVersion =
+             }
+       it "single cookie ends up as claims" $
+         request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue")]
++          (
++          if actualPgVersion >= pgVersion140 then
+             [json| {"prefix": "request.cookies", "name":"acookie"} |]
++          else
++            [json| {"name":"request.cookie.acookie"} |]
++          )
+             `shouldRespondWith`
+             [json|"cookievalue"|]
+             { matchStatus = 200
+             , matchHeaders = []
+             }
+-      it "multiple cookies end up as claims" $
++      it "multiple cookies ends up as claims" $
+         request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue;secondcookie=anothervalue")]
++          (
++          if actualPgVersion >= pgVersion140 then
+             [json| {"prefix": "request.cookies", "name":"secondcookie"} |]
++          else
++            [json| {"name":"request.cookie.secondcookie"} |]
++          )
+             `shouldRespondWith`
+             [json|"anothervalue"|]
+             { matchStatus = 200
+@@ -1022,7 +1048,12 @@ spec actualPgVersion =
+             }
+       it "gets the Authorization value" $
+         request methodPost "/rpc/get_guc_value" [authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"]
++          (
++          if actualPgVersion >= pgVersion140 then
+             [json| {"prefix": "request.headers", "name":"authorization"} |]
++          else
++            [json| {"name":"request.header.authorization"} |]
++          )
+             `shouldRespondWith`
+             [json|"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"|]
+             { matchStatus = 200
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 86ced443..418d462e 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -25,6 +25,7 @@ import qualified Feature.Auth.NoJwtSpec
+ import qualified Feature.ConcurrentSpec
+ import qualified Feature.CorsSpec
+ import qualified Feature.ExtraSearchPathSpec
++import qualified Feature.LegacyGucsSpec
+ import qualified Feature.NoSuperuserSpec
+ import qualified Feature.ObservabilitySpec
+ import qualified Feature.OpenApi.DisabledOpenApiSpec
+@@ -105,6 +106,7 @@ main = do
+       responseHeadersApp   = app testCfgResponseHeaders
+       disallowRollbackApp  = app testCfgDisallowRollback
+       forceRollbackApp     = app testCfgForceRollback
++      testCfgLegacyGucsApp = app testCfgLegacyGucs
+       planEnabledApp       = app testPlanEnabledCfg
+       pgSafeUpdateApp      = app testPgSafeUpdateEnabledCfg
+       obsApp               = app testObservabilityCfg
+@@ -227,6 +229,10 @@ main = do
+     parallel $ before multipleSchemaApp $
+       describe "Feature.Query.MultipleSchemaSpec" Feature.Query.MultipleSchemaSpec.spec
+ 
++    -- this test runs with db-uses-legacy-gucs = false
++    parallel $ before testCfgLegacyGucsApp $
++      describe "Feature.LegacyGucsSpec" Feature.LegacyGucsSpec.spec
++
+     -- this test runs with db-plan-enabled = true
+     parallel $ before planEnabledApp $
+       describe "Feature.Query.PlanSpec.spec" $ Feature.Query.PlanSpec.spec actualPgVersion
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 9d4661f1..1f5eba65 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -116,6 +116,7 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbConfig                  = False
+   , configDbPreConfig               = Nothing
+   , configDbUri                     = "postgresql://"
++  , configDbUseLegacyGucs           = True
+   , configFilePath                  = Nothing
+   , configJWKS                      = parseSecret <$> secret
+   , configJwtAudience               = Nothing
+@@ -225,6 +226,9 @@ testCfgResponseHeaders = baseCfg { configDbPreRequest = Just $ QualifiedIdentifi
+ testMultipleSchemaCfg :: AppConfig
+ testMultipleSchemaCfg = baseCfg { configDbSchemas = fromList ["v1", "v2", "SPECIAL \"@/\\#~_-"] }
+ 
++testCfgLegacyGucs :: AppConfig
++testCfgLegacyGucs = baseCfg { configDbUseLegacyGucs = False }
++
+ testPgSafeUpdateEnabledCfg :: AppConfig
+ testPgSafeUpdateEnabledCfg = baseCfg { configDbPreRequest = Just $ QualifiedIdentifier "test" "load_safeupdate" }
+ 
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 6eeac7d0..f2fd2dfa 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -91,7 +91,10 @@ CREATE FUNCTION set_authors_only_owner() RETURNS trigger
+     LANGUAGE plpgsql
+     AS $$
+ begin
+-  NEW.owner = current_setting('request.jwt.claims')::json->>'id';
++  NEW.owner = case when current_setting('server_version_num')::int >= 140000
++              then current_setting('request.jwt.claims')::json->>'id'
++              else current_setting('request.jwt.claim.id')
++              end;
+   RETURN NEW;
+ end
+ $$;
+@@ -374,7 +377,10 @@ CREATE OR REPLACE FUNCTION switch_role() RETURNS void
+ declare
+   user_id text;
+ Begin
+-  user_id = (current_setting('request.jwt.claims')::json->>'id')::text;
++  user_id = case when current_setting('server_version_num')::int >= 140000
++            then (current_setting('request.jwt.claims')::json->>'id')::text
++            else current_setting('request.jwt.claim.id')::text
++            end;
+   if user_id = '1'::text then
+     execute 'set local role postgrest_test_author';
+   elseif user_id = '2'::text then
+@@ -402,15 +408,34 @@ CREATE FUNCTION reveal_big_jwt() RETURNS TABLE (
+       iss text, sub text, exp bigint,
+       nbf bigint, iat bigint, jti text, "http://postgrest.com/foo" boolean
+     )
+-AS $$
+-  SELECT current_setting('request.jwt.claims')::json->>'iss' as iss,
+-         current_setting('request.jwt.claims')::json->>'sub' as sub,
+-         (current_setting('request.jwt.claims')::json->>'exp')::bigint as exp,
+-         (current_setting('request.jwt.claims')::json->>'nbf')::bigint as nbf,
+-         (current_setting('request.jwt.claims')::json->>'iat')::bigint as iat,
+-         current_setting('request.jwt.claims')::json->>'jti' as jti,
+-         (current_setting('request.jwt.claims')::json->>'http://postgrest.com/foo')::boolean as "http://postgrest.com/foo";
+-$$ LANGUAGE sql SECURITY DEFINER STABLE;
++    LANGUAGE plpgsql SECURITY DEFINER
++    STABLE
++    AS $$
++    BEGIN
++    -- JWT claims are set in JSON format since v14
++    IF (current_setting('server_version_num')::INT >= 140000) THEN
++        RETURN QUERY
++        SELECT current_setting('request.jwt.claims')::json->>'iss' as iss,
++               current_setting('request.jwt.claims')::json->>'sub' as sub,
++               (current_setting('request.jwt.claims')::json->>'exp')::bigint as exp,
++               (current_setting('request.jwt.claims')::json->>'nbf')::bigint as nbf,
++               (current_setting('request.jwt.claims')::json->>'iat')::bigint as iat,
++               current_setting('request.jwt.claims')::json->>'jti' as jti,
++               (current_setting('request.jwt.claims')::json->>'http://postgrest.com/foo')::boolean
++                 as "http://postgrest.com/foo";
++    ELSE
++        RETURN QUERY
++        SELECT current_setting('request.jwt.claim.iss') as iss,
++               current_setting('request.jwt.claim.sub') as sub,
++               current_setting('request.jwt.claim.exp')::bigint as exp,
++               current_setting('request.jwt.claim.nbf')::bigint as nbf,
++               current_setting('request.jwt.claim.iat')::bigint as iat,
++               current_setting('request.jwt.claim.jti') as jti,
++               current_setting('request.jwt.claim.http://postgrest.com/foo')::boolean
++                 as "http://postgrest.com/foo";
++    END IF;
++END;
++$$;
+ 
+ 
+ CREATE FUNCTION assert() RETURNS void
+@@ -1162,7 +1187,7 @@ create function test.get_guc_value(name text) returns text as $$
+   select nullif(current_setting(name), '')::text;
+ $$ language sql;
+ 
+--- Get the JSON type GUC values
++-- Get the GUC values for Postgres v14.0 and up
+ create function test.get_guc_value(prefix text, name text) returns text as $$
+ select nullif(current_setting(prefix)::json->>name, '')::text;
+ $$ language sql;
+@@ -2068,9 +2093,15 @@ where fst_shift_activity_id is not null
+ -- for a pre-request function
+ create or replace function custom_headers() returns void as $$
+ declare
+-  user_agent text := current_setting('request.headers', true)::json->>'user-agent';
++  user_agent text := case when current_setting('server_version_num')::int >= 140000
++                     then current_setting('request.headers', true)::json->>'user-agent'
++                     else current_setting('request.header.user-agent', true)
++                     end;
+   req_path   text := current_setting('request.path', true);
+-  req_accept text := current_setting('request.headers', true)::json->>'accept';
++  req_accept text := case when current_setting('server_version_num')::int >= 140000
++                     then current_setting('request.headers', true)::json->>'accept'
++                     else current_setting('request.header.accept', true)
++                     end;
+   req_method text := current_setting('request.method', true);
+ begin
+   if user_agent similar to 'MSIE (6.0|7.0)' then

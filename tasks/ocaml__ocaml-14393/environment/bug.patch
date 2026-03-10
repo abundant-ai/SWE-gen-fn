@@ -1,0 +1,397 @@
+diff --git a/Changes b/Changes
+index c8f829e1ff..c0cbcce73c 100644
+--- a/Changes
++++ b/Changes
+@@ -288,12 +288,6 @@ OCaml 5.5.0
+   (Kate Deplaix, review by Daniel Bünzli, Gabriel Scherer,
+    Nicolás Ojeda Bär, Florian Angeletti and Josh Berdine)
+ 
+-- #14043, #14393: Lazy.Mutexed: simple mutex-protected lazy thunks,
+-  that may block the entire domain/thread on initialization races.
+-  (Gabriel Scherer, suggestion by Kate Deplaix and Pierre Chambart,
+-  review by KC Sivaramakrishnan, Florian Angeletti, Kate Deplaix
+-  and Daniel Bünzli)
+-
+ - #14086: Add Domain.count.
+   (Nicolás Ojeda Bär, review by David Allsopp, Gabriel Scherer, Daniel Bünzli
+   and KC Sivaramakrishnan)
+diff --git a/stdlib/.depend b/stdlib/.depend
+index 7943bd1c0d..ca5c9212bd 100644
+--- a/stdlib/.depend
++++ b/stdlib/.depend
+@@ -485,12 +485,10 @@ stdlib__Int64.cmi : int64.mli
+ stdlib__Lazy.cmo : lazy.ml \
+     stdlib__Obj.cmi \
+     camlinternalLazy.cmi \
+-    stdlib__Atomic.cmi \
+     stdlib__Lazy.cmi
+ stdlib__Lazy.cmx : lazy.ml \
+     stdlib__Obj.cmx \
+     camlinternalLazy.cmx \
+-    stdlib__Atomic.cmx \
+     stdlib__Lazy.cmi
+ stdlib__Lazy.cmi : lazy.mli \
+     camlinternalLazy.cmi
+diff --git a/stdlib/lazy.ml b/stdlib/lazy.ml
+index b05e494d8e..553c0caff2 100644
+--- a/stdlib/lazy.ml
++++ b/stdlib/lazy.ml
+@@ -78,68 +78,3 @@ let map_val f x =
+   if is_val x
+   then from_val (f (force x))
+   else lazy (f (force x))
+-
+-
+-
+-module Mutexed = struct
+-  (* we define these as primitives to avoid a dependency on Printexc *)
+-  type raw_backtrace
+-  external get_raw_backtrace:
+-    unit -> raw_backtrace = "caml_get_exception_raw_backtrace"
+-  external raise_with_backtrace: exn -> raw_backtrace -> 'a
+-    = "%raise_with_backtrace"
+-
+-  (* micro-module to avoid a dependency on Mutex *)
+-  module Mutex = struct
+-    type t
+-    external create: unit -> t = "caml_ml_mutex_new"
+-    external lock: t -> unit = "caml_ml_mutex_lock"
+-    external unlock: t -> unit = "caml_ml_mutex_unlock"
+-  end
+-
+-  type 'a state =
+-    | Thunk of (unit -> 'a)
+-    | Forcing of Mutex.t
+-    | Result of ('a, exn * raw_backtrace) result
+-
+-  type 'a t = 'a state Atomic.t
+-
+-  let from_val v = Atomic.make (Result (Ok v))
+-  let from_fun f = Atomic.make (Thunk f)
+-
+-  let is_val th =
+-    match Atomic.get th with
+-    | Result (Ok _) -> true
+-    | _ -> false
+-
+-  let rec force th =
+-    match Atomic.get th with
+-    | Result (Ok v) -> v
+-    | Result (Error (exn, bt)) ->
+-      raise_with_backtrace exn bt
+-    | Forcing mut ->
+-        (* Taking the lock may fail if our domain already owns
+-           it. This can happen if the thunk forces itself recursively,
+-           or if two fibers on the same domain try to force
+-           concurrently. We propagate the lower-level [Sys_error]
+-           exception in this case. *)
+-        Mutex.lock mut;
+-        Mutex.unlock mut;
+-        force th
+-    | Thunk f as thunk ->
+-        let mut = Mutex.create () in
+-        Mutex.lock mut;
+-        if not (Atomic.compare_and_set th thunk (Forcing mut)) then begin
+-          Mutex.unlock mut;
+-          force th (* retry *)
+-        end else begin
+-          begin match f () with
+-          | v -> Atomic.set th (Result (Ok v))
+-          | exception exn ->
+-            let bt = get_raw_backtrace () in
+-            Atomic.set th (Result (Error (exn, bt)))
+-          end;
+-          Mutex.unlock mut;
+-          force th
+-        end
+-end
+diff --git a/stdlib/lazy.mli b/stdlib/lazy.mli
+index bf0a18fbc5..0dbdadbd30 100644
+--- a/stdlib/lazy.mli
++++ b/stdlib/lazy.mli
+@@ -139,107 +139,3 @@ val force_val : 'a t -> 'a
+ 
+     @raise Undefined (see {!Undefined}).
+ *)
+-
+-module Mutexed : sig
+-  (** Simple mutex-protected lazy thunks, which can be accessed from
+-      several domains or several threads.
+-
+-      This implementation has two downsides:
+-      - It is less optimized than [Lazy.t].
+-      - It uses a standard library {!Mutex} to wait on concurrent
+-        initialization, so it does not interoperate well with user-level
+-        fiber/task abstractions (see the {!Lazy.Mutexed.force} documentation
+-        for a dangerous example).
+-
+-      A typical use-case is optional library initialization code that
+-      is moderately expensive, or acquires resources. The library
+-      author does not want to do this work on startup, because it may
+-      not be needed, but using ['a Lazy.t] is incorrect if the library
+-      may be used in concurrent settings. ['a Lazy.Mutexed.t]
+-      can be used, as long as the blocking behavior is acceptable.
+-
+-     {b Note}: ['a Lazy.t] contains a protection against recursively
+-     forcing a thunk, it will raise {!Undefined}. On the other hand,
+-     ['a Lazy.Mutexed.t] will try to lock the mutex
+-     recursively, which will raise [Sys_error].
+-
+-     See {{!examples} the examples} below.
+-
+-     @since 5.5
+-  *)
+-
+-  type !'a t
+-  (* A value of type ['a Lazy.Mutexed.t] is similar to a value
+-     of type ['a Lazy.t], it represents a deferred computation, but it can
+-     safely be used in concurrent settings as it is protected by a mutex
+-     during forcing. *)
+-
+-  val is_val : 'a t -> bool
+-  (** [is_val x] returns [true] if the deferred computation [x] has
+-      already been forced and its result is a value, not an
+-      exception. *)
+-
+-  val from_val : 'a -> 'a t
+-  (** [from_val v] is a deferred computation which is already
+-      finished and whose result is the value [v]. *)
+-
+-  val from_fun : (unit -> 'a) -> 'a t
+-  (** [from_fun f] is a deferred computation that will take a mutex
+-      and call [f] when forced. *)
+-
+-  val force : 'a t -> 'a
+-  (** [force x] forces the suspension [x]. If [x] has already been
+-      forced, [Lazy.force x] returns the same value again without
+-      recomputing it. If it raised an exception, the same exception is
+-      raised again.
+-
+-      If a concurrent call to [force] happens while the result is
+-      being computed, the caller will block on a {!Mutex}.
+-
+-      @raise Sys_error if the suspension is forced on a thread where
+-        it is already being forced. This can happen if the thunk tries
+-        to force itself recursively, but it can also happen if the
+-        thunk code contains a `yield()` operation for a user-level
+-        fiber/task abstraction, and two fibers/tasks try to force the
+-        thunk in parallel on the same domain:
+-      {[
+-        (* This is wrong, a mutex-protected thunk should not yield control. *)
+-        let thunk = Lazy.Mutexed.from_fun (fun () -> ... Fiber.yield () ...)
+-
+-        (* It may result in a same-thread [Sys_error] exception below. *)
+-        let wrong =
+-          Fiber.both
+-            (fun () -> Lazy.Mutexed.force thunk)
+-            (fun () -> Lazy.Mutexed.force thunk)
+-      ]}
+-
+-      To avoid such errors, you should ensure that mutex-protected
+-      thunks never yield control outside of their sub-computation --
+-      by not using a user-level thread library within it, or by using
+-      appropriate blocking/masking functions if available. *)
+-
+-
+-  (** {1:examples Examples}
+-
+-      A typical use-case is to initialize some library-local
+-      state that is used by library functions.
+-
+-      {[
+-        let config = Lazy.Mutexed.from_fun (fun () ->
+-          match Sys.getenv_opt "MYLIB_CONFIG_PATH" with
+-          | None | Some "" -> Config.default ()
+-          | Some path -> Config.read_from_path path
+-        )
+-      ]}
+-
+-      {[
+-        let entropy =
+-          (* we use a mibibyte of random data from /dev/urandom *)
+-          Lazy.Mutexed.from_fun (fun () ->
+-            In_channel.with_open_bin "/dev/urandom" (fun chan ->
+-              In_channel.really_input_string chan (1024 * 1024)
+-            )
+-          )
+-      ]}
+- *)
+-end
+diff --git a/testsuite/tests/lib-lazy/test-mutexed.ml b/testsuite/tests/lib-lazy/test-mutexed.ml
+deleted file mode 100644
+index 3eedee3d2a..0000000000
+--- a/testsuite/tests/lib-lazy/test-mutexed.ml
++++ /dev/null
+@@ -1,172 +0,0 @@
+-(* TEST
+- hassysthreads;
+- flags = "-I ${ocamlsrcdir}/otherlibs/unix -I ${ocamlsrcdir}/otherlibs/systhreads";
+- include systhreads;
+- expect;
+-*)
+-
+-#load "unix.cma";;
+-#load "threads.cma";;
+-[%%expect{|
+-|}]
+-
+-module LazyM = Lazy.Mutexed
+-[%%expect{|
+-module LazyM = Lazy.Mutexed
+-|}]
+-
+-(* direct value return *)
+-let it =
+-  let v = LazyM.from_val 42 in
+-  assert (LazyM.is_val v);
+-  (LazyM.force v, LazyM.force v)
+-[%%expect{|
+-val it : int * int = (42, 42)
+-|}]
+-
+-(* value return *)
+-let it =
+-  let v = LazyM.from_fun (fun () -> 43) in
+-  assert (not (LazyM.is_val v));
+-  (LazyM.force v, LazyM.force v)
+-[%%expect{|
+-val it : int * int = (43, 43)
+-|}]
+-
+-
+-(* exception case *)
+-let it =
+-  let fail = LazyM.from_fun (fun () -> raise Exit) in
+-  let check () = match LazyM.force fail with
+-  | exception Exit ->
+-      assert (not (LazyM.is_val fail));
+-      true
+-  | exception _ | _ -> false
+-  in
+-  check () && check ()
+-[%%expect{|
+-val it : bool = true
+-|}]
+-
+-(* sharing test *)
+-let it =
+-  let r = ref 0 in
+-  let test = LazyM.from_fun (fun () -> incr r) in
+-  assert (not (LazyM.is_val test));
+-  (* side-effects must not be repeated in sequential settings. *)
+-  LazyM.force test;
+-  assert (LazyM.is_val test);
+-  LazyM.force test;
+-  if !r = 1 then Ok () else Error !r
+-[%%expect{|
+-val it : (unit, int) result = Ok ()
+-|}]
+-
+-(* Recursive forcing test *)
+-let it =
+-  let thunk = ref (LazyM.from_val 0) in
+-  thunk := LazyM.from_fun (fun () -> LazyM.force !thunk + 1);
+-  LazyM.force !thunk
+-[%%expect{|
+-Exception: Sys_error "Mutex.lock: Resource deadlock avoided".
+-|}]
+-
+-(* Concurrency test *)
+-let it =
+-  (* [nb_threads] will force a single thunk concurrently -- to create
+-     concurrency we ensure that the initialization function yields
+-     [nb_yields] times. *)
+-  let nb_threads = 3 in
+-  let nb_yields = 30 in
+-
+-  (* helper functions *)
+-  let spawn (f : unit -> 'a) =
+-    let result = ref (None : ('a, exn) result option) in
+-    let thread = Thread.create (fun () ->
+-      match f () with
+-      | v -> result := Some (Ok v)
+-      | exception exn -> result := Some (Error exn)
+-    ) () in
+-    (result, thread)
+-  in
+-  let join (result, thread) =
+-    Thread.join thread;
+-    Option.get !result
+-  in
+-
+-  (* The initialization function of the thunk increments a global
+-     atomic counter and returns the pre-increment value. We expect
+-     that it runs only once, and thus returns [0]. *)
+-  let count = Atomic.make 0 in
+-  let thunk = LazyM.from_fun (fun () ->
+-    let id = Atomic.fetch_and_add count 1 in
+-    (* Now yield a lot so that concurrent forcers have a chance to
+-       observe the forcing state. *)
+-    for _ = 1 to nb_yields do Thread.yield () done;
+-    assert (Atomic.get count = id + 1);
+-    id
+-  ) in
+-
+-  (* We use [go] as a barrier to make all threads start computing at
+-     roughly the same time, after they have all spawned. *)
+-  let go = Mutex.create () in
+-  Mutex.lock go; (* don't go yet *)
+-  let worker () =
+-    Mutex.lock go; Mutex.unlock go;
+-    LazyM.force thunk
+-  in
+-  let threads = List.init nb_threads (fun _ -> spawn worker) in
+-  Mutex.unlock go; (* now you can go *)
+-  let results =
+-    List.map join threads
+-    |> List.sort Stdlib.compare
+-  in
+-
+-  (* We expect a list of [Ok 0] as results: initialization function
+-     has run once, returns the initial counter state [0], and all
+-     other count block and observe this value once available. *)
+-  let expected = List.init nb_threads (fun _ -> Ok 0) in
+-  let status =
+-    if results = expected then "pass" else "fail"
+-  in
+-  status, results
+-
+-[%%expect{|
+-val it : string * (int, exn) result list = ("pass", [Ok 0; Ok 0; Ok 0])
+-|}]
+-
+-
+-(* Check that the documentation examples are well-typed. *)
+-module Example1 (Config : sig
+-  type t
+-  val default : unit -> t
+-  val read_from_path : string -> t
+-end) = struct
+-  let config = Lazy.Mutexed.from_fun (fun () ->
+-    match Sys.getenv_opt "MYLIB_CONFIG_PATH" with
+-    | None | Some "" -> Config.default ()
+-    | Some path -> Config.read_from_path path
+-  )
+-end
+-[%%expect{|
+-module Example1 :
+-  (Config : sig
+-              type t
+-              val default : unit -> t
+-              val read_from_path : string -> t
+-            end)
+-    -> sig val config : Config.t Lazy.Mutexed.t end
+-|}]
+-
+-module Example2 = struct
+-  let entropy =
+-    (* we use a mibibyte of random data from /dev/urandom *)
+-    Lazy.Mutexed.from_fun (fun () ->
+-      In_channel.with_open_bin "/dev/urandom" (fun chan ->
+-        In_channel.really_input_string chan (1024 * 1024)
+-      )
+-    )
+-end
+-[%%expect {|
+-module Example2 : sig val entropy : string option Lazy.Mutexed.t end
+-|}]

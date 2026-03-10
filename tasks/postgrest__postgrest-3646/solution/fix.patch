@@ -1,0 +1,97 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7d841b9d..62d02004 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Fixed
++
++ - #3093, Nested empty embeds no longer show empty values and are correctly omitted - @laurenceisla
++ - #3644, Make --dump-schema work with in-database pgrst.db_schemas setting - @wolfgangwalther
++ - #3644, Show number of timezones in schema cache load report - @wolfgangwalther
++ - #3644, List correct enum options in OpenApi output when multiple types with same name are present - @wolfgangwalther
++
+ ## [12.2.1] - 2024-06-27
+ 
+ ### Fixed
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index c4f18d54..c09e3b5f 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -44,7 +44,9 @@ main CLI{cliCommand, cliPath} = do
+       CmdDumpConfig -> do
+         when configDbConfig $ AppState.reReadConfig True appState
+         putStr . Config.toText =<< AppState.getConfig appState
+-      CmdDumpSchema -> putStrLn =<< dumpSchema appState
++      CmdDumpSchema -> do
++        when configDbConfig $ AppState.reReadConfig True appState
++        putStrLn =<< dumpSchema appState
+       CmdRun -> App.run appState)
+ 
+ -- | Dump SchemaCache schema to JSON
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index db52d363..4acedf42 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -622,7 +622,11 @@ generateRelSelectField (Node ReadPlan{relToParent=Just rel, select, relName, rel
+   where
+     rsSelName = fromMaybe relName relAlias
+     rsEmbedMode = if relIsToOne rel then JsonObject else JsonArray
+-    rsEmptyEmbed = null select && null forest
++    rsEmptyEmbed = hasOnlyNullEmbed (null select) forest
++    hasOnlyNullEmbed = foldr checkIfNullEmbed
++    checkIfNullEmbed :: ReadPlanTree -> Bool -> Bool
++    checkIfNullEmbed (Node ReadPlan{select=s} f) isNullEmbed =
++      isNullEmbed && hasOnlyNullEmbed (null s) f
+ generateRelSelectField _ = Nothing
+ 
+ generateSpreadSelectFields :: ReadPlan -> [SpreadSelectField]
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index b6dca5ba..be34c29f 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -95,13 +95,14 @@ instance JSON.ToJSON SchemaCache where
+     ]
+ 
+ showSummary :: SchemaCache -> Text
+-showSummary (SchemaCache tbls rels routs reps mediaHdlrs _) =
++showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs) =
+   T.intercalate ", "
+   [ show (HM.size tbls)       <> " Relations"
+   , show (HM.size rels)       <> " Relationships"
+   , show (HM.size routs)      <> " Functions"
+   , show (HM.size reps)       <> " Domain Representations"
+   , show (HM.size mediaHdlrs) <> " Media Type Handlers"
++  , show (S.size tzs)         <> " Timezones"
+   ]
+ 
+ -- | A view foreign key or primary key dependency detected on its source table
+@@ -646,7 +647,7 @@ tablesSqlQuery pgVer =
+               information_schema._pg_truetypid(a.*, t.*),
+               information_schema._pg_truetypmod(a.*, t.*)
+           )::integer AS character_maximum_length,
+-          COALESCE(bt.typname, t.typname)::name AS udt_name,
++          COALESCE(bt.oid, t.oid) AS base_type,
+           a.attnum::integer AS position
+       FROM pg_attribute a
+           LEFT JOIN pg_description AS d
+@@ -690,14 +691,13 @@ tablesSqlQuery pgVer =
+     FROM columns info
+     LEFT OUTER JOIN (
+         SELECT
+-            n.nspname AS s,
+-            t.typname AS n,
++            e.enumtypid,
+             array_agg(e.enumlabel ORDER BY e.enumsortorder) AS vals
+         FROM pg_type t
+         JOIN pg_enum e ON t.oid = e.enumtypid
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+-        GROUP BY s,n
+-    ) AS enum_info ON info.udt_name = enum_info.n
++        GROUP BY enumtypid
++    ) AS enum_info ON info.base_type = enum_info.enumtypid
+     WHERE info.table_schema NOT IN ('pg_catalog', 'information_schema')
+     GROUP BY info.table_schema, info.table_name
+   ),

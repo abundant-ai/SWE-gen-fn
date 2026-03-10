@@ -1,0 +1,157 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index afeeeec7..581fdd74 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,7 +16,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3747, Allow `not_null` value for the `is` operator - @taimoorzaeem
+  - #2255, Apply `to_tsvector()` explicitly to the full-text search filtered column (excluding `tsvector` types) - @laurenceisla
+  - #1578, Log the main SQL query to stderr at the current `log-level` when `log-query=main-query` - @laurenceisla
+- - #3903, Log connection pool borrows on `log-level=debug` - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index dac40922..667a9a7d 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -94,12 +94,10 @@ observationLogger loggerState logLevel obs = case obs of
+     -- Does not log SQL when it's empty (for OPTIONS requests or for the default OpenAPI output)
+     when (sql /= mempty && shouldLogResponse logLevel status) $ do
+       logWithZTime loggerState $ observationMessage o
+-  o@PoolRequest ->
+-    when (logLevel >= LogDebug) $ do
+-      logWithZTime loggerState $ observationMessage o
+-  o@PoolRequestFullfilled ->
+-    when (logLevel >= LogDebug) $ do
+-      logWithZTime loggerState $ observationMessage o
++  PoolRequest ->
++    pure ()
++  PoolRequestFullfilled ->
++    pure ()
+   o ->
+     logWithZTime loggerState $ observationMessage o
+ 
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 1b333571..66519258 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -142,10 +142,7 @@ observationMessage = \case
+           SQL.ReleaseConnectionTerminationReason        -> "release"
+           SQL.NetworkErrorConnectionTerminationReason _ -> "network error" -- usage error is already logged, no need to repeat the same message.
+     )
+-  PoolRequest ->
+-    "Trying to borrow a connection from pool"
+-  PoolRequestFullfilled ->
+-    "Borrowed a connection from the pool"
++  _ -> mempty
+   where
+     showMillis :: Double -> Text
+     showMillis x = toS $ showFFloat (Just 1) (x * 1000) ""
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 1cb27bd8..39f188b8 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -683,16 +683,13 @@ def test_pool_acquisition_timeout(level, defaultenv, metapostgrest):
+         assert data["message"] == "Timed out acquiring connection from connection pool."
+ 
+         # ensure the message appears on the logs as well
+-        output = sorted(postgrest.read_stdout(nlines=10))
++        output = sorted(postgrest.read_stdout(nlines=3))
+ 
+         if level == "crit":
+             assert len(output) == 0
+         else:
+-            assert any(" 504 " in line for line in output)
+-            assert any(
+-                "Timed out acquiring connection from connection pool." in line
+-                for line in output
+-            )
++            assert " 504 " in output[0]
++            assert "Timed out acquiring connection from connection pool." in output[2]
+ 
+ 
+ def test_change_statement_timeout_held_connection(defaultenv, metapostgrest):
+@@ -977,9 +974,9 @@ def test_log_level(level, defaultenv):
+                 output[2],
+             )
+ 
+-            assert len(output) == 7
+-            assert any("Connection" and "is available" in line for line in output)
+-            assert any("Connection" and "is used" in line for line in output)
++            assert len(output) == 5
++            assert "Connection" and "is available" in output[3]
++            assert "Connection" and "is used" in output[4]
+ 
+ 
+ @pytest.mark.parametrize("level", ["crit", "error", "warn", "info", "debug"])
+@@ -1026,15 +1023,13 @@ def test_log_query(level, defaultenv):
+             assert re.match(infinite_recursion_5xx_regx, output[5])
+             assert len(output) == 6
+         elif level == "debug":
+-            output_root = postgrest.read_stdout(nlines=6)
+-            assert re.match(root_2xx_regx, output_root[4])
+-            assert len(output_root) == 6
+-            output_get = postgrest.read_stdout(nlines=6)
+-            assert re.match(get_2xx_regx, output_get[4])
+-            assert len(output_get) == 6
+-            output_err = postgrest.read_stdout(nlines=6)
+-            assert re.match(infinite_recursion_5xx_regx, output_err[5])
+-            assert len(output_err) == 6
++            output_ok = postgrest.read_stdout(nlines=8)
++            assert re.match(root_2xx_regx, output_ok[2])
++            assert re.match(get_2xx_regx, output_ok[6])
++            assert len(output_ok) == 8
++            output_err = postgrest.read_stdout(nlines=4)
++            assert re.match(infinite_recursion_5xx_regx, output_err[3])
++            assert len(output_err) == 4
+ 
+ 
+ def test_no_pool_connection_required_on_bad_http_logic(defaultenv):
+@@ -1575,13 +1570,13 @@ def test_db_error_logging_to_stderr(level, defaultenv, metapostgrest):
+         assert response.status_code == 500
+ 
+         # ensure the message appears on the logs
+-        output = sorted(postgrest.read_stdout(nlines=6))
++        output = sorted(postgrest.read_stdout(nlines=4))
+ 
+         if level == "crit":
+             assert len(output) == 0
+         elif level == "debug":
+             assert " 500 " in output[0]
+-            assert "canceling statement due to statement timeout" in output[5]
++            assert "canceling statement due to statement timeout" in output[3]
+         else:
+             assert " 500 " in output[0]
+             assert "canceling statement due to statement timeout" in output[1]
+@@ -1772,31 +1767,3 @@ def test_pgrst_log_503_client_error_to_stderr(defaultenv):
+         log_message = '{"code":"PGRST001","details":"no connection to the server\\n","hint":null,"message":"Database client error. Retrying the connection."}\n'
+ 
+         assert any(log_message in line for line in output)
+-
+-
+-@pytest.mark.parametrize("level", ["crit", "error", "warn", "info", "debug"])
+-def test_log_pool_req_observation(level, defaultenv):
+-    "PostgREST should log PoolRequest and PoolRequestFullfilled observation when log-level=debug"
+-
+-    env = {**defaultenv, "PGRST_LOG_LEVEL": level, "PGRST_JWT_SECRET": SECRET}
+-
+-    headers = jwtauthheader({"role": "postgrest_test_author"}, SECRET)
+-
+-    pool_req = "Trying to borrow a connection from pool"
+-    pool_req_fullfill = "Borrowed a connection from the pool"
+-
+-    with run(env=env) as postgrest:
+-
+-        postgrest.session.get("/authors_only", headers=headers)
+-
+-        if level == "debug":
+-            output = postgrest.read_stdout(nlines=4)
+-            assert pool_req in output[0]
+-            assert pool_req_fullfill in output[3]
+-            assert len(output) == 4
+-        elif level == "info":
+-            output = postgrest.read_stdout(nlines=4)
+-            assert len(output) == 1
+-        else:
+-            output = postgrest.read_stdout(nlines=4)
+-            assert len(output) == 0

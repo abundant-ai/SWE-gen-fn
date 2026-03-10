@@ -1,0 +1,553 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cd9a66af..dd27258c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #1614, Add `db-pool-automatic-recovery` configuration to disable connection retrying - @taimoorzaeem
+  - #2492, Allow full response control when raising exceptions - @taimoorzaeem, @laurenceisla
+- - #2771, Add `Server-Timing` header with JWT duration - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 290618a0..1fd1cef4 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -114,7 +114,6 @@ library
+                     , swagger2                  >= 2.4 && < 2.9
+                     , text                      >= 1.2.2 && < 1.3
+                     , time                      >= 1.6 && < 1.12
+-                    , timeit                    >= 2.0 && < 2.1
+                     , unordered-containers      >= 0.2.8 && < 0.3
+                     , vault                     >= 0.3.1.5 && < 0.4
+                     , vector                    >= 0.11 && < 0.14
+@@ -204,14 +203,13 @@ test-suite spec
+                       Feature.Query.DeleteSpec
+                       Feature.Query.EmbedDisambiguationSpec
+                       Feature.Query.EmbedInnerJoinSpec
+-                      Feature.Query.ErrorSpec
++                      Feature.Query.PlanSpec
+                       Feature.Query.HtmlRawOutputSpec
+                       Feature.Query.InsertSpec
+                       Feature.Query.JsonOperatorSpec
+                       Feature.Query.MultipleSchemaSpec
+-                      Feature.Query.NullsStripSpec
++                      Feature.Query.ErrorSpec
+                       Feature.Query.PgSafeUpdateSpec
+-                      Feature.Query.PlanSpec
+                       Feature.Query.PostGISSpec
+                       Feature.Query.QueryLimitedSpec
+                       Feature.Query.QuerySpec
+@@ -219,8 +217,8 @@ test-suite spec
+                       Feature.Query.RawOutputTypesSpec
+                       Feature.Query.RelatedQueriesSpec
+                       Feature.Query.RpcSpec
+-                      Feature.Query.ServerTimingSpec
+                       Feature.Query.SingularSpec
++                      Feature.Query.NullsStrip
+                       Feature.Query.SpreadQueriesSpec
+                       Feature.Query.UnicodeSpec
+                       Feature.Query.UpdateSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 219d9e43..c08e02a1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -52,7 +52,6 @@ import PostgREST.Config              (AppConfig (..))
+ import PostgREST.Config.PgVersion    (PgVersion (..))
+ import PostgREST.Error               (Error)
+ import PostgREST.Query               (DbHandler)
+-import PostgREST.Response            (ServerTimingParams (..))
+ import PostgREST.SchemaCache         (SchemaCache (..))
+ import PostgREST.SchemaCache.Routine (Routine (..))
+ import PostgREST.Version             (docsVersion, prettyVersion)
+@@ -151,8 +150,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf req body
+ 
+-  let serverTimingParams = if configDbPlanEnabled then Just (ServerTimingParams { jwtDur = fromJust $ Auth.getJwtDur req }) else Nothing
+-  handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache serverTimingParams
++  handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
+ 
+ runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState isoLvl mode authenticated prepared handler = do
+@@ -166,38 +164,38 @@ runDbHandler appState isoLvl mode authenticated prepared handler = do
+ 
+   liftEither resp
+ 
+-handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> Maybe ServerTimingParams -> Handler IO Wai.Response
+-handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache serverTimingParams =
++handleRequest :: AuthResult -> AppConfig -> AppState.AppState -> Bool -> Bool -> PgVersion -> ApiRequest -> SchemaCache -> Handler IO Wai.Response
++handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@ApiRequest{..} sCache =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       wrPlan <- liftEither $ Plan.wrappedReadPlan identifier conf sCache apiReq
+       resultSet <- runQuery roleIsoLvl (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
+-      return $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet serverTimingParams
++      return $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
+-      return $ Response.createResponse identifier mrPlan apiReq resultSet serverTimingParams
++      return $ Response.createResponse identifier mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+-      return $ Response.updateResponse mrPlan apiReq resultSet serverTimingParams
++      return $ Response.updateResponse mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+-      return $ Response.singleUpsertResponse mrPlan apiReq resultSet serverTimingParams
++      return $ Response.singleUpsertResponse mrPlan apiReq resultSet
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       mrPlan <- liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+       resultSet <- runQuery roleIsoLvl (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+-      return $ Response.deleteResponse mrPlan apiReq resultSet serverTimingParams
++      return $ Response.deleteResponse mrPlan apiReq resultSet
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       cPlan <- liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+       resultSet <- runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan))(Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+-      return $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet serverTimingParams
++      return $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+       iPlan <- liftEither $ Plan.inspectPlan conf apiReq
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index fb07daa6..26c3850b 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -14,7 +14,6 @@ very simple authentication system inside the PostgreSQL database.
+ module PostgREST.Auth
+   ( AuthResult (..)
+   , getResult
+-  , getJwtDur
+   , getRole
+   , middleware
+   ) where
+@@ -38,7 +37,6 @@ import Data.Either.Combinators (mapLeft)
+ import Data.List               (lookup)
+ import Data.Time.Clock         (UTCTime)
+ import System.IO.Unsafe        (unsafePerformIO)
+-import System.TimeIt           (timeItT)
+ 
+ import PostgREST.AppState (AppState, getConfig, getTime)
+ import PostgREST.Config   (AppConfig (..), JSPath, JSPathExp (..))
+@@ -104,19 +102,13 @@ middleware appState app req respond = do
+   conf <- getConfig appState
+   time <- getTime appState
+ 
+-  let token  = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
+-      parseJwt = runExceptT $ parseToken conf (LBS.fromStrict token) time >>= parseClaims conf
+-
+-  if configDbPlanEnabled conf
+-    then do
+-      (dur,authResult) <- timeItT parseJwt
+-      let req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult & Vault.insert jwtDurKey dur }
+-      app req' respond
+-    else do
+-      authResult <- parseJwt
+-      let req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
+-      app req' respond
++  let token = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
++  authResult <- runExceptT $
++    parseToken conf (LBS.fromStrict token) time >>=
++    parseClaims conf
+ 
++  let req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
++  app req' respond
+ 
+ authResultKey :: Vault.Key (Either Error AuthResult)
+ authResultKey = unsafePerformIO Vault.newKey
+@@ -125,12 +117,5 @@ authResultKey = unsafePerformIO Vault.newKey
+ getResult :: Wai.Request -> Maybe (Either Error AuthResult)
+ getResult = Vault.lookup authResultKey . Wai.vault
+ 
+-jwtDurKey :: Vault.Key Double
+-jwtDurKey = unsafePerformIO Vault.newKey
+-{-# NOINLINE jwtDurKey #-}
+-
+-getJwtDur :: Wai.Request -> Maybe Double
+-getJwtDur =  Vault.lookup jwtDurKey . Wai.vault
+-
+ getRole :: Wai.Request -> Maybe BS.ByteString
+ getRole req = authRole <$> (rightToMaybe =<< getResult req)
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 3e1a778b..dcf618c8 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -18,7 +18,6 @@ module PostgREST.Response
+   , addRetryHint
+   , isServiceUnavailable
+   , traceHeaderMiddleware
+-  , ServerTimingParams(..)
+   ) where
+ 
+ import qualified Data.Aeson                as JSON
+@@ -31,7 +30,6 @@ import qualified Network.HTTP.Types.Header as HTTP
+ import qualified Network.HTTP.Types.Status as HTTP
+ import qualified Network.HTTP.Types.URI    as HTTP
+ import qualified Network.Wai               as Wai
+-import           Numeric                   (showFFloat)
+ 
+ import qualified PostgREST.Error            as Error
+ import qualified PostgREST.MediaType        as MediaType
+@@ -66,44 +64,35 @@ import qualified PostgREST.SchemaCache.Routine as Routine
+ import Protolude      hiding (Handler, toS)
+ import Protolude.Conv (toS)
+ 
+--- Parameters for server-timing header
+--- e.g "Server-Timing: jwt;dur=23.2"
+--- Add other durations like app, db, render later
+-newtype ServerTimingParams = ServerTimingParams {
+-  jwtDur :: Double
+-}
+-
+-readResponse :: WrappedReadPlan -> Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-readResponse WrappedReadPlan{wrMedia} headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet serverTimingParams =
+-  case resultSet of
+-    RSStandard{..} -> do
+-      let
+-        (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        response = gucResponse rsGucStatus rsGucHeaders
+-        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing
+-        headers =
+-          [ contentRange
+-          , ( "Content-Location"
+-            , "/"
+-                <> toUtf8 (qiName identifier)
+-                <> if BS.null (qsCanonical iQueryParams) then mempty else "?" <> qsCanonical iQueryParams
+-            )
+-          ]
+-          ++ contentTypeHeaders wrMedia ctxApiRequest
+-          ++ prefHeader
+-          ++ serverTimingHeader serverTimingParams
+-        rsOrErrBody = if status == HTTP.status416
+-          then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+-            $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+-          else LBS.fromStrict rsBody
++readResponse :: WrappedReadPlan -> Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
++readResponse WrappedReadPlan{wrMedia} headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
++  RSStandard{..} -> do
++    let
++      (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
++      response = gucResponse rsGucStatus rsGucHeaders
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing
++      headers =
++        [ contentRange
++        , ( "Content-Location"
++          , "/"
++              <> toUtf8 (qiName identifier)
++              <> if BS.null (qsCanonical iQueryParams) then mempty else "?" <> qsCanonical iQueryParams
++          )
++        ]
++        ++ contentTypeHeaders wrMedia ctxApiRequest
++        ++ prefHeader
++      rsOrErrBody = if status == HTTP.status416
++        then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
++          $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
++        else LBS.fromStrict rsBody
+ 
+-      response status headers $ if headersOnly then mempty else rsOrErrBody
++    response status headers $ if headersOnly then mempty else rsOrErrBody
+ 
+-    RSPlan plan ->
+-      Wai.responseLBS HTTP.status200 (contentTypeHeaders wrMedia ctxApiRequest) $ LBS.fromStrict plan
++  RSPlan plan ->
++    Wai.responseLBS HTTP.status200 (contentTypeHeaders wrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-createResponse :: QualifiedIdentifier -> MutateReadPlan -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet serverTimingParams = case resultSet of
++createResponse :: QualifiedIdentifier -> MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+@@ -125,7 +114,7 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctx
+           , Just . RangeQuery.contentRangeH 1 0 $
+               if shouldCount preferCount then Just rsQueryTotal else Nothing
+           , prefHeader
+-          ] ++ serverTimingHeader serverTimingParams
++          ]
+ 
+     case preferRepresentation of
+       Just Full -> response HTTP.status201 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+@@ -136,8 +125,8 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctx
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-updateResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet serverTimingParams = case resultSet of
++updateResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -145,7 +134,7 @@ updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+       prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing
+-      headers = catMaybes [contentRangeHeader, prefHeader] ++ serverTimingHeader serverTimingParams
++      headers = catMaybes [contentRangeHeader, prefHeader]
+ 
+     case preferRepresentation of
+         Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+@@ -155,25 +144,23 @@ updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-singleUpsertResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet serverTimingParams = case resultSet of
++singleUpsertResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
+-      sTHeader = serverTimingHeader serverTimingParams
+-      cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+     case preferRepresentation of
+-      Just Full -> response HTTP.status200 (cTHeader ++ sTHeader ++ prefHeader) (LBS.fromStrict rsBody)
+-      Just None -> response HTTP.status204 (sTHeader ++ prefHeader) mempty
+-      _ -> response HTTP.status204 (sTHeader ++ prefHeader) mempty
++      Just Full -> response HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest ++ prefHeader) (LBS.fromStrict rsBody)
++      Just None -> response HTTP.status204 prefHeader mempty
++      _ -> response HTTP.status204 prefHeader mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders mrMedia ctxApiRequest) $ LBS.fromStrict plan
+ 
+-deleteResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet serverTimingParams = case resultSet of
++deleteResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Wai.Response
++deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -181,7 +168,7 @@ deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
+-      headers = contentRangeHeader : prefHeader ++ serverTimingHeader serverTimingParams
++      headers = contentRangeHeader : prefHeader
+ 
+     case preferRepresentation of
+         Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders mrMedia ctxApiRequest) (LBS.fromStrict rsBody)
+@@ -218,8 +205,8 @@ respondInfo allowHeader =
+   let allOrigins = ("Access-Control-Allow-Origin", "*") in
+   Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
+ 
+-invokeResponse :: CallReadPlan -> InvokeMethod -> Routine -> ApiRequest -> ResultSet -> Maybe ServerTimingParams -> Wai.Response
+-invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet serverTimingParams = case resultSet of
++invokeResponse :: CallReadPlan -> InvokeMethod -> Routine -> ApiRequest -> ResultSet -> Wai.Response
++invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -230,7 +217,7 @@ invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPr
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing
+-      headers = contentRange : prefHeader ++ serverTimingHeader serverTimingParams
++      headers = contentRange : prefHeader
+ 
+     if Routine.funcReturnsVoid proc then
+         response HTTP.status204 headers mempty
+@@ -295,18 +282,6 @@ addHeadersIfNotIncluded newHeaders initialHeaders =
+   filter (\(nk, _) -> isNothing $ find (\(ik, _) -> ik == nk) initialHeaders) newHeaders ++
+   initialHeaders
+ 
+--- | Adds the server-timing parameters to Server-Timing Header
+---
+--- >>> :{
+---  serverTimingHeader $
+---      Just ServerTimingParams { jwtDur = 0.0000134 }
+--- :}
+--- [("Server-Timing","jwt;dur=13.4")]
+-
+-serverTimingHeader :: Maybe ServerTimingParams -> [HTTP.Header]
+-serverTimingHeader (Just ServerTimingParams{..}) = [("Server-Timing", "jwt;dur=" <> BS.pack (showFFloat (Just 1) (jwtDur*1000000) ""))]
+-serverTimingHeader Nothing = []
+-
+ traceHeaderMiddleware :: AppConfig -> Wai.Middleware
+ traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
+   case configServerTraceHeader of
+diff --git a/test/spec/Feature/Query/NullsStripSpec.hs b/test/spec/Feature/Query/NullsStrip.hs
+similarity index 99%
+rename from test/spec/Feature/Query/NullsStripSpec.hs
+rename to test/spec/Feature/Query/NullsStrip.hs
+index 0a4b82c0..4cb73faa 100644
+--- a/test/spec/Feature/Query/NullsStripSpec.hs
++++ b/test/spec/Feature/Query/NullsStrip.hs
+@@ -1,4 +1,4 @@
+-module Feature.Query.NullsStripSpec where
++module Feature.Query.NullsStrip where
+ 
+ import Network.Wai (Application)
+ 
+diff --git a/test/spec/Feature/Query/ServerTimingSpec.hs b/test/spec/Feature/Query/ServerTimingSpec.hs
+deleted file mode 100644
+index 4ab8954a..00000000
+--- a/test/spec/Feature/Query/ServerTimingSpec.hs
++++ /dev/null
+@@ -1,79 +0,0 @@
+-module Feature.Query.ServerTimingSpec where
+-
+-import Network.Wai (Application)
+-
+-import Network.HTTP.Types
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "Show Duration on Server-Timing header" $ do
+-
+-    context "responds with Server-Timing header" $ do
+-      it "works with get request" $ do
+-        request methodGet  "/organizations?id=eq.6"
+-          []
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"id":6,"name":"Oscorp","referee":3,"auditor":4,"manager_id":6}]|]
+-          { matchStatus  = 200
+-          , matchHeaders = [ matchContentTypeJson
+-                           , matchHeaderPresent "Server-Timing"]
+-          }
+-
+-      it "works with post request" $
+-        request methodPost  "/organizations?select=*"
+-          [("Prefer","return=representation")]
+-          [json|{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}|]
+-          `shouldRespondWith`
+-          [json|[{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}]|]
+-          { matchStatus  = 201
+-          , matchHeaders = [ matchContentTypeJson
+-                           , matchHeaderPresent "Server-Timing"]
+-          }
+-
+-      it "works with patch request" $
+-        request methodPatch "/no_pk?b=eq.0" mempty
+-            [json| { b: "1" } |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderPresent "Server-Timing" ]
+-            }
+-
+-      it "works with put request" $
+-        request methodPut "/tiobe_pls?name=eq.Go"
+-            [("Prefer", "return=representation")]
+-            [json| [ { "name": "Go", "rank": 19 } ]|]
+-          `shouldRespondWith`
+-            [json| [ { "name": "Go", "rank": 19 } ]|]
+-            { matchStatus  = 200
+-            , matchHeaders = [ matchHeaderPresent "Server-Timing" ]
+-            }
+-
+-      it "works with delete request" $
+-        request methodDelete "/items?id=eq.1"
+-            []
+-            ""
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderPresent "Server-Timing" ]
+-            }
+-
+-      it "works with rpc call" $
+-        request methodPost "/rpc/ret_point_overloaded"
+-          []
+-          [json|{"x": 1, "y": 2}|]
+-          `shouldRespondWith`
+-          [json|{"x": 1, "y": 2}|]
+-          { matchStatus  = 200
+-          , matchHeaders = [ matchHeaderPresent "Server-Timing" ]
+-          }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 3897c3db..c6e1c12c 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -45,7 +45,7 @@ import qualified Feature.Query.HtmlRawOutputSpec
+ import qualified Feature.Query.InsertSpec
+ import qualified Feature.Query.JsonOperatorSpec
+ import qualified Feature.Query.MultipleSchemaSpec
+-import qualified Feature.Query.NullsStripSpec
++import qualified Feature.Query.NullsStrip
+ import qualified Feature.Query.PgSafeUpdateSpec
+ import qualified Feature.Query.PlanSpec
+ import qualified Feature.Query.PostGISSpec
+@@ -55,7 +55,6 @@ import qualified Feature.Query.RangeSpec
+ import qualified Feature.Query.RawOutputTypesSpec
+ import qualified Feature.Query.RelatedQueriesSpec
+ import qualified Feature.Query.RpcSpec
+-import qualified Feature.Query.ServerTimingSpec
+ import qualified Feature.Query.SingularSpec
+ import qualified Feature.Query.SpreadQueriesSpec
+ import qualified Feature.Query.UnicodeSpec
+@@ -110,7 +109,6 @@ main = do
+       planEnabledApp       = app testPlanEnabledCfg
+       pgSafeUpdateApp      = app testPgSafeUpdateEnabledCfg
+       obsApp               = app testObservabilityCfg
+-      serverTiming         = app testCfgServerTiming
+ 
+       extraSearchPathApp   = appDbs testCfgExtraSearchPath
+       unicodeApp           = appDbs testUnicodeCfg
+@@ -142,7 +140,7 @@ main = do
+         , ("Feature.Query.RawOutputTypesSpec"            , Feature.Query.RawOutputTypesSpec.spec)
+         , ("Feature.Query.RpcSpec"                       , Feature.Query.RpcSpec.spec actualPgVersion)
+         , ("Feature.Query.SingularSpec"                  , Feature.Query.SingularSpec.spec)
+-        , ("Feature.Query.NullsStripSpec"                , Feature.Query.NullsStripSpec.spec)
++        , ("Feature.Query.NullsStrip"                    , Feature.Query.NullsStrip.spec)
+         , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec actualPgVersion)
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+@@ -247,9 +245,6 @@ main = do
+     parallel $ before obsApp $
+       describe "Feature.ObservabilitySpec.spec" Feature.ObservabilitySpec.spec
+ 
+-    parallel $ before serverTiming $
+-      describe "Feature.Query.ServerTimingSpec.spec" Feature.Query.ServerTimingSpec.spec
+-
+     -- Note: the rollback tests can not run in parallel, because they test persistance and
+     -- this results in race conditions
+ 
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 93b8dac1..bc0b0074 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -58,12 +58,6 @@ matchHeaderAbsent name = MatchHeader $ \headers _body ->
+     Just _  -> Just $ "unexpected header: " <> toS (original name) <> "\n"
+     Nothing -> Nothing
+ 
+-matchHeaderPresent :: HeaderName -> MatchHeader
+-matchHeaderPresent name = MatchHeader $ \headers _body ->
+-  case lookup name headers of
+-    Just _  -> Nothing
+-    Nothing -> Just $ "missing header: " <> toS (original name) <> "\n"
+-
+ validateOpenApiResponse :: [Header] -> WaiSession () ()
+ validateOpenApiResponse headers = do
+   r <- request methodGet "/" headers ""
+@@ -232,9 +226,6 @@ testPgSafeUpdateEnabledCfg = baseCfg { configDbPreRequest = Just $ QualifiedIden
+ testObservabilityCfg :: AppConfig
+ testObservabilityCfg = baseCfg { configServerTraceHeader = Just $ mk "X-Request-Id" }
+ 
+-testCfgServerTiming :: AppConfig
+-testCfgServerTiming = baseCfg { configDbPlanEnabled = True }
+-
+ analyzeTable :: Text -> IO ()
+ analyzeTable tableName =
+   void $ readProcess "psql" ["-U", "postgres", "--set", "ON_ERROR_STOP=1", "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []

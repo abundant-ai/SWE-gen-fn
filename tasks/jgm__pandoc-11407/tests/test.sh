@@ -10,8 +10,7 @@ cp "/tests/command/pdfstandard.md" "test/command/pdfstandard.md"
 cabal build --enable-tests --disable-optimization
 
 # Run the specific test for the pdfstandard command
-# Using tasty-pattern to run only tests matching "pdfstandard"
-cabal test pandoc --test-show-details=direct --test-option='--pattern' --test-option='pdfstandard'
+cabal test pandoc --test-show-details=direct --test-option='--pattern' --test-option='pdfstandard.md'
 test_status=$?
 
 if [ $test_status -eq 0 ]; then

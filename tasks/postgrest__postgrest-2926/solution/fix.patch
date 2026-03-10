@@ -1,0 +1,255 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7e8dd01e..b4f603a2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+  - #3015, Fix unnecessary count() on RPC returning single - @steve-chavez
++ - #1070, Fix HTTP status responses for upserts - @taimoorzaeem
++   + `PUT` returns `201` instead of `200` when rows are inserted
++   + `POST` with `Prefer: resolution=merge-duplicates` returns `200` instead of `201` when no rows are inserted
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index e4b3ca4f..4e86610a 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -176,6 +176,7 @@ class ToHeaderValue a where
+ data PreferResolution
+   = MergeDuplicates
+   | IgnoreDuplicates
++  deriving Eq
+ 
+ instance ToHeaderValue PreferResolution where
+   toHeaderValue MergeDuplicates  = "resolution=merge-duplicates"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 85e08dfe..1b154461 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -190,7 +190,7 @@ openApiQuery sCache pgVer AppConfig{..} tSchema =
+ writeQuery :: MutateReadPlan -> ApiRequest -> AppConfig  -> DbHandler ResultSet
+ writeQuery MutateReadPlan{..} ApiRequest{iPreferences=Preferences{..}} conf =
+   let
+-    (isInsert, pkCols) = case mrMutatePlan of {Insert{insPkCols} -> (True, insPkCols); _ -> (False, mempty);}
++    (isPut, isInsert, pkCols) = case mrMutatePlan of {Insert{where_,insPkCols} -> ((not . null) where_, True, insPkCols); _ -> (False,False, mempty);}
+   in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+@@ -198,9 +198,11 @@ writeQuery MutateReadPlan{..} ApiRequest{iPreferences=Preferences{..}} conf =
+       (QueryBuilder.readPlanToQuery mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
++      isPut
+       mrMedia
+       mrHandler
+       preferRepresentation
++      preferResolution
+       pkCols
+       (configDbPreparedStatements conf)
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 06e4ad1f..c81772b8 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -87,7 +87,8 @@ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _
+   "INSERT INTO " <> fromQi mainQi <> (if null iCols then " " else "(" <> cols <> ") ") <>
+   fromJsonBodyF body iCols True False applyDefaults <>
+   -- Only used for PUT
+-  (if null putConditions then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree (QualifiedIdentifier mempty "pgrst_body") <$> putConditions)) <>
++  (if null putConditions then mempty else "WHERE " <> addConfigPgrstInserted True <> " AND " <> intercalateSnippet " AND " (pgFmtLogicTree (QualifiedIdentifier mempty "pgrst_body") <$> putConditions)) <>
++  (if null putConditions && mergeDups then "WHERE " <> addConfigPgrstInserted True else mempty) <>
+   maybe mempty (\(oncDo, oncCols) ->
+     if null oncCols then
+       mempty
+@@ -98,11 +99,12 @@ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _
+       MergeDuplicates  ->
+         if null iCols
+            then "DO NOTHING"
+-           else "DO UPDATE SET " <> intercalateSnippet ", " ((pgFmtIdent . cfName) <> const " = EXCLUDED." <> (pgFmtIdent . cfName) <$> iCols)
++           else "DO UPDATE SET " <> intercalateSnippet ", " ((pgFmtIdent . cfName) <> const " = EXCLUDED." <> (pgFmtIdent . cfName) <$> iCols) <> (if null putConditions && not mergeDups then mempty else "WHERE " <> addConfigPgrstInserted False)
+     ) onConflct <> " " <>
+-  returningF mainQi returnings
++    returningF mainQi returnings
+   where
+     cols = intercalateSnippet ", " $ pgFmtIdent . cfName <$> iCols
++    mergeDups = case onConflct of {Just (MergeDuplicates,_) -> True; _ -> False;}
+ 
+ -- An update without a limit is always filtered with a WHERE
+ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings applyDefaults)
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index af64e670..02abb947 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -24,6 +24,8 @@ module PostgREST.Query.SqlFragment
+   , fromJsonBodyF
+   , responseHeadersF
+   , responseStatusF
++  , addConfigPgrstInserted
++  , currentSettingF
+   , returningF
+   , singleParameter
+   , sourceCTE
+@@ -433,6 +435,11 @@ responseHeadersF = currentSettingF "response.headers"
+ responseStatusF :: SQL.Snippet
+ responseStatusF = currentSettingF "response.status"
+ 
++addConfigPgrstInserted :: Bool -> SQL.Snippet
++addConfigPgrstInserted add =
++  let (symbol, num) =  if add then ("+", "0") else ("-", "-1") in
++  "set_config('pgrst.inserted', (coalesce(" <> currentSettingF "pgrst.inserted" <> "::int, 0) " <> symbol <> " 1)::text, true) <> '" <> num <> "'"
++
+ currentSettingF :: SQL.Snippet -> SQL.Snippet
+ currentSettingF setting =
+   -- nullif is used because of https://gist.github.com/steve-chavez/8d7033ea5655096903f3b52f8ed09a15
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index a6733ecc..2c6d7d28 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -50,15 +50,19 @@ data ResultSet
+   -- ^ the HTTP headers to be added to the response
+   , rsGucStatus  :: Maybe Text
+   -- ^ the HTTP status to be added to the response
++  , rsInserted   :: Maybe Int64
++  -- ^ the number of rows inserted (Only used for upserts)
+   }
+   | RSPlan BS.ByteString -- ^ the plan of the query
+ 
+ 
+-prepareWrite :: QualifiedIdentifier -> SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> MediaHandler ->
+-                Maybe PreferRepresentation -> [Text] -> Bool -> SQL.Statement () ResultSet
+-prepareWrite qi selectQuery mutateQuery isInsert mt handler rep pKeys =
++prepareWrite :: QualifiedIdentifier -> SQL.Snippet -> SQL.Snippet -> Bool -> Bool -> MediaType -> MediaHandler ->
++                Maybe PreferRepresentation -> Maybe PreferResolution -> [Text] -> Bool -> SQL.Statement () ResultSet
++prepareWrite qi selectQuery mutateQuery isInsert isPut mt handler rep resolution pKeys =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+  where
++  checkUpsert snip = if isInsert && (isPut || resolution == Just MergeDuplicates) then snip else "''"
++  pgrstInsertedF = checkUpsert "nullif(current_setting('pgrst.inserted', true),'')::int"
+   snippet =
+     "WITH " <> sourceCTE <> " AS (" <> mutateQuery <> ") " <>
+     "SELECT " <>
+@@ -67,7 +71,8 @@ prepareWrite qi selectQuery mutateQuery isInsert mt handler rep pKeys =
+       locF <> " AS header, " <>
+       handlerF Nothing qi handler <> " AS body, " <>
+       responseHeadersF <> " AS response_headers, " <>
+-      responseStatusF  <> " AS response_status " <>
++      responseStatusF  <> " AS response_status, " <>
++      pgrstInsertedF <> " AS response_inserted " <>
+     "FROM (" <> selectF <> ") _postgrest_t"
+ 
+   locF =
+@@ -87,7 +92,7 @@ prepareWrite qi selectQuery mutateQuery isInsert mt handler rep pKeys =
+   decodeIt :: HD.Result ResultSet
+   decodeIt = case mt of
+     MTVndPlan{} -> planRow
+-    _        -> fromMaybe (RSStandard Nothing 0 mempty mempty Nothing Nothing) <$> HD.rowMaybe (standardRow False)
++    _           -> fromMaybe (RSStandard Nothing 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow False)
+ 
+ prepareRead :: QualifiedIdentifier -> SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> MediaHandler -> Bool -> SQL.Statement () ResultSet
+ prepareRead qi selectQuery countQuery countTotal mt handler =
+@@ -101,7 +106,8 @@ prepareRead qi selectQuery countQuery countTotal mt handler =
+       "pg_catalog.count(_postgrest_t) AS page_total, " <>
+       handlerF Nothing qi handler <> " AS body, " <>
+       responseHeadersF <> " AS response_headers, " <>
+-      responseStatusF <> " AS response_status " <>
++      responseStatusF <> " AS response_status, " <>
++      "''" <> " AS response_inserted " <>
+     "FROM ( SELECT * FROM " <> sourceCTE <> " ) _postgrest_t"
+ 
+   (countCTEF, countResultF) = countF countQuery countTotal
+@@ -127,7 +133,8 @@ prepareCall qi rout callProcQuery selectQuery countQuery countTotal mt handler =
+           else "pg_catalog.count(_postgrest_t)") <> " AS page_total, " <>
+         handlerF (Just rout) qi handler <> " AS body, " <>
+         responseHeadersF <> " AS response_headers, " <>
+-        responseStatusF <> " AS response_status " <>
++        responseStatusF <> " AS response_status, " <>
++        "''" <> " AS response_inserted " <>
+       "FROM (" <> selectQuery <> ") _postgrest_t"
+ 
+     (countCTEF, countResultF) = countF countQuery countTotal
+@@ -135,7 +142,7 @@ prepareCall qi rout callProcQuery selectQuery countQuery countTotal mt handler =
+     decodeIt :: HD.Result ResultSet
+     decodeIt = case mt of
+       MTVndPlan{} -> planRow
+-      _        -> fromMaybe (RSStandard (Just 0) 0 mempty mempty Nothing Nothing) <$> HD.rowMaybe (standardRow True)
++      _           -> fromMaybe (RSStandard (Just 0) 0 mempty mempty Nothing Nothing Nothing) <$> HD.rowMaybe (standardRow True)
+ 
+ preparePlanRows :: SQL.Snippet -> Bool -> SQL.Statement () (Maybe Int64)
+ preparePlanRows countQuery =
+@@ -153,6 +160,7 @@ standardRow noLocation =
+              <*> (if noLocation then pure mempty else fmap splitKeyValue <$> arrayColumn HD.bytea) <*> column HD.bytea
+              <*> nullableColumn HD.bytea
+              <*> nullableColumn HD.text
++             <*> nullableColumn HD.int8
+   where
+     splitKeyValue :: ByteString -> (ByteString, ByteString)
+     splitKeyValue kv =
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index fee977ef..96faaf8f 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -22,6 +22,7 @@ import qualified Data.Aeson                as JSON
+ import qualified Data.ByteString.Char8     as BS
+ import qualified Data.ByteString.Lazy      as LBS
+ import qualified Data.HashMap.Strict       as HM
++import           Data.Maybe                (fromJust)
+ import           Data.Text.Read            (decimal)
+ import qualified Network.HTTP.Types.Header as HTTP
+ import qualified Network.HTTP.Types.Status as HTTP
+@@ -35,6 +36,7 @@ import qualified PostgREST.Response.OpenAPI as OpenAPI
+ import PostgREST.ApiRequest              (ApiRequest (..),
+                                           InvokeMethod (..))
+ import PostgREST.ApiRequest.Preferences  (PreferRepresentation (..),
++                                          PreferResolution (..),
+                                           Preferences (..),
+                                           prefAppliedHeader,
+                                           shouldCount)
+@@ -119,8 +121,13 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctx
+               if shouldCount preferCount then Just rsQueryTotal else Nothing
+           , prefHeader ]
+ 
+-    let status = HTTP.status201
+-    let (headers', bod) = case preferRepresentation of
++    let isInsertIfGTZero i =
++          if i <= 0 && preferResolution == Just MergeDuplicates then
++            HTTP.status200
++          else
++            HTTP.status201
++        status = maybe HTTP.status200 isInsertIfGTZero rsInserted
++        (headers', bod) = case preferRepresentation of
+           Just Full -> (headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
+           Just None -> (headers, mempty)
+           Just HeadersOnly -> (headers, mempty)
+@@ -142,11 +149,11 @@ updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+       prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling []
+       headers = catMaybes [contentRangeHeader, prefHeader]
+ 
+-    let
+-      (status, headers', body) = case preferRepresentation of
+-                          Just Full -> (HTTP.status200, headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
+-                          Just None -> (HTTP.status204, headers, mempty)
+-                          _ -> (HTTP.status204, headers, mempty)
++    let (status, headers', body) =
++          case preferRepresentation of
++            Just Full -> (HTTP.status200, headers ++ contentTypeHeaders mrMedia ctxApiRequest, LBS.fromStrict rsBody)
++            Just None -> (HTTP.status204, headers, mempty)
++            _         -> (HTTP.status204, headers, mempty)
+ 
+     (ovStatus, ovHeaders) <- overrideStatusHeaders rsGucStatus rsGucHeaders status headers'
+ 
+@@ -162,9 +169,11 @@ singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferenc
+       prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling []
+       cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+-    let (status, headers, body) =
++    let isInsertIfGTZero i = if i > 0 then HTTP.status201 else HTTP.status200
++        upsertStatus       = isInsertIfGTZero $ fromJust rsInserted
++        (status, headers, body) =
+           case preferRepresentation of
+-            Just Full -> (HTTP.status200, cTHeader ++ prefHeader, LBS.fromStrict rsBody)
++            Just Full -> (upsertStatus, cTHeader ++ prefHeader, LBS.fromStrict rsBody)
+             Just None -> (HTTP.status204,  prefHeader, mempty)
+             _ -> (HTTP.status204, prefHeader, mempty)
+     (ovStatus, ovHeaders) <- overrideStatusHeaders rsGucStatus rsGucHeaders status headers

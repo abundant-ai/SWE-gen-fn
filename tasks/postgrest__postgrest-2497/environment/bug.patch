@@ -1,0 +1,953 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 996cf661..69e3746d 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -59,14 +59,13 @@ library
+                       PostgREST.Query.QueryBuilder
+                       PostgREST.Query.SqlFragment
+                       PostgREST.Query.Statements
+-                      PostgREST.Plan
+-                      PostgREST.Plan.CallPlan
+-                      PostgREST.Plan.MutatePlan
+-                      PostgREST.Plan.ReadPlan
+                       PostgREST.RangeQuery
+                       PostgREST.Request.ApiRequest
++                      PostgREST.Request.DbRequestBuilder
++                      PostgREST.Request.MutateQuery
+                       PostgREST.Request.Preferences
+                       PostgREST.Request.QueryParams
++                      PostgREST.Request.ReadQuery
+                       PostgREST.Request.Types
+                       PostgREST.Response
+                       PostgREST.Response.OpenAPI
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index d2f0290b..74a17855 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -31,18 +31,19 @@ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.Wai                as Wai
+ import qualified Network.Wai.Handler.Warp   as Warp
+ 
+-import qualified PostgREST.Admin              as Admin
+-import qualified PostgREST.AppState           as AppState
+-import qualified PostgREST.Auth               as Auth
+-import qualified PostgREST.Cors               as Cors
+-import qualified PostgREST.Error              as Error
+-import qualified PostgREST.Logger             as Logger
+-import qualified PostgREST.Middleware         as Middleware
+-import qualified PostgREST.Plan               as Plan
+-import qualified PostgREST.Query              as Query
+-import qualified PostgREST.Request.ApiRequest as ApiRequest
+-import qualified PostgREST.Request.Types      as ApiRequestTypes
+-import qualified PostgREST.Response           as Response
++import qualified PostgREST.Admin                    as Admin
++import qualified PostgREST.AppState                 as AppState
++import qualified PostgREST.Auth                     as Auth
++import qualified PostgREST.Cors                     as Cors
++import qualified PostgREST.Error                    as Error
++import qualified PostgREST.Logger                   as Logger
++import qualified PostgREST.Middleware               as Middleware
++import qualified PostgREST.Query                    as Query
++import qualified PostgREST.Request.ApiRequest       as ApiRequest
++import qualified PostgREST.Request.DbRequestBuilder as ReqBuilder
++import qualified PostgREST.Request.MutateQuery      as MutateRequest
++import qualified PostgREST.Request.Types            as ApiRequestTypes
++import qualified PostgREST.Response                 as Response
+ 
+ import PostgREST.AppState                (AppState)
+ import PostgREST.Auth                    (AuthResult (..))
+@@ -56,14 +57,13 @@ import PostgREST.DbStructure.Identifiers (FieldName,
+ import PostgREST.DbStructure.Proc        (ProcDescription (..))
+ import PostgREST.DbStructure.Table       (Table (..))
+ import PostgREST.Error                   (Error)
+-import PostgREST.Plan.MutatePlan         (MutatePlan)
+-import PostgREST.Plan.ReadPlan           (ReadPlanTree)
+ import PostgREST.Query                   (DbHandler)
+ import PostgREST.Request.ApiRequest      (Action (..),
+                                           ApiRequest (..),
+                                           InvokeMethod (..),
+                                           Mutation (..), Target (..))
+ import PostgREST.Request.Preferences     (PreferRepresentation (..))
++import PostgREST.Request.ReadQuery       (ReadRequest)
+ import PostgREST.Version                 (prettyVersion)
+ import PostgREST.Workers                 (connectionWorker, listener)
+ 
+@@ -223,7 +223,7 @@ handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+ 
+ handleRead :: Bool -> QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleRead headersOnly identifier context@RequestContext{..} = do
+-  req <- liftEither $ readPlan identifier context
++  req <- liftEither $ readRequest identifier context
+ 
+   (resultSet, total) <- Query.readQuery req ctxConfig ctxApiRequest
+ 
+@@ -237,7 +237,7 @@ handleCreate identifier context@RequestContext{..} = do
+       then maybe mempty tablePKCols $ HM.lookup identifier $ dbTables ctxDbStructure
+       else mempty
+ 
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationCreate identifier context pkCols
++  (mutateReq, readReq) <- liftEither $ writeRequest MutationCreate identifier context pkCols
+ 
+   resultSet <- Query.createQuery mutateReq readReq pkCols ctxApiRequest ctxConfig
+ 
+@@ -245,20 +245,20 @@ handleCreate identifier context@RequestContext{..} = do
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleUpdate identifier context@(RequestContext ctxConfig _ ctxApiRequest _) = do
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationUpdate identifier context mempty
++  (mutateReq, readReq) <- liftEither $ writeRequest MutationUpdate identifier context mempty
+   resultSet <- Query.updateQuery mutateReq readReq ctxApiRequest ctxConfig
+   pure $ Response.updateResponse ctxApiRequest resultSet
+ 
+ handleSingleUpsert :: QualifiedIdentifier -> RequestContext-> DbHandler Wai.Response
+ handleSingleUpsert identifier context@(RequestContext ctxConfig ctxDbStructure ctxApiRequest _) = do
+   let pkCols = maybe mempty tablePKCols $ HM.lookup identifier $ dbTables ctxDbStructure
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationSingleUpsert identifier context pkCols
++  (mutateReq, readReq) <- liftEither $ writeRequest MutationSingleUpsert identifier context pkCols
+   resultSet <- Query.singleUpsertQuery mutateReq readReq ctxApiRequest ctxConfig
+   pure $ Response.singleUpsertResponse ctxApiRequest resultSet
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleDelete identifier context@(RequestContext ctxConfig _ ctxApiRequest _) = do
+-  (mutateReq, readReq) <- liftEither $ mutatePlan MutationDelete identifier context mempty
++  (mutateReq, readReq) <- liftEither $ writeRequest MutationDelete identifier context mempty
+   resultSet <- Query.deleteQuery mutateReq readReq ctxApiRequest ctxConfig
+   pure $ Response.deleteResponse ctxApiRequest resultSet
+ 
+@@ -270,8 +270,8 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+         (pdSchema proc)
+         (fromMaybe (pdName proc) $ Proc.procTableName proc)
+ 
+-  readReq <- liftEither $ readPlan identifier context
+-  let callReq = Plan.callPlan proc ctxApiRequest readReq
++  readReq <- liftEither $ readRequest identifier context
++  let callReq = ReqBuilder.callRequest proc ctxApiRequest readReq
+ 
+   resultSet <- Query.invokeQuery proc callReq readReq ctxApiRequest ctxConfig
+ 
+@@ -282,14 +282,14 @@ handleOpenApi headersOnly tSchema (RequestContext conf dbStructure apiRequest pg
+   oaiResult <- Query.openApiQuery dbStructure pgVer conf tSchema
+   pure $ Response.openApiResponse headersOnly oaiResult conf dbStructure (iSchema apiRequest) (iNegotiatedByProfile apiRequest)
+ 
+-mutatePlan :: Mutation -> QualifiedIdentifier -> RequestContext -> [FieldName] -> Either Error (MutatePlan, ReadPlanTree)
+-mutatePlan mutation identifier@QualifiedIdentifier{..} context@RequestContext{..} pkCols = do
+-  readReq <- readPlan identifier context
+-  mutateReq <- Plan.mutatePlan mutation qiSchema qiName ctxApiRequest pkCols readReq
++writeRequest :: Mutation -> QualifiedIdentifier -> RequestContext -> [FieldName] -> Either Error (MutateRequest.MutateRequest, ReadRequest)
++writeRequest mutation identifier@QualifiedIdentifier{..} context@RequestContext{..} pkCols = do
++  readReq <- readRequest identifier context
++  mutateReq <- ReqBuilder.mutateRequest mutation qiSchema qiName ctxApiRequest pkCols readReq
+   pure (mutateReq, readReq)
+ 
+-readPlan :: QualifiedIdentifier -> RequestContext -> Either Error ReadPlanTree
+-readPlan QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
+-  Plan.readPlan qiSchema qiName configDbMaxRows
++readRequest :: QualifiedIdentifier -> RequestContext -> Either Error ReadRequest
++readRequest QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
++  ReqBuilder.readRequest qiSchema qiName configDbMaxRows
+     (dbRelationships dbStructure)
+     apiRequest
+diff --git a/src/PostgREST/Plan/CallPlan.hs b/src/PostgREST/Plan/CallPlan.hs
+deleted file mode 100644
+index 10817ac5..00000000
+--- a/src/PostgREST/Plan/CallPlan.hs
++++ /dev/null
+@@ -1,25 +0,0 @@
+-module PostgREST.Plan.CallPlan
+-  ( CallPlan(..)
+-  , CallParams(..)
+-  )
+-where
+-
+-import qualified Data.ByteString.Lazy              as LBS
+-import           PostgREST.DbStructure.Identifiers (FieldName,
+-                                                    QualifiedIdentifier)
+-import           PostgREST.DbStructure.Proc        (ProcParam (..))
+-
+-import Protolude
+-
+-data CallPlan = FunctionCall
+-  { funCQi           :: QualifiedIdentifier
+-  , funCParams       :: CallParams
+-  , funCArgs         :: Maybe LBS.ByteString
+-  , funCScalar       :: Bool
+-  , funCMultipleCall :: Bool
+-  , funCReturning    :: [FieldName]
+-  }
+-
+-data CallParams
+-  = KeyParams [ProcParam] -- ^ Call with key params: func(a := val1, b:= val2)
+-  | OnePosParam ProcParam -- ^ Call with positional params(only one supported): func(val)
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 3d27e40d..d696dccb 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -24,12 +24,14 @@ import qualified Hasql.DynamicStatements.Statement as SQL
+ import qualified Hasql.Transaction                 as SQL
+ import qualified Hasql.Transaction.Sessions        as SQL
+ 
+-import qualified PostgREST.DbStructure        as DbStructure
+-import qualified PostgREST.DbStructure.Proc   as Proc
+-import qualified PostgREST.Error              as Error
+-import qualified PostgREST.Query.QueryBuilder as QueryBuilder
+-import qualified PostgREST.Query.Statements   as Statements
+-import qualified PostgREST.RangeQuery         as RangeQuery
++import qualified PostgREST.DbStructure         as DbStructure
++import qualified PostgREST.DbStructure.Proc    as Proc
++import qualified PostgREST.Error               as Error
++import qualified PostgREST.Query.QueryBuilder  as QueryBuilder
++import qualified PostgREST.Query.Statements    as Statements
++import qualified PostgREST.RangeQuery          as RangeQuery
++import qualified PostgREST.Request.MutateQuery as MutateRequest
++import qualified PostgREST.Request.Types       as ApiRequestTypes
+ 
+ import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+ 
+@@ -47,9 +49,6 @@ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+ import PostgREST.DbStructure.Table       (TablesMap)
+ import PostgREST.Error                   (Error)
+ import PostgREST.MediaType               (MediaType (..))
+-import PostgREST.Plan.CallPlan           (CallPlan)
+-import PostgREST.Plan.MutatePlan         (MutatePlan)
+-import PostgREST.Plan.ReadPlan           (ReadPlanTree)
+ import PostgREST.Query.SqlFragment       (fromQi, intercalateSnippet,
+                                           pgFmtIdentList,
+                                           setConfigLocal,
+@@ -62,18 +61,19 @@ import PostgREST.Request.ApiRequest      (Action (..),
+ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferParameters (..),
+                                           shouldCount)
++import PostgREST.Request.ReadQuery       (ReadRequest)
+ 
+ import Protolude hiding (Handler)
+ 
+ type DbHandler = ExceptT Error SQL.Transaction
+ 
+-readQuery :: ReadPlanTree -> AppConfig -> ApiRequest -> DbHandler (ResultSet, Maybe Int64)
++readQuery :: ReadRequest -> AppConfig -> ApiRequest -> DbHandler (ResultSet, Maybe Int64)
+ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+-  let countQuery = QueryBuilder.readPlanToCountQuery req
++  let countQuery = QueryBuilder.readRequestToCountQuery req
+   resultSet <-
+      lift . SQL.statement mempty $
+       Statements.prepareRead
+-        (QueryBuilder.readPlanToQuery req)
++        (QueryBuilder.readRequestToQuery req)
+         (if iPreferCount == Just EstimatedCount then
+            -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+            QueryBuilder.limitedQuery countQuery ((+ 1) <$> configDbMaxRows)
+@@ -106,20 +106,20 @@ readTotal AppConfig{..} ApiRequest{..} RSStandard{rsTableTotal=tableTotal} count
+       lift . SQL.statement mempty . Statements.preparePlanRows countQuery $
+         configDbPreparedStatements
+ 
+-createQuery :: MutatePlan -> ReadPlanTree -> [FieldName] -> ApiRequest -> AppConfig -> DbHandler ResultSet
++createQuery :: MutateRequest.MutateRequest -> ReadRequest -> [FieldName] -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ createQuery mutateReq readReq pkCols apiReq@ApiRequest{..} conf = do
+   resultSet <- writeQuery mutateReq readReq True pkCols apiReq conf
+   failNotSingular iAcceptMediaType resultSet
+   pure resultSet
+ 
+-updateQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
++updateQuery :: MutateRequest.MutateRequest -> ReadRequest -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ updateQuery mutateReq readReq apiReq@ApiRequest{..} conf = do
+   resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
+   failNotSingular iAcceptMediaType resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
+   pure resultSet
+ 
+-singleUpsertQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
++singleUpsertQuery :: MutateRequest.MutateRequest -> ReadRequest -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ singleUpsertQuery mutateReq readReq apiReq conf = do
+   resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
+   failPut resultSet
+@@ -137,23 +137,23 @@ failPut RSStandard{rsQueryTotal=queryTotal} =
+     lift SQL.condemn
+     throwError Error.PutMatchingPkError
+ 
+-deleteQuery :: MutatePlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
++deleteQuery :: MutateRequest.MutateRequest -> ReadRequest -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ deleteQuery mutateReq readReq apiReq@ApiRequest{..} conf = do
+   resultSet <- writeQuery mutateReq readReq False mempty apiReq conf
+   failNotSingular iAcceptMediaType resultSet
+   failsChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resultSet
+   pure resultSet
+ 
+-invokeQuery :: ProcDescription -> CallPlan -> ReadPlanTree -> ApiRequest -> AppConfig -> DbHandler ResultSet
++invokeQuery :: ProcDescription -> ApiRequestTypes.CallRequest -> ReadRequest -> ApiRequest -> AppConfig -> DbHandler ResultSet
+ invokeQuery proc callReq readReq ApiRequest{..} AppConfig{..} = do
+   resultSet <-
+     lift . SQL.statement mempty $
+       Statements.prepareCall
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingle proc)
+-        (QueryBuilder.callPlanToQuery callReq)
+-        (QueryBuilder.readPlanToQuery readReq)
+-        (QueryBuilder.readPlanToCountQuery readReq)
++        (QueryBuilder.requestToCallProcQuery callReq)
++        (QueryBuilder.readRequestToQuery readReq)
++        (QueryBuilder.readRequestToCountQuery readReq)
+         (shouldCount iPreferCount)
+         iAcceptMediaType
+         (iPreferParameters == Just MultipleObjects)
+@@ -197,12 +197,12 @@ txMode ApiRequest{..} =
+     _ ->
+       SQL.Write
+ 
+-writeQuery :: MutatePlan -> ReadPlanTree -> Bool -> [Text] -> ApiRequest -> AppConfig  -> DbHandler ResultSet
++writeQuery :: MutateRequest.MutateRequest -> ReadRequest -> Bool -> [Text] -> ApiRequest -> AppConfig  -> DbHandler ResultSet
+ writeQuery mutateReq readReq isInsert pkCols apiReq conf = do
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+-      (QueryBuilder.readPlanToQuery readReq)
+-      (QueryBuilder.mutatePlanToQuery mutateReq)
++      (QueryBuilder.readRequestToQuery readReq)
++      (QueryBuilder.mutateRequestToQuery mutateReq)
+       isInsert
+       (iAcceptMediaType apiReq)
+       (iPreferRepresentation apiReq)
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 286993bb..f3202185 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -5,14 +5,14 @@ Module      : PostgREST.Query.QueryBuilder
+ Description : PostgREST SQL queries generating functions.
+ 
+ This module provides functions to consume data types that
+-represent database queries (e.g. ReadPlanTree, MutatePlan) and SqlFragment
++represent database queries (e.g. ReadRequest, MutateRequest) and SqlFragment
+ to produce SqlQuery type outputs.
+ -}
+ module PostgREST.Query.QueryBuilder
+-  ( readPlanToQuery
+-  , mutatePlanToQuery
+-  , readPlanToCountQuery
+-  , callPlanToQuery
++  ( readRequestToQuery
++  , mutateRequestToQuery
++  , readRequestToCountQuery
++  , requestToCallProcQuery
+   , limitedQuery
+   ) where
+ 
+@@ -29,36 +29,35 @@ import PostgREST.DbStructure.Relationship (Cardinality (..),
+                                            Relationship (..))
+ import PostgREST.Request.Preferences      (PreferResolution (..))
+ 
+-import PostgREST.Plan.CallPlan
+-import PostgREST.Plan.MutatePlan
+-import PostgREST.Plan.ReadPlan
+ import PostgREST.Query.SqlFragment
+-import PostgREST.RangeQuery        (allRange)
++import PostgREST.RangeQuery          (allRange)
++import PostgREST.Request.MutateQuery
++import PostgREST.Request.ReadQuery
+ import PostgREST.Request.Types
+ 
+ import Protolude
+ 
+-readPlanToQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,joinConditions, order, range_=readRange, nodeRel} forest) =
++readRequestToQuery :: ReadRequest -> SQL.Snippet
++readRequestToQuery (Node (Select colSelects mainQi tblAlias logicForest joinConditions_ ordts range, (_, rel, _, _, _, _)) forest) =
+   "SELECT " <>
+-  intercalateSnippet ", " ((pgFmtSelectItem qi <$> select) ++ selects) <> " " <>
++  intercalateSnippet ", " ((pgFmtSelectItem qi <$> colSelects) ++ selects) <> " " <>
+   fromFrag <> " " <>
+   intercalateSnippet " " joins <> " " <>
+-  (if null logicForest && null joinConditions
++  (if null logicForest && null joinConditions_
+     then mempty
+-    else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition joinConditions)) <> " " <>
+-  orderF qi order <> " " <>
+-  limitOffsetF readRange
++    else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition joinConditions_)) <> " " <>
++  orderF qi ordts <> " " <>
++  limitOffsetF range
+   where
+-    fromFrag = fromF nodeRel mainQi fromAlias
+-    qi = getQualifiedIdentifier nodeRel mainQi fromAlias
++    fromFrag = fromF rel mainQi tblAlias
++    qi = getQualifiedIdentifier rel mainQi tblAlias
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+-getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+-getSelectsJoins (Node ReadPlan{nodeRel=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{nodeName=name, nodeRel=Just rel, nodeAlias=alias, nodeJoinType=joinType} _) (selects,joins) =
++getSelectsJoins :: ReadRequest -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
++getSelectsJoins (Node (_, (_, Nothing, _, _, _, _)) _) _ = ([], [])
++getSelectsJoins rr@(Node (_, (name, Just rel, alias, _, joinType, _)) _) (selects,joins) =
+   let
+-    subquery = readPlanToQuery rr
++    subquery = readRequestToQuery rr
+     aliasOrName = fromMaybe name alias
+     locTblName = qiName (relTable rel) <> "_" <> aliasOrName
+     localTableName = pgFmtIdent locTblName
+@@ -83,8 +82,8 @@ getSelectsJoins rr@(Node ReadPlan{nodeName=name, nodeRel=Just rel, nodeAlias=ali
+   in
+   (sel:selects, joi:joins)
+ 
+-mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+-mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
++mutateRequestToQuery :: MutateRequest -> SQL.Snippet
++mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
+   "WITH " <> normalizedBody body <> " " <>
+   "INSERT INTO " <> SQL.sql (fromQi mainQi) <> SQL.sql (if S.null iCols then " " else "(" <> cols <> ") ") <>
+   "SELECT " <> SQL.sql cols <> " " <>
+@@ -110,7 +109,7 @@ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings)
+     cols = BS.intercalate ", " $ pgFmtIdent <$> S.toList iCols
+ 
+ -- An update without a limit is always filtered with a WHERE
+-mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings)
++mutateRequestToQuery (Update mainQi uCols body logicForest range ordts returnings)
+   | S.null uCols =
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+@@ -146,7 +145,7 @@ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings)
+     rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent col <> " = (SELECT " <> pgFmtIdent col <> " FROM pgrst_update_body) ") <$> S.toList uCols)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+-mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
++mutateRequestToQuery (Delete mainQi logicForest range ordts returnings)
+   | range == allRange =
+     "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+     whereLogic <> " " <>
+@@ -169,8 +168,8 @@ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+     whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+-callPlanToQuery :: CallPlan -> SQL.Snippet
+-callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
++requestToCallProcQuery :: CallRequest -> SQL.Snippet
++requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
+   prmsCTE <> argsBody
+   where
+     (prmsCTE, argFrag) = case params of
+@@ -224,8 +223,8 @@ callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnin
+ -- For this case, we use a WHERE EXISTS instead of an INNER JOIN on the count query.
+ -- See https://github.com/PostgREST/postgrest/issues/2009#issuecomment-977473031
+ -- Only for the nodes that have an INNER JOIN linked to the root level.
+-readPlanToCountQuery :: ReadPlanTree -> SQL.Snippet
+-readPlanToCountQuery (Node ReadPlan{from=mainQi, fromAlias=tblAlias, where_=logicForest, joinConditions=joinConditions_, nodeRel=rel} forest) =
++readRequestToCountQuery :: ReadRequest -> SQL.Snippet
++readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, where_=logicForest, joinConditions=joinConditions_}, (_, rel, _, _, _, _)) forest) =
+   "SELECT 1 " <> fromFrag <>
+   (if null logicForest && null joinConditions_ && null subQueries
+     then mempty
+@@ -239,16 +238,16 @@ readPlanToCountQuery (Node ReadPlan{from=mainQi, fromAlias=tblAlias, where_=logi
+     qi = getQualifiedIdentifier rel mainQi tblAlias
+     fromFrag = fromF rel mainQi tblAlias
+     subQueries = foldr existsSubquery [] forest
+-    existsSubquery :: ReadPlanTree -> [SQL.Snippet] -> [SQL.Snippet]
+-    existsSubquery readReq@(Node ReadPlan{nodeJoinType=joinType} _) rest =
++    existsSubquery :: ReadRequest -> [SQL.Snippet] -> [SQL.Snippet]
++    existsSubquery readReq@(Node (_, (_, _, _, _, joinType, _)) _) rest =
+       if joinType == Just JTInner
+-        then ("EXISTS (" <> readPlanToCountQuery readReq <> " )"):rest
++        then ("EXISTS (" <> readRequestToCountQuery readReq <> " )"):rest
+         else rest
+ 
+ limitedQuery :: SQL.Snippet -> Maybe Integer -> SQL.Snippet
+ limitedQuery query maxRows = query <> SQL.sql (maybe mempty (\x -> " LIMIT " <> BS.pack (show x)) maxRows)
+ 
+--- TODO refactor so this function is uneeded and ComputedRelationship QualifiedIdentifier comes from the ReadPlan type
++-- TODO refactor so this function is uneeded and ComputedRelationship QualifiedIdentifier comes from the ReadQuery type
+ getQualifiedIdentifier :: Maybe Relationship -> QualifiedIdentifier -> Maybe Alias -> QualifiedIdentifier
+ getQualifiedIdentifier rel mainQi tblAlias = case rel of
+   Just ComputedRelationship{relFunction} -> QualifiedIdentifier mempty $ fromMaybe (qiName relFunction) tblAlias
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+similarity index 72%
+rename from src/PostgREST/Plan.hs
+rename to src/PostgREST/Request/DbRequestBuilder.hs
+index a9cd76fd..f0856976 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -1,9 +1,9 @@
+ {-|
+-Module      : PostgREST.Plan
+-Description : PostgREST Request Planner
++Module      : PostgREST.Request.DbRequestBuilder
++Description : PostgREST database request builder
+ 
+ This module is in charge of building an intermediate
+-representation between the HTTP request and the
++representation(ReadRequest, MutateRequest) between the HTTP request and the
+ final resulting SQL query.
+ 
+ A query tree is built in case of resource embedding. By inferring the
+@@ -15,10 +15,10 @@ resource.
+ {-# LANGUAGE NamedFieldPuns        #-}
+ {-# LANGUAGE RecordWildCards       #-}
+ 
+-module PostgREST.Plan
+-  ( readPlan
+-  , mutatePlan
+-  , callPlan
++module PostgREST.Request.DbRequestBuilder
++  ( readRequest
++  , mutateRequest
++  , callRequest
+   ) where
+ 
+ import qualified Data.HashMap.Strict as HM
+@@ -48,21 +48,20 @@ import PostgREST.Request.ApiRequest       (Action (..),
+                                            Mutation (..),
+                                            Payload (..))
+ 
+-import PostgREST.Plan.CallPlan
+-import PostgREST.Plan.MutatePlan
+-import PostgREST.Plan.ReadPlan       as ReadPlan
++import PostgREST.Request.MutateQuery
+ import PostgREST.Request.Preferences
++import PostgREST.Request.ReadQuery   as ReadQuery
+ import PostgREST.Request.Types
+ 
+ import qualified PostgREST.Request.QueryParams as QueryParams
+ 
+ import Protolude hiding (from)
+ 
+--- | Builds the ReadPlan tree on a number of stages.
++-- | Builds the ReadRequest tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+-readPlan :: Schema -> TableName -> Maybe Integer -> RelationshipsMap -> ApiRequest -> Either Error ReadPlanTree
+-readPlan schema rootTableName maxRows allRels apiRequest  =
++readRequest :: Schema -> TableName -> Maybe Integer -> RelationshipsMap -> ApiRequest -> Either Error ReadRequest
++readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange maxRows (iAction apiRequest) =<<
+   augmentRequestWithJoin schema allRels =<<
+@@ -81,67 +80,67 @@ readPlan schema rootTableName maxRows allRels apiRequest  =
+ -- can differentiate the parent and child tables by having an alias like
+ -- "table_depth", this is related to
+ -- http://github.com/PostgREST/postgrest/issues/987.
+-initReadRequest :: QualifiedIdentifier -> Maybe Alias -> [Tree SelectItem] -> ReadPlanTree
++initReadRequest :: QualifiedIdentifier -> Maybe Alias -> [Tree SelectItem] -> ReadRequest
+ initReadRequest rootQi rootAlias =
+   foldr (treeEntry rootDepth) initial
+   where
+     rootDepth = 0
+     rootSchema = qiSchema rootQi
+     rootName = qiName rootQi
+-    initial = Node (ReadPlan [] rootQi rootAlias [] [] [] allRange rootName Nothing Nothing Nothing Nothing rootDepth) []
+-    treeEntry :: Depth -> Tree SelectItem -> ReadPlanTree -> ReadPlanTree
+-    treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node q rForest) =
++    initial = Node (Select [] rootQi rootAlias [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
++    treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
++    treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node (q, i) rForest) =
+       let nxtDepth = succ depth in
+       case fldForest of
+-        [] -> Node q{select=fld:select q} rForest
+-        _  -> Node q $
++        [] -> Node (q {select=fld:select q}, i) rForest
++        _  -> Node (q, i) $
+               foldr (treeEntry nxtDepth)
+-              (Node (ReadPlan [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] allRange fn Nothing alias hint joinType nxtDepth) [])
++              (Node (Select [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] allRange,
++                (fn, Nothing, alias, hint, joinType, nxtDepth)) [])
+               fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+-treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++treeRestrictRange :: Maybe Integer -> Action -> ReadRequest -> Either ApiRequestError ReadRequest
+ treeRestrictRange _ (ActionMutate _) request = Right request
+ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> request
+   where
+-    nodeRestrictRange :: Maybe Integer -> ReadPlan -> ReadPlan
+-    nodeRestrictRange m q@ReadPlan{range_=r} = q{range_=restrictRange m r }
++    nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
++    nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+ 
+-augmentRequestWithJoin :: Schema -> RelationshipsMap -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++augmentRequestWithJoin :: Schema -> RelationshipsMap -> ReadRequest -> Either ApiRequestError ReadRequest
+ augmentRequestWithJoin schema allRels request =
+  addJoinConditions Nothing <$> addRels schema allRels Nothing request
+ 
+-addRels :: Schema -> RelationshipsMap -> Maybe ReadPlanTree -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addRels schema allRels parentNode (Node query@ReadPlan{from=tbl,nodeName,nodeHint,nodeDepth} forest) =
++addRels :: Schema -> RelationshipsMap -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
++addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
+   case parentNode of
+-    Just (Node ReadPlan{from=parentNodeQi, fromAlias=aliasQi} _) ->
++    Just (Node (Select{from=parentNodeQi, fromAlias=aliasQi}, _) _) ->
+       let newFrom r = if qiName tbl == nodeName then relForeignTable r else tbl
+-          newReadPlan = (\r ->
++          newReadNode = (\r ->
+             if not $ relIsSelf r -- add alias if self rel TODO consolidate aliasing in another function
+-              then query{from=newFrom r, nodeRel=Just r}
+-              else query{from=newFrom r, nodeRel=Just r, fromAlias=Just (qiName (newFrom r) <> "_" <> show nodeDepth)}
++              then (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType, depth))
++              else (query{from=newFrom r, fromAlias=Just (qiName (newFrom r) <> "_" <> show depth)}, (nodeName, Just r, alias, hint, joinType, depth))
+             ) <$> rel
+-          origin = if nodeDepth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
++          origin = if depth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
+             then fromMaybe (qiName parentNodeQi) aliasQi
+             else qiName parentNodeQi
+-          rel = findRel schema allRels origin nodeName nodeHint
++          rel = findRel schema allRels origin nodeName hint
+       in
+-      Node <$> newReadPlan <*> (updateForest . hush $ Node <$> newReadPlan <*> pure forest)
++      Node <$> newReadNode <*> (updateForest . hush $ Node <$> newReadNode <*> pure forest)
+     _ ->
+-      Node query <$> updateForest (Just $ Node query forest)
++      let rn = (query, (nodeName, Nothing, alias, Nothing, joinType, depth)) in
++      Node rn <$> updateForest (Just $ Node rn forest)
+   where
+-    updateForest :: Maybe ReadPlanTree -> Either ApiRequestError [ReadPlanTree]
++    updateForest :: Maybe ReadRequest -> Either ApiRequestError [ReadRequest]
+     updateForest rq = addRels schema allRels rq `traverse` forest
+ 
+ -- applies aliasing to join conditions TODO refactor, this should go into the querybuilder module
+-addJoinConditions :: Maybe Alias -> ReadPlanTree -> ReadPlanTree
+-addJoinConditions _ (Node node@ReadPlan{fromAlias=tblAlias, nodeRel=Nothing} forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions _ (Node node@ReadPlan{fromAlias=tblAlias, nodeRel=Just ComputedRelationship{}} forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions previousAlias (Node query@ReadPlan{fromAlias=tblAlias, nodeRel=Just Relationship{relTable=qi,relForeignTable=fQi,relCardinality=card}} forest) =
+-  Node query{joinConditions=joinConds} (addJoinConditions tblAlias <$> forest)
++addJoinConditions :: Maybe Alias -> ReadRequest -> ReadRequest
++addJoinConditions _ (Node node@(Select{fromAlias=tblAlias}, (_, Nothing, _, _, _, _)) forest) = Node node (addJoinConditions tblAlias <$> forest)
++addJoinConditions _ (Node node@(Select{fromAlias=tblAlias}, (_, Just ComputedRelationship{}, _, _, _, _)) forest) = Node node (addJoinConditions tblAlias <$> forest)
++addJoinConditions previousAlias (Node (query@Select{fromAlias=tblAlias}, nodeProps@(_, Just (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} _ card _ _), _, _, _, _)) forest) =
++  Node (query{joinConditions=joinConds}, nodeProps) (addJoinConditions tblAlias <$> forest)
+   where
+-    QualifiedIdentifier{qiSchema=tSchema, qiName=tN} = qi
+-    QualifiedIdentifier{qiName=ftN} = fQi
+     joinConds =
+       case card of
+         M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
+@@ -242,7 +241,7 @@ findRel schema allRels origin target hint =
+             )
+       ) $ fromMaybe mempty $ HM.lookup (QualifiedIdentifier schema origin, schema) allRels
+ 
+-addFilters :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addFilters :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addFilters ApiRequest{..} rReq =
+   foldr addFilterToNode (Right rReq) flts
+   where
+@@ -255,11 +254,11 @@ addFilters ApiRequest{..} rReq =
+         ActionRead _         -> qsFilters
+         _                    -> qsFiltersNotRoot
+ 
+-    addFilterToNode :: (EmbedPath, Filter) -> Either ApiRequestError ReadPlanTree ->  Either ApiRequestError ReadPlanTree
++    addFilterToNode :: (EmbedPath, Filter) -> Either ApiRequestError ReadRequest ->  Either ApiRequestError ReadRequest
+     addFilterToNode =
+-      updateNode (\flt (Node q@ReadPlan{where_=lf} f) -> Node q{ReadPlan.where_=addFilterToLogicForest flt lf}  f)
++      updateNode (\flt (Node (q@Select {where_=lf}, i) f) -> Node (q{ReadQuery.where_=addFilterToLogicForest flt lf}, i) f)
+ 
+-addOrders :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addOrders :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addOrders ApiRequest{..} rReq =
+   case iAction of
+     ActionMutate _ -> Right rReq
+@@ -267,10 +266,10 @@ addOrders ApiRequest{..} rReq =
+   where
+     QueryParams.QueryParams{..} = iQueryParams
+ 
+-    addOrderToNode :: (EmbedPath, [OrderTerm]) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-    addOrderToNode = updateNode (\o (Node q f) -> Node q{order=o} f)
++    addOrderToNode :: (EmbedPath, [OrderTerm]) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
++    addOrderToNode = updateNode (\o (Node (q,i) f) -> Node (q{order=o}, i) f)
+ 
+-addRanges :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addRanges :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addRanges ApiRequest{..} rReq =
+   case iAction of
+     ActionMutate _ -> Right rReq
+@@ -279,20 +278,20 @@ addRanges ApiRequest{..} rReq =
+     ranges :: Either ApiRequestError [(EmbedPath, NonnegRange)]
+     ranges = first QueryParamError $ QueryParams.pRequestRange `traverse` HM.toList iRange
+ 
+-    addRangeToNode :: (EmbedPath, NonnegRange) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-    addRangeToNode = updateNode (\r (Node q f) -> Node q{range_=r} f)
++    addRangeToNode :: (EmbedPath, NonnegRange) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
++    addRangeToNode = updateNode (\r (Node (q,i) f) -> Node (q{range_=r}, i) f)
+ 
+-addLogicTrees :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addLogicTrees :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addLogicTrees ApiRequest{..} rReq =
+   foldr addLogicTreeToNode (Right rReq) qsLogic
+   where
+     QueryParams.QueryParams{..} = iQueryParams
+ 
+-    addLogicTreeToNode :: (EmbedPath, LogicTree) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-    addLogicTreeToNode = updateNode (\t (Node q@ReadPlan{where_=lf} f) -> Node q{ReadPlan.where_=t:lf} f)
++    addLogicTreeToNode :: (EmbedPath, LogicTree) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
++    addLogicTreeToNode = updateNode (\t (Node (q@Select{where_=lf},i) f) -> Node (q{ReadQuery.where_=t:lf}, i) f)
+ 
+ -- Find a Node of the Tree and apply a function to it
+-updateNode :: (a -> ReadPlanTree -> ReadPlanTree) -> (EmbedPath, a) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
++updateNode :: (a -> ReadRequest -> ReadRequest) -> (EmbedPath, a) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
+ updateNode f ([], a) rr = f a <$> rr
+ updateNode _ _ (Left e) = Left e
+ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+@@ -302,11 +301,11 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+       (\node -> Node rootNode $ node : delete target forest) <$>
+       updateNode f (remainingPath, a) (Right target)
+   where
+-    findNode :: Maybe ReadPlanTree
+-    findNode = find (\(Node ReadPlan{nodeName, nodeAlias} _) -> nodeName == targetNodeName || nodeAlias == Just targetNodeName) forest
++    findNode :: Maybe ReadRequest
++    findNode = find (\(Node (_,(nodeName,_,alias,_,_, _)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
+ 
+-mutatePlan :: Mutation -> Schema -> TableName -> ApiRequest -> [FieldName] -> ReadPlanTree -> Either Error MutatePlan
+-mutatePlan mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
++mutateRequest :: Mutation -> Schema -> TableName -> ApiRequest -> [FieldName] -> ReadRequest -> Either Error MutateRequest
++mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
+   case mutation of
+     MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+@@ -335,8 +334,8 @@ mutatePlan mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequ
+     combinedLogic = foldr addFilterToLogicForest logic qsFiltersRoot
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+ 
+-callPlan :: ProcDescription -> ApiRequest -> ReadPlanTree -> CallPlan
+-callPlan proc apiReq readReq = FunctionCall {
++callRequest :: ProcDescription -> ApiRequest -> ReadRequest -> CallRequest
++callRequest proc apiReq readReq = FunctionCall {
+   funCQi = QualifiedIdentifier (pdSchema proc) (pdName proc)
+ , funCParams = callParams
+ , funCArgs = payRaw <$> iPayload apiReq
+@@ -353,7 +352,7 @@ callPlan proc apiReq readReq = FunctionCall {
+       prms  -> KeyParams $ specifiedParams prms
+     specifiedParams = filter (\x -> ppName x `S.member` iColumns apiReq)
+ 
+-returningCols :: ReadPlanTree -> [FieldName] -> [FieldName]
++returningCols :: ReadRequest -> [FieldName] -> [FieldName]
+ returningCols rr@(Node _ forest) pkCols
+   -- if * is part of the select, we must not add pk or fk columns manually -
+   -- otherwise those would be selected and output twice
+@@ -361,31 +360,24 @@ returningCols rr@(Node _ forest) pkCols
+   | otherwise           = returnings
+   where
+     fldNames = fstFieldNames rr
+-    -- Without fkCols, when a mutatePlan to
++    -- Without fkCols, when a mutateRequest to
+     -- /projects?select=name,clients(name) occurs, the RETURNING SQL part would
+     -- be `RETURNING name`(see QueryBuilder).  This would make the embedding
+     -- fail because the following JOIN would need the "client_id" column from
+     -- projects.  So this adds the foreign key columns to ensure the embedding
+     -- succeeds, result would be `RETURNING name, client_id`.
+     fkCols = concat $ mapMaybe (\case
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=O2M _ cols}} _ ->
+-          Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=M2O _ cols}} _ ->
+-          Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=O2O _ cols}} _ ->
+-          Just $ fst <$> cols
+-        Node ReadPlan{nodeRel=Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}} _ ->
+-          Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
+-        Node ReadPlan{nodeRel=Just ComputedRelationship{}} _ ->
+-          Nothing
+-        Node ReadPlan{nodeRel=Nothing} _ ->
+-          Nothing
++        Node (_, (_, Just Relationship{relCardinality=O2M _ cols}, _, _, _, _)) _ -> Just $ fst <$> cols
++        Node (_, (_, Just Relationship{relCardinality=M2O _ cols}, _, _, _, _)) _ -> Just $ fst <$> cols
++        Node (_, (_, Just Relationship{relCardinality=O2O _ cols}, _, _, _, _)) _ -> Just $ fst <$> cols
++        Node (_, (_, Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}, _, _, _, _)) _ -> Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
++        _                                                        -> Nothing
+       ) forest
+     hasComputedRel = isJust $ find (\case
+-      Node ReadPlan{nodeRel=Just ComputedRelationship{}} _ -> True
+-      _                                                    -> False
++      Node (_, (_, Just ComputedRelationship{}, _, _, _, _)) _ -> True
++      _ -> False
+       ) forest
+-    -- However if the "client_id" is present, e.g. mutatePlan to
++    -- However if the "client_id" is present, e.g. mutateRequest to
+     -- /projects?select=client_id,name,clients(name) we would get `RETURNING
+     -- client_id, name, client_id` and then we would produce the "column
+     -- reference \"client_id\" is ambiguous" error from PostgreSQL. So we
+diff --git a/src/PostgREST/Plan/MutatePlan.hs b/src/PostgREST/Request/MutateQuery.hs
+similarity index 90%
+rename from src/PostgREST/Plan/MutatePlan.hs
+rename to src/PostgREST/Request/MutateQuery.hs
+index 395dd95f..5d5d8561 100644
+--- a/src/PostgREST/Plan/MutatePlan.hs
++++ b/src/PostgREST/Request/MutateQuery.hs
+@@ -1,5 +1,6 @@
+-module PostgREST.Plan.MutatePlan
+-  ( MutatePlan(..)
++module PostgREST.Request.MutateQuery
++  ( MutateQuery(..)
++  , MutateRequest
+   )
+ where
+ 
+@@ -14,7 +15,9 @@ import PostgREST.Request.Types           (LogicTree, OrderTerm)
+ 
+ import Protolude
+ 
+-data MutatePlan
++type MutateRequest = MutateQuery
++
++data MutateQuery
+   = Insert
+       { in_        :: QualifiedIdentifier
+       , insCols    :: S.Set FieldName
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Request/ReadQuery.hs
+similarity index 66%
+rename from src/PostgREST/Plan/ReadPlan.hs
+rename to src/PostgREST/Request/ReadQuery.hs
+index 4d459892..ed709235 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Request/ReadQuery.hs
+@@ -1,7 +1,7 @@
+-{-# LANGUAGE NamedFieldPuns #-}
+-module PostgREST.Plan.ReadPlan
+-  ( ReadPlanTree
+-  , ReadPlan(..)
++module PostgREST.Request.ReadQuery
++  ( ReadNode
++  , ReadQuery(..)
++  , ReadRequest
+   , fstFieldNames
+   ) where
+ 
+@@ -19,9 +19,12 @@ import PostgREST.Request.Types            (Alias, Depth, Hint,
+ 
+ import Protolude
+ 
+-type ReadPlanTree = Tree ReadPlan
++type ReadRequest = Tree ReadNode
+ 
+-data ReadPlan = ReadPlan
++type ReadNode =
++  (ReadQuery, (NodeName, Maybe Relationship, Maybe Alias, Maybe Hint, Maybe JoinType, Depth))
++
++data ReadQuery = Select
+   { select         :: [SelectItem]
+   , from           :: QualifiedIdentifier
+   , fromAlias      :: Maybe Alias
+@@ -30,16 +33,10 @@ data ReadPlan = ReadPlan
+   , joinConditions :: [JoinCondition]
+   , order          :: [OrderTerm]
+   , range_         :: NonnegRange
+-  , nodeName       :: NodeName
+-  , nodeRel        :: Maybe Relationship
+-  , nodeAlias      :: Maybe Alias
+-  , nodeHint       :: Maybe Hint
+-  , nodeJoinType   :: Maybe JoinType
+-  , nodeDepth      :: Depth
+   }
+   deriving (Eq)
+ 
+ -- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
+-fstFieldNames :: ReadPlanTree -> [FieldName]
+-fstFieldNames (Node ReadPlan{select} _) =
+-  fst . (\(f, _, _, _, _) -> f) <$> select
++fstFieldNames :: ReadRequest -> [FieldName]
++fstFieldNames (Node (sel, _) _) =
++  fst . (\(f, _, _, _, _) -> f) <$> select sel
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index f0f179e6..a08cfaed 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -9,6 +9,9 @@ module PostgREST.Request.Types
+   , Field
+   , Filter(..)
+   , Hint
++  , CallQuery(..)
++  , CallParams(..)
++  , CallRequest
+   , JoinCondition(..)
+   , JoinType(..)
+   , JsonOperand(..)
+@@ -32,9 +35,12 @@ module PostgREST.Request.Types
+   , SelectItem
+   ) where
+ 
++import qualified Data.ByteString.Lazy as LBS
++
+ import PostgREST.DbStructure.Identifiers  (FieldName,
+                                            QualifiedIdentifier)
+-import PostgREST.DbStructure.Proc         (ProcDescription (..))
++import PostgREST.DbStructure.Proc         (ProcDescription (..),
++                                           ProcParam (..))
+ import PostgREST.DbStructure.Relationship (Relationship)
+ import PostgREST.MediaType                (MediaType (..))
+ 
+@@ -69,6 +75,8 @@ data RangeError
+   | LowerGTUpper
+   | OutOfBounds Text Text
+ 
++type CallRequest = CallQuery
++
+ type NodeName = Text
+ type Depth = Integer
+ 
+@@ -95,6 +103,19 @@ data OrderNulls
+   | OrderNullsLast
+   deriving (Eq)
+ 
++data CallQuery = FunctionCall
++  { funCQi           :: QualifiedIdentifier
++  , funCParams       :: CallParams
++  , funCArgs         :: Maybe LBS.ByteString
++  , funCScalar       :: Bool
++  , funCMultipleCall :: Bool
++  , funCReturning    :: [FieldName]
++  }
++
++data CallParams
++  = KeyParams [ProcParam] -- ^ Call with key params: func(a := val1, b:= val2)
++  | OnePosParam ProcParam -- ^ Call with positional params(only one supported): func(val)
++
+ type Field = (FieldName, JsonPath)
+ type Cast = Text
+ type Alias = Text
+diff --git a/test/spec/QueryCost.hs b/test/spec/QueryCost.hs
+index 0a5faf8c..9c3dcd94 100644
+--- a/test/spec/QueryCost.hs
++++ b/test/spec/QueryCost.hs
+@@ -14,8 +14,8 @@ import           Text.Heredoc
+ 
+ import Protolude hiding (get, toS)
+ 
+-import PostgREST.Plan.CallPlan
+-import PostgREST.Query.QueryBuilder (callPlanToQuery)
++import PostgREST.Query.QueryBuilder (requestToCallProcQuery)
++import PostgREST.Request.Types
+ 
+ import PostgREST.DbStructure.Identifiers
+ import PostgREST.DbStructure.Proc
+@@ -30,7 +30,7 @@ main = do
+     context "call proc query" $ do
+       it "should not exceed cost when calling setof composite proc" $ do
+         cost <- exec pool $
+-          callPlanToQuery (FunctionCall (QualifiedIdentifier "test" "get_projects_below")
++          requestToCallProcQuery (FunctionCall (QualifiedIdentifier "test" "get_projects_below")
+           (KeyParams [ProcParam "id" "int" True False])
+           (Just [str| {"id": 3} |]) False False [])
+         liftIO $
+@@ -38,13 +38,13 @@ main = do
+ 
+       it "should not exceed cost when calling setof composite proc with empty params" $ do
+         cost <- exec pool $
+-          callPlanToQuery (FunctionCall (QualifiedIdentifier "test" "getallprojects") (KeyParams []) Nothing False False [])
++          requestToCallProcQuery (FunctionCall (QualifiedIdentifier "test" "getallprojects") (KeyParams []) Nothing False False [])
+         liftIO $
+           cost `shouldSatisfy` (< Just 30)
+ 
+       it "should not exceed cost when calling scalar proc" $ do
+         cost <- exec pool $
+-          callPlanToQuery (FunctionCall (QualifiedIdentifier "test" "add_them")
++          requestToCallProcQuery (FunctionCall (QualifiedIdentifier "test" "add_them")
+           (KeyParams [ProcParam "a" "int" True False, ProcParam "b" "int" True False])
+           (Just [str| {"a": 3, "b": 4} |]) True False [])
+         liftIO $
+@@ -53,7 +53,7 @@ main = do
+       context "params=multiple-objects" $ do
+         it "should not exceed cost when calling setof composite proc" $ do
+           cost <- exec pool $
+-            callPlanToQuery (FunctionCall (QualifiedIdentifier "test" "get_projects_below")
++            requestToCallProcQuery (FunctionCall (QualifiedIdentifier "test" "get_projects_below")
+             (KeyParams [ProcParam "id" "int" True False])
+             (Just [str| [{"id": 1}, {"id": 4}] |]) False True [])
+           liftIO $ do
+@@ -63,7 +63,7 @@ main = do
+ 
+         it "should not exceed cost when calling scalar proc" $ do
+           cost <- exec pool $
+-            callPlanToQuery (FunctionCall (QualifiedIdentifier "test" "add_them")
++            requestToCallProcQuery (FunctionCall (QualifiedIdentifier "test" "add_them")
+             (KeyParams [ProcParam "a" "int" True False, ProcParam "b" "int" True False])
+             (Just [str| [{"a": 3, "b": 4}, {"a": 1, "b": 2}, {"a": 8, "b": 7}] |]) True False [])
+           liftIO $

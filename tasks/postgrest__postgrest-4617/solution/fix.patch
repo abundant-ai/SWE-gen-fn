@@ -1,0 +1,65 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ee2cad41..4864b9c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file. From versio
+ - Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+ - Add a `HINT` when the LISTEN channel stops working due to a PostgreSQL bug by @laurenceisla in #4581
+ - Add string slicing operator for `jwt-role-claim-key` by @taimoorzaeem in #4599
++- Log the actual host and port of listener database connection by @mkleczek in #4617
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Listener.hs b/src/PostgREST/Listener.hs
+index b8680a74..13eae3c8 100644
+--- a/src/PostgREST/Listener.hs
++++ b/src/PostgREST/Listener.hs
+@@ -17,8 +17,11 @@ import           PostgREST.Version     (prettyVersion)
+ import qualified PostgREST.AppState as AppState
+ import qualified PostgREST.Config   as Config
+ 
+-import Data.Either.Combinators (whenRight)
+-import Protolude
++import           Control.Arrow             ((&&&))
++import           Data.Bitraversable        (bisequence)
++import           Data.Either.Combinators   (whenRight)
++import qualified Database.PostgreSQL.LibPQ as LibPQ
++import           Protolude
+ 
+ -- | Starts the Listener in a thread
+ runListener :: AppState -> IO ()
+@@ -70,7 +73,9 @@ retryingListen appState = do
+             -- reset the delay
+             AppState.putNextListenerDelay appState 1
+ 
+-          observer $ DBListenStart dbChannel
++          (pqHost, pqPort) <- SQL.withLibPQConnection db $ bisequence . (LibPQ.host &&& LibPQ.port)
++          observer $ DBListenStart pqHost pqPort dbChannel
++
+           SQL.waitForNotifications handleNotification db
+ 
+         Left err -> do
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 23adac72..03a8e6d9 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -44,7 +44,7 @@ data Observation
+   | SchemaCacheSummaryObs Text
+   | SchemaCacheLoadedObs Double
+   | ConnectionRetryObs Int
+-  | DBListenStart Text
++  | DBListenStart (Maybe ByteString) (Maybe ByteString) Text -- host, port, channel
+   | DBListenFail Text (Either SQL.ConnectionError (Either SomeException ()))
+   | DBListenRetry Int
+   | DBListenBugHint -- https://github.com/PostgREST/postgrest/issues/3147
+@@ -110,8 +110,8 @@ observationMessage = \case
+     "Attempting to reconnect to the database in " <> (show delay::Text) <> " seconds..."
+   QueryPgVersionError usageErr ->
+     "Failed to query the PostgreSQL version. " <> jsonMessage usageErr
+-  DBListenStart channel -> do
+-    "Listening for database notifications on the " <> show channel <> " channel"
++  DBListenStart host port channel -> do
++    "Listener connected to " <> show (fold $ host <> fmap (":" <>) port) <> " and listening for database notifications on the " <> show channel <> " channel"
+   DBListenFail channel listenErr ->
+     "Failed listening for database notifications on the " <> show channel <> " channel. " <>
+       either showListenerConnError showListenerException listenErr

@@ -1,0 +1,216 @@
+diff --git a/runtime/caml/domain_state.tbl b/runtime/caml/domain_state.tbl
+index b18e0aacb8..f6ddc0e6be 100644
+--- a/runtime/caml/domain_state.tbl
++++ b/runtime/caml/domain_state.tbl
+@@ -170,7 +170,9 @@ DOMAIN_STATE(intnat, slice_target)
+ DOMAIN_STATE(intnat, slice_budget)
+ 
+ /* Accounting for sweeping work done while allocating. */
+-DOMAIN_STATE(intnat, major_work_done_between_slices)
++DOMAIN_STATE(uintnat, sweep_work_done_between_slices)
++/* Accounting for marking work done in the write barrier. */
++DOMAIN_STATE(uintnat, mark_work_done_between_slices)
+ 
+ DOMAIN_STATE(struct caml_extern_state*, extern_state)
+ DOMAIN_STATE(struct caml_intern_state*, intern_state)
+diff --git a/runtime/domain.c b/runtime/domain.c
+index 58c8436f8e..8aef0dcc15 100644
+--- a/runtime/domain.c
++++ b/runtime/domain.c
+@@ -903,7 +903,8 @@ static void domain_create(uintnat initial_minor_heap_wsize,
+   domain_state->dependent_size = 0;
+   domain_state->dependent_allocated = 0;
+ 
+-  domain_state->major_work_done_between_slices = 0;
++  domain_state->sweep_work_done_between_slices = 0;
++  domain_state->mark_work_done_between_slices = 0;
+ 
+   /* the minor heap arena will be initialized by
+      [allocate_minor_heap_arena] below. */
+diff --git a/runtime/major_gc.c b/runtime/major_gc.c
+index 67f7715dea..2813c8e1ec 100644
+--- a/runtime/major_gc.c
++++ b/runtime/major_gc.c
+@@ -436,7 +436,6 @@ static intnat ephe_sweep (caml_domain_state* domain_state, intnat budget)
+ 
+     if (is_unmarked(v)) {
+       /* The whole array is dead, drop this ephemeron */
+-      budget -= 1;
+     } else {
+       caml_ephe_clean(v);
+       Ephe_link(v) = domain_state->ephe_info->live;
+@@ -741,6 +740,20 @@ void caml_reset_major_pacing(void)
+   } while (!res);
+ }
+ 
++static uintnat mark_work_done_between_slices(void)
++{
++  uintnat work = Caml_state->mark_work_done_between_slices;
++  Caml_state->mark_work_done_between_slices = 0;
++  return work;
++}
++
++static uintnat sweep_work_done_between_slices(void)
++{
++  uintnat work = Caml_state->sweep_work_done_between_slices;
++  Caml_state->sweep_work_done_between_slices = 0;
++  return work;
++}
++
+ /* The [log_events] parameter is used to disable writing to the ring for two
+    reasons:
+    1. To prevent spamming the ring with numerous events generated during
+@@ -872,8 +885,10 @@ update_major_slice_work(intnat howmuch,
+   new_work = max3 (alloc_work, dependent_work, extra_work);
+   atomic_fetch_add (&alloc_counter, new_work);
+ 
+-  atomic_fetch_add (&work_counter, dom_st->major_work_done_between_slices);
+-  dom_st->major_work_done_between_slices = 0;
++  uintnat work_done_between_slices =
++    mark_work_done_between_slices() +
++    sweep_work_done_between_slices();
++  atomic_fetch_add (&work_counter, work_done_between_slices);
+ 
+   /* If the work_counter is falling far behind the alloc_counter,
+    * artificially catch up some of the difference. This is a band-aid
+@@ -1344,7 +1359,7 @@ Caml_noinline static intnat do_some_marking(struct mark_stack* stk,
+ 
+       if (Tag_hd(hd) == Cont_tag) {
+         caml_darken_cont(block);
+-        budget -= Wosize_hd(hd);
++        budget -= Whsize_hd(hd);
+         continue;
+       }
+ 
+@@ -1495,6 +1510,7 @@ void caml_darken_cont(value cont)
+                           Ptr_val(stk), 0);
+         atomic_store_release(Hp_atomic_val(cont),
+                              With_status_hd(hd, caml_global_heap_state.MARKED));
++        Caml_state->mark_work_done_between_slices += Whsize_hd(hd);
+       }
+     }
+   }
+@@ -1524,6 +1540,9 @@ void caml_darken(void* state, value v, volatile value* ignored) {
+          With_status_hd(hd, caml_global_heap_state.MARKED));
+       if (Tag_hd(hd) < No_scan_tag) {
+         mark_stack_push_block(domain_state->mark_stack, v);
++        Caml_state->mark_work_done_between_slices += 1; /* just the header */
++      } else {
++        Caml_state->mark_work_done_between_slices += Whsize_hd(hd);
+       }
+     }
+   }
+@@ -1982,6 +2001,11 @@ mark_again:
+            (budget = get_major_slice_work(mode)) > 0) {
+       intnat left = mark(budget);
+       intnat work_done = budget - left;
++      /* It is possible to call caml_darken directly during marking,
++         if we e.g. discover a continuation and mark its stack.
++         This work should count towards this slice */
++      work_done += mark_work_done_between_slices();
++
+       mark_work += work_done;
+       commit_major_slice_work(work_done);
+     }
+@@ -2036,6 +2060,8 @@ mark_again:
+                (budget = get_major_slice_work(mode)) > 0) {
+           intnat left = ephe_mark(budget, saved_ephe_cycle, EPHE_MARK_DEFAULT);
+           intnat work_done = budget - left;
++          /* caml_darken is called by ephe_mark, so count the work it does */
++          work_done += mark_work_done_between_slices();
+           commit_major_slice_work (work_done);
+ 
+           // FIXME: Can we delete this?
+diff --git a/runtime/shared_heap.c b/runtime/shared_heap.c
+index 251b6c8128..be34eeef34 100644
+--- a/runtime/shared_heap.c
++++ b/runtime/shared_heap.c
+@@ -390,7 +390,7 @@ static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
+   caml_plat_unlock(&pool_freelist.lock);
+ 
+   if( !r && adopted_pool ) {
+-    Caml_state->major_work_done_between_slices +=
++    Caml_state->sweep_work_done_between_slices +=
+       pool_sweep(local, &local->full_pools[sz], sz, 0);
+     r = local->avail_pools[sz];
+   }
+@@ -409,7 +409,7 @@ static pool* pool_find(struct caml_heap_state* local, sizeclass sz) {
+ 
+   /* Otherwise, try to sweep until we find one */
+   while (!local->avail_pools[sz] && local->unswept_avail_pools[sz]) {
+-    Caml_state->major_work_done_between_slices +=
++    Caml_state->sweep_work_done_between_slices +=
+       pool_sweep(local, &local->unswept_avail_pools[sz], sz, 0);
+   }
+ 
+@@ -536,7 +536,7 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
+ /* Sweeping of the major heap shared pools */
+ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+                          sizeclass sz, int release_to_global_pool) {
+-  intnat work;
++  uintnat work = 0;
+   pool* a = *plist;
+   if (!a) return 0;
+   *plist = a->next;
+@@ -553,10 +553,7 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+ 
+     a->next_obj = 0;
+ 
+-    /* note that the below will have to be changed for the new GC pacing
+-      logic */
+-    work = end - p;
+-    do {
++    while (p + wh <= end) {
+       header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+ 
+       if( (char*)p + caml_plat_pagesize < (char*)end ) {
+@@ -640,9 +637,10 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+         /* there's still a live block, the pool can't be released to the global
+             freelist */
+         release_to_global_pool = 0;
++        work += wh;
+       }
+       p += wh;
+-    } while (p + wh <= end);
++    }
+     CAMLassert(p == end);
+ 
+     if( !all_used ) {
+@@ -666,9 +664,12 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
+     }
+   }
+ 
++  /* Return the amount of GC budget consumed in units of words */
+   return work;
+ }
+ 
++/* Sweep one large block. Returns the block's size. */
++
+ static intnat large_alloc_sweep(struct caml_heap_state* local) {
+   value* p;
+   header_t hd;
+@@ -725,20 +726,14 @@ intnat caml_sweep(struct caml_heap_state* local, intnat work) {
+   /* Sweep local pools */
+   while (work > 0 && local->next_to_sweep < NUM_SIZECLASSES) {
+     sizeclass sz = local->next_to_sweep;
+-    intnat full_sweep_work = 0;
+-    intnat avail_sweep_work =
+-      pool_sweep(local, &local->unswept_avail_pools[sz], sz, 1);
+-    work -= avail_sweep_work;
++    work -= pool_sweep(local, &local->unswept_avail_pools[sz], sz, 1);
+ 
+     if (work > 0) {
+-      full_sweep_work = pool_sweep(local,
+-                                   &local->unswept_full_pools[sz],
+-                                   sz, 1);
+-
+-      work -= full_sweep_work;
++      work -= pool_sweep(local, &local->unswept_full_pools[sz], sz, 1);
+     }
+ 
+-    if(full_sweep_work+avail_sweep_work == 0) {
++    if (local->unswept_avail_pools[sz] == NULL &&
++        local->unswept_full_pools[sz] == NULL) {
+       local->next_to_sweep++;
+     }
+   }

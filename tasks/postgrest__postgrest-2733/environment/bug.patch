@@ -1,0 +1,399 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 64899126..f9fc86d1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,10 +35,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2667, Fix `db-pool-acquisition-timeout` not logging to stderr when the timeout is reached - @steve-chavez
+  - #1652, Fix function call with arguments not inlining - @steve-chavez
+ 
+-### Changed
+-
+- - #2733, Remove bulk RPC call with the `Prefer: params=multiple-objects` header. A function with a JSON array or object parameter should be used instead.
+-
+ ## [10.1.2] - 2023-02-01
+ 
+ ### Fixed
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 302d7a00..c21bdb55 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -112,7 +112,7 @@ fromHeaders headers =
+   Preferences
+     { preferResolution = parsePrefs [MergeDuplicates, IgnoreDuplicates]
+     , preferRepresentation = fromMaybe None $ parsePrefs [Full, None, HeadersOnly]
+-    , preferParameters = parsePrefs [SingleObject]
++    , preferParameters = parsePrefs [SingleObject, MultipleObjects]
+     , preferCount = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction = parsePrefs [Commit, Rollback]
+     , preferMissing = parsePrefs [ApplyDefaults, ApplyNulls]
+@@ -176,10 +176,13 @@ instance ToHeaderValue PreferRepresentation where
+ -- | How to pass parameters to stored procedures.
+ data PreferParameters
+   = SingleObject    -- ^ Pass all parameters as a single json object to a stored procedure.
++  | MultipleObjects -- ^ Pass an array of json objects as params to a stored procedure.
+   deriving Eq
+ 
++-- TODO: Deprecate params=multiple-objects in next major version
+ instance ToHeaderValue PreferParameters where
+   toHeaderValue SingleObject    = "params=single-object"
++  toHeaderValue MultipleObjects = "params=multiple-objects"
+ 
+ -- | How to determine the count of (expected) results
+ data PreferCount
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 1f400df7..a1ae8753 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -56,8 +56,7 @@ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            Schema)
+ import PostgREST.SchemaCache.Proc         (ProcDescription (..),
+                                            ProcParam (..), ProcsMap,
+-                                           procReturnsScalar,
+-                                           procReturnsSetOfScalar)
++                                           procReturnsScalar)
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            Junction (..),
+                                            Relationship (..),
+@@ -549,7 +548,7 @@ callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq =
+ , funCParams = callParams
+ , funCArgs = Just args
+ , funCScalar = procReturnsScalar proc
+-, funCSetOfScalar = procReturnsSetOfScalar proc
++, funCMultipleCall = preferParameters == Just MultipleObjects
+ , funCReturning = inferColsEmbedNeeds readReq []
+ }
+   where
+@@ -617,8 +616,7 @@ addFilterToLogicForest flt lf = Stmnt flt : lf
+ binaryField :: AppConfig -> MediaType -> Maybe ProcDescription -> ReadPlanTree -> Either ApiRequestError (Maybe FieldName)
+ binaryField AppConfig{configRawMediaTypes} acceptMediaType proc rpTree
+   | isRawMediaType =
+-    if (procReturnsScalar <$> proc) == Just True ||
+-       (procReturnsSetOfScalar <$> proc) == Just True
++    if (procReturnsScalar <$> proc) == Just True
+       then Right $ Just "pgrst_scalar"
+       else
+         let
+diff --git a/src/PostgREST/Plan/CallPlan.hs b/src/PostgREST/Plan/CallPlan.hs
+index 90c6405f..12d99fed 100644
+--- a/src/PostgREST/Plan/CallPlan.hs
++++ b/src/PostgREST/Plan/CallPlan.hs
+@@ -17,12 +17,12 @@ import           PostgREST.SchemaCache.Proc        (ProcDescription (..),
+ import Protolude
+ 
+ data CallPlan = FunctionCall
+-  { funCQi          :: QualifiedIdentifier
+-  , funCParams      :: CallParams
+-  , funCArgs        :: Maybe LBS.ByteString
+-  , funCScalar      :: Bool
+-  , funCSetOfScalar :: Bool
+-  , funCReturning   :: [FieldName]
++  { funCQi           :: QualifiedIdentifier
++  , funCParams       :: CallParams
++  , funCArgs         :: Maybe LBS.ByteString
++  , funCScalar       :: Bool
++  , funCMultipleCall :: Bool
++  , funCReturning    :: [FieldName]
+   }
+ 
+ data CallParams
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 6f5f08d0..a2fa37ca 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -38,6 +38,7 @@ import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+ 
+ import PostgREST.ApiRequest              (ApiRequest (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
++                                          PreferParameters (..),
+                                           PreferTransaction (..),
+                                           Preferences (..),
+                                           shouldCount)
+@@ -158,13 +159,13 @@ invokeQuery proc CallReadPlan{crReadPlan, crCallPlan, crBinField} apiReq@ApiRequ
+     lift . SQL.statement mempty $
+       Statements.prepareCall
+         (Proc.procReturnsScalar proc)
+-        (Proc.procReturnsSingleComposite proc)
+-        (Proc.procReturnsSetOfScalar proc)
++        (Proc.procReturnsSingle proc)
+         (QueryBuilder.callPlanToQuery crCallPlan)
+         (QueryBuilder.readPlanToQuery crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount preferCount)
+         iAcceptMediaType
++        (preferParameters == Just MultipleObjects)
+         crBinField
+         configDbPreparedStatements
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index fa73e500..88304c9a 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -164,14 +164,14 @@ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+ callPlanToQuery :: CallPlan -> SQL.Snippet
+-callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar returnings) =
+-  "SELECT " <> (if returnsScalar || returnsSetOfScalar then "pgrst_call AS pgrst_scalar " else returnedColumns) <> " " <>
++callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
++  "SELECT " <> (if returnsScalar then "pgrst_call AS pgrst_scalar " else returnedColumns) <> " " <>
+   fromCall
+   where
+     fromCall = case params of
+       OnePosParam prm -> "FROM " <> callIt (singleParameter args $ encodeUtf8 $ ppType prm)
+       KeyParams []    -> "FROM " <> callIt mempty
+-      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p) Nothing) <$> prms) False True False <> ", " <>
++      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p) Nothing) <$> prms) False (not multipleCall) False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 71cb23d9..334efe45 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -178,18 +178,16 @@ asCsvF = asCsvHeaderF <> " || '\n' || " <> asCsvBodyF
+       ")"
+     asCsvBodyF = "coalesce(string_agg(substring(_postgrest_t::text, 2, length(_postgrest_t::text) - 2), '\n'), '')"
+ 
++asJsonF :: Bool -> SqlFragment
++asJsonF returnsScalar
++  | returnsScalar = "coalesce(json_agg(_postgrest_t.pgrst_scalar), '[]')"
++  | otherwise     = "coalesce(json_agg(_postgrest_t), '[]')"
++
+ asJsonSingleF :: Bool -> SqlFragment
+ asJsonSingleF returnsScalar
+   | returnsScalar = "coalesce(json_agg(_postgrest_t.pgrst_scalar)->0, 'null')"
+   | otherwise     = "coalesce(json_agg(_postgrest_t)->0, 'null')"
+ 
+-asJsonF :: Bool -> Bool -> Bool -> SqlFragment
+-asJsonF returnsScalar returnsSetOfScalar returnsSingleComposite
+-  | returnsSingleComposite              = "coalesce(json_agg(_postgrest_t)->0, 'null')"
+-  | returnsScalar                       = "coalesce(json_agg(_postgrest_t.pgrst_scalar)->0, 'null')"
+-  | returnsSetOfScalar                  = "coalesce(json_agg(_postgrest_t.pgrst_scalar), '[]')"
+-  | otherwise                           = "coalesce(json_agg(_postgrest_t), '[]')"
+-
+ asXmlF :: FieldName -> SqlFragment
+ asXmlF fieldName = "coalesce(xmlagg(_postgrest_t." <> pgFmtIdent fieldName <> "), '')"
+ 
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 145d3ce0..be90e8a4 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -87,7 +87,7 @@ prepareWrite selectQuery mutateQuery isInsert mt rep pKeys =
+     | getMediaType mt == MTTextCSV      = asCsvF
+     | getMediaType mt == MTGeoJSON      = asGeoJsonF
+     | getMediaType mt == MTSingularJSON = asJsonSingleF False
+-    | otherwise                         = asJsonF False False False
++    | otherwise                         = asJsonF False
+ 
+   selectF
+     -- prevent using any of the column names in ?select= when no response is returned from the CTE
+@@ -123,17 +123,17 @@ prepareRead selectQuery countQuery countTotal mt binaryField =
+     | getMediaType mt == MTGeoJSON                       = asGeoJsonF
+     | isJust binaryField && getMediaType mt == MTTextXML = asXmlF $ fromJust binaryField
+     | isJust binaryField                                 = asBinaryF $ fromJust binaryField
+-    | otherwise                                          = asJsonF False False False
++    | otherwise                                          = asJsonF False
+ 
+   decodeIt :: HD.Result ResultSet
+   decodeIt = case mt of
+     MTPlan{} -> planRow
+     _        -> HD.singleRow $ standardRow True
+ 
+-prepareCall :: Bool -> Bool -> Bool -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
+-               MediaType -> Maybe FieldName -> Bool ->
++prepareCall :: Bool -> Bool -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
++               MediaType -> Bool -> Maybe FieldName -> Bool ->
+                SQL.Statement () ResultSet
+-prepareCall returnsScalar returnsSingleComposite returnsSetOfScalar callProcQuery selectQuery countQuery countTotal mt binaryField =
++prepareCall returnsScalar returnsSingle callProcQuery selectQuery countQuery countTotal mt multObjects binaryField =
+   SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
+   where
+     snippet =
+@@ -156,7 +156,8 @@ prepareCall returnsScalar returnsSingleComposite returnsSetOfScalar callProcQuer
+      | getMediaType mt == MTGeoJSON                       = asGeoJsonF
+      | isJust binaryField && getMediaType mt == MTTextXML = asXmlF $ fromJust binaryField
+      | isJust binaryField                                 = asBinaryF $ fromJust binaryField
+-     | otherwise                                          = asJsonF returnsScalar returnsSetOfScalar returnsSingleComposite
++     | returnsSingle && not multObjects                   = asJsonSingleF returnsScalar
++     | otherwise                                          = asJsonF returnsScalar
+ 
+     decodeIt :: HD.Result ResultSet
+     decodeIt = case mt of
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 00a317f7..14cd9428 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -255,16 +255,16 @@ decodeProcs =
+     addKey :: ProcDescription -> (QualifiedIdentifier, ProcDescription)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+ 
+-    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> RetType
++    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> Maybe RetType
+     parseRetType schema name isSetOf isComposite isVoid
+-      | isVoid    = Single $ Scalar True
+-      | isSetOf   = SetOf pgType
+-      | otherwise = Single pgType
++      | isVoid    = Nothing
++      | isSetOf   = Just (SetOf pgType)
++      | otherwise = Just (Single pgType)
+       where
+         qi = QualifiedIdentifier schema name
+         pgType
+           | isComposite = Composite qi
+-          | otherwise   = Scalar False
++          | otherwise   = Scalar
+ 
+     parseVolatility :: Char -> ProcVolatility
+     parseVolatility v | v == 'i' = Immutable
+diff --git a/src/PostgREST/SchemaCache/Proc.hs b/src/PostgREST/SchemaCache/Proc.hs
+index cf792138..d3161cd3 100644
+--- a/src/PostgREST/SchemaCache/Proc.hs
++++ b/src/PostgREST/SchemaCache/Proc.hs
+@@ -9,8 +9,7 @@ module PostgREST.SchemaCache.Proc
+   , ProcsMap
+   , RetType(..)
+   , procReturnsScalar
+-  , procReturnsSetOfScalar
+-  , procReturnsSingleComposite
++  , procReturnsSingle
+   , procReturnsVoid
+   , procTableName
+   ) where
+@@ -24,7 +23,7 @@ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..),
+ import Protolude
+ 
+ data PgType
+-  = Scalar Bool -- True if the type is void
++  = Scalar
+   | Composite QualifiedIdentifier
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 
+@@ -44,7 +43,7 @@ data ProcDescription = ProcDescription
+   , pdName        :: Text
+   , pdDescription :: Maybe Text
+   , pdParams      :: [ProcParam]
+-  , pdReturnType  :: RetType
++  , pdReturnType  :: Maybe RetType
+   , pdVolatility  :: ProcVolatility
+   , pdHasVariadic :: Bool
+   }
+@@ -71,26 +70,22 @@ type ProcsMap = HM.HashMap QualifiedIdentifier [ProcDescription]
+ 
+ procReturnsScalar :: ProcDescription -> Bool
+ procReturnsScalar proc = case proc of
+-  ProcDescription{pdReturnType = Single (Scalar _)} -> True
+-  _                                                 -> False
+-
+-procReturnsSetOfScalar :: ProcDescription -> Bool
+-procReturnsSetOfScalar proc = case proc of
+-  ProcDescription{pdReturnType = SetOf (Scalar _)} -> True
+-  _                                                -> False
+-
+-procReturnsSingleComposite :: ProcDescription -> Bool
+-procReturnsSingleComposite proc = case proc of
+-  ProcDescription{pdReturnType = Single (Composite _)} -> True
++  ProcDescription{pdReturnType = Just (Single Scalar)} -> True
++  ProcDescription{pdReturnType = Just (SetOf Scalar)}  -> True
+   _                                                    -> False
+ 
++procReturnsSingle :: ProcDescription -> Bool
++procReturnsSingle proc = case proc of
++  ProcDescription{pdReturnType = Just (Single _)} -> True
++  _                                               -> False
++
+ procReturnsVoid :: ProcDescription -> Bool
+ procReturnsVoid proc = case proc of
+-  ProcDescription{pdReturnType = Single (Scalar True)} -> True
+-  _                                                    -> False
++  ProcDescription{pdReturnType = Nothing} -> True
++  _                                       -> False
+ 
+ procTableName :: ProcDescription -> Maybe TableName
+ procTableName proc = case pdReturnType proc of
+-  SetOf  (Composite qi) -> Just $ qiName qi
+-  Single (Composite qi) -> Just $ qiName qi
+-  _                     -> Nothing
++  Just (SetOf  (Composite qi)) -> Just $ qiName qi
++  Just (Single (Composite qi)) -> Just $ qiName qi
++  _                            -> Nothing
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index eb21d95c..977c8e51 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -15,6 +15,7 @@ import           Network.HTTP.Types
+ import           Test.Hspec           hiding (pendingWith)
+ import           Test.Hspec.Wai
+ import           Test.Hspec.Wai.JSON
++import           Text.Heredoc
+ 
+ import PostgREST.Config.PgVersion (PgVersion, pgVersion120,
+                                    pgVersion130)
+@@ -330,6 +331,21 @@ spec actualPgVersion = do
+ 
+       liftIO $ planCost r `shouldSatisfy` (< 1.18)
+ 
++    context "params=multiple-objects" $ do
++      it "should not exceed cost when calling setof composite proc" $ do
++        r <- request methodPost "/rpc/get_projects_below"
++               [planHdr, ("Prefer", "params=multiple-objects")]
++               [str| [{"id": 1}, {"id": 4}] |]
++
++        liftIO $ planCost r `shouldSatisfy` (< 4503.4)
++
++      it "should not exceed cost when calling scalar proc" $ do
++        r <- request methodPost "/rpc/add_them"
++               [planHdr, ("Prefer", "params=multiple-objects")]
++               [str| [{"a": 3, "b": 4}, {"a": 1, "b": 2}, {"a": 8, "b": 7}] |]
++
++        liftIO $ planCost r `shouldSatisfy` (< 5.85)
++
+     context "function inlining" $ do
+       it "should inline a zero argument function(the function won't appear in the plan tree)" $ do
+         r <- request methodGet "/rpc/getallusers?id=eq.1"
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 50dd3f70..3b95e5db 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -863,6 +863,42 @@ spec actualPgVersion =
+           `shouldRespondWith` "3"
+           { matchHeaders = [matchContentTypeJson] }
+ 
++    context "bulk RPC with params=multiple-objects" $ do
++      it "works with a scalar function an returns a json array" $
++        request methodPost "/rpc/add_them" [("Prefer", "params=multiple-objects")]
++          [json|[
++            {"a": 1, "b": 2},
++            {"a": 4, "b": 6},
++            {"a": 100, "b": 200} ]|]
++          `shouldRespondWith`
++          [json|
++            [3, 10, 300]
++          |] { matchHeaders = [matchContentTypeJson] }
++
++      it "works with a scalar function an returns a json array when posting CSV" $
++        request methodPost "/rpc/add_them" [("Content-Type", "text/csv"), ("Prefer", "params=multiple-objects")]
++          "a,b\n1,2\n4,6\n100,200"
++          `shouldRespondWith`
++          [json|
++            [3, 10, 300]
++          |]
++          { matchStatus  = 200
++          , matchHeaders = [matchContentTypeJson]
++          }
++
++      it "works with a non-scalar result" $
++        request methodPost "/rpc/get_projects_below?select=id,name" [("Prefer", "params=multiple-objects")]
++          [json|[
++            {"id": 1},
++            {"id": 5} ]|]
++          `shouldRespondWith`
++          [json|
++            [{"id":1,"name":"Windows 7"},
++             {"id":2,"name":"Windows 10"},
++             {"id":3,"name":"IOS"},
++             {"id":4,"name":"OSX"}]
++          |] { matchHeaders = [matchContentTypeJson] }
++
+     context "HTTP request env vars" $ do
+       it "custom header is set" $
+         request methodPost "/rpc/get_guc_value"

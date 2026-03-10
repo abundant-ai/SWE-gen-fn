@@ -1,0 +1,258 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7b6fb0e8..0966bf16 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,7 +14,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Allows including the join table columns when resource embedding
+    + Allows disambiguating a recursive m2m embed
+    + Allows disambiguating an embed that has a many-to-many relationship using two foreign keys on a junction
+- - #2340, Allow embedding without selecting any column - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 9bc0a299..95e69907 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -36,8 +36,8 @@ import Text.ParserCombinators.Parsec (GenParser, ParseError, Parser,
+                                       eof, errorPos, letter,
+                                       lookAhead, many1, noneOf,
+                                       notFollowedBy, oneOf,
+-                                      optionMaybe, sepBy, sepBy1,
+-                                      string, try, (<?>))
++                                      optionMaybe, sepBy1, string,
++                                      try, (<?>))
+ 
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeGeq, rangeLimit,
+@@ -323,25 +323,26 @@ pTreePath = do
+ -- >>> P.parse pFieldForest "" "*,..client(*),other(*)"
+ -- Right [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SpreadRelation {selRelation = "client", selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]},Node {rootLabel = SelectRelation {selRelation = "other", selAlias = Nothing, selHint = Nothing, selJoinType = Nothing}, subForest = [Node {rootLabel = SelectField {selField = ("*",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]}]
+ --
+--- >>> P.parse pFieldForest "" ""
+--- Right []
+---
+ -- >>> P.parse pFieldForest "" "id,clients(name[])"
+ -- Left (line 1, column 16):
+ -- unexpected '['
+--- expecting letter, digit, "-", "->>", "->", "::", ")", "," or end of input
++-- expecting letter, digit, "-", "!", "(", "->>", "->", "::", ")", "," or end of input
+ --
+ -- >>> P.parse pFieldForest "" "data->>-78xy"
+ -- Left (line 1, column 11):
+ -- unexpected 'x'
+ -- expecting digit, "->", "::", ".", "," or end of input
+ pFieldForest :: Parser [Tree SelectItem]
+-pFieldForest = pFieldTree `sepBy` lexeme (char ',')
++pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
+   where
+-    pFieldTree =  Node <$> try pSpreadRelationSelect <*> between (char '(') (char ')') pFieldForest <|>
+-                  Node <$> try pRelationSelect       <*> between (char '(') (char ')') pFieldForest <|>
++    pFieldTree :: Parser (Tree SelectItem)
++    pFieldTree =  try (Node <$> pSpreadRelationSelect <*> between (char '(') (char ')') pFieldForest) <|>
++                  try (Node <$> pRelationSelect       <*> between (char '(') (char ')') pFieldForest) <|>
+                   Node <$> pFieldSelect <*> pure []
+ 
++pStar :: Parser Text
++pStar = string "*" $> "*"
++
+ -- |
+ -- Parse field names
+ --
+@@ -479,12 +480,13 @@ aliasSeparator = char ':' >> notFollowedBy (char ':')
+ -- Left (line 1, column 6):
+ -- unexpected '>'
+ pRelationSelect :: Parser SelectItem
+-pRelationSelect = lexeme $ do
++pRelationSelect = lexeme $ try ( do
+     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+     name <- pFieldName
+     (hint, jType) <- pEmbedParams
+     try (void $ lookAhead (string "("))
+     return $ SelectRelation name alias hint jType
++  )
+ 
+ -- |
+ -- Parse regular fields in select
+@@ -522,22 +524,23 @@ pRelationSelect = lexeme $ do
+ -- unexpected end of input
+ -- expecting letter or digit
+ pFieldSelect :: Parser SelectItem
+-pFieldSelect = lexeme $ try (do
+-    s <- pStar
+-    pEnd
+-    return $ SelectField (s, []) Nothing Nothing)
++pFieldSelect = lexeme $
++  try (
++    do
++      alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
++      fld <- pField
++      cast' <- optionMaybe (string "::" *> pIdentifier)
++      pEnd
++      return $ SelectField fld (toS <$> cast') alias
++  )
+   <|> do
+-    alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+-    fld <- pField
+-    cast' <- optionMaybe (string "::" *> pIdentifier)
++    s <- pStar
+     pEnd
+-    return $ SelectField fld (toS <$> cast') alias
++    return $ SelectField (s, []) Nothing Nothing
+   where
+     pEnd = try (void $ lookAhead (string ")")) <|>
+            try (void $ lookAhead (string ",")) <|>
+            try eof
+-    pStar = string "*" $> "*"
+-
+ 
+ -- |
+ -- Parse spread relations in select
+@@ -562,11 +565,12 @@ pFieldSelect = lexeme $ try (do
+ -- Left (line 1, column 8):
+ -- unexpected '>'
+ pSpreadRelationSelect :: Parser SelectItem
+-pSpreadRelationSelect = lexeme $ do
++pSpreadRelationSelect = lexeme $ try ( do
+     name <- string ".." >> pFieldName
+     (hint, jType) <- pEmbedParams
+     try (void $ lookAhead (string "("))
+     return $ SpreadRelation name hint jType
++  )
+ 
+ pEmbedParams :: Parser (Maybe Hint, Maybe JoinType)
+ pEmbedParams = do
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index edb98f63..022a3af3 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -76,7 +76,7 @@ readQuery req conf@AppConfig{..} apiReq@ApiRequest{..} = do
+   resultSet <-
+      lift . SQL.statement mempty $
+       Statements.prepareRead
+-        (QueryBuilder.readPlanToQuery True req)
++        (QueryBuilder.readPlanToQuery req)
+         (if iPreferCount == Just EstimatedCount then
+            -- LIMIT maxRows + 1 so we can determine below that maxRows was surpassed
+            QueryBuilder.limitedQuery countQuery ((+ 1) <$> configDbMaxRows)
+@@ -163,7 +163,7 @@ invokeQuery proc CallReadPlan{crReadPlan, crCallPlan} apiReq@ApiRequest{..} conf
+         (Proc.procReturnsScalar proc)
+         (Proc.procReturnsSingle proc)
+         (QueryBuilder.callPlanToQuery crCallPlan)
+-        (QueryBuilder.readPlanToQuery True crReadPlan)
++        (QueryBuilder.readPlanToQuery crReadPlan)
+         (QueryBuilder.readPlanToCountQuery crReadPlan)
+         (shouldCount iPreferCount)
+         iAcceptMediaType
+@@ -217,7 +217,7 @@ writeQuery MutateReadPlan{mrReadPlan, mrMutatePlan} apiReq conf =
+   in
+   lift . SQL.statement mempty $
+     Statements.prepareWrite
+-      (QueryBuilder.readPlanToQuery True mrReadPlan)
++      (QueryBuilder.readPlanToQuery mrReadPlan)
+       (QueryBuilder.mutatePlanToQuery mrMutatePlan)
+       isInsert
+       (iAcceptMediaType apiReq)
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 4fb689de..fa8d624a 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -39,10 +39,10 @@ import PostgREST.RangeQuery        (allRange)
+ 
+ import Protolude
+ 
+-readPlanToQuery :: Bool -> ReadPlanTree -> SQL.Snippet
+-readPlanToQuery isRoot (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
++readPlanToQuery :: ReadPlanTree -> SQL.Snippet
++readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,order, range_=readRange, relToParent, relJoinConds} forest) =
+   "SELECT " <>
+-  intercalateSnippet ", " ((pgFmtSelectItem qi <$> (if isRoot && null select && null forest then defRootSelect else select)) ++ selects) <> " " <>
++  intercalateSnippet ", " ((pgFmtSelectItem qi <$> select) ++ selects) <> " " <>
+   fromFrag <> " " <>
+   intercalateSnippet " " joins <> " " <>
+   (if null logicForest && null relJoinConds
+@@ -53,14 +53,13 @@ readPlanToQuery isRoot (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicF
+   where
+     fromFrag = fromF relToParent mainQi fromAlias
+     qi = getQualifiedIdentifier relToParent mainQi fromAlias
+-    defRootSelect = [(("*", []), Nothing, Nothing)] -- gets all columns in case an empty select, e.g. `/tbl?select=`, is done.
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+ getSelectsJoins (Node ReadPlan{relToParent=Nothing} _) _ = ([], [])
+-getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} forest) (selects,joins) =
++getSelectsJoins rr@(Node ReadPlan{relName, relToParent=Just rel, relAggAlias, relAlias, relJoinType, relIsSpread} _) (selects,joins) =
+   let
+-    subquery = readPlanToQuery False rr
++    subquery = readPlanToQuery rr
+     aliasOrName = pgFmtIdent $ fromMaybe relName relAlias
+     aggAlias = pgFmtIdent relAggAlias
+     correlatedSubquery sub al cond =
+@@ -78,7 +77,7 @@ getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggA
+             "FROM (" <> subquery <> " ) AS " <> SQL.sql aggAlias
+           ) aggAlias $ if relJoinType == Just JTInner then SQL.sql aggAlias <> " IS NOT NULL" else "TRUE")
+   in
+-  (if null select && null forest then selects else sel:selects, joi:joins)
++  (sel:selects, joi:joins)
+ 
+ mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _) =
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index eedf0d70..c076f11e 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1224,54 +1224,3 @@ spec actualPgVersion = do
+     liftIO $ do
+       let respHeaders = simpleHeaders r
+       respHeaders `shouldSatisfy` noProfileHeader
+-
+-  context "empty embed" $ do
+-    it "works on a many-to-one relationship" $ do
+-      get "/projects?select=id,name,clients()" `shouldRespondWith`
+-        [json| [
+-          {"id":1,"name":"Windows 7"},
+-          {"id":2,"name":"Windows 10"},
+-          {"id":3,"name":"IOS"},
+-          {"id":4,"name":"OSX"},
+-          {"id":5,"name":"Orphan"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/projects?select=id,name,clients!inner()&clients.id=eq.2" `shouldRespondWith`
+-        [json|[
+-          {"id":3,"name":"IOS"},
+-          {"id":4,"name":"OSX"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works on a one-to-many relationship" $ do
+-      get "/clients?select=id,name,projects()" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Microsoft"}, {"id":2,"name":"Apple"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/clients?select=id,name,projects!inner()&projects.name=eq.IOS" `shouldRespondWith`
+-        [json|[{"id":2,"name":"Apple"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works on a many-to-many relationship" $ do
+-      get "/users?select=*,tasks!inner()" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Angela Martin"}, {"id":2,"name":"Michael Scott"}, {"id":3,"name":"Dwight Schrute"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/users?select=*,tasks!inner()&tasks.id=eq.3" `shouldRespondWith`
+-        [json|[{"id":1,"name":"Angela Martin"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-  context "empty root select" $
+-    it "gives all columns" $ do
+-      get "/projects?select=" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"name":"Windows 7","client_id":1},
+-          {"id":2,"name":"Windows 10","client_id":1},
+-          {"id":3,"name":"IOS","client_id":2},
+-          {"id":4,"name":"OSX","client_id":2},
+-          {"id":5,"name":"Orphan","client_id":null}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/rpc/getallprojects?select=" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"name":"Windows 7","client_id":1},
+-          {"id":2,"name":"Windows 10","client_id":1},
+-          {"id":3,"name":"IOS","client_id":2},
+-          {"id":4,"name":"OSX","client_id":2},
+-          {"id":5,"name":"Orphan","client_id":null}]|]
+-        { matchHeaders = [matchContentTypeJson] }

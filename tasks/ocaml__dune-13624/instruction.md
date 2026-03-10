@@ -1,0 +1,9 @@
+When building a library declared with `(stdlib ...)`, modules listed under `(modules_before_stdlib ...)` are expected to be available as implicit dependencies to other modules in that same stdlib library. This works in non-sandboxed builds, but fails in sandboxed builds (e.g. using a symlink sandbox): compilation of modules that reference `CamlinternalFormatBasics` fails because the dependency on modules from `modules_before_stdlib` is not picked up.
+
+Reproduction scenario: define a library with `(library (stdlib (modules_before_stdlib CamlinternalFormatBasics) ...))` and have the library’s public interface and implementation refer to `CamlinternalFormatBasics.format6` in type definitions (e.g. `type ('a,'b,'c) format = ('a,'b,'c,'c,'c,'c) CamlinternalFormatBasics.format6`). Provide `CamlinternalFormatBasics.ml/.mli` sources in the project so the build can compile it locally. Then build the project twice: once without sandboxing and once with sandboxing enabled. Without sandboxing the build succeeds, but with sandboxing the build fails due to missing/incorrectly tracked dependencies on `CamlinternalFormatBasics`.
+
+Expected behavior: sandboxed builds must behave the same as non-sandboxed builds. Any module in a `(stdlib ...)` library that references a module listed in `(modules_before_stdlib ...)` should have an implicit dependency on that module so that it is built/available in the sandbox environment before compilation proceeds.
+
+Actual behavior: in the sandbox, these implicit dependencies are not honored, leading to build failures when stdlib modules reference `modules_before_stdlib` modules.
+
+Implement the missing dependency propagation so that, in sandboxed builds, modules of a `(stdlib ...)` library implicitly depend on the modules specified in `(modules_before_stdlib ...)`, ensuring compilation order and availability are correct.

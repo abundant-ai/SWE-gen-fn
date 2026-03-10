@@ -1,0 +1,659 @@
+diff --git a/Changes b/Changes
+index 8280f5b2b4..5f5b6caead 100644
+--- a/Changes
++++ b/Changes
+@@ -133,11 +133,6 @@ Working version
+ 
+ ### Standard library:
+ 
+-- #14381: Add String.find_{first,last}_index, String.find_{first,last},
+-  String.[r]find_all.
+-  (Daniel Bünzli, review by Nicolás Ojeda Bär, Ali Caglayan and
+-   Florian Angeletti)
+-
+ - #14438: Add String.is_empty
+   (Daniel Bünzli, review by Nicolás Ojeda Bär and Gabriel Scherer)
+ 
+diff --git a/stdlib/.depend b/stdlib/.depend
+index 3c641c22e4..d6c5987c0a 100644
+--- a/stdlib/.depend
++++ b/stdlib/.depend
+@@ -804,7 +804,6 @@ stdlib__String.cmo : string.ml \
+     stdlib.cmi \
+     stdlib__List.cmi \
+     stdlib__Int.cmi \
+-    stdlib__Char.cmi \
+     stdlib__Bytes.cmi \
+     stdlib__Array.cmi \
+     stdlib__String.cmi
+@@ -813,7 +812,6 @@ stdlib__String.cmx : string.ml \
+     stdlib.cmx \
+     stdlib__List.cmx \
+     stdlib__Int.cmx \
+-    stdlib__Char.cmx \
+     stdlib__Bytes.cmx \
+     stdlib__Array.cmx \
+     stdlib__String.cmi
+diff --git a/stdlib/string.ml b/stdlib/string.ml
+index ecbcf43331..9ff399619e 100644
+--- a/stdlib/string.ml
++++ b/stdlib/string.ml
+@@ -117,27 +117,6 @@ let escaped s =
+      its argument. *)
+   if b == b' then s else bts b'
+ 
+-(* Finding indices *)
+-
+-let invalid_start ~start len =
+-  let i = string_of_int in
+-  invalid_arg @@ concat "" ["start: "; i start; " not in range [0;"; i len; "]"]
+-
+-let find_first_index sat ?(start = 0) s =
+-  let len = length s in
+-  if not (0 <= start && start <= len) then invalid_start ~start len else
+-  let i = ref start in
+-  while !i < len && not (sat (unsafe_get s !i)) do incr i done;
+-  if !i < len then Some !i else None
+-
+-let find_last_index sat ?start s =
+-  let len = length s in
+-  let start = match start with None -> len | Some s -> s in
+-  if not (0 <= start && start <= len) then invalid_start ~start len else
+-  let i = ref (if start = len then len - 1 else start) in
+-  while !i >= 0 && not (sat (unsafe_get s !i)) do decr i done;
+-  if !i < 0 then None else Some !i
+-
+ (* duplicated in bytes.ml *)
+ let rec index_rec s lim i c =
+   if i >= lim then raise Not_found else
+@@ -216,214 +195,6 @@ let rcontains_from s i c =
+   else
+     try ignore (rindex_rec s i c); true with Not_found -> false
+ 
+-(* Finding substrings *)
+-
+-module Search = struct
+-  (* Two way string search, see https://doi.org/10.1145/116825.116845 or
+-     http://www-igm.univ-mlv.fr/~lecroq/string/node26.html#SECTION00260 *)
+-
+-  let find_maximal_suffix_and_period ~sub =
+-    let sublen = length sub in
+-    let i = ref (-1) and j = ref 0 and k = ref 1 and p = ref 1 in
+-    let[@inline] maximal_suffix ~order =
+-      while (!j + !k < sublen) do
+-        let c = order * Char.compare (get sub (!j + !k)) (get sub (!i + !k)) in
+-        if c < 0 then (j := !j + !k; k := 1; p := !j - !i) else
+-        if c > 0 then (i := !j; j := !i + 1; k := 1; p := 1) else
+-        (* c = 0 *)
+-        if !k = !p then (j := !j + !p; k := 1) else incr k
+-      done;
+-    in
+-    (maximal_suffix[@inlined]) ~order:1;
+-    let l0 = !i and p0 = !p in
+-    i := -1; j := 0; k := 1; p := 1;
+-    (maximal_suffix[@inlined]) ~order:(-1);
+-    let l1 = !i and p1 = !p in
+-    if l0 > l1 then (l0, p0) else (l1, p1)
+-
+-  let is_sub_periodic ~sub ~sub_lp:(l, p) =
+-    l < length sub / 2 &&
+-    let i = ref 0 in
+-    while !i <= l && Char.equal (get sub !i) (get sub (!i + p))
+-    do incr i done;
+-    !i > l
+-
+-  let find ~start ~sub ~sub_lp:(l, p) ~sub_periodic s = (* -1 on not found *)
+-    let slen = length s and sublen = length sub in
+-    if not (0 <= start && start <= slen) then invalid_start ~start slen else
+-    let smax = slen - sublen in
+-    let j = ref start in
+-    try
+-      if sub_periodic then begin
+-        let memory = ref (-1) in
+-        while (!j <= smax) do
+-          let i = ref (1 + Int.max l !memory) in
+-          while (!i < sublen && Char.equal (get sub !i) (get s (!i + !j)))
+-          do incr i done;
+-          if !i < sublen then (j := !j + (!i - l); memory := -1) else
+-          begin
+-            i := l;
+-            while (!i > !memory && Char.equal (get sub !i) (get s (!i + !j)))
+-            do decr i done;
+-            if !i <= !memory then raise_notrace Exit else
+-            (j := !j + p; memory := sublen - p - 1)
+-          end
+-        done;
+-        -1
+-      end else begin
+-        let q = 1 + Int.max (l + 1) (sublen - l - 1) in
+-        while (!j <= smax) do
+-          let i = ref (l + 1) in
+-          while (!i < sublen && Char.equal (get sub !i) (get s (!i + !j)))
+-          do incr i done;
+-          if !i < sublen then (j := !j + (!i - l)) else
+-          begin
+-            i := l;
+-            while (!i >= 0 && Char.equal (get sub !i) (get s (!i + !j)))
+-            do decr i done;
+-            if !i < 0 then raise_notrace Exit else (j := !j + q)
+-          end
+-        done;
+-        -1
+-      end
+-    with Exit -> !j
+-
+-  (* The following searches from the end of string. Except for changes
+-     marked with an explicit comment this a cut and paste of the above
+-     code to search forward but with the [get] function mapping
+-     indices from the range [0;n-1] to [n-1;0] which we call the
+-     "reverse space" below *)
+-
+-  let[@inline] get s i = get s (length s - 1 - i)
+-
+-  let rfind_maximal_suffix_and_period ~sub =
+-    let sublen = length sub in
+-    let i = ref (-1) and j = ref 0 and k = ref 1 and p = ref 1 in
+-    let[@inline] maximal_suffix ~order =
+-      while (!j + !k < sublen) do
+-        let c = order * Char.compare (get sub (!j + !k)) (get sub (!i + !k)) in
+-        if c < 0 then (j := !j + !k; k := 1; p := !j - !i) else
+-        if c > 0 then (i := !j; j := !i + 1; k := 1; p := 1) else
+-        (* c = 0 *)
+-        if !k = !p then (j := !j + !p; k := 1) else incr k
+-      done;
+-    in
+-    (maximal_suffix[@inlined]) ~order:1;
+-    let l0 = !i and p0 = !p in
+-    i := -1; j := 0; k := 1; p := 1;
+-    (maximal_suffix[@inlined]) ~order:(-1);
+-    let l1 = !i and p1 = !p in
+-    if l0 > l1 then (l0, p0) else (l1, p1)
+-
+-  let ris_sub_periodic ~sub ~rsub_lp:(l, p) =
+-    l < length sub / 2 &&
+-    let i = ref 0 in
+-    while !i <= l && Char.equal (get sub !i) (get sub (!i + p))
+-    do incr i done;
+-    !i > l
+-
+-  let rfind ~start ~sub ~rsub_lp:(l, p) ~rsub_periodic s = (* -1 on not found *)
+-    let slen = length s and sublen = length sub in
+-    if not (0 <= start && start <= slen) then invalid_start ~start slen else
+-    let start =
+-      (* In the reverse space we start searches at the index of the end of
+-         [sub] so we need to adjust start to search from there which is the
+-         index [start + sublen - 1]. This index is then converted into the
+-         reverse index space. That may end up negative, e.g. if [start] is
+-         toward the end and [sub] is large so we clamp to 0. *)
+-      Int.max 0 (slen - 1 - (start + (sublen - 1)))
+-    in
+-    let smax = slen - sublen in
+-    let j = ref start in
+-    try
+-      if rsub_periodic then begin
+-        let memory = ref (-1) in
+-        while (!j <= smax) do
+-          let i = ref (1 + Int.max l !memory) in
+-          while (!i < sublen && Char.equal (get sub !i) (get s (!i + !j)))
+-          do incr i done;
+-          if !i < sublen then (j := !j + (!i - l); memory := -1) else
+-          begin
+-            i := l;
+-            while (!i > !memory && Char.equal (get sub !i) (get s (!i + !j)))
+-            do decr i done;
+-            if !i <= !memory then raise_notrace Exit else
+-            (j := !j + p; memory := sublen - p - 1)
+-          end
+-        done;
+-        -1
+-      end else begin
+-        let q = 1 + Int.max (l + 1) (sublen - l - 1) in
+-        while (!j <= smax) do
+-          let i = ref (l + 1) in
+-          while (!i < sublen && Char.equal (get sub !i) (get s (!i + !j)))
+-          do incr i done;
+-          if !i < sublen then (j := !j + (!i - l)) else
+-          begin
+-            i := l;
+-            while (!i >= 0 && Char.equal (get sub !i) (get s (!i + !j)))
+-            do decr i done;
+-            if !i < 0 then raise_notrace Exit else (j := !j + q)
+-          end
+-        done;
+-        -1
+-      end
+-    with Exit ->
+-      (* This transforms back from the reverse space and compensates
+-         for the fact that we found the index of the end of [sub]. *)
+-      slen - 1 - (!j + (sublen - 1))
+-end
+-
+-let find_first ~sub =
+-  let sub_lp = Search.find_maximal_suffix_and_period ~sub in
+-  let sub_periodic = Search.is_sub_periodic ~sub ~sub_lp in
+-  fun ?(start = 0) s ->
+-    match Search.find ~start ~sub_lp ~sub_periodic ~sub s with
+-    | -1 -> None | i -> Some i
+-
+-let find_last ~sub =
+-  let rsub_lp = Search.rfind_maximal_suffix_and_period ~sub in
+-  let rsub_periodic = Search.ris_sub_periodic ~sub ~rsub_lp in
+-  fun ?start s ->
+-    let start = match start with None -> length s | Some s -> s in
+-    match Search.rfind ~start ~sub ~rsub_lp ~rsub_periodic s with
+-    | -1 -> None | i -> Some i
+-
+-let find_all ~sub =
+-  let sub_lp = Search.find_maximal_suffix_and_period ~sub in
+-  let sub_periodic = Search.is_sub_periodic ~sub ~sub_lp in
+-  fun f ?(start = 0) s acc ->
+-    let rec loop f acc sub sub_lp sub_periodic s ~start ~slen =
+-      if start > slen then acc else
+-      match Search.find ~start ~sub ~sub_lp ~sub_periodic s with
+-      | -1 -> acc
+-      | i ->
+-          let start = i + Int.max (length sub) 1 in
+-          loop f (f i acc) sub sub_lp sub_periodic s ~start ~slen
+-    in
+-    let slen = length s in
+-    if not (0 <= start && start <= slen) then invalid_start ~start slen else
+-    loop f acc sub sub_lp sub_periodic s ~start ~slen
+-
+-let rfind_all ~sub =
+-  let rsub_lp = Search.rfind_maximal_suffix_and_period ~sub in
+-  let rsub_periodic = Search.ris_sub_periodic ~sub ~rsub_lp in
+-  fun f ?start s acc ->
+-    let rec loop f acc sub rsub_lp rsub_periodic s ~start ~slen =
+-      if start < 0 then acc else
+-      match Search.rfind ~start ~sub ~rsub_lp ~rsub_periodic s with
+-      | -1 -> acc
+-      | i ->
+-          let start = i - Int.max (length sub) 1 in
+-          loop f (f i acc) sub rsub_lp rsub_periodic s ~start ~slen
+-    in
+-    let slen = length s in
+-    let start = match start with None -> length s | Some s -> s in
+-    if not (0 <= start && start <= slen) then invalid_start ~start slen else
+-    loop f acc sub rsub_lp rsub_periodic s ~start ~slen
+-
+-(* ASCII transforms *)
+-
+ let uppercase_ascii s =
+   B.uppercase_ascii (bos s) |> bts
+ let lowercase_ascii s =
+diff --git a/stdlib/string.mli b/stdlib/string.mli
+index a8bdf6969a..87f81ff0dc 100644
+--- a/stdlib/string.mli
++++ b/stdlib/string.mli
+@@ -385,27 +385,7 @@ val iteri : (int -> char -> unit) -> string -> unit
+ 
+     @since 4.00 *)
+ 
+-(** {1:finding_indices Finding indices} *)
+-
+-val find_first_index : (char -> bool) -> ?start:int -> string -> int option
+-(** [find_first_index p start s] is the index of the first character
+-    of [s] that satisfies predicate [p] at or after the index or
+-    position [start] (defaults to [0]).
+-
+-    If [start] is [length s], the result is always [None].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_last_index : (char -> bool) -> ?start:int -> string -> int option
+-(** [find_last_index p start s] is the index of the last character of
+-    [s] that satisfies predicate [p] at or before the index or
+-    position [start] (defaults to [length s]).
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
++(** {1:searching Searching} *)
+ 
+ val index_from : string -> int -> char -> int
+ (** [index_from s i c] is the index of the first occurrence of [c] in
+@@ -414,6 +394,7 @@ val index_from : string -> int -> char -> int
+     @raise Not_found if [c] does not occur in [s] after position [i].
+     @raise Invalid_argument if [i] is not a valid position in [s]. *)
+ 
++
+ val index_from_opt : string -> int -> char -> int option
+ (** [index_from_opt s i c] is the index of the first occurrence of [c]
+     in [s] after position [i] (if any).
+@@ -451,76 +432,6 @@ val rindex_opt : string -> char -> int option
+ 
+     @since 4.05 *)
+ 
+-(** {1:find_subs Finding substrings}
+-
+-    {b Note.} To find the same [sub] string multiple times, partially
+-    applying the [~sub] argument of these functions and using the
+-    resulting function repeatedly is more efficient *)
+-
+-val find_first :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  ?start:int -> string -> int option
+-(** [find_first sub start s] is the starting position of the first
+-    occurrence of [sub] in [s] at or after the index or position [start]
+-    (defaults to [0]).
+-
+-    If [sub] is [""] the result is [Some start]. The result of the
+-    function is always a valid index of [s] except when [sub] is
+-    [""] and [start] is [length s].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_last :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  ?start:int -> string -> int option
+-(** [find_last sub start s] is the starting position of the last
+-    occurrence of [sub] in [s] at or before the index or position
+-    [start] (defaults to [String.length s]).
+-
+-    If [sub] is [""] the result is [Some start]. The result of the
+-    function is always a valid index of [s] except when [sub] is
+-    [""] and [start] is [length s].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_all :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  (int -> 'acc -> 'acc) ->
+-  ?start:int -> string -> 'acc -> 'acc
+-(** [find_all sub f start s acc], starting with [acc], folds [f] by
+-    increasing index order over all non-overlapping starting positions
+-    of [sub] in [s] at or after the index or position [start]
+-    (defaults to [0]). The result is [acc] if [sub] could not be found
+-    in [s].
+-
+-    If [sub] is [""], [f] gets invoked on all positions of [s] at or after
+-    [start].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val rfind_all :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  (int -> 'acc -> 'acc) ->
+-  ?start:int -> string -> 'acc -> 'acc
+-(** [rfind_all sub f start s acc], starting with [acc], folds [f] by
+-    decreasing index order over all non-overlapping starting
+-    positions of [sub] in [s] at or before the index or position
+-    [start] (defaults to [String.length s]). The result is [acc] if
+-    [sub] could not be found in [s].
+-
+-    If [sub] is [""], [f] gets invoked on all positions of [s] at
+-    or before [start].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+ (** {1 Strings and Sequences} *)
+ 
+ val to_seq : t -> char Seq.t
+diff --git a/stdlib/stringLabels.mli b/stdlib/stringLabels.mli
+index 9ce734c820..25a9271145 100644
+--- a/stdlib/stringLabels.mli
++++ b/stdlib/stringLabels.mli
+@@ -385,27 +385,7 @@ val iteri : f:(int -> char -> unit) -> string -> unit
+ 
+     @since 4.00 *)
+ 
+-(** {1:finding_indices Finding indices} *)
+-
+-val find_first_index : (char -> bool) -> ?start:int -> string -> int option
+-(** [find_first_index p ~start s] is the index of the first character
+-    of [s] that satisfies predicate [p] at or after the index or
+-    position [start] (defaults to [0]).
+-
+-    If [start] is [length s], the result is always [None].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_last_index : (char -> bool) -> ?start:int -> string -> int option
+-(** [find_last_index p ~start s] is the index of the last character of
+-    [s] that satisfies predicate [p] at or before the index or
+-    position [start] (defaults to [length s]).
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
++(** {1:searching Searching} *)
+ 
+ val index_from : string -> int -> char -> int
+ (** [index_from s i c] is the index of the first occurrence of [c] in
+@@ -414,6 +394,7 @@ val index_from : string -> int -> char -> int
+     @raise Not_found if [c] does not occur in [s] after position [i].
+     @raise Invalid_argument if [i] is not a valid position in [s]. *)
+ 
++
+ val index_from_opt : string -> int -> char -> int option
+ (** [index_from_opt s i c] is the index of the first occurrence of [c]
+     in [s] after position [i] (if any).
+@@ -451,76 +432,6 @@ val rindex_opt : string -> char -> int option
+ 
+     @since 4.05 *)
+ 
+-(** {1:find_subs Finding substrings}
+-
+-    {b Note.} To find the same [sub] string multiple times, partially
+-    applying the [~sub] argument of these functions and using the
+-    resulting function repeatedly is more efficient *)
+-
+-val find_first :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  ?start:int -> string -> int option
+-(** [find_first ~sub ~start s] is the starting position of the first
+-    occurrence of [sub] in [s] at or after the index or position [start]
+-    (defaults to [0]).
+-
+-    If [sub] is [""] the result is [Some start]. The result of the
+-    function is always a valid index of [s] except when [sub] is
+-    [""] and [start] is [length s].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_last :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  ?start:int -> string -> int option
+-(** [find_last ~sub ~start s] is the starting position of the last
+-    occurrence of [sub] in [s] at or before the index or position
+-    [start] (defaults to [String.length s]).
+-
+-    If [sub] is [""] the result is [Some start]. The result of the
+-    function is always a valid index of [s] except when [sub] is
+-    [""] and [start] is [length s].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val find_all :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  f:(int -> 'acc -> 'acc) ->
+-  ?start:int -> string -> 'acc -> 'acc
+-(** [find_all ~sub f ~start s acc], starting with [acc], folds [f] by
+-    increasing index order over all non-overlapping starting positions
+-    of [sub] in [s] at or after the index or position [start]
+-    (defaults to [0]). The result is [acc] if [sub] could not be found
+-    in [s].
+-
+-    If [sub] is [""], [f] gets invoked on all positions of [s] at or after
+-    [start].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+-val rfind_all :
+-  sub (* comment thwarts tools/sync_stdlib_docs *) :string ->
+-  f:(int -> 'acc -> 'acc) ->
+-  ?start:int -> string -> 'acc -> 'acc
+-(** [rfind_all ~sub f ~start s acc], starting with [acc], folds [f] by
+-    decreasing index order over all non-overlapping starting
+-    positions of [sub] in [s] at or before the index or position
+-    [start] (defaults to [String.length s]). The result is [acc] if
+-    [sub] could not be found in [s].
+-
+-    If [sub] is [""], [f] gets invoked on all positions of [s] at
+-    or before [start].
+-
+-    @raise Invalid_argument if [start] is not a valid position of [s].
+-
+-    @since 5.5 *)
+-
+ (** {1 Strings and Sequences} *)
+ 
+ val to_seq : t -> char Seq.t
+diff --git a/testsuite/tests/lib-string/test_string.ml b/testsuite/tests/lib-string/test_string.ml
+index 653620fa00..938745833e 100644
+--- a/testsuite/tests/lib-string/test_string.ml
++++ b/testsuite/tests/lib-string/test_string.ml
+@@ -264,135 +264,3 @@ let () =
+   assert (String.is_empty "life" = false);
+   assert (String.is_empty "" = true);
+   ()
+-
+-let () =
+-  (* Test String.find_{first,last}_index *)
+-  let is_letter = Char.Ascii.is_letter in
+-  let is_invalid_arg f = match f () with
+-    | exception Invalid_argument _ -> () | _ -> assert false
+-  in
+-  is_invalid_arg (fun () -> String.find_first_index ~start:(-1) is_letter "");
+-  is_invalid_arg (fun () -> String.find_last_index ~start:(-1) is_letter "");
+-  assert (String.find_first_index ~start:0 is_letter "" = None);
+-  assert (String.find_last_index ~start:0 is_letter "" = None);
+-  is_invalid_arg (fun () -> String.find_first_index ~start:1 is_letter "");
+-  is_invalid_arg (fun () -> String.find_last_index ~start:1 is_letter "");
+-  assert (String.find_first_index ~start:0 is_letter "-" = None);
+-  assert (String.find_first_index ~start:1 is_letter "-" = None);
+-  assert (String.find_last_index ~start:0 is_letter "-" = None);
+-  assert (String.find_last_index ~start:1 is_letter "-" = None);
+-  assert (String.find_first_index ~start:0 is_letter "a-" = Some 0);
+-  assert (String.find_first_index ~start:1 is_letter "a-" = None);
+-  assert (String.find_first_index ~start:2 is_letter "a-" = None);
+-  assert (String.find_last_index ~start:0 is_letter "a-" = Some 0);
+-  assert (String.find_last_index ~start:1 is_letter "a-" = Some 0);
+-  assert (String.find_last_index ~start:2 is_letter "a-" = Some 0);
+-  assert (String.find_first_index ~start:0 is_letter "a-a" = Some 0);
+-  assert (String.find_first_index ~start:1 is_letter "a-a" = Some 2);
+-  assert (String.find_first_index ~start:2 is_letter "a-a" = Some 2);
+-  assert (String.find_first_index ~start:3 is_letter "a-a" = None);
+-  assert (String.find_last_index ~start:0 is_letter "a-a" = Some 0);
+-  assert (String.find_last_index ~start:1 is_letter "a-a" = Some 0);
+-  assert (String.find_last_index ~start:2 is_letter "a-a" = Some 2);
+-  assert (String.find_last_index ~start:3 is_letter "a-a" = Some 2);
+-  assert (String.find_first_index ~start:0 is_letter "-a-" = Some 1);
+-  assert (String.find_first_index ~start:1 is_letter "-a-" = Some 1);
+-  assert (String.find_first_index ~start:2 is_letter "-a-" = None);
+-  assert (String.find_first_index ~start:3 is_letter "-a-" = None);
+-  assert (String.find_last_index ~start:0 is_letter "-a-" = None);
+-  assert (String.find_last_index ~start:1 is_letter "-a-" = Some 1);
+-  assert (String.find_last_index ~start:2 is_letter "-a-" = Some 1);
+-  assert (String.find_last_index ~start:3 is_letter "-a-" = Some 1);
+-  ()
+-
+-let () =
+-  (* Test String.find_first *)
+-  let is_invalid_arg f = match f () with
+-    | exception Invalid_argument _ -> () | _ -> assert false
+-  in
+-  is_invalid_arg (fun () -> String.find_first ~start:(-1) ~sub:"" "");
+-  assert (String.find_first ~start:0 ~sub:"" "" = Some 0);
+-  is_invalid_arg (fun () -> String.find_first ~start:1 ~sub:"" "");
+-  assert (String.find_first ~start:0 ~sub:"" "ab" = Some 0);
+-  assert (String.find_first ~start:1 ~sub:"" "ab" = Some 1);
+-  assert (String.find_first ~start:2 ~sub:"" "ab" = Some 2);
+-  is_invalid_arg (fun () -> String.find_first ~start:3 ~sub:"" "ab");
+-  assert (String.find_first ~start:0 ~sub:"a" "" = None);
+-  assert (String.find_first ~start:0 ~sub:"a" "a" = Some 0);
+-  assert (String.find_first ~start:1 ~sub:"a" "a" = None);
+-  assert (String.find_first ~start:0 ~sub:"a" "ba" = Some 1);
+-  assert (String.find_first ~start:1 ~sub:"a" "ba" = Some 1);
+-  assert (String.find_first ~start:2 ~sub:"a" "ba" = None);
+-  assert (String.find_first ~start:0 ~sub:"ab" "" = None);
+-  assert (String.find_first ~start:0 ~sub:"ab" "ab" = Some 0);
+-  assert (String.find_first ~start:0 ~sub:"ab" "aab" = Some 1);
+-  assert (String.find_first ~start:1 ~sub:"ab" "aab" = Some 1);
+-  assert (String.find_first ~start:2 ~sub:"ab" "aab" = None);
+-  assert (String.find_first ~start:3 ~sub:"ab" "aab" = None);
+-  is_invalid_arg (fun () -> String.find_first ~start:(-1) ~sub:"abaa" "aba");
+-  assert (String.find_first ~start:0 ~sub:"abaa" "aba" = None);
+-  assert (String.find_first ~start:2 ~sub:"abaa" "aba" = None);
+-  assert (String.find_first ~start:3 ~sub:"abaa" "aba" = None);
+-  is_invalid_arg (fun () -> String.find_first ~start:4 ~sub:"abaa" "aba");
+-  assert (String.find_first ~start:0 ~sub:"aba" "ababa" = Some 0);
+-  assert (String.find_first ~start:1 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_first ~start:2 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_first ~start:3 ~sub:"aba" "ababa" = None);
+-  assert (String.find_first ~start:4 ~sub:"aba" "ababa" = None);
+-  assert (String.find_first ~start:5 ~sub:"aba" "ababa" = None);
+-  assert (String.find_first ~start:0 ~sub:"abab" "ababab" = Some 0);
+-  assert (String.find_first ~start:1 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_first ~start:2 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_first ~start:3 ~sub:"abab" "ababab" = None);
+-  assert (String.find_first ~start:4 ~sub:"abab" "ababab" = None);
+-  assert (String.find_first ~start:5 ~sub:"abab" "ababab" = None);
+-  assert (String.find_first ~start:6 ~sub:"abab" "ababab" = None);
+-  assert (String.find_first ~start:0 ~sub:"aba" "xbabxbaba" = Some 6);
+-  assert (String.find_first ~start:0 ~sub:"xxxxaz" "yyyyazxxxxxaz" = Some 7);
+-  assert (String.find_first ~start:0 ~sub:"aaa" "abaacaaad" = Some 5);
+-  ()
+-
+-let () =
+-  (* Test String.find_last *)
+-  let is_invalid_arg f = match f () with
+-    | exception Invalid_argument _ -> () | _ -> assert false
+-  in
+-  is_invalid_arg (fun () -> String.find_last ~start:(-1) ~sub:"" "");
+-  assert (String.find_last ~start:0 ~sub:"" "" = Some 0);
+-  is_invalid_arg (fun () -> String.find_last ~start:1 ~sub:"" "");
+-  assert (String.find_last ~start:0 ~sub:"" "ab" = Some 0);
+-  assert (String.find_last ~start:1 ~sub:"" "ab" = Some 1);
+-  assert (String.find_last ~start:2 ~sub:"" "ab" = Some 2);
+-  is_invalid_arg (fun () -> String.find_last ~start:3 ~sub:"" "ab");
+-  assert (String.find_last ~start:0 ~sub:"a" "" = None);
+-  assert (String.find_last ~start:0 ~sub:"a" "a" = Some 0);
+-  assert (String.find_last ~start:1 ~sub:"a" "a" = Some 0);
+-  assert (String.find_last ~start:0 ~sub:"a" "ba" = None);
+-  assert (String.find_last ~start:1 ~sub:"a" "ba" = Some 1);
+-  assert (String.find_last ~start:2 ~sub:"a" "ba" = Some 1);
+-  assert (String.find_last ~start:0 ~sub:"ab" "" = None);
+-  assert (String.find_last ~start:0 ~sub:"ab" "ab" = Some 0);
+-  assert (String.find_last ~start:0 ~sub:"ab" "aab" = None);
+-  assert (String.find_last ~start:1 ~sub:"ab" "aab" = Some 1);
+-  assert (String.find_last ~start:2 ~sub:"ab" "aab" = Some 1);
+-  assert (String.find_last ~start:3 ~sub:"ab" "aab" = Some 1);
+-  is_invalid_arg (fun () -> String.find_last ~start:(-1) ~sub:"abaa" "aba");
+-  assert (String.find_last ~start:0 ~sub:"abaa" "aba" = None);
+-  assert (String.find_last ~start:2 ~sub:"abaa" "aba" = None);
+-  assert (String.find_last ~start:3 ~sub:"abaa" "aba" = None);
+-  is_invalid_arg (fun () -> String.find_last ~start:4 ~sub:"abaa" "aba");
+-  assert (String.find_last ~start:0 ~sub:"aba" "ababa" = Some 0);
+-  assert (String.find_last ~start:1 ~sub:"aba" "ababa" = Some 0);
+-  assert (String.find_last ~start:2 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_last ~start:3 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_last ~start:4 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_last ~start:5 ~sub:"aba" "ababa" = Some 2);
+-  assert (String.find_last ~start:0 ~sub:"abab" "ababab" = Some 0);
+-  assert (String.find_last ~start:1 ~sub:"abab" "ababab" = Some 0);
+-  assert (String.find_last ~start:2 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_last ~start:3 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_last ~start:4 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_last ~start:5 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_last ~start:6 ~sub:"abab" "ababab" = Some 2);
+-  assert (String.find_last ~sub:"ab" "aabb" = Some 1);
+-  ()

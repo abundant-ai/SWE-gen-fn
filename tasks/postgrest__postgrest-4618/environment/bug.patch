@@ -1,0 +1,97 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0c61e38a..4864b9c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file. From versio
+ - Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+ - Add a `HINT` when the LISTEN channel stops working due to a PostgreSQL bug by @laurenceisla in #4581
+ - Add string slicing operator for `jwt-role-claim-key` by @taimoorzaeem in #4599
+-- Log host, port and pg version of listener database connection by @mkleczek in #4617 #4618
++- Log the actual host and port of listener database connection by @mkleczek in #4617
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Listener.hs b/src/PostgREST/Listener.hs
+index 9fcf7726..13eae3c8 100644
+--- a/src/PostgREST/Listener.hs
++++ b/src/PostgREST/Listener.hs
+@@ -17,13 +17,10 @@ import           PostgREST.Version     (prettyVersion)
+ import qualified PostgREST.AppState as AppState
+ import qualified PostgREST.Config   as Config
+ 
+-import           Control.Arrow              ((&&&))
+-import           Data.Bitraversable         (bisequence)
+-import           Data.Either.Combinators    (whenRight)
+-import qualified Database.PostgreSQL.LibPQ  as LibPQ
+-import qualified Hasql.Session              as SQL
+-import           PostgREST.Config.Database  (queryPgVersion)
+-import           PostgREST.Config.PgVersion (pgvFullName)
++import           Control.Arrow             ((&&&))
++import           Data.Bitraversable        (bisequence)
++import           Data.Either.Combinators   (whenRight)
++import qualified Database.PostgreSQL.LibPQ as LibPQ
+ import           Protolude
+ 
+ -- | Starts the Listener in a thread
+@@ -67,9 +64,6 @@ retryingListen appState = do
+       \case
+         Right db -> do
+           SQL.listen db $ SQL.toPgIdentifier dbChannel
+-          (pqHost, pqPort) <- SQL.withLibPQConnection db $ bisequence . (LibPQ.host &&& LibPQ.port)
+-          pgFullName <- SQL.run (queryPgVersion False) db >>= either throwIO (pure . pgvFullName)
+-
+           AppState.putIsListenerOn appState True
+ 
+           delay <- AppState.getNextListenerDelay appState
+@@ -79,7 +73,8 @@ retryingListen appState = do
+             -- reset the delay
+             AppState.putNextListenerDelay appState 1
+ 
+-          observer $ DBListenStart pqHost pqPort pgFullName dbChannel
++          (pqHost, pqPort) <- SQL.withLibPQConnection db $ bisequence . (LibPQ.host &&& LibPQ.port)
++          observer $ DBListenStart pqHost pqPort dbChannel
+ 
+           SQL.waitForNotifications handleNotification db
+ 
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 9f1e646e..03a8e6d9 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -44,7 +44,7 @@ data Observation
+   | SchemaCacheSummaryObs Text
+   | SchemaCacheLoadedObs Double
+   | ConnectionRetryObs Int
+-  | DBListenStart (Maybe ByteString) (Maybe ByteString) Text Text -- host, port, version string, channel
++  | DBListenStart (Maybe ByteString) (Maybe ByteString) Text -- host, port, channel
+   | DBListenFail Text (Either SQL.ConnectionError (Either SomeException ()))
+   | DBListenRetry Int
+   | DBListenBugHint -- https://github.com/PostgREST/postgrest/issues/3147
+@@ -110,8 +110,8 @@ observationMessage = \case
+     "Attempting to reconnect to the database in " <> (show delay::Text) <> " seconds..."
+   QueryPgVersionError usageErr ->
+     "Failed to query the PostgreSQL version. " <> jsonMessage usageErr
+-  DBListenStart host port fullName channel -> do
+-    "Listener connected to " <> fullName <> " on " <> show (fold $ host <> fmap (":" <>) port) <> " and listening for database notifications on the " <> show channel <> " channel"
++  DBListenStart host port channel -> do
++    "Listener connected to " <> show (fold $ host <> fmap (":" <>) port) <> " and listening for database notifications on the " <> show channel <> " channel"
+   DBListenFail channel listenErr ->
+     "Failed listening for database notifications on the " <> show channel <> " channel. " <>
+       either showListenerConnError showListenerException listenErr
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index e384a28f..46f6414a 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1649,11 +1649,9 @@ def test_log_listener_connection_start(defaultenv):
+     }
+ 
+     with run(env=env, no_startup_stdout=False, wait_for_readiness=True) as postgrest:
+-        output = postgrest.read_stdout(nlines=10)
+-        # Check for the listener start message containing host and port
+-        # Do not check if pg version is displayed properly as it is tricky to test it
++        output = postgrest.read_stdout(nlines=5)
+         assert any(
+-            f'"{defaultenv["PGHOST"]}:5432" and listening for database notifications on the "pgrst" channel'
++            f'Listener connected to "{defaultenv["PGHOST"]}:5432" and listening for database notifications on the "pgrst" channel'
+             in line
+             for line in output
+         )

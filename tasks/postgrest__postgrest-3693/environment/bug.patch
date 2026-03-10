@@ -1,0 +1,504 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 91c73428..532c2374 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,14 +13,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
+  - #3560, Log resolved host in "Listening on ..." messages - @develop7
+ 
+-### Fixed
+-
+- - #3693, Prevent spread embedding to allow aggregates when they are disabled - @laurenceisla
+- - #3693, A nested spread embedding now correctly groups by the fields of its top parent relationship - @laurenceisla
+- - #3693, Fix spread embedding errors when using the `count()` aggregate without a field - @laurenceisla
+-   + Fixed `"column reference <col> is ambiguous"` error when selecting `?select=...table(col,count())`
+-   + Fixed `"column <json_aggregate>.<alias> does not exist"` error when selecting `?select=...table(aias:count())`
+-
+ ### Changed
+ 
+  - #2052, Dropped support for PostgreSQL 9.6 - @wolfgangwalther
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 926ab3f9..4718b05e 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -270,7 +270,7 @@ data ResolverContext = ResolverContext
+   }
+ 
+ resolveColumnField :: Column -> CoercibleField
+-resolveColumnField col = CoercibleField (colName col) mempty False (colNominalType col) Nothing (colDefault col) False
++resolveColumnField col = CoercibleField (colName col) mempty False (colNominalType col) Nothing (colDefault col)
+ 
+ resolveTableFieldName :: Table -> FieldName -> CoercibleField
+ resolveTableFieldName table fieldName =
+@@ -332,8 +332,8 @@ readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows, configDbAggregate
+   in
+     mapLeft ApiRequestError $
+     treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-    hoistSpreadAggFunctions =<<
+     validateAggFunctions configDbAggregates =<<
++    hoistSpreadAggFunctions =<<
+     addRelSelects =<<
+     addNullEmbedFilters =<<
+     validateSpreadEmbeds =<<
+@@ -380,19 +380,11 @@ addAliases = Right . fmap addAliasToPlan
+ 
+     aliasSelectField :: CoercibleSelectField -> CoercibleSelectField
+     aliasSelectField field@CoercibleSelectField{csField=fieldDetails, csAggFunction=aggFun, csAlias=alias}
+-      | isJust alias = field
+-      | isJust aggFun = fieldAliasForSpreadAgg field
++      | isJust alias || isJust aggFun = field
+       | isJsonKeyPath fieldDetails, Just key <- lastJsonKey fieldDetails = field { csAlias = Just key }
+       | isTransformPath fieldDetails = field { csAlias = Just (cfName fieldDetails) }
+       | otherwise = field
+ 
+-    -- A request like: `/top_table?select=...middle_table(...nested_table(count()))` will `SELECT` the full row instead of `*`,
+-    -- because doing a `COUNT(*)` in `top_table` would not return the desired results.
+-    -- So we use the "count" alias if none is present since the field name won't be selected.
+-    fieldAliasForSpreadAgg field
+-      | cfFullRow (csField field) = field { csAlias = Just "count" }
+-      | otherwise                 = field
+-
+     isJsonKeyPath CoercibleField{cfJsonPath=(_: _)} = True
+     isJsonKeyPath _                                 = False
+ 
+@@ -436,30 +428,26 @@ expandStars ctx rPlanTree = Right $ expandStarsForReadPlan False rPlanTree
+     adjustContext context fromQI _ = context{qi=fromQI}
+ 
+ expandStarsForTable :: ResolverContext -> Bool -> ReadPlan -> ReadPlan
+-expandStarsForTable ctx@ResolverContext{representations, outputType} hasAgg rp@ReadPlan{select=selectFields, relIsSpread=isSpread}
++expandStarsForTable ctx@ResolverContext{representations, outputType} hasAgg rp@ReadPlan{select=selectFields}
+   -- We expand if either of the below are true:
+   -- * We have a '*' select AND there is an aggregate function in this ReadPlan's sub-tree.
+   -- * We have a '*' select AND the target table has at least one data representation.
+-  -- We ignore '*' selects that have an aggregate function attached, unless it's a `COUNT(*)` for a Spread Embed,
+-  -- we tag it as "full row" in that case.
+-  | hasStarSelect && (hasAgg || hasDataRepresentation) = rp{select = concatMap (expandStarSelectField isSpread knownColumns) selectFields}
++  -- We ignore any '*' selects that have an aggregate function attached (i.e for COUNT(*)).
++  | hasStarSelect && (hasAgg || hasDataRepresentation) = rp{select = concatMap (expandStarSelectField knownColumns) selectFields}
+   | otherwise = rp
+   where
+     hasStarSelect = "*" `elem` map (cfName . csField) filteredSelectFields
+-    filteredSelectFields = filter (shouldExpandOrTag . csAggFunction) selectFields
+-    shouldExpandOrTag aggFunc = isNothing aggFunc || (isSpread && aggFunc == Just Count)
++    filteredSelectFields = filter (isNothing . csAggFunction) selectFields
+     hasDataRepresentation = any hasOutputRep knownColumns
+     knownColumns = knownColumnsInContext ctx
+ 
+     hasOutputRep :: Column -> Bool
+     hasOutputRep col = HM.member (colNominalType col, outputType) representations
+ 
+-    expandStarSelectField :: Bool -> [Column] -> CoercibleSelectField -> [CoercibleSelectField]
+-    expandStarSelectField _ columns sel@CoercibleSelectField{csField=CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Nothing} =
++    expandStarSelectField :: [Column] -> CoercibleSelectField -> [CoercibleSelectField]
++    expandStarSelectField columns sel@CoercibleSelectField{csField=CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Nothing} =
+       map (\col -> sel { csField = withOutputFormat ctx $ resolveColumnField col }) columns
+-    expandStarSelectField True _ sel@CoercibleSelectField{csField=fld@CoercibleField{cfName="*", cfJsonPath=[]}, csAggFunction=Just Count} =
+-      [sel { csField = fld { cfFullRow = True } }]
+-    expandStarSelectField _ _ selectField = [selectField]
++    expandStarSelectField _ selectField = [selectField]
+ 
+ -- | Enforces the `max-rows` config on the result
+ treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -691,23 +679,15 @@ applySpreadAggHoistingToNode (Node rp@ReadPlan{relAggAlias, relToParent, relIsSp
+                                 then (select rp, [])
+                                 else hoistFromSelectFields relAggAlias (select rp)
+ 
+-      -- If the current `ReadPlan` is a spread rel and it has aggregates hoisted from
+-      -- child relationships, then it must hoist those aggregates to its parent rel.
+-      -- So we update them with the current `relAggAlias`.
+-      hoistAgg ((_, fieldName), hoistFunc) = ((relAggAlias, fieldName), hoistFunc)
+-      hoistedAggList = if relIsSpread
+-                       then aggList ++ map hoistAgg allChildAggLists
+-                       else aggList
+-
+-      newRelSelects = if null children || relIsSpread
++      newRelSelects = if null children
+                       then relSelect rp
+                       else map (hoistIntoRelSelectFields allChildAggLists) $ relSelect rp
+-  in  (Node rp { select = newSelects, relSelect = newRelSelects } newChildren, hoistedAggList)
++  in  (Node rp { select = newSelects, relSelect = newRelSelects } newChildren, aggList)
+ 
+ -- Hoist aggregate functions from the select list of a ReadPlan, and return the
+ -- updated select list and the list of hoisted aggregates.
+ hoistFromSelectFields :: Alias -> [CoercibleSelectField] -> ([CoercibleSelectField], [HoistedAgg])
+-hoistFromSelectFields relAggAlias fields =
++hoistFromSelectFields aggAlias fields =
+     let (newFields, maybeAggs) = foldr processField ([], []) fields
+     in (newFields, catMaybes maybeAggs)
+   where
+@@ -715,21 +695,23 @@ hoistFromSelectFields relAggAlias fields =
+       let (modifiedField, maybeAgg) = modifyField field
+       in (modifiedField : newFields, maybeAgg : aggList)
+ 
+-    modifyField field@CoercibleSelectField{csAggFunction=Just aggFunc, csField, csAggCast, csAlias} =
+-      let determineFieldName = fromMaybe (cfName csField) csAlias
+-          updatedField = field {csAggFunction = Nothing, csAggCast = Nothing}
+-          hoistedField = Just ((relAggAlias, determineFieldName), (aggFunc, csAggCast, csAlias))
+-      in (updatedField, hoistedField)
+-    modifyField field = (field, Nothing)
++    modifyField field =
++      case csAggFunction field of
++        Just aggFunc ->
++          ( field { csAggFunction = Nothing, csAggCast = Nothing },
++            Just ((aggAlias, determineFieldName field), (aggFunc, csAggCast field, csAlias field)))
++        Nothing -> (field, Nothing)
++
++    determineFieldName field = fromMaybe (cfName $ csField field) (csAlias field)
+ 
+ -- Taking the hoisted aggregates, modify the rel selects to apply the aggregates,
+ -- and any applicable casts or aliases.
+ hoistIntoRelSelectFields :: [HoistedAgg] -> RelSelectField -> RelSelectField
+-hoistIntoRelSelectFields aggList r@(Spread {rsSpreadSel = spreadSelects, rsAggAlias = relAggAlias}) =
++hoistIntoRelSelectFields aggList r@(Spread {rsSpreadSel = spreadSelects, rsAggAlias = aggAlias}) =
+     r { rsSpreadSel = map updateSelect spreadSelects }
+   where
+     updateSelect s =
+-        case lookup (relAggAlias, ssSelName s) aggList of
++        case lookup (aggAlias, ssSelName s) aggList of
+             Just (aggFunc, aggCast, fldAlias) ->
+                 s { ssSelAggFunction = Just aggFunc,
+                     ssSelAggCast     = aggCast,
+@@ -739,7 +721,8 @@ hoistIntoRelSelectFields _ r = r
+ 
+ validateAggFunctions :: Bool -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+-  | not aggFunctionsAllowed && any (isJust . csAggFunction) select = Left AggregatesNotAllowed
++  | aggFunctionsAllowed = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
++  | any (isJust . csAggFunction) select = Left AggregatesNotAllowed
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -835,7 +818,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --       where_ = [
+ --         CoercibleStmnt (
+ --           CoercibleFilter {
+---            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False},
++--            field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson=False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing},
+ --            opExpr = op
+ --           }
+ --         )
+@@ -851,7 +834,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is TriNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing}, opExpr = OpExpr True (Is TriNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -870,7 +853,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+     newNullFilters rPlans = \case
+       (CoercibleExpr b lOp trees) ->
+         CoercibleExpr b lOp <$> (newNullFilters rPlans `traverse` trees)
+-      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _) opExpr)) ->
++      flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _) opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+           (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index 2d72c054..97de4699 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -39,11 +39,10 @@ data CoercibleField = CoercibleField
+   , cfIRType    :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
+   , cfTransform :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+   , cfDefault   :: Maybe Text
+-  , cfFullRow   :: Bool                  -- ^ True if the field represents the whole selected row. Used in spread rels: instead of COUNT(*), it does a COUNT(<row>) in order to not mix with other spreaded resources.
+   } deriving (Eq, Show)
+ 
+ unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path False "" Nothing Nothing False
++unknownField name path = CoercibleField name path False "" Nothing Nothing
+ 
+ -- | Like an API request LogicTree, but with coercible field information.
+ data CoercibleLogicTree
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 602ae27e..96701be2 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -206,7 +206,7 @@ callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScal
+       KeyParams []    -> "FROM " <> callIt mempty
+       KeyParams prms  -> case arguments of
+         DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
+-        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing False) <$> prms) False True False <> ", " <>
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index b2e58841..39b869d5 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -252,7 +252,6 @@ pgFmtCallUnary :: Text -> SQL.Snippet -> SQL.Snippet
+ pgFmtCallUnary f x = SQL.sql (encodeUtf8 f) <> "(" <> x <> ")"
+ 
+ pgFmtField :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
+-pgFmtField table CoercibleField{cfFullRow=True}                                          = fromQi table
+ pgFmtField table CoercibleField{cfName=fn, cfJsonPath=[]}                                = pgFmtColumn table fn
+ pgFmtField table CoercibleField{cfName=fn, cfToJson=doToJson, cfJsonPath=jp} | doToJson  = "to_jsonb(" <> pgFmtColumn table fn <> ")" <> pgFmtJsonPath jp
+                                                                              | otherwise = pgFmtColumn table fn <> pgFmtJsonPath jp
+diff --git a/test/spec/Feature/Query/AggregateFunctionsSpec.hs b/test/spec/Feature/Query/AggregateFunctionsSpec.hs
+index def85cbd..5030fa3f 100644
+--- a/test/spec/Feature/Query/AggregateFunctionsSpec.hs
++++ b/test/spec/Feature/Query/AggregateFunctionsSpec.hs
+@@ -152,144 +152,6 @@ allowed =
+         get "/budget_expenses?select=...budget_categories(total_budget:budget_amount.sum())" `shouldRespondWith`
+           [json|[{"total_budget": 9501.06}]|]
+           { matchHeaders = [matchContentTypeJson] }
+-      it "supports aggregates from a spread relationships grouped by spreaded fields from other relationships" $ do
+-        get "/processes?select=...process_costs(cost.sum()),...process_categories(name)" `shouldRespondWith`
+-          [json|[
+-            {"sum": 400.00, "name": "Batch"},
+-            {"sum": 320.00, "name": "Mass"}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/processes?select=...process_costs(cost_sum:cost.sum()),...process_categories(category:name)" `shouldRespondWith`
+-          [json|[
+-            {"cost_sum": 400.00, "category": "Batch"},
+-            {"cost_sum": 320.00, "category": "Mass"}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-      it "supports aggregates on spreaded fields from nested relationships" $ do
+-        get "/process_supervisor?select=...processes(factory_id,...process_costs(cost.sum()))" `shouldRespondWith`
+-          [json|[
+-            {"factory_id": 3, "sum": 120.00},
+-            {"factory_id": 2, "sum": 500.00},
+-            {"factory_id": 1, "sum": 350.00}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/process_supervisor?select=...processes(factory_id,...process_costs(cost_sum:cost.sum()))" `shouldRespondWith`
+-          [json|[
+-            {"factory_id": 3, "cost_sum": 120.00},
+-            {"factory_id": 2, "cost_sum": 500.00},
+-            {"factory_id": 1, "cost_sum": 350.00}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-      it "supports aggregates on spreaded fields from nested relationships, grouped by a regular nested relationship" $ do
+-        get "/process_supervisor?select=...processes(factories(name),...process_costs(cost.sum()))" `shouldRespondWith`
+-          [json|[
+-            {"factories": {"name": "Factory A"}, "sum": 350.00},
+-            {"factories": {"name": "Factory B"}, "sum": 500.00},
+-            {"factories": {"name": "Factory C"}, "sum": 120.00}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/process_supervisor?select=...processes(factory:factories(name),...process_costs(cost_sum:cost.sum()))" `shouldRespondWith`
+-          [json|[
+-            {"factory": {"name": "Factory A"}, "cost_sum": 350.00},
+-            {"factory": {"name": "Factory B"}, "cost_sum": 500.00},
+-            {"factory": {"name": "Factory C"}, "cost_sum": 120.00}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-      it "supports aggregates on spreaded fields from nested relationships, grouped by spreaded fields from other nested relationships" $ do
+-        get "/process_supervisor?select=supervisor_id,...processes(...process_costs(cost.sum()),...process_categories(name))&order=supervisor_id" `shouldRespondWith`
+-          [json|[
+-            {"supervisor_id": 1, "sum": 220.00, "name": "Batch"},
+-            {"supervisor_id": 2, "sum": 70.00, "name": "Batch"},
+-            {"supervisor_id": 2, "sum": 200.00, "name": "Mass"},
+-            {"supervisor_id": 3, "sum": 180.00, "name": "Batch"},
+-            {"supervisor_id": 3, "sum": 120.00, "name": "Mass"},
+-            {"supervisor_id": 4, "sum": 180.00, "name": "Batch"}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/process_supervisor?select=supervisor_id,...processes(...process_costs(cost_sum:cost.sum()),...process_categories(category:name))&order=supervisor_id" `shouldRespondWith`
+-          [json|[
+-            {"supervisor_id": 1, "cost_sum": 220.00, "category": "Batch"},
+-            {"supervisor_id": 2, "cost_sum": 70.00, "category": "Batch"},
+-            {"supervisor_id": 2, "cost_sum": 200.00, "category": "Mass"},
+-            {"supervisor_id": 3, "cost_sum": 180.00, "category": "Batch"},
+-            {"supervisor_id": 3, "cost_sum": 120.00, "category": "Mass"},
+-            {"supervisor_id": 4, "cost_sum": 180.00, "category": "Batch"}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-      it "supports aggregates on spreaded fields from nested relationships, grouped by spreaded fields from other nested relationships, using a nested relationship as top parent" $ do
+-        get "/supervisors?select=name,process_supervisor(...processes(...process_costs(cost.sum()),...process_categories(name)))" `shouldRespondWith`
+-          [json|[
+-            {"name": "Mary", "process_supervisor": [{"name": "Batch", "sum": 220.00}]},
+-            {"name": "John", "process_supervisor": [{"name": "Batch", "sum": 70.00}, {"name": "Mass", "sum": 200.00}]},
+-            {"name": "Peter", "process_supervisor": [{"name": "Batch", "sum": 180.00}, {"name": "Mass", "sum": 120.00}]},
+-            {"name": "Sarah", "process_supervisor": [{"name": "Batch", "sum": 180.00}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/supervisors?select=name,process_supervisor(...processes(...process_costs(cost_sum:cost.sum()),...process_categories(category:name)))" `shouldRespondWith`
+-          [json|[
+-            {"name": "Mary", "process_supervisor": [{"category": "Batch", "cost_sum": 220.00}]},
+-            {"name": "John", "process_supervisor": [{"category": "Batch", "cost_sum": 70.00}, {"category": "Mass", "cost_sum": 200.00}]},
+-            {"name": "Peter", "process_supervisor": [{"category": "Batch", "cost_sum": 180.00}, {"category": "Mass", "cost_sum": 120.00}]},
+-            {"name": "Sarah", "process_supervisor": [{"category": "Batch", "cost_sum": 180.00}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      context "supports count() aggregate without specifying a field" $ do
+-        it "works by itself in the embedded resource" $ do
+-          get "/process_supervisor?select=supervisor_id,...processes(count())&order=supervisor_id" `shouldRespondWith`
+-            [json|[
+-              {"supervisor_id": 1, "count": 2},
+-              {"supervisor_id": 2, "count": 2},
+-              {"supervisor_id": 3, "count": 3},
+-              {"supervisor_id": 4, "count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/process_supervisor?select=supervisor_id,...processes(processes_count:count())&order=supervisor_id" `shouldRespondWith`
+-            [json|[
+-              {"supervisor_id": 1, "processes_count": 2},
+-              {"supervisor_id": 2, "processes_count": 2},
+-              {"supervisor_id": 3, "processes_count": 3},
+-              {"supervisor_id": 4, "processes_count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-        it "works alongside other columns in the embedded resource" $ do
+-          get "/process_supervisor?select=...supervisors(id,count())&order=supervisors(id)" `shouldRespondWith`
+-            [json|[
+-              {"id": 1, "count": 2},
+-              {"id": 2, "count": 2},
+-              {"id": 3, "count": 3},
+-              {"id": 4, "count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/process_supervisor?select=...supervisors(supervisor:id,supervisor_count:count())&order=supervisors(supervisor)" `shouldRespondWith`
+-            [json|[
+-              {"supervisor": 1, "supervisor_count": 2},
+-              {"supervisor": 2, "supervisor_count": 2},
+-              {"supervisor": 3, "supervisor_count": 3},
+-              {"supervisor": 4, "supervisor_count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-        it "works on nested resources" $ do
+-          get "/process_supervisor?select=supervisor_id,...processes(...process_costs(count()))&order=supervisor_id" `shouldRespondWith`
+-            [json|[
+-              {"supervisor_id": 1, "count": 2},
+-              {"supervisor_id": 2, "count": 2},
+-              {"supervisor_id": 3, "count": 2},
+-              {"supervisor_id": 4, "count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/process_supervisor?select=supervisor:supervisor_id,...processes(...process_costs(process_costs_count:count()))&order=supervisor_id" `shouldRespondWith`
+-            [json|[
+-              {"supervisor": 1, "process_costs_count": 2},
+-              {"supervisor": 2, "process_costs_count": 2},
+-              {"supervisor": 3, "process_costs_count": 2},
+-              {"supervisor": 4, "process_costs_count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-        it "works on nested resources grouped by spreaded fields" $ do
+-          get "/process_supervisor?select=...processes(factory_id,...process_costs(count()))&order=processes(factory_id)" `shouldRespondWith`
+-            [json|[
+-              {"factory_id": 1, "count": 2},
+-              {"factory_id": 2, "count": 4},
+-              {"factory_id": 3, "count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/process_supervisor?select=...processes(factory:factory_id,...process_costs(process_costs_count:count()))&order=processes(factory)" `shouldRespondWith`
+-            [json|[
+-              {"factory": 1, "process_costs_count": 2},
+-              {"factory": 2, "process_costs_count": 4},
+-              {"factory": 3, "process_costs_count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+-        it "works on different levels of the nested resources at the same time" $
+-          get "/process_supervisor?select=...processes(factory:factory_id,processes_count:count(),...process_costs(process_costs_count:count()))&order=processes(factory)" `shouldRespondWith`
+-            [json|[
+-              {"factory": 1, "processes_count": 2, "process_costs_count": 2},
+-              {"factory": 2, "processes_count": 4, "process_costs_count": 4},
+-              {"factory": 3, "processes_count": 2, "process_costs_count": 1}]|]
+-            { matchHeaders = [matchContentTypeJson] }
+ 
+ disallowed :: SpecWith ((), Application)
+ disallowed =
+@@ -304,25 +166,3 @@ disallowed =
+         }|]
+         { matchStatus = 400
+         , matchHeaders = [matchContentTypeJson] }
+-
+-    it "prevents the use of aggregates on embedded relationships" $
+-      get "/projects?select=name,project_invoices(invoice_total.sum())" `shouldRespondWith`
+-        [json|{
+-          "hint":null,
+-          "details":null,
+-          "code":"PGRST123",
+-          "message":"Use of aggregate functions is not allowed"
+-        }|]
+-        { matchStatus = 400
+-        , matchHeaders = [matchContentTypeJson] }
+-
+-    it "prevents the use of aggregates on spread embeds" $
+-      get "/project_invoices?select=...projects(id.count())" `shouldRespondWith`
+-        [json|{
+-          "hint":null,
+-          "details":null,
+-          "code":"PGRST123",
+-          "message":"Use of aggregate functions is not allowed"
+-        }|]
+-        { matchStatus = 400
+-        , matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index f6adbdff..3a5af386 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -883,44 +883,3 @@ INSERT INTO budget_expenses VALUES (1, 200.26, 1);
+ INSERT INTO budget_expenses VALUES (2, 400.26, 3);
+ INSERT INTO budget_expenses VALUES (3, 100.22, 4);
+ INSERT INTO budget_expenses VALUES (5, 900.27, 5);
+-
+-TRUNCATE TABLE factories CASCADE;
+-INSERT INTO factories VALUES (1, 'Factory A');
+-INSERT INTO factories VALUES (2, 'Factory B');
+-INSERT INTO factories VALUES (3, 'Factory C');
+-INSERT INTO factories VALUES (4, 'Factory D');
+-
+-TRUNCATE TABLE process_categories CASCADE;
+-INSERT INTO process_categories VALUES (1, 'Batch');
+-INSERT INTO process_categories VALUES (2, 'Mass');
+-
+-TRUNCATE TABLE processes CASCADE;
+-INSERT INTO processes VALUES (1, 'Process A1', 1, 1);
+-INSERT INTO processes VALUES (2, 'Process A2', 1, 2);
+-INSERT INTO processes VALUES (3, 'Process B1', 2, 1);
+-INSERT INTO processes VALUES (4, 'Process B2', 2, 1);
+-INSERT INTO processes VALUES (5, 'Process C1', 3, 2);
+-INSERT INTO processes VALUES (6, 'Process C2', 3, 2);
+-
+-TRUNCATE TABLE process_costs CASCADE;
+-INSERT INTO process_costs VALUES (1, 150.00);
+-INSERT INTO process_costs VALUES (2, 200.00);
+-INSERT INTO process_costs VALUES (3, 180.00);
+-INSERT INTO process_costs VALUES (4, 70.00);
+-INSERT INTO process_costs VALUES (5, 120.00);
+-
+-TRUNCATE TABLE supervisors CASCADE;
+-INSERT INTO supervisors VALUES (1, 'Mary');
+-INSERT INTO supervisors VALUES (2, 'John');
+-INSERT INTO supervisors VALUES (3, 'Peter');
+-INSERT INTO supervisors VALUES (4, 'Sarah');
+-
+-TRUNCATE TABLE process_supervisor CASCADE;
+-INSERT INTO process_supervisor VALUES (1, 1);
+-INSERT INTO process_supervisor VALUES (2, 2);
+-INSERT INTO process_supervisor VALUES (3, 3);
+-INSERT INTO process_supervisor VALUES (3, 4);
+-INSERT INTO process_supervisor VALUES (4, 1);
+-INSERT INTO process_supervisor VALUES (4, 2);
+-INSERT INTO process_supervisor VALUES (5, 3);
+-INSERT INTO process_supervisor VALUES (6, 3);
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index a3b6edda..67cfd7f6 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3749,36 +3749,3 @@ after insert
+ on infinite_inserts
+ for each row
+ execute procedure infinite_inserts();
+-
+-create table factories (
+-  id int primary key,
+-  name text
+-);
+-
+-create table process_categories (
+-  id int primary key,
+-  name text
+-);
+-
+-create table processes (
+-  id int primary key,
+-  name text,
+-  factory_id int references factories(id),
+-  category_id int references process_categories(id)
+-);
+-
+-create table process_costs (
+-  process_id int references processes(id) primary key,
+-  cost numeric
+-);
+-
+-create table supervisors (
+-  id int primary key,
+-  name text
+-);
+-
+-create table process_supervisor (
+-  process_id int references processes(id),
+-  supervisor_id int references supervisors(id),
+-  primary key (process_id, supervisor_id)
+-);

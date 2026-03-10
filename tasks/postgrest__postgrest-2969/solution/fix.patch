@@ -1,0 +1,341 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f460f9cb..d6517f0c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2492, Allow full response control when raising exceptions - @taimoorzaeem, @laurenceisla
+  - #2771, Add `Server-Timing` header with JWT duration - @taimoorzaeem
+  - #2698, Add config `jwt-cache-max-lifetime` and implement JWT caching - @taimoorzaeem
++ - #2943, Add `handling=strict/lenient` for Prefer header - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index dbd74ac0..567e6fe5 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -215,6 +215,7 @@ test-suite spec
+                       Feature.Query.PgSafeUpdateSpec
+                       Feature.Query.PlanSpec
+                       Feature.Query.PostGISSpec
++                      Feature.Query.PreferencesSpec
+                       Feature.Query.QueryLimitedSpec
+                       Feature.Query.QuerySpec
+                       Feature.Query.RangeSpec
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 4d0f91a1..e4b3ca4f 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -15,6 +15,7 @@ module PostgREST.ApiRequest.Preferences
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+   , PreferTransaction(..)
++  , PreferHandling(..)
+   , fromHeaders
+   , shouldCount
+   , prefAppliedHeader
+@@ -26,7 +27,6 @@ import qualified Network.HTTP.Types.Header as HTTP
+ 
+ import Protolude
+ 
+-
+ -- $setup
+ -- Setup for doctests
+ -- >>> import Text.Pretty.Simple (pPrint)
+@@ -36,6 +36,7 @@ import Protolude
+ -- >>> deriving instance Show PreferCount
+ -- >>> deriving instance Show PreferTransaction
+ -- >>> deriving instance Show PreferMissing
++-- >>> deriving instance Show PreferHandling
+ -- >>> deriving instance Show Preferences
+ 
+ -- | Preferences recognized by the application.
+@@ -47,6 +48,8 @@ data Preferences
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+     , preferMissing        :: Maybe PreferMissing
++    , preferHandling       :: Maybe PreferHandling
++    , invalidPrefs         :: [ByteString]
+     }
+ 
+ -- |
+@@ -62,11 +65,13 @@ data Preferences
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Nothing
++--     , preferHandling = Nothing
++--     , invalidPrefs = []
+ --     }
+ --
+ -- Multiple headers can also be used:
+ --
+--- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
++-- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null"), ("Prefer", "handling=lenient"), ("Prefer", "invalid")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+@@ -74,6 +79,8 @@ data Preferences
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Just ApplyNulls
++--     , preferHandling = Just Lenient
++--     , invalidPrefs = [ "invalid" ]
+ --     }
+ --
+ -- If a preference is set more than once, only the first is used:
+@@ -91,14 +98,10 @@ data Preferences
+ -- :}
+ -- Just IgnoreDuplicates
+ --
+--- Preferences not recognized by the application are ignored:
+---
+--- >>> preferResolution $ fromHeaders True [("Prefer", "resolution=foo")]
+--- Nothing
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders True [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
++-- >>> pPrint $ fromHeaders True [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default, handling=strict, anything")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Just Full
+@@ -106,6 +109,8 @@ data Preferences
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+ --     , preferMissing = Just ApplyDefaults
++--     , preferHandling = Just Strict
++--     , invalidPrefs = [ "anything" ]
+ --     }
+ --
+ fromHeaders :: Bool -> [HTTP.Header] -> Preferences
+@@ -117,8 +122,20 @@ fromHeaders allowTxEndOverride headers =
+     , preferCount          = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction    = if allowTxEndOverride then parsePrefs [Commit, Rollback] else Nothing
+     , preferMissing        = parsePrefs [ApplyDefaults, ApplyNulls]
++    , preferHandling       = parsePrefs [Strict, Lenient]
++    , invalidPrefs         = filter (`notElem` acceptedPrefs) prefs
+     }
+   where
++    mapToHeadVal :: ToHeaderValue a => [a] -> [ByteString]
++    mapToHeadVal = map toHeaderValue
++    acceptedPrefs = mapToHeadVal [MergeDuplicates, IgnoreDuplicates] ++
++                    mapToHeadVal [Full, None, HeadersOnly] ++
++                    mapToHeadVal [SingleObject] ++
++                    mapToHeadVal [ExactCount, PlannedCount, EstimatedCount] ++
++                    mapToHeadVal [Commit, Rollback] ++
++                    mapToHeadVal [ApplyDefaults, ApplyNulls] ++
++                    mapToHeadVal [Strict, Lenient]
++
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+     prefs = fmap BS.strip . concatMap (BS.split ',' . snd) $ prefHeaders
+ 
+@@ -130,7 +147,7 @@ fromHeaders allowTxEndOverride headers =
+     prefMap = Map.fromList . fmap (\pref -> (toHeaderValue pref, pref))
+ 
+ prefAppliedHeader :: Preferences -> Maybe HTTP.Header
+-prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing } =
++prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing, preferHandling } =
+   if null prefsVals
+     then Nothing
+     else Just (HTTP.hPreferenceApplied, combined)
+@@ -143,6 +160,7 @@ prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferPar
+       , toHeaderValue <$> preferParameters
+       , toHeaderValue <$> preferCount
+       , toHeaderValue <$> preferTransaction
++      , toHeaderValue <$> preferHandling
+       ]
+ 
+ -- |
+@@ -223,3 +241,14 @@ data PreferMissing
+ instance ToHeaderValue PreferMissing where
+   toHeaderValue ApplyDefaults = "missing=default"
+   toHeaderValue ApplyNulls    = "missing=null"
++
++-- |
++-- Handling of unrecognised preferences
++data PreferHandling
++  = Strict  -- ^ Throw error on unrecognised preferences
++  | Lenient -- ^ Ignore unrecognised preferences
++  deriving Eq
++
++instance ToHeaderValue PreferHandling where
++  toHeaderValue Strict  = "handling=strict"
++  toHeaderValue Lenient = "handling=lenient"
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index fae7b993..645d4d09 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -71,6 +71,7 @@ data ApiRequestError
+   | MediaTypeError [ByteString]
+   | InvalidBody ByteString
+   | InvalidFilters
++  | InvalidPreferences [ByteString]
+   | InvalidRange RangeError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 7ce061a0..ff0b66d4 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -66,6 +66,7 @@ instance PgrstError ApiRequestError where
+   status MediaTypeError{}        = HTTP.status415
+   status InvalidBody{}           = HTTP.status400
+   status InvalidFilters          = HTTP.status405
++  status InvalidPreferences{}    = HTTP.status400
+   status InvalidRpcMethod{}      = HTTP.status405
+   status InvalidRange{}          = HTTP.status416
+   status NotFound                = HTTP.status404
+@@ -172,6 +173,11 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= ("Bad operator on the '" <> target <> "' embedded resource":: Text),
+     "details" .= ("Only is null or not is null filters are allowed on embedded resources":: Text),
+     "hint"    .= JSON.Null]
++  toJSON (InvalidPreferences prefs) = JSON.object [
++    "code"    .= ApiRequestErrorCode22,
++    "message" .= ("Invalid preferences given with handling=strict" :: Text),
++    "details" .= T.decodeUtf8 ("Invalid preferences: " <> BS.intercalate ", " prefs),
++    "hint"    .= JSON.Null]
+ 
+   toJSON (NoRelBetween parent child embedHint schema allRels) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+@@ -646,6 +652,7 @@ data ErrorCode
+   | ApiRequestErrorCode19
+   | ApiRequestErrorCode20
+   | ApiRequestErrorCode21
++  | ApiRequestErrorCode22
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -693,6 +700,7 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode19  -> "119"
+   ApiRequestErrorCode20  -> "120"
+   ApiRequestErrorCode21  -> "121"
++  ApiRequestErrorCode22  -> "122"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 5778ac09..f996c394 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -121,35 +121,37 @@ data InspectPlan = InspectPlan {
+ }
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Either Error WrappedReadPlan
+-wrappedReadPlan  identifier conf sCache apiRequest = do
++wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+-  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf iAction iPathInfo iAcceptMediaType
+   binField <- mapLeft ApiRequestError $ binaryField conf mediaType Nothing rPlan
++  if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+   return $ WrappedReadPlan rPlan SQL.Read (mediaToAggregate mediaType binField apiRequest) mediaType
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error MutateReadPlan
+-mutateReadPlan  mutation apiRequest identifier conf sCache = do
++mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+   rPlan <- readPlan identifier conf sCache apiRequest
+   mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
+-  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf iAction iPathInfo iAcceptMediaType
+   binField <- mapLeft ApiRequestError $ binaryField conf mediaType Nothing rPlan
++  if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+   return $ MutateReadPlan rPlan mPlan SQL.Write (mediaToAggregate mediaType binField apiRequest) mediaType
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+-callReadPlan identifier conf sCache apiRequest invMethod = do
++callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} invMethod = do
+   let paramKeys = case invMethod of
+         InvGet  -> S.fromList $ fst <$> qsParams'
+         InvHead -> S.fromList $ fst <$> qsParams'
+-        InvPost -> iColumns apiRequest
++        InvPost -> iColumns
+   proc@Function{..} <- mapLeft ApiRequestError $
+-    findProc identifier paramKeys (preferParameters == Just SingleObject) (dbRoutines sCache) (iContentMediaType apiRequest) (invMethod == InvPost)
++    findProc identifier paramKeys (preferParameters == Just SingleObject) (dbRoutines sCache) iContentMediaType (invMethod == InvPost)
+   let relIdentifier = QualifiedIdentifier pdSchema (fromMaybe pdName $ Routine.funcTableName proc) -- done so a set returning function can embed other relations
+   rPlan <- readPlan relIdentifier conf sCache apiRequest
+-  let args = case (invMethod, iContentMediaType apiRequest) of
++  let args = case (invMethod, iContentMediaType) of
+         (InvGet, _)             -> jsonRpcParams proc qsParams'
+         (InvHead, _)            -> jsonRpcParams proc qsParams'
+-        (InvPost, MTUrlEncoded) -> maybe mempty (jsonRpcParams proc . payArray) $ iPayload apiRequest
+-        (InvPost, _)            -> maybe mempty payRaw $ iPayload apiRequest
++        (InvPost, MTUrlEncoded) -> maybe mempty (jsonRpcParams proc . payArray) iPayload
++        (InvPost, _)            -> maybe mempty payRaw iPayload
+       txMode = case (invMethod, pdVolatility) of
+           (InvGet,  _)                 -> SQL.Read
+           (InvHead, _)                 -> SQL.Read
+@@ -157,12 +159,12 @@ callReadPlan identifier conf sCache apiRequest invMethod = do
+           (InvPost, Routine.Immutable) -> SQL.Read
+           (InvPost, Routine.Volatile)  -> SQL.Write
+       cPlan = callPlan proc apiRequest paramKeys args rPlan
+-  mediaType <- mapLeft ApiRequestError $ negotiateContent conf (iAction apiRequest) (iPathInfo apiRequest) (iAcceptMediaType apiRequest)
++  mediaType <- mapLeft ApiRequestError $ negotiateContent conf iAction iPathInfo iAcceptMediaType
+   binField <- mapLeft ApiRequestError $ binaryField conf mediaType (Just proc) rPlan
++  if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+   return $ CallReadPlan rPlan cPlan txMode proc (mediaToAggregate mediaType binField apiRequest) mediaType
+   where
+-    Preferences{..} = iPreferences apiRequest
+-    qsParams' = QueryParams.qsParams (iQueryParams apiRequest)
++    qsParams' = QueryParams.qsParams iQueryParams
+ 
+ inspectPlan :: AppConfig -> ApiRequest -> Either Error InspectPlan
+ inspectPlan conf apiRequest = do
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 4f810058..77ecc385 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -86,7 +86,7 @@ readResponse WrappedReadPlan{wrMedia} headersOnly identifier ctxApiRequest@ApiRe
+     RSStandard{..} -> do
+       let
+         (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing
++        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing preferHandling []
+         headers =
+           [ contentRange
+           , ( "Content-Location"
+@@ -118,7 +118,7 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctx
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+       prefHeader = prefAppliedHeader $
+         Preferences (if null pkCols && isNothing (qsOnConflict iQueryParams) then Nothing else preferResolution)
+-        preferRepresentation Nothing preferCount preferTransaction preferMissing
++        preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling []
+       headers =
+         catMaybes
+           [ if null rsLocation then
+@@ -155,7 +155,7 @@ updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing
++      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling []
+       headers = catMaybes [contentRangeHeader, prefHeader] ++ serverTimingHeader serverTimingParams
+ 
+     let
+@@ -175,7 +175,7 @@ singleUpsertResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Maybe Serve
+ singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet serverTimingParams = case resultSet of
+   RSStandard {..} -> do
+     let
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling []
+       sTHeader = serverTimingHeader serverTimingParams
+       cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+@@ -198,7 +198,7 @@ deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+       contentRangeHeader =
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling []
+       headers = contentRangeHeader : prefHeader ++ serverTimingHeader serverTimingParams
+ 
+     let (status, headers', body) =
+@@ -251,7 +251,7 @@ invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPr
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing preferHandling []
+       headers = contentRange : prefHeader ++ serverTimingHeader serverTimingParams
+ 
+     let (status', headers', body) =

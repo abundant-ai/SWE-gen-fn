@@ -1,0 +1,1685 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 780317cc..8ed00daf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,22 +5,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Added
+-
+- - #2523, Data representations - @aljungberg
+-   + Allows for flexible API output formatting and input parsing on a per-column type basis using regular SQL functions configured in the database
+-   + Enables greater flexibility in the form and shape of your APIs, both for output and input, making PostgREST a more versatile general-purpose API server
+-   + Examples include base64 encode/decode your binary data (like a `bytea` column containing an image), choose whether to present a timestamp column as seconds since the Unix epoch or as an ISO 8601 string, or represent fixed precision decimals as strings, not doubles, to preserve precision
+-   + ...and accept the same in `POST/PUT/PATCH` by configuring the reverse transformation(s)
+-   + Other use-cases include custom representation of enums, arrays, nested objects, CSS hex colour strings, gzip compressed fields, metric to imperial conversions, and much more
+-   + Works when using the `select` parameter to select only a subset of columns, embedding through complex joins, renaming fields, with views and computed columns
+-   + Works when filtering on a formatted column without extra indexes by parsing to the canonical representation
+-   + Works for data `RETURNING` operations, such as requesting the full body in a POST/PUT/PATCH with `Prefer: return=representation`
+-   + Works for batch updates and inserts
+-   + Completely optional, define the functions in the database and they will be used automatically everywhere
+-   + Data representations preserve the ability to write to the original column and require no extra storage or complex triggers (compared to using `GENERATED ALWAYS` columns)
+-   + Note: data representations require Postgres 10 (Postgres 11 if using `IN` predicates); data representations are not implemented for RPC
+-
+ ### Fixed
+ 
+  - #2821, Fix OPTIONS not accepting all available media types - @steve-chavez
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 8e279426..3dd45893 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -49,7 +49,6 @@ library
+                       PostgREST.SchemaCache.Identifiers
+                       PostgREST.SchemaCache.Routine
+                       PostgREST.SchemaCache.Relationship
+-                      PostgREST.SchemaCache.Representations
+                       PostgREST.SchemaCache.Table
+                       PostgREST.Error
+                       PostgREST.Logger
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index acd7bb09..b5429083 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -25,9 +25,9 @@ module PostgREST.Plan
+   , inspectPlanTxMode
+   ) where
+ 
++
+ import qualified Data.ByteString.Lazy          as LBS
+ import qualified Data.HashMap.Strict           as HM
+-import qualified Data.HashMap.Strict.InsOrd    as HMI
+ import qualified Data.List                     as L
+ import qualified Data.Set                      as S
+ import qualified PostgREST.SchemaCache.Routine as Routine
+@@ -36,39 +36,34 @@ import Data.Either.Combinators (mapLeft, mapRight)
+ import Data.List               (delete)
+ import Data.Tree               (Tree (..))
+ 
+-import PostgREST.ApiRequest                  (Action (..),
+-                                              ApiRequest (..),
+-                                              InvokeMethod (..),
+-                                              Mutation (..),
+-                                              Payload (..))
+-import PostgREST.Config                      (AppConfig (..))
+-import PostgREST.Error                       (Error (..))
+-import PostgREST.MediaType                   (MediaType (..))
+-import PostgREST.Query.SqlFragment           (sourceCTEName)
+-import PostgREST.RangeQuery                  (NonnegRange, allRange,
+-                                              convertToLimitZeroRange,
+-                                              restrictRange)
+-import PostgREST.SchemaCache                 (SchemaCache (..))
+-import PostgREST.SchemaCache.Identifiers     (FieldName,
+-                                              QualifiedIdentifier (..),
+-                                              Schema)
+-import PostgREST.SchemaCache.Relationship    (Cardinality (..),
+-                                              Junction (..),
+-                                              Relationship (..),
+-                                              RelationshipsMap,
+-                                              relIsToOne)
+-import PostgREST.SchemaCache.Representations (DataRepresentation (..),
+-                                              RepresentationsMap)
+-import PostgREST.SchemaCache.Routine         (Routine (..),
+-                                              RoutineMap,
+-                                              RoutineParam (..),
+-                                              funcReturnsCompositeAlias,
+-                                              funcReturnsScalar,
+-                                              funcReturnsSetOfScalar)
+-import PostgREST.SchemaCache.Table           (Column (..), Table (..),
+-                                              TablesMap,
+-                                              tableColumnsList,
+-                                              tablePKCols)
++import PostgREST.ApiRequest               (Action (..),
++                                           ApiRequest (..),
++                                           InvokeMethod (..),
++                                           Mutation (..),
++                                           Payload (..))
++import PostgREST.Config                   (AppConfig (..))
++import PostgREST.Error                    (Error (..))
++import PostgREST.MediaType                (MediaType (..))
++import PostgREST.Query.SqlFragment        (sourceCTEName)
++import PostgREST.RangeQuery               (NonnegRange, allRange,
++                                           convertToLimitZeroRange,
++                                           restrictRange)
++import PostgREST.SchemaCache              (SchemaCache (..))
++import PostgREST.SchemaCache.Identifiers  (FieldName,
++                                           QualifiedIdentifier (..),
++                                           Schema)
++import PostgREST.SchemaCache.Relationship (Cardinality (..),
++                                           Junction (..),
++                                           Relationship (..),
++                                           RelationshipsMap,
++                                           relIsToOne)
++import PostgREST.SchemaCache.Routine      (Routine (..), RoutineMap,
++                                           RoutineParam (..),
++                                           funcReturnsCompositeAlias,
++                                           funcReturnsScalar,
++                                           funcReturnsSetOfScalar)
++import PostgREST.SchemaCache.Table        (Table (tableName),
++                                           tablePKCols)
+ 
+ import PostgREST.ApiRequest.Preferences
+ import PostgREST.ApiRequest.Types
+@@ -202,93 +197,26 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentMediaType isInvPo
+ inspectPlanTxMode :: SQL.Mode
+ inspectPlanTxMode = SQL.Read
+ 
+--- | During planning we need to resolve Field -> CoercibleField (finding the context specific target type and map function).
+--- | ResolverContext facilitates this without the need to pass around a laundry list of parameters.
+-data ResolverContext = ResolverContext
+-  { tables          :: TablesMap
+-  , representations :: RepresentationsMap
+-  , qi              :: QualifiedIdentifier  -- ^ The table we're currently attending; changes as we recurse into joins etc.
+-  , outputType      :: Text                 -- ^ The output type for the response payload; e.g. "csv", "json", "binary".
+-  }
+-
+-resolveColumnField :: Column -> CoercibleField
+-resolveColumnField col = CoercibleField (colName col) mempty (colNominalType col) Nothing (colDefault col)
+-
+-resolveTableFieldName :: Table -> FieldName -> CoercibleField
+-resolveTableFieldName table fieldName =
+-  fromMaybe (unknownField fieldName []) $ HMI.lookup fieldName (tableColumns table) >>=
+-    Just . resolveColumnField
+-
+-resolveTableField :: Table -> Field -> CoercibleField
+-resolveTableField table (fieldName, []) = resolveTableFieldName table fieldName
+--- If the field is known and a JSON path is given, always assume the JSON type. But don't assume a type for entirely unknown fields.
+-resolveTableField table (fieldName, jp) =
+-  case resolveTableFieldName table fieldName of
+-    cf@CoercibleField{cfIRType=""} -> cf{cfJsonPath=jp}
+-    cf                             -> cf{cfJsonPath=jp, cfIRType="json"}
+-
+--- | Resolve a type within the context based on the given field name and JSON path. Although there are situations where failure to resolve a field is considered an error (see `resolveOrError`), there are also situations where we allow it (RPC calls). If it should be an error and `resolveOrError` doesn't fit, ensure to check the `cfIRType` isn't empty.
+-resolveTypeOrUnknown :: ResolverContext -> Field -> CoercibleField
+-resolveTypeOrUnknown ResolverContext{..} field@(fn, jp) =
+-  fromMaybe (unknownField fn jp) $ HM.lookup qi tables >>=
+-    Just . flip resolveTableField field
+-
+--- | Install any pre-defined data representation from source to target to coerce this reference.
+---
+--- Note that we change the IR type here. This might seem unintuitive. The short of it is that for a CoercibleField without a transformer, input type == output type. A transformer maps from a -> b, so by definition the input type will be a and the output type b after. And cfIRType is the *input* type.
+---
+--- It might feel odd that once a transformer is added we 'forget' the target type (because now a /= b). You might also note there's no obvious way to stack transforms (even if there was a stack, you erased what type you're working with so it's awkward). Alas as satisfying as it would be to engineer a layered mapping system with full type information, we just don't need it.
+-withTransformer :: ResolverContext -> Text -> Text -> CoercibleField -> CoercibleField
+-withTransformer ResolverContext{representations} sourceType targetType field =
+-  fromMaybe field $ HM.lookup (sourceType, targetType) representations >>=
+-    (\fieldRepresentation -> Just field{cfIRType=sourceType, cfTransform=Just (drFunction fieldRepresentation)})
+-
+--- | Map the intermediate representation type to the output type, if available.
+-withOutputFormat :: ResolverContext -> CoercibleField -> CoercibleField
+-withOutputFormat ctx@ResolverContext{outputType} field@CoercibleField{cfIRType} = withTransformer ctx cfIRType outputType field
+-
+--- | Map text into the intermediate representation type, if available.
+-withTextParse :: ResolverContext -> CoercibleField -> CoercibleField
+-withTextParse ctx field@CoercibleField{cfIRType} = withTransformer ctx "text" cfIRType field
+-
+--- | Map json into the intermediate representation type, if available.
+-withJsonParse :: ResolverContext -> CoercibleField -> CoercibleField
+-withJsonParse ctx field@CoercibleField{cfIRType} = withTransformer ctx "json" cfIRType field
+-
+--- | Map the intermediate representation type to the output type defined by the resolver context (normally json), if available.
+-resolveOutputField :: ResolverContext -> Field -> CoercibleField
+-resolveOutputField ctx field = withOutputFormat ctx $ resolveTypeOrUnknown ctx field
+-
+--- | Map the query string format of a value (text) into the intermediate representation type, if available.
+-resolveQueryInputField :: ResolverContext -> Field -> CoercibleField
+-resolveQueryInputField ctx field = withTextParse ctx $ resolveTypeOrUnknown ctx field
+-
+ -- | Builds the ReadPlan tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+ readPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Either Error ReadPlanTree
+-readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbTables, dbRelationships, dbRepresentations} apiRequest  =
+-  let
+-    -- JSON output format hardcoded for now. In the future we might want to support other output mappings such as CSV.
+-    ctx = ResolverContext dbTables dbRepresentations qi "json"
+-  in
+-    mapLeft ApiRequestError $
+-    treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
+-    addNullEmbedFilters =<<
+-    validateSpreadEmbeds =<<
+-    addRelatedOrders =<<
+-    addDataRepresentationAliases =<<
+-    expandStarsForDataRepresentations ctx =<<
+-    addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
+-    addLogicTrees ctx apiRequest =<<
+-    addRanges apiRequest =<<
+-    addOrders apiRequest =<<
+-    addFilters ctx apiRequest (initReadRequest ctx $ QueryParams.qsSelect $ iQueryParams apiRequest)
++readPlan qi@QualifiedIdentifier{..} AppConfig{configDbMaxRows} SchemaCache{dbRelationships} apiRequest  =
++  mapLeft ApiRequestError $
++  treeRestrictRange configDbMaxRows (iAction apiRequest) =<<
++  addNullEmbedFilters =<<
++  validateSpreadEmbeds =<<
++  addRelatedOrders =<<
++  addRels qiSchema (iAction apiRequest) dbRelationships Nothing =<<
++  addLogicTrees apiRequest =<<
++  addRanges apiRequest =<<
++  addOrders apiRequest =<<
++  addFilters apiRequest (initReadRequest qi $ QueryParams.qsSelect $ iQueryParams apiRequest)
+ 
+ -- Build the initial read plan tree
+-initReadRequest :: ResolverContext -> [Tree SelectItem] -> ReadPlanTree
+-initReadRequest ctx@ResolverContext{qi=QualifiedIdentifier{..}} =
+-  foldr (treeEntry rootDepth) $ Node defReadPlan{from=qi ctx, relName=qiName, depth=rootDepth} []
++initReadRequest :: QualifiedIdentifier -> [Tree SelectItem] -> ReadPlanTree
++initReadRequest qi@QualifiedIdentifier{..} =
++  foldr (treeEntry rootDepth) $ Node defReadPlan{from=qi, relName=qiName, depth=rootDepth} []
+   where
+     rootDepth = 0
+     defReadPlan = ReadPlan [] (QualifiedIdentifier mempty mempty) Nothing [] [] allRange mempty Nothing [] Nothing mempty Nothing Nothing False rootDepth
+@@ -307,49 +235,7 @@ initReadRequest ctx@ResolverContext{qi=QualifiedIdentifier{..}} =
+             (Node defReadPlan{from=QualifiedIdentifier qiSchema selRelation, relName=selRelation, relHint=selHint, relJoinType=selJoinType, depth=nxtDepth, relIsSpread=True} [])
+             fldForest:rForest
+         SelectField{..} ->
+-          Node q{select=(resolveOutputField ctx{qi=from q} selField, selCast, selAlias):select q} rForest
+-
+--- | Preserve the original field name if data representation is used to coerce the value.
+-addDataRepresentationAliases :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addDataRepresentationAliases rPlanTree = Right $ fmap (\rPlan@ReadPlan{select=sel} -> rPlan{select=map aliasSelectItem sel}) rPlanTree
+-  where
+-    aliasSelectItem :: (CoercibleField, Maybe Cast, Maybe Alias) -> (CoercibleField, Maybe Cast, Maybe Alias)
+-    -- If there already is an alias, don't overwrite it.
+-    aliasSelectItem (fld@(CoercibleField{cfName=fieldName, cfTransform=(Just _)}), Nothing, Nothing) = (fld, Nothing, Just fieldName)
+-    aliasSelectItem fld = fld
+-
+-knownColumnsInContext :: ResolverContext -> [Column]
+-knownColumnsInContext ResolverContext{..} =
+-  fromMaybe [] $ HM.lookup qi tables >>=
+-  Just . tableColumnsList
+-
+--- | Expand "select *" into explicit field names of the table, if necessary to apply data representations.
+-expandStarsForDataRepresentations :: ResolverContext -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-expandStarsForDataRepresentations ctx@ResolverContext{qi} rPlanTree = Right $ fmap expandStars rPlanTree
+-  where
+-    expandStars :: ReadPlan -> ReadPlan
+-    -- When the schema is "" and the table is the source CTE, we assume the true source table is given in the from
+-    -- alias and belongs to the request schema. See the bit in `addRels` with `newFrom = ...`.
+-    expandStars rPlan@ReadPlan{from=(QualifiedIdentifier "" "pgrst_source"), fromAlias=(Just tblAlias)} =
+-      expandStarsForTable ctx{qi=qi{qiName=tblAlias}} rPlan
+-    expandStars rPlan@ReadPlan{from=fromTable} =
+-      expandStarsForTable ctx{qi=fromTable} rPlan
+-
+-expandStarsForTable :: ResolverContext -> ReadPlan -> ReadPlan
+-expandStarsForTable ctx@ResolverContext{representations, outputType} rplan@ReadPlan{select=selectItems} =
+-  -- If we have a '*' select AND the target table has at least one data representation, expand.
+-  if ("*" `elem` map (\(field, _, _) -> cfName field) selectItems) && any hasOutputRep knownColumns
+-    then rplan{select=concatMap (expandStarSelectItem knownColumns) selectItems}
+-    else rplan
+-  where
+-    knownColumns = knownColumnsInContext ctx
+-
+-    hasOutputRep :: Column -> Bool
+-    hasOutputRep col = HM.member (colNominalType col, outputType) representations
+-
+-    expandStarSelectItem :: [Column] -> (CoercibleField, Maybe Cast, Maybe Alias) -> [(CoercibleField, Maybe Cast, Maybe Alias)]
+-    expandStarSelectItem columns (CoercibleField{cfName="*", cfJsonPath=[]}, b, c) = map (\col -> (withOutputFormat ctx $ resolveColumnField col, b, c)) columns
+-    expandStarSelectItem _ selectItem = [selectItem]
++          Node q{select=(selField, selCast, selAlias):select q} rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+ treeRestrictRange :: Maybe Integer -> Action -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -504,8 +390,8 @@ findRel schema allRels origin target hint =
+             )
+       ) $ fromMaybe mempty $ HM.lookup (QualifiedIdentifier schema origin, schema) allRels
+ 
+-addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addFilters ctx ApiRequest{..} rReq =
++addFilters :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addFilters ApiRequest{..} rReq =
+   foldr addFilterToNode (Right rReq) flts
+   where
+     QueryParams.QueryParams{..} = iQueryParams
+@@ -517,7 +403,7 @@ addFilters ctx ApiRequest{..} rReq =
+ 
+     addFilterToNode :: (EmbedPath, Filter) -> Either ApiRequestError ReadPlanTree ->  Either ApiRequestError ReadPlanTree
+     addFilterToNode =
+-      updateNode (\flt (Node q@ReadPlan{from=fromTable, where_=lf} f) -> Node q{ReadPlan.where_=addFilterToLogicForest (resolveFilter ctx{qi=fromTable} flt) lf}  f)
++      updateNode (\flt (Node q@ReadPlan{where_=lf} f) -> Node q{ReadPlan.where_=addFilterToLogicForest flt lf}  f)
+ 
+ addOrders :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addOrders ApiRequest{..} rReq =
+@@ -561,15 +447,15 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=oldLogic} forest) = do
+   newLogic <- getFilters readPlans `traverse` oldLogic
+   Node rp{ReadPlan.where_= newLogic} <$> (addNullEmbedFilters `traverse` forest)
+   where
+-    getFilters :: [ReadPlan] -> CoercibleLogicTree -> Either ApiRequestError CoercibleLogicTree
+-    getFilters rPlans (CoercibleExpr b lOp trees) = CoercibleExpr b lOp <$> (getFilters rPlans `traverse` trees)
+-    getFilters rPlans flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _) opExpr)) =
++    getFilters :: [ReadPlan] -> LogicTree -> Either ApiRequestError LogicTree
++    getFilters rPlans (Expr b lOp trees) = Expr b lOp <$> (getFilters rPlans `traverse` trees)
++    getFilters rPlans flt@(Stmnt (Filter (fld, []) opExpr)) =
+       let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+       case (foundRP, opExpr) of
+-        (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
++        (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ Stmnt $ FilterNullEmbed b relAggAlias
+         (Just ReadPlan{relName}, _)                         -> Left $ UnacceptableFilter relName
+         _                                                   -> Right flt
+-    getFilters _ flt@(CoercibleStmnt _)        = Right flt
++    getFilters _ flt@(Stmnt _)        = Right flt
+ 
+ addRanges :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addRanges ApiRequest{..} rReq =
+@@ -583,22 +469,14 @@ addRanges ApiRequest{..} rReq =
+     addRangeToNode :: (EmbedPath, NonnegRange) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+     addRangeToNode = updateNode (\r (Node q f) -> Node q{range_=r} f)
+ 
+-addLogicTrees :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-addLogicTrees ctx ApiRequest{..} rReq =
++addLogicTrees :: ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
++addLogicTrees ApiRequest{..} rReq =
+   foldr addLogicTreeToNode (Right rReq) qsLogic
+   where
+     QueryParams.QueryParams{..} = iQueryParams
+ 
+     addLogicTreeToNode :: (EmbedPath, LogicTree) -> Either ApiRequestError ReadPlanTree -> Either ApiRequestError ReadPlanTree
+-    addLogicTreeToNode = updateNode (\t (Node q@ReadPlan{from=fromTable, where_=lf} f) -> Node q{ReadPlan.where_=resolveLogicTree ctx{qi=fromTable} t:lf} f)
+-
+-resolveLogicTree :: ResolverContext -> LogicTree -> CoercibleLogicTree
+-resolveLogicTree ctx (Stmnt flt) = CoercibleStmnt $ resolveFilter ctx flt
+-resolveLogicTree ctx (Expr b op lts) = CoercibleExpr b op (map (resolveLogicTree ctx) lts)
+-
+-resolveFilter :: ResolverContext -> Filter -> CoercibleFilter
+-resolveFilter ctx (Filter fld opExpr) = CoercibleFilter{field=resolveQueryInputField ctx fld, opExpr=opExpr}
+-resolveFilter _ (FilterNullEmbed isNot fieldName) = CoercibleFilterNullEmbed isNot fieldName
++    addLogicTreeToNode = updateNode (\t (Node q@ReadPlan{where_=lf} f) -> Node q{ReadPlan.where_=t:lf} f)
+ 
+ -- Validates that spread embeds are only done on to-one relationships
+ validateSpreadEmbeds :: ReadPlanTree -> Either ApiRequestError ReadPlanTree
+@@ -624,7 +502,7 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+     findNode = find (\(Node ReadPlan{relName, relAlias} _) -> relName == targetNodeName || relAlias == Just targetNodeName) forest
+ 
+ mutatePlan :: Mutation -> QualifiedIdentifier -> ApiRequest -> SchemaCache -> ReadPlanTree -> Either Error MutatePlan
+-mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{dbTables, dbRepresentations} readReq = mapLeft ApiRequestError $
++mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} sCache readReq = mapLeft ApiRequestError $
+   case mutation of
+     MutationCreate ->
+       mapRight (\typedColumns -> Insert qi typedColumns body ((,) <$> preferResolution <*> Just confCols) [] returnings pkCols applyDefaults) typedColumnsOrError
+@@ -642,28 +520,27 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+           Left InvalidFilters
+     MutationDelete -> Right $ Delete qi combinedLogic iTopLevelRange rootOrder returnings
+   where
+-    ctx = ResolverContext dbTables dbRepresentations qi "json"
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+     returnings =
+       if preferRepresentation == None
+         then []
+         else inferColsEmbedNeeds readReq pkCols
+-    tbl = HM.lookup qi dbTables
+-    pkCols = maybe mempty tablePKCols tbl
+-    logic = map (resolveLogicTree ctx . snd) qsLogic
++    pkCols = maybe mempty tablePKCols $ HM.lookup qi $ dbTables sCache
++    logic = map snd qsLogic
+     rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+-    combinedLogic = foldr (addFilterToLogicForest . resolveFilter ctx) logic qsFiltersRoot
++    combinedLogic = foldr addFilterToLogicForest logic qsFiltersRoot
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
++    tbl = HM.lookup qi $ dbTables sCache
++    typedColumnsOrError = resolveOrError tbl `traverse` S.toList iColumns
+     applyDefaults = preferMissing == Just ApplyDefaults
+-    typedColumnsOrError = resolveOrError ctx tbl `traverse` S.toList iColumns
+ 
+-resolveOrError :: ResolverContext -> Maybe Table -> FieldName -> Either ApiRequestError CoercibleField
+-resolveOrError _ Nothing _ = Left NotFound
+-resolveOrError ctx (Just table) field =
+-  case resolveTableFieldName table field of
+-    CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+-    cf                          -> Right $ withJsonParse ctx cf
++resolveOrError :: Maybe Table -> FieldName -> Either ApiRequestError TypedField
++resolveOrError Nothing _ = Left NotFound
++resolveOrError (Just table) field =
++  case resolveTableField table field of
++    Nothing         -> Left $ ColumnNotFound (tableName table) field
++    Just typedField -> Right typedField
+ 
+ callPlan :: Routine -> ApiRequest -> S.Set FieldName -> LBS.ByteString -> ReadPlanTree -> CallPlan
+ callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq = FunctionCall {
+@@ -692,7 +569,7 @@ inferColsEmbedNeeds (Node ReadPlan{select} forest) pkCols
+   | "*" `elem` fldNames = ["*"]
+   | otherwise           = returnings
+   where
+-    fldNames = cfName . (\(f, _, _) -> f) <$> select
++    fldNames = (\((fld, _), _, _) -> fld) <$> select
+     -- Without fkCols, when a mutatePlan to
+     -- /projects?select=name,clients(name) occurs, the RETURNING SQL part would
+     -- be `RETURNING name`(see QueryBuilder).  This would make the embedding
+@@ -731,8 +608,8 @@ inferColsEmbedNeeds (Node ReadPlan{select} forest) pkCols
+ 
+ -- Traditional filters(e.g. id=eq.1) are added as root nodes of the LogicTree
+ -- they are later concatenated with AND in the QueryBuilder
+-addFilterToLogicForest :: CoercibleFilter -> [CoercibleLogicTree] -> [CoercibleLogicTree]
+-addFilterToLogicForest flt lf = CoercibleStmnt flt : lf
++addFilterToLogicForest :: Filter -> [LogicTree] -> [LogicTree]
++addFilterToLogicForest flt lf = Stmnt flt : lf
+ 
+ -- | If raw(binary) output is requested, check that MediaType is one of the
+ -- admitted rawMediaTypes and that`?select=...` contains only one field other
+@@ -761,6 +638,6 @@ binaryField AppConfig{configRawMediaTypes} acceptMediaType proc rpTree
+       _                        -> False
+ 
+     fstFieldName :: ReadPlanTree -> Maybe FieldName
+-    fstFieldName (Node ReadPlan{select=(CoercibleField{cfName="*", cfJsonPath=[]}, _, _):_} [])  = Nothing
+-    fstFieldName (Node ReadPlan{select=[(CoercibleField{cfName=fld, cfJsonPath=[]}, _, _)]} [])  = Just fld
++    fstFieldName (Node ReadPlan{select=(("*", []), _, _):_} [])  = Nothing
++    fstFieldName (Node ReadPlan{select=[((fld, []), _, _)]} []) = Just fld
+     fstFieldName _                                               = Nothing
+diff --git a/src/PostgREST/Plan/MutatePlan.hs b/src/PostgREST/Plan/MutatePlan.hs
+index 42ba07a5..ffb0b8e5 100644
+--- a/src/PostgREST/Plan/MutatePlan.hs
++++ b/src/PostgREST/Plan/MutatePlan.hs
+@@ -6,9 +6,8 @@ where
+ import qualified Data.ByteString.Lazy as LBS
+ 
+ import PostgREST.ApiRequest.Preferences  (PreferResolution)
+-import PostgREST.ApiRequest.Types        (OrderTerm)
+-import PostgREST.Plan.Types              (CoercibleField,
+-                                          CoercibleLogicTree)
++import PostgREST.ApiRequest.Types        (LogicTree, OrderTerm)
++import PostgREST.Plan.Types              (TypedField)
+ import PostgREST.RangeQuery              (NonnegRange)
+ import PostgREST.SchemaCache.Identifiers (FieldName,
+                                           QualifiedIdentifier)
+@@ -19,19 +18,19 @@ import Protolude
+ data MutatePlan
+   = Insert
+       { in_        :: QualifiedIdentifier
+-      , insCols    :: [CoercibleField]
++      , insCols    :: [TypedField]
+       , insBody    :: Maybe LBS.ByteString
+       , onConflict :: Maybe (PreferResolution, [FieldName])
+-      , where_     :: [CoercibleLogicTree]
++      , where_     :: [LogicTree]
+       , returning  :: [FieldName]
+       , insPkCols  :: [FieldName]
+       , applyDefs  :: Bool
+       }
+   | Update
+       { in_       :: QualifiedIdentifier
+-      , updCols   :: [CoercibleField]
++      , updCols   :: [TypedField]
+       , updBody   :: Maybe LBS.ByteString
+-      , where_    :: [CoercibleLogicTree]
++      , where_    :: [LogicTree]
+       , mutRange  :: NonnegRange
+       , mutOrder  :: [OrderTerm]
+       , returning :: [FieldName]
+@@ -39,7 +38,7 @@ data MutatePlan
+       }
+   | Delete
+       { in_       :: QualifiedIdentifier
+-      , where_    :: [CoercibleLogicTree]
++      , where_    :: [LogicTree]
+       , mutRange  :: NonnegRange
+       , mutOrder  :: [OrderTerm]
+       , returning :: [FieldName]
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index 4cf8a8ce..94e181ca 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -6,11 +6,9 @@ module PostgREST.Plan.ReadPlan
+ 
+ import Data.Tree (Tree (..))
+ 
+-import PostgREST.ApiRequest.Types         (Alias, Cast, Depth, Hint,
+-                                           JoinType, NodeName,
+-                                           OrderTerm)
+-import PostgREST.Plan.Types               (CoercibleField (..),
+-                                           CoercibleLogicTree)
++import PostgREST.ApiRequest.Types         (Alias, Cast, Depth, Field,
++                                           Hint, JoinType, LogicTree,
++                                           NodeName, OrderTerm)
+ import PostgREST.RangeQuery               (NonnegRange)
+ import PostgREST.SchemaCache.Identifiers  (FieldName,
+                                            QualifiedIdentifier)
+@@ -28,10 +26,10 @@ data JoinCondition =
+   deriving (Eq)
+ 
+ data ReadPlan = ReadPlan
+-  { select       :: [(CoercibleField, Maybe Cast, Maybe Alias)]
++  { select       :: [(Field, Maybe Cast, Maybe Alias)]
+   , from         :: QualifiedIdentifier
+   , fromAlias    :: Maybe Alias
+-  , where_       :: [CoercibleLogicTree]
++  , where_       :: [LogicTree]
+   , order        :: [OrderTerm]
+   , range_       :: NonnegRange
+   , relName      :: NodeName
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index f201ae50..ca53611a 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -1,50 +1,24 @@
+ module PostgREST.Plan.Types
+-  ( CoercibleField(..)
+-  , unknownField
+-  , CoercibleLogicTree(..)
+-  , CoercibleFilter(..)
+-  , TransformerProc
++  ( TypedField(..)
++  , resolveTableField
+   ) where
+ 
+-import PostgREST.ApiRequest.Types (JsonPath, LogicOperator, OpExpr)
++import qualified Data.HashMap.Strict.InsOrd as HMI
+ 
+ import PostgREST.SchemaCache.Identifiers (FieldName)
++import PostgREST.SchemaCache.Table       (Column (..), Table (..))
+ 
+ import Protolude
+ 
+-type TransformerProc = Text
+-
+--- | A CoercibleField pairs the name of a query element with any type coercion information we need for some specific use case.
+--- |
+--- | As suggested by the name, it's often a reference to a field in a table but really it can be any nameable element (function parameter, calculation with an alias, etc) with a knowable type.
+--- |
+--- | In the simplest case, it allows us to parse JSON payloads with `json_to_recordset`, for which we need to know both the name and the type of each thing we'd like to extract. At a higher level, CoercibleField generalises to reflect that any value we work with in a query may need type specific handling.
+--- |
+--- | CoercibleField is the foundation for the Data Representations feature. This feature allow user-definable mappings between database types so that the same data can be presented or interpreted in various ways as needed. Sometimes the way Postgres coerces data implicitly isn't right for the job. Different mappings might be appropriate for different situations: parsing a filter from a query string requires one function (text -> field type) while parsing a payload from JSON takes another (json -> field type). And the reverse, outputting a field as JSON, requires yet a third (field type -> json). CoercibleField is that "job specific" reference to an element paired with the type we desire for that particular purpose and the function we'll use to get there, if any.
+--- |
+--- | In the planning phase, we "resolve" generic named elements into these specialised CoercibleFields. Again this is context specific: two different CoercibleFields both representing the exact same table column in the database, even in the same query, might have two different target types and mapping functions. For example, one might represent a column in a filter, and another the very same column in an output role to be sent in the response body.
+--- |
+--- | The type value is allowed to be the empty string. The analog here is soft type checking in programming languages: sometimes we don't need a variable to have a specified type and things will work anyhow. So the empty type variant is valid when we don't know and *don't need to know* about the specific type in some context. Note that this variation should not be used if it guarantees failure: in that case you should instead raise an error at the planning stage and bail out. For example, we can't parse JSON with `json_to_recordset` without knowing the types of each recipient field, and so error out. Using the empty string for the type would be incorrect and futile. On the other hand we use the empty type for RPC calls since type resolution isn't implemented for RPC, but it's fine because the query still works with Postgres' implicit coercion. In the future, hopefully we will support data representations across the board and then the empty type may be permanently retired.
+-data CoercibleField = CoercibleField
+-  { cfName      :: FieldName
+-  , cfJsonPath  :: JsonPath
+-  , cfIRType    :: Text                  -- ^ The native Postgres type of the field, the intermediate (IR) type before mapping.
+-  , cfTransform :: Maybe TransformerProc -- ^ The optional mapping from irType -> targetType.
+-  , cfDefault   :: Maybe Text
+-  } deriving Eq
+-
+-unknownField :: FieldName -> JsonPath -> CoercibleField
+-unknownField name path = CoercibleField name path "" Nothing Nothing
+-
+--- | Like an API request LogicTree, but with coercible field information.
+-data CoercibleLogicTree
+-  = CoercibleExpr Bool LogicOperator [CoercibleLogicTree]
+-  | CoercibleStmnt CoercibleFilter
+-  deriving (Eq)
+-
+-data CoercibleFilter = CoercibleFilter
+-  { field  :: CoercibleField
+-  , opExpr :: OpExpr
+-  }
+-  | CoercibleFilterNullEmbed Bool FieldName
+-  deriving (Eq)
++-- | A TypedField is a field with sufficient information to be read from JSON with `json_to_recordset`.
++data TypedField = TypedField
++   { tfName    :: FieldName
++   , tfIRType  :: Text -- ^ The initial type of the field, before any casting.
++   , tfDefault :: Maybe Text
++   } deriving (Eq)
++
++resolveTableField :: Table -> FieldName -> Maybe TypedField
++resolveTableField table fieldName =
++  case HMI.lookup fieldName (tableColumns table) of
++    Just column -> Just $ TypedField (colName column) (colNominalType column) (colDefault column)
++    Nothing     -> Nothing
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index fc53c848..17d5f3ff 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -55,7 +55,7 @@ readPlanToQuery (Node ReadPlan{select,from=mainQi,fromAlias,where_=logicForest,o
+   where
+     fromFrag = fromF relToParent mainQi fromAlias
+     qi = getQualifiedIdentifier relToParent mainQi fromAlias
+-    defSelect = [(unknownField "*" [], Nothing, Nothing)] -- gets all the columns in case of an empty select, ignoring/obtaining these columns is done at the aggregation stage
++    defSelect = [(("*", []), Nothing, Nothing)] -- gets all the columns in case of an empty select, ignoring/obtaining these columns is done at the aggregation stage
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadPlanTree -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+@@ -98,11 +98,11 @@ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _
+       MergeDuplicates  ->
+         if null iCols
+            then "DO NOTHING"
+-           else "DO UPDATE SET " <> intercalateSnippet ", " ((pgFmtIdent . cfName) <> const " = EXCLUDED." <> (pgFmtIdent . cfName) <$> iCols)
++           else "DO UPDATE SET " <> intercalateSnippet ", " ((pgFmtIdent . tfName) <> const " = EXCLUDED." <> (pgFmtIdent . tfName) <$> iCols)
+     ) onConflct <> " " <>
+   returningF mainQi returnings
+   where
+-    cols = intercalateSnippet ", " $ pgFmtIdent . cfName <$> iCols
++    cols = intercalateSnippet ", " $ pgFmtIdent . tfName <$> iCols
+ 
+ -- An update without a limit is always filtered with a WHERE
+ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings applyDefaults)
+@@ -136,8 +136,8 @@ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings a
+     whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+     mainTbl = fromQi mainQi
+     emptyBodyReturnedColumns = if null returnings then "NULL" else intercalateSnippet ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+-    nonRangeCols = intercalateSnippet ", " (pgFmtIdent . cfName <> const " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_body") . cfName <$> uCols)
+-    rangeCols = intercalateSnippet ", " ((\col -> pgFmtIdent (cfName col) <> " = (SELECT " <> pgFmtIdent (cfName col) <> " FROM pgrst_update_body) ") <$> uCols)
++    nonRangeCols = intercalateSnippet ", " (pgFmtIdent . tfName <> const " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_body") . tfName <$> uCols)
++    rangeCols = intercalateSnippet ", " ((\col -> pgFmtIdent (tfName col) <> " = (SELECT " <> pgFmtIdent (tfName col) <> " FROM pgrst_update_body) ") <$> uCols)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+@@ -171,7 +171,7 @@ callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar re
+     fromCall = case params of
+       OnePosParam prm -> "FROM " <> callIt (singleParameter args $ encodeUtf8 $ ppType prm)
+       KeyParams []    -> "FROM " <> callIt mempty
+-      KeyParams prms  -> fromJsonBodyF args ((\p -> CoercibleField (ppName p) mempty (ppType p) Nothing Nothing) <$> prms) False True False <> ", " <>
++      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p) Nothing) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 050bcf1a..f30099ae 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -55,13 +55,14 @@ import Control.Arrow ((***))
+ import Data.Foldable                 (foldr1)
+ import Text.InterpolatedString.Perl6 (qc)
+ 
+-import PostgREST.ApiRequest.Types        (Alias, Cast,
++import PostgREST.ApiRequest.Types        (Alias, Cast, Field,
++                                          Filter (..),
+                                           FtsOperator (..),
+                                           JsonOperand (..),
+                                           JsonOperation (..),
+                                           JsonPath,
+                                           LogicOperator (..),
+-                                          OpExpr (..),
++                                          LogicTree (..), OpExpr (..),
+                                           OpQuantifier (..),
+                                           Operation (..),
+                                           OrderDirection (..),
+@@ -73,10 +74,7 @@ import PostgREST.ApiRequest.Types        (Alias, Cast,
+ import PostgREST.MediaType               (MTPlanFormat (..),
+                                           MTPlanOption (..))
+ import PostgREST.Plan.ReadPlan           (JoinCondition (..))
+-import PostgREST.Plan.Types              (CoercibleField (..),
+-                                          CoercibleFilter (..),
+-                                          CoercibleLogicTree (..),
+-                                          unknownField)
++import PostgREST.Plan.Types              (TypedField (..))
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           rangeLimit, rangeOffset)
+ import PostgREST.SchemaCache.Identifiers (FieldName,
+@@ -237,36 +235,23 @@ pgFmtColumn :: QualifiedIdentifier -> Text -> SQL.Snippet
+ pgFmtColumn table "*" = fromQi table <> ".*"
+ pgFmtColumn table c   = fromQi table <> "." <> pgFmtIdent c
+ 
+-pgFmtCallUnary :: Text -> SQL.Snippet -> SQL.Snippet
+-pgFmtCallUnary f x = SQL.sql (encodeUtf8 f) <> "(" <> x <> ")"
+-
+-pgFmtField :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
+-pgFmtField table CoercibleField{cfName=fn, cfJsonPath=[]} = pgFmtColumn table fn
++pgFmtField :: QualifiedIdentifier -> Field -> SQL.Snippet
++pgFmtField table (c, []) = pgFmtColumn table c
+ -- Using to_jsonb instead of to_json to avoid missing operator errors when filtering:
+ -- "operator does not exist: json = unknown"
+-pgFmtField table CoercibleField{cfName=fn, cfJsonPath=jp} = "to_jsonb(" <> pgFmtColumn table fn <> ")" <> pgFmtJsonPath jp
+-
+--- Select the value of a named element from a table, applying its optional coercion mapping if any.
+-pgFmtTableCoerce :: QualifiedIdentifier -> CoercibleField -> SQL.Snippet
+-pgFmtTableCoerce table fld@(CoercibleField{cfTransform=(Just formatterProc)}) = pgFmtCallUnary formatterProc (pgFmtField table fld)
+-pgFmtTableCoerce table f = pgFmtField table f
+-
+--- | Like the previous but now we just have a name so no namespace or JSON paths.
+-pgFmtCoerceNamed :: CoercibleField -> SQL.Snippet
+-pgFmtCoerceNamed CoercibleField{cfName=fn, cfTransform=(Just formatterProc)} = pgFmtCallUnary formatterProc (pgFmtIdent fn) <> " AS " <> pgFmtIdent fn
+-pgFmtCoerceNamed CoercibleField{cfName=fn} = pgFmtIdent fn
++pgFmtField table (c, jp) = "to_jsonb(" <> pgFmtColumn table c <> ")" <> pgFmtJsonPath jp
+ 
+-pgFmtSelectItem :: QualifiedIdentifier -> (CoercibleField, Maybe Cast, Maybe Alias) -> SQL.Snippet
+-pgFmtSelectItem table (fld, Nothing, alias) = pgFmtTableCoerce table fld <> pgFmtAs (cfName fld) (cfJsonPath fld) alias
++pgFmtSelectItem :: QualifiedIdentifier -> (Field, Maybe Cast, Maybe Alias) -> SQL.Snippet
++pgFmtSelectItem table (f@(fName, jp), Nothing, alias) = pgFmtField table f <> pgFmtAs fName jp alias
+ -- Ideally we'd quote the cast with "pgFmtIdent cast". However, that would invalidate common casts such as "int", "bigint", etc.
+ -- Try doing: `select 1::"bigint"` - it'll err, using "int8" will work though. There's some parser magic that pg does that's invalidated when quoting.
+ -- Not quoting should be fine, we validate the input on Parsers.
+-pgFmtSelectItem table (fld, Just cast, alias) = "CAST (" <> pgFmtTableCoerce table fld <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> pgFmtAs (cfName fld) (cfJsonPath fld) alias
++pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField table f <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> pgFmtAs fName jp alias
+ 
+ -- TODO: At this stage there shouldn't be a Maybe since ApiRequest should ensure that an INSERT/UPDATE has a body
+-fromJsonBodyF :: Maybe LBS.ByteString -> [CoercibleField] -> Bool -> Bool -> Bool -> SQL.Snippet
++fromJsonBodyF :: Maybe LBS.ByteString -> [TypedField] -> Bool -> Bool -> Bool -> SQL.Snippet
+ fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
+-  (if includeSelect then "SELECT " <> namedCols <> " " else mempty) <>
++  (if includeSelect then "SELECT " <> parsedCols <> " " else mempty) <>
+   "FROM (SELECT " <> jsonPlaceHolder <> " AS json_data) pgrst_payload, " <>
+   -- convert a json object into a json array, this way we can use json_to_recordset for all json payloads
+   -- Otherwise we'd have to use json_to_record for json objects and json_to_recordset for json arrays
+@@ -275,7 +260,7 @@ fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
+   (if includeDefaults
+     then "LATERAL (SELECT jsonb_agg(jsonb_build_object(" <> defsJsonb <> ") || elem) AS val from jsonb_array_elements(pgrst_uniform_json.val) elem) pgrst_json_defs, "
+     else mempty) <>
+-  "LATERAL (SELECT " <> parsedCols <> " FROM " <>
++  "LATERAL (SELECT * FROM " <>
+     (if null fields
+       -- When we are inserting no columns (e.g. using default values), we can't use our ordinary `json_to_recordset`
+       -- because it can't extract records with no columns (there's no valid syntax for the `AS (colName colType,...)`
+@@ -285,13 +270,12 @@ fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
+     ) <>
+   ") pgrst_body "
+   where
+-    namedCols = intercalateSnippet ", " $ fromQi  . QualifiedIdentifier "pgrst_body" . cfName <$> fields
+-    parsedCols = intercalateSnippet ", " $ pgFmtCoerceNamed <$> fields
+-    typedCols = intercalateSnippet ", " $ pgFmtIdent . cfName <> const " " <> SQL.sql . encodeUtf8 . cfIRType <$> fields
++    parsedCols = intercalateSnippet ", " $ fromQi  . QualifiedIdentifier "pgrst_body" . tfName <$> fields
++    typedCols = intercalateSnippet ", " $ pgFmtIdent . tfName <> const " " <> SQL.sql . encodeUtf8 . tfIRType <$> fields
+     defsJsonb = SQL.sql $ BS.intercalate "," fieldsWDefaults
+     fieldsWDefaults = mapMaybe (\case
+-        CoercibleField{cfName=nam, cfDefault=Just def} -> Just $ encodeUtf8 (pgFmtLit nam <> ", " <> def)
+-        CoercibleField{cfDefault=Nothing} -> Nothing
++        TypedField{tfName=nam, tfDefault=Just def} -> Just $ encodeUtf8 (pgFmtLit nam <> ", " <> def)
++        TypedField{tfDefault=Nothing} -> Nothing
+       ) fields
+     (finalBodyF, jsonTypeofF, jsonBuildArrayF, jsonArrayElementsF, jsonToRecordsetF) =
+       if includeDefaults
+@@ -307,8 +291,8 @@ pgFmtOrderTerm qi ot =
+     maybe mempty nullOrder $ otNullOrder ot])
+   where
+     fmtOTerm = \case
+-      OrderTerm{otTerm=(fn, jp)}                        -> pgFmtField qi (unknownField fn jp)
+-      OrderRelationTerm{otRelation, otRelTerm=(fn, jp)} -> pgFmtField (QualifiedIdentifier mempty otRelation) (unknownField fn jp)
++      OrderTerm{otTerm}                        -> pgFmtField qi otTerm
++      OrderRelationTerm{otRelation, otRelTerm} -> pgFmtField (QualifiedIdentifier mempty otRelation) otRelTerm
+ 
+     direction OrderAsc  = "ASC"
+     direction OrderDesc = "DESC"
+@@ -316,31 +300,17 @@ pgFmtOrderTerm qi ot =
+     nullOrder OrderNullsFirst = "NULLS FIRST"
+     nullOrder OrderNullsLast  = "NULLS LAST"
+ 
+--- | Interpret a literal in the way the planner indicated through the CoercibleField.
+-pgFmtUnknownLiteralForField :: SQL.Snippet -> CoercibleField -> SQL.Snippet
+-pgFmtUnknownLiteralForField value CoercibleField{cfTransform=(Just parserProc)} = pgFmtCallUnary parserProc value
+--- But when no transform is requested, we just use the literal as-is.
+-pgFmtUnknownLiteralForField value _ = value
+-
+--- | Array version of the above, used by ANY().
+-pgFmtArrayLiteralForField :: [Text] -> CoercibleField -> SQL.Snippet
+--- When a transformation is requested, we need to apply the transformation to each element of the array. This could be done by just making a query with `parser(value)` for each value, but may lead to huge query lengths. Imagine `data_representations.color_from_text('...'::text)` for repeated for a hundred values. Instead we use `unnest()` to unpack a standard array literal and then apply the transformation to each element, like a map.
+--- Note the literals will be treated as text since in every case when we use ANY() the parameters are textual (coming from a query string). We want to rely on the `text->domain` parser to do the right thing.
+-pgFmtArrayLiteralForField values CoercibleField{cfTransform=(Just parserProc)} = SQL.sql "(SELECT " <> pgFmtCallUnary parserProc (SQL.sql "unnest(" <> unknownLiteral (pgBuildArrayLiteral values) <> "::text[])") <> ")"
+--- When no transformation is requested, we don't need a subquery.
+-pgFmtArrayLiteralForField values _ = unknownLiteral (pgBuildArrayLiteral values)
+-
+ 
+-pgFmtFilter :: QualifiedIdentifier -> CoercibleFilter -> SQL.Snippet
+-pgFmtFilter _ (CoercibleFilterNullEmbed hasNot fld) = pgFmtIdent fld <> " IS " <> (if hasNot then "NOT" else mempty) <> " NULL"
+-pgFmtFilter _ (CoercibleFilter _ (NoOpExpr _)) = mempty -- TODO unreachable because NoOpExpr is filtered on QueryParams
+-pgFmtFilter table (CoercibleFilter fld (OpExpr hasNot oper)) = notOp <> " " <> pgFmtField table fld <> case oper of
+-   Op op val  -> " " <> simpleOperator op <> " " <> pgFmtUnknownLiteralForField (unknownLiteral val) fld
++pgFmtFilter :: QualifiedIdentifier -> Filter -> SQL.Snippet
++pgFmtFilter _ (FilterNullEmbed hasNot fld) = pgFmtIdent fld <> " IS " <> (if hasNot then "NOT" else mempty) <> " NULL"
++pgFmtFilter _ (Filter _ (NoOpExpr _)) = mempty -- TODO unreachable because NoOpExpr is filtered on QueryParams
++pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> pgFmtField table fld <> case oper of
++   Op op val -> " " <> simpleOperator op <> " " <> unknownLiteral val
+ 
+    OpQuant op quant val -> " " <> quantOperator op <> " " <> case op of
+      OpLike  -> fmtQuant quant $ unknownLiteral (T.map star val)
+      OpILike -> fmtQuant quant $ unknownLiteral (T.map star val)
+-     _       -> fmtQuant quant $ pgFmtUnknownLiteralForField (unknownLiteral val) fld
++     _       -> fmtQuant quant $ unknownLiteral val
+ 
+    -- IS cannot be prepared. `PREPARE boolplan AS SELECT * FROM projects where id IS $1` will give a syntax error.
+    -- The above can be fixed by using `PREPARE boolplan AS SELECT * FROM projects where id IS NOT DISTINCT FROM $1;`
+@@ -359,7 +329,7 @@ pgFmtFilter table (CoercibleFilter fld (OpExpr hasNot oper)) = notOp <> " " <> p
+    -- + Can invalidate prepared statements: multiple parameters on an IN($1, $2, $3) will lead to using different prepared statements and not take advantage of caching.
+    In vals -> " " <> case vals of
+       [""] -> "= ANY('{}') "
+-      _    -> "= ANY (" <> pgFmtArrayLiteralForField vals fld <> ") "
++      _    -> "= ANY (" <> unknownLiteral (pgBuildArrayLiteral vals) <> ") "
+ 
+    Fts op lang val -> " " <> ftsOperator op <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
+  where
+@@ -375,14 +345,14 @@ pgFmtJoinCondition :: JoinCondition -> SQL.Snippet
+ pgFmtJoinCondition (JoinCondition (qi1, col1) (qi2, col2)) =
+   pgFmtColumn qi1 col1 <> " = " <> pgFmtColumn qi2 col2
+ 
+-pgFmtLogicTree :: QualifiedIdentifier -> CoercibleLogicTree -> SQL.Snippet
+-pgFmtLogicTree qi (CoercibleExpr hasNot op forest) = SQL.sql notOp <> " (" <> intercalateSnippet (opSql op) (pgFmtLogicTree qi <$> forest) <> ")"
++pgFmtLogicTree :: QualifiedIdentifier -> LogicTree -> SQL.Snippet
++pgFmtLogicTree qi (Expr hasNot op forest) = SQL.sql notOp <> " (" <> intercalateSnippet (opSql op) (pgFmtLogicTree qi <$> forest) <> ")"
+   where
+     notOp =  if hasNot then "NOT" else mempty
+ 
+     opSql And = " AND "
+     opSql Or  = " OR "
+-pgFmtLogicTree qi (CoercibleStmnt flt) = pgFmtFilter qi flt
++pgFmtLogicTree qi (Stmnt flt) = pgFmtFilter qi flt
+ 
+ pgFmtJsonPath :: JsonPath -> SQL.Snippet
+ pgFmtJsonPath = \case
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 37ef6333..8ec61e7d 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -40,38 +40,32 @@ import qualified Hasql.Transaction          as SQL
+ import Contravariant.Extras          (contrazip2)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+-import PostgREST.Config                      (AppConfig (..))
+-import PostgREST.Config.Database             (pgVersionStatement,
+-                                              toIsolationLevel)
+-import PostgREST.Config.PgVersion            (PgVersion, pgVersion100,
+-                                              pgVersion110,
+-                                              pgVersion120)
+-import PostgREST.SchemaCache.Identifiers     (AccessSet, FieldName,
+-                                              QualifiedIdentifier (..),
+-                                              Schema)
+-import PostgREST.SchemaCache.Relationship    (Cardinality (..),
+-                                              Junction (..),
+-                                              Relationship (..),
+-                                              RelationshipsMap)
+-import PostgREST.SchemaCache.Representations (DataRepresentation (..),
+-                                              RepresentationsMap)
+-import PostgREST.SchemaCache.Routine         (FuncVolatility (..),
+-                                              PgType (..),
+-                                              RetType (..),
+-                                              Routine (..),
+-                                              RoutineMap,
+-                                              RoutineParam (..))
+-import PostgREST.SchemaCache.Table           (Column (..), ColumnMap,
+-                                              Table (..), TablesMap)
++import PostgREST.Config                   (AppConfig (..))
++import PostgREST.Config.Database          (pgVersionStatement,
++                                           toIsolationLevel)
++import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
++                                           pgVersion110, pgVersion120)
++import PostgREST.SchemaCache.Identifiers  (AccessSet, FieldName,
++                                           QualifiedIdentifier (..),
++                                           Schema)
++import PostgREST.SchemaCache.Relationship (Cardinality (..),
++                                           Junction (..),
++                                           Relationship (..),
++                                           RelationshipsMap)
++import PostgREST.SchemaCache.Routine      (FuncVolatility (..),
++                                           PgType (..), RetType (..),
++                                           Routine (..), RoutineMap,
++                                           RoutineParam (..))
++import PostgREST.SchemaCache.Table        (Column (..), ColumnMap,
++                                           Table (..), TablesMap)
+ 
+ import Protolude
+ 
+ 
+ data SchemaCache = SchemaCache
+-  { dbTables          :: TablesMap
+-  , dbRelationships   :: RelationshipsMap
+-  , dbRoutines        :: RoutineMap
+-  , dbRepresentations :: RepresentationsMap
++  { dbTables        :: TablesMap
++  , dbRelationships :: RelationshipsMap
++  , dbRoutines      :: RoutineMap
+   }
+   deriving (Generic, JSON.ToJSON)
+ 
+@@ -122,7 +116,6 @@ querySchemaCache AppConfig{..} = do
+   m2oRels <- SQL.statement mempty $ allM2OandO2ORels pgVer prepared
+   funcs   <- SQL.statement schemas $ allFunctions pgVer prepared
+   cRels   <- SQL.statement mempty $ allComputedRels prepared
+-  reps    <- SQL.statement schemas $ dataRepresentations prepared
+   _       <-
+     let sleepCall = SQL.Statement "select pg_sleep($1)" (param HE.int4) HD.noResult prepared in
+     whenJust configInternalSCSleep (`SQL.statement` sleepCall) -- only used for testing
+@@ -134,7 +127,6 @@ querySchemaCache AppConfig{..} = do
+       dbTables = tabsWViewsPks
+     , dbRelationships = getOverrideRelationshipsMap rels cRels
+     , dbRoutines = funcs
+-    , dbRepresentations = reps
+     }
+   where
+     schemas = toList configDbSchemas
+@@ -164,11 +156,10 @@ getOverrideRelationshipsMap rels cRels =
+ removeInternal :: [Schema] -> SchemaCache -> SchemaCache
+ removeInternal schemas dbStruct =
+   SchemaCache {
+-      dbTables          = HM.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas) $ dbTables dbStruct
+-    , dbRelationships   = filter (\r -> qiSchema (relForeignTable r) `elem` schemas && not (hasInternalJunction r)) <$>
+-                          HM.filterWithKey (\(QualifiedIdentifier sch _, _) _ -> sch `elem` schemas ) (dbRelationships dbStruct)
+-    , dbRoutines        = dbRoutines dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+-    , dbRepresentations = dbRepresentations dbStruct -- no need to filter, not directly exposed through the API
++      dbTables        = HM.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas) $ dbTables dbStruct
++    , dbRelationships = filter (\r -> qiSchema (relForeignTable r) `elem` schemas && not (hasInternalJunction r)) <$>
++                        HM.filterWithKey (\(QualifiedIdentifier sch _, _) _ -> sch `elem` schemas ) (dbRelationships dbStruct)
++    , dbRoutines      = dbRoutines dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+     }
+   where
+     hasInternalJunction ComputedRelationship{} = False
+@@ -289,42 +280,6 @@ decodeFuncs =
+                       | v == 's' = Stable
+                       | otherwise = Volatile -- only 'v' can happen here
+ 
+-decodeRepresentations :: HD.Result RepresentationsMap
+-decodeRepresentations =
+-  HM.fromList . map (\rep@DataRepresentation{drSourceType, drTargetType} -> ((drSourceType, drTargetType), rep)) <$> HD.rowList row
+-  where
+-    row = DataRepresentation
+-      <$> column HD.text
+-      <*> column HD.text
+-      <*> column HD.text
+-
+--- Selects all potential data representation transformations. To qualify the cast must be
+--- 1. to or from a domain
+--- 2. implicit
+--- For the time being it must also be to/from JSON or text, although one can imagine a future where we support special
+--- cases like CSV specific representations.
+-dataRepresentations :: Bool -> SQL.Statement [Schema] RepresentationsMap
+-dataRepresentations = SQL.Statement sql (arrayParam HE.text) decodeRepresentations
+-  where
+-    sql = [q|
+-    SELECT
+-      c.castsource::regtype::text,
+-      c.casttarget::regtype::text,
+-      c.castfunc::regproc::text
+-    FROM
+-      pg_catalog.pg_cast c
+-    JOIN pg_catalog.pg_type src_t
+-      ON c.castsource::oid = src_t.oid
+-    JOIN pg_catalog.pg_type dst_t
+-      ON c.casttarget::oid = dst_t.oid
+-    WHERE
+-      c.castcontext = 'i'
+-      AND c.castmethod = 'f'
+-      AND has_function_privilege(c.castfunc, 'execute')
+-      AND ((src_t.typtype = 'd' AND c.casttarget IN ('json'::regtype::oid , 'text'::regtype::oid))
+-       OR (dst_t.typtype = 'd' AND c.castsource IN ('json'::regtype::oid , 'text'::regtype::oid)))
+-    |]
+-
+ allFunctions :: PgVersion -> Bool -> SQL.Statement [Schema] RoutineMap
+ allFunctions pgVer = SQL.Statement sql (arrayParam HE.text) decodeFuncs
+   where
+diff --git a/src/PostgREST/SchemaCache/Representations.hs b/src/PostgREST/SchemaCache/Representations.hs
+deleted file mode 100644
+index 027365f6..00000000
+--- a/src/PostgREST/SchemaCache/Representations.hs
++++ /dev/null
+@@ -1,29 +0,0 @@
+-{-# LANGUAGE DeriveAnyClass #-}
+-{-# LANGUAGE DeriveGeneric  #-}
+-
+-module PostgREST.SchemaCache.Representations
+-  ( DataRepresentation(..)
+-  , RepresentationsMap
+-  ) where
+-
+-import qualified Data.Aeson          as JSON
+-import qualified Data.HashMap.Strict as HM
+-
+-
+-import Protolude
+-
+--- | Data representations allow user customisation of how to present and receive data through APIs, per field.
+--- This structure is used for the library of available transforms. It answers questions like:
+--- - What function, if any, should be used to present a certain field that's been selected for API output?
+--- - How do we parse incoming data for a certain field type when inserting or updating?
+--- - And similarly, how do we parse textual data in a query string to be used as a filter?
+---
+--- Support for outputting special formats like CSV and binary data would fit into the same system.
+-data DataRepresentation = DataRepresentation
+-  { drSourceType :: Text
+-  , drTargetType :: Text
+-  , drFunction   :: Text
+-  } deriving (Eq, Show, Generic, JSON.ToJSON, JSON.FromJSON)
+-
+--- The representation map maps from (source type, target type) to a DR.
+-type RepresentationsMap = HM.HashMap (Text, Text) DataRepresentation
+diff --git a/test/spec/Feature/Query/ComputedRelsSpec.hs b/test/spec/Feature/Query/ComputedRelsSpec.hs
+index f7d85849..ea66ad43 100644
+--- a/test/spec/Feature/Query/ComputedRelsSpec.hs
++++ b/test/spec/Feature/Query/ComputedRelsSpec.hs
+@@ -104,47 +104,6 @@ spec = describe "computed relationships" $ do
+         [json|[ {"name":"Final Fantasy I","designer":{"name":"Hironobu Sakaguchi"}} ]|]
+         { matchStatus  = 200 }
+ 
+-  it "applies data representations to response" $ do
+-    -- A smoke test for data reps in the presence of computed relations.
+-
+-    -- The data rep here title cases the designer name before presentation. So here the lowercase version will be saved,
+-    -- but the title case version returned. Pulling in a computed relation should not confuse this.
+-    request methodPatch "/designers?select=name,videogames:computed_videogames(name)&id=eq.1"
+-      [("Prefer", "return=representation"), ("Prefer", "tx=commit")]
+-      [json| {"name": "sidney k. meier"} |]
+-      `shouldRespondWith`
+-      [json|[{"name":"Sidney K. Meier","videogames":[{"name":"Civilization I"}, {"name":"Civilization II"}]}]|]
+-      { matchStatus = 200 }
+-
+-    -- Verify it was saved the way we requested (there's no text data rep for this column, so if we select with the wrong casing, it should fail.)
+-    get "/designers?select=id&name=eq.Sidney%20K.%20Meier"
+-      `shouldRespondWith`
+-      [json|[]|]
+-      { matchStatus = 200, matchHeaders = [matchContentTypeJson] }
+-    -- But with the right casing it works.
+-    get "/designers?select=id,name&name=eq.sidney%20k.%20meier"
+-      `shouldRespondWith`
+-      [json|[{"id": 1, "name":"Sidney K. Meier"}]|]
+-      { matchStatus = 200, matchHeaders = [matchContentTypeJson] }
+-
+-    -- Most importantly, if you read it back even via a computed relation, the data rep should be applied.
+-    get "/videogames?select=name,designer:computed_designers(*)&id=eq.1"
+-      `shouldRespondWith`
+-      [json|[
+-        {"name":"Civilization I","designer":{"id": 1, "name":"Sidney K. Meier"}}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-    -- reset the test fixture
+-    request methodPatch "/designers?id=eq.1"
+-      [("Prefer", "tx=commit")]
+-      [json| {"name": "Sid Meier"} |]
+-      `shouldRespondWith` 204
+-    -- need to poke the second one too to prevent inherent ordering from changing
+-    request methodPatch "/designers?id=eq.2"
+-      [("Prefer", "tx=commit")]
+-      [json| {"name": "Hironobu Sakaguchi"} |]
+-      `shouldRespondWith` 204
+-
+   it "works with self joins" $
+     get "/web_content?select=name,child_web_content(name),parent_web_content(name)&id=in.(0,1)"
+     `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 1eb438eb..9babe03e 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -742,114 +742,3 @@ spec actualPgVersion = do
+                              , "Location" <:> "/test_null_pk_competitors_sponsors?id=eq.1&sponsor_id=is.null"
+                              , "Content-Range" <:> "*/*" ]
+             }
+-
+-  -- Data representations for payload parsing requires Postgres 10 or above.
+-  when (actualPgVersion >= pgVersion100) $ do
+-    describe "Data representations" $ do
+-      context "on regular table" $ do
+-        it "parses values in POST body" $
+-          -- we don't check that the parsing is correct here, just that it's happening. If it doesn't happen we'll get a
+-          -- an "invalid input syntax for type integer:" error.
+-          request methodPost "/datarep_todos" [("Prefer", "return=headers-only")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00"} |]
+-            `shouldRespondWith`
+-            ""
+-              { matchStatus  = 201
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Location" <:> "/datarep_todos?id=eq.5"
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-        it "parses values in POST body and formats individually selected values in return=representation" $
+-          request methodPost "/datarep_todos?select=id,label_color" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5, "label_color": "#001100"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-        it "parses values in POST body and formats values in return=representation" $
+-          request methodPost "/datarep_todos" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00", "icon_image": "3q2+7w", "created_at":-15, "budget": "-100000000000000.13"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5,"name": "party", "label_color": "#001100", "due_at":"2018-01-03T11:00:00Z", "icon_image": "3q2+7w==", "created_at":-15, "budget": "-100000000000000.13"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-      context "with ?columns parameter" $ do
+-        it "ignores json keys not included in ?columns; parses only the ones specified" $
+-          request methodPost "/datarep_todos?columns=id,label_color&select=id,name,label_color,due_at" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "invalid but should be ignored"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5, "name":null, "label_color": "#001100", "due_at": "2018-01-01T00:00:00Z"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-        it "fails without parsing anything if at least one specified column doesn't exist" $
+-          request methodPost "/datarep_todos?columns=id,label_color,helicopters&select=id,name,label_color,due_at" [("Prefer", "return=representation")]
+-            [json| {"due_at": "2019-01-03T11:00:00+00", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-            `shouldRespondWith`
+-            [json| {"code":"PGRST204","message":"Column 'helicopters' of relation 'datarep_todos' does not exist","details":null,"hint":null} |]
+-              { matchStatus  = 400
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+-              }
+-
+-      context "on updatable view" $ do
+-        it "parses values in POST body" $
+-          -- we don't check that the parsing is correct here, just that it's happening. If it doesn't happen we'll get a
+-          -- an "invalid input syntax for type integer:" error.
+-          request methodPost "/datarep_todos_computed" [("Prefer", "return=headers-only")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00"} |]
+-            `shouldRespondWith`
+-            ""
+-              { matchStatus  = 201
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Location" <:> "/datarep_todos_computed?id=eq.5"
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-        it "parses values in POST body and formats individually selected values in return=representation" $
+-          request methodPost "/datarep_todos_computed?select=id,label_color" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5, "label_color": "#001100"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-        it "parses values in POST body and formats values in return=representation" $
+-          request methodPost "/datarep_todos_computed" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "2018-01-03T11:00:00+00"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5,"name": "party", "label_color": "#001100", "due_at":"2018-01-03T11:00:00Z", "dark_color":"#000880"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-      context "on updatable views with ?columns parameter" $ do
+-        it "ignores json keys not included in ?columns; parses only the ones specified" $
+-          request methodPost "/datarep_todos_computed?columns=id,label_color&select=id,name,label_color,due_at" [("Prefer", "return=representation")]
+-            [json| {"id":5, "name": "party", "label_color": "#001100", "due_at": "invalid but should be ignored"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":5, "name":null, "label_color": "#001100", "due_at": "2018-01-01T00:00:00Z"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "*/*"]
+-              }
+-
+-        it "fails without parsing anything if at least one specified column doesn't exist" $
+-          request methodPost "/datarep_todos_computed?columns=id,label_color,helicopters&select=id,name,label_color,due_at" [("Prefer", "return=representation")]
+-            [json| {"due_at": "2019-01-03T11:00:00+00", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-            `shouldRespondWith`
+-            [json| {"code":"PGRST204","message":"Column 'helicopters' of relation 'datarep_todos_computed' does not exist","details":null,"hint":null} |]
+-              { matchStatus  = 400
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+-              }
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 2d61bf0e..8b5f3b2a 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1328,122 +1328,3 @@ spec actualPgVersion = do
+       get "/articles?body=imatch(any).{stop,thing}&select=id" `shouldRespondWith`
+         [json|[{"id":1}, {"id":2}]|]
+         { matchHeaders = [matchContentTypeJson] }
+-
+-  describe "Data representations for customisable value formatting and parsing" $ do
+-    it "formats a single column" $
+-      get "/datarep_todos?select=id,label_color&id=lt.4" `shouldRespondWith`
+-        [json| [{"id":1,"label_color":"#000000"},{"id":2,"label_color":"#000100"},{"id":3,"label_color":"#01E240"}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats two columns with different formatters" $
+-      get "/datarep_todos?select=id,label_color,due_at&id=lt.4" `shouldRespondWith`
+-        [json| [{"id":1,"label_color":"#000000","due_at":"2018-01-02T00:00:00Z"},{"id":2,"label_color":"#000100","due_at":"2018-01-03T00:00:00Z"},{"id":3,"label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z"}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "fails in some reasonable way when selecting fields that don't exist" $
+-      get "/datarep_todos?select=id,label_color,banana" `shouldRespondWith`
+-        [json| {"code":"42703","details":null,"hint":null,"message":"column datarep_todos.banana does not exist"} |]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-    it "formats columns in views including computed columns" $
+-      get "/datarep_todos_computed?select=id,label_color,dark_color" `shouldRespondWith`
+-        [json| [
+-          {"id":1, "label_color":"#000000", "dark_color":"#000000"},
+-          {"id":2, "label_color":"#000100", "dark_color":"#000080"},
+-          {"id":3, "label_color":"#01E240", "dark_color":"#00F120"},
+-          {"id":4, "label_color":"", "dark_color":""}
+-        ] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats and allows rename" $
+-      get "/datarep_todos?select=id,clr:label_color&id=lt.4" `shouldRespondWith`
+-        [json| [{"id":1,"clr":"#000000"},{"id":2,"clr":"#000100"},{"id":3,"clr":"#01E240"}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats, renames and allows manual casting on top" $
+-      get "/datarep_todos?select=id,clr:label_color::text&id=lt.4" `shouldRespondWith`
+-        [json| [{"id":1,"clr":"\"#000000\""},{"id":2,"clr":"\"#000100\""},{"id":3,"clr":"\"#01E240\""}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats nulls" $
+-      -- due_at is formatted as NULL but label_color NULLs become empty strings-- it's up to the formatting function.
+-      get "/datarep_todos?select=id,label_color,due_at&id=gt.2&id=lt.5" `shouldRespondWith`
+-        [json| [{"id":3,"label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z"},{"id":4,"label_color":"","due_at":null}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats star select" $
+-      get "/datarep_todos?select=*&id=lt.4" `shouldRespondWith`
+-        [json| [
+-          {"id":1,"name":"Report","label_color":"#000000","due_at":"2018-01-02T00:00:00Z","icon_image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=","created_at":1513213350,"budget":"12.50"},
+-           {"id":2,"name":"Essay","label_color":"#000100","due_at":"2018-01-03T00:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"},
+-           {"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}
+-        ] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats implicit star select" $
+-      get "/datarep_todos?id=lt.4" `shouldRespondWith`
+-        [json| [
+-          {"id":1,"name":"Report","label_color":"#000000","due_at":"2018-01-02T00:00:00Z","icon_image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=","created_at":1513213350,"budget":"12.50"},
+- {"id":2,"name":"Essay","label_color":"#000100","due_at":"2018-01-03T00:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"},
+- {"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}
+-        ] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats star and explicit mix" $
+-      get "/datarep_todos?select=due_at,*&id=lt.4" `shouldRespondWith`
+-        [json| [
+-          {"due_at":"2018-01-02T00:00:00Z","id":1,"name":"Report","label_color":"#000000","due_at":"2018-01-02T00:00:00Z","icon_image":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=","created_at":1513213350,"budget":"12.50"},
+-           {"due_at":"2018-01-03T00:00:00Z","id":2,"name":"Essay","label_color":"#000100","due_at":"2018-01-03T00:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"},
+-           {"due_at":"2018-01-01T14:12:34.123456Z","id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}
+-        ] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats through join" $
+-      get "/datarep_next_two_todos?select=id,name,first_item:datarep_todos!datarep_next_two_todos_first_item_id_fkey(label_color,due_at)" `shouldRespondWith`
+-        [json| [{"id":1,"name":"school related","first_item":{"label_color":"#000100","due_at":"2018-01-03T00:00:00Z"}},{"id":2,"name":"do these first","first_item":{"label_color":"#000000","due_at":"2018-01-02T00:00:00Z"}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "formats through join with star select" $
+-      get "/datarep_next_two_todos?select=id,name,second_item:datarep_todos!datarep_next_two_todos_second_item_id_fkey(*)" `shouldRespondWith`
+-        [json| [
+-          {"id":1,"name":"school related","second_item":{"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}},
+-          {"id":2,"name":"do these first","second_item":{"id":3,"name":"Algebra","label_color":"#01E240","due_at":"2018-01-01T14:12:34.123456Z","icon_image":null,"created_at":1513213350,"budget":"0.00"}}
+-        ] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "uses text parser on value for filter given through query parameters" $
+-      get "/datarep_todos?select=id,due_at&label_color=eq.000100" `shouldRespondWith`
+-        [json| [{"id":2,"due_at":"2018-01-03T00:00:00Z"}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    it "in the absense of text parser, does not try to use the JSON parser for query parameters" $
+-      get "/datarep_todos?select=id,due_at&due_at=eq.Z" `shouldRespondWith`
+-        -- we prove the parser is not used because it'd replace the Z with `+00:00` and a different error message.
+-        [json| {"code":"22007","details":null,"hint":null,"message":"invalid input syntax for type timestamp with time zone: \"Z\""} |]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-    -- Before PG 11, this will fail because we need arrays of domain type values. The docs should explain data reps are
+-    -- not supported in this case.
+-    when (actualPgVersion >= pgVersion110) $ do
+-      it "uses text parser for filter with 'IN' predicates" $
+-        get "/datarep_todos?select=id,due_at&label_color=in.(000100,01E240)" `shouldRespondWith`
+-          [json| [
+-            {"id":2, "due_at": "2018-01-03T00:00:00Z"},
+-            {"id":3, "due_at": "2018-01-01T14:12:34.123456Z"}
+-          ] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-      it "uses text parser for filter with 'NOT IN' predicates" $
+-        get "/datarep_todos?select=id,due_at&label_color=not.in.(000000,01E240)" `shouldRespondWith`
+-          [json| [
+-            {"id":2, "due_at": "2018-01-03T00:00:00Z"}
+-          ] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-    it "uses text parser on value for filter across relations" $
+-      get "/datarep_next_two_todos?select=id,name,datarep_todos!datarep_next_two_todos_first_item_id_fkey(label_color,due_at)&datarep_todos.label_color=neq.000100" `shouldRespondWith`
+-        [json| [{"id":1,"name":"school related","datarep_todos":null},{"id":2,"name":"do these first","datarep_todos":{"label_color":"#000000","due_at":"2018-01-02T00:00:00Z"}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-    -- This is not supported by data reps (would be hard to make it work with high performance). So the test just
+-    -- verifies we don't panic or add inappropriate SQL to the filters.
+-    it "fails safely on user trying to use ilike operator on data reps column" $
+-      get "/datarep_todos?select=id,name&label_color=ilike.#*100" `shouldRespondWith` (
+-        if actualPgVersion >= pgVersion110 then
+-        [json|
+-          {"code":"42883","details":null,"hint":"No operator matches the given name and argument types. You might need to add explicit type casts.","message":"operator does not exist: public.color ~~* unknown"}
+-        |]
+-        else
+-        [json|
+-          {"code":"42883","details":null,"hint":"No operator matches the given name and argument type(s). You might need to add explicit type casts.","message":"operator does not exist: public.color ~~* unknown"}
+-        |])
+-        { matchStatus  = 404
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 5f552b7e..1c6393ba 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -9,9 +9,6 @@ import Network.HTTP.Types
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import PostgREST.Config.PgVersion (PgVersion, pgVersion100)
+-
+-
+ import Protolude  hiding (get)
+ import SpecHelper
+ 
+@@ -21,8 +18,8 @@ tblDataBefore = [aesonQQ|[
+                 , { "id": 3, "name": "item-3" }
+                 ]|]
+ 
+-spec :: PgVersion -> SpecWith ((), Application)
+-spec actualPgVersion = do
++spec :: SpecWith ((), Application)
++spec = do
+   describe "Patching record" $ do
+     context "to unknown uri" $
+       it "indicates no table found by returning 404" $
+@@ -745,187 +742,3 @@ spec actualPgVersion = do
+        , { "id": 2, "name": "updated-item" }
+        , { "id": 3, "name": "updated-item" }
+        ]|]
+-
+-  -- Data representations for payload parsing requires Postgres 10 or above.
+-  when (actualPgVersion >= pgVersion100) $ do
+-    describe "Data representations" $ do
+-      context "for a single row" $ do
+-        it "parses values in payload" $
+-          request methodPatch "/datarep_todos?id=eq.2" [("Prefer", "return=headers-only")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-            `shouldRespondWith`
+-            ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "0-0/*" ]
+-              }
+-
+-        it "parses values in payload and formats individually selected values in return=representation" $
+-          request methodPatch "/datarep_todos?id=eq.2&select=id,label_color" [("Prefer", "return=representation")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-            `shouldRespondWith`
+-            [json| [{"id":2, "label_color": "#221100"}] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-0/*"]
+-              }
+-
+-        it "parses values in payload and formats values in return=representation" $
+-          request methodPatch "/datarep_todos?id=eq.2" [("Prefer", "return=representation")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:20Z", "icon_image": "3q2+7w"} |]
+-            `shouldRespondWith`
+-            [json|  [{"id":2,"name":"Essay","label_color":"#221100","due_at":"2019-01-03T11:00:20Z","icon_image":"3q2+7w==","created_at":1513213350,"budget":"100000000000000.13"}] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-0/*"]
+-              }
+-
+-        it "parses values in payload and formats star mixed selected values in return=representation" $
+-          request methodPatch "/datarep_todos?id=eq.2&select=due_at,*" [("Prefer", "return=representation")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z", "created_at": 0} |]
+-            `shouldRespondWith`
+-            -- end up with due_at twice here but that's unrelated to data reps
+-            [json| [{"due_at":"2019-01-03T11:00:00Z","id":2,"name":"Essay","label_color":"#221100","due_at":"2019-01-03T11:00:00Z","icon_image":null,"created_at":0,"budget":"100000000000000.13"}] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-0/*"]
+-              }
+-      context "for multiple rows" $ do
+-        it "parses values in payload and formats individually selected values in return=representation" $
+-          request methodPatch "/datarep_todos?id=lt.4&select=id,name,label_color" [("Prefer", "return=representation")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-            `shouldRespondWith`
+-            [json| [
+-              {"id":1, "name": "Report", "label_color": "#221100"},
+-              {"id":2, "name": "Essay", "label_color": "#221100"},
+-              {"id":3, "name": "Algebra", "label_color": "#221100"}
+-            ] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-2/*"]
+-              }
+-
+-        it "parses values in payload and formats values in return=representation" $
+-          request methodPatch "/datarep_todos?id=lt.4" [("Prefer", "return=representation")]
+-            [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z", "icon_image": "3q2+7w="} |]
+-            `shouldRespondWith`
+-            [json| [
+-              {"id":1,"name":"Report","label_color":"#221100","due_at":"2019-01-03T11:00:00Z","icon_image":"3q2+7w==","created_at":1513213350,"budget":"12.50"},
+-              {"id":2,"name":"Essay","label_color":"#221100","due_at":"2019-01-03T11:00:00Z","icon_image":"3q2+7w==","created_at":1513213350,"budget":"100000000000000.13"},
+-              {"id":3,"name":"Algebra","label_color":"#221100","due_at":"2019-01-03T11:00:00Z","icon_image":"3q2+7w==","created_at":1513213350,"budget":"0.00"}
+-            ] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-2/*"]
+-              }
+-      context "with ?columns parameter" $ do
+-        it "ignores json keys not included in ?columns; parses only the ones specified" $
+-          request methodPatch "/datarep_todos?id=eq.2&columns=due_at" [("Prefer", "return=representation")]
+-            [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-            `shouldRespondWith`
+-            [json| [
+-               {"id":2,"name":"Essay","label_color":"#000100","due_at":"2019-01-03T11:00:00Z","icon_image":null,"created_at":1513213350,"budget":"100000000000000.13"}
+-            ] |]
+-              { matchStatus  = 200
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                "Content-Range" <:> "0-0/*"]
+-              }
+-
+-        it "fails if at least one specified column doesn't exist" $
+-          request methodPatch "/datarep_todos?id=eq.2&columns=label_color,helicopters" [("Prefer", "return=representation")]
+-            [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-            `shouldRespondWith`
+-            [json| {"code":"PGRST204","message":"Column 'helicopters' of relation 'datarep_todos' does not exist","details":null,"hint":null} |]
+-              { matchStatus  = 400
+-              , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+-              }
+-
+-        it "ignores json keys and gives 200 if no record updated" $
+-          request methodPatch "/datarep_todos?id=eq.2001&columns=label_color" [("Prefer", "return=representation")]
+-           [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-           `shouldRespondWith` 200
+-      context "on a view" $ do
+-        context "for a single row" $ do
+-          it "parses values in payload" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2" [("Prefer", "return=headers-only")]
+-              [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-              `shouldRespondWith`
+-              ""
+-                { matchStatus  = 204
+-                , matchHeaders = [ matchHeaderAbsent hContentType
+-                                 , "Content-Range" <:> "0-0/*" ]
+-                }
+-
+-          it "parses values in payload and formats individually selected values in return=representation" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2&select=id,label_color" [("Prefer", "return=representation")]
+-              [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-              `shouldRespondWith`
+-              [json| [{"id":2, "label_color": "#221100"}] |]
+-                { matchStatus  = 200
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                  "Content-Range" <:> "0-0/*"]
+-                }
+-
+-          it "parses values in payload and formats values in return=representation" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2" [("Prefer", "return=representation")]
+-              [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:20Z"} |]
+-              `shouldRespondWith`
+-              [json| [{"id":2, "name": "Essay", "label_color": "#221100", "dark_color":"#110880", "due_at":"2019-01-03T11:00:20Z"}] |]
+-                { matchStatus  = 200
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                  "Content-Range" <:> "0-0/*"]
+-                }
+-        context "for multiple rows" $ do
+-          it "parses values in payload and formats individually selected values in return=representation" $
+-            request methodPatch "/datarep_todos_computed?id=lt.4&select=id,name,label_color,dark_color" [("Prefer", "return=representation")]
+-              [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-              `shouldRespondWith`
+-              [json| [
+-                {"id":1, "name": "Report", "label_color": "#221100", "dark_color":"#110880"},
+-                {"id":2, "name": "Essay", "label_color": "#221100", "dark_color":"#110880"},
+-                {"id":3, "name": "Algebra", "label_color": "#221100", "dark_color":"#110880"}
+-              ] |]
+-                { matchStatus  = 200
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                  "Content-Range" <:> "0-2/*"]
+-                }
+-
+-          it "parses values in payload and formats values in return=representation" $
+-            request methodPatch "/datarep_todos_computed?id=lt.4" [("Prefer", "return=representation")]
+-              [json| {"label_color": "#221100", "due_at": "2019-01-03T11:00:00Z"} |]
+-              `shouldRespondWith`
+-              [json| [
+-                {"id":1, "name": "Report", "label_color": "#221100", "dark_color":"#110880", "due_at":"2019-01-03T11:00:00Z"},
+-                {"id":2, "name": "Essay", "label_color": "#221100", "dark_color":"#110880", "due_at":"2019-01-03T11:00:00Z"},
+-                {"id":3, "name": "Algebra", "label_color": "#221100", "dark_color":"#110880", "due_at":"2019-01-03T11:00:00Z"}
+-              ] |]
+-                { matchStatus  = 200
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                  "Content-Range" <:> "0-2/*"]
+-                }
+-        context "with ?columns parameter" $ do
+-          it "ignores json keys not included in ?columns; parses only the ones specified" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2&columns=due_at" [("Prefer", "return=representation")]
+-              [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-              `shouldRespondWith`
+-              [json| [
+-                {"id":2, "name": "Essay", "label_color": "#000100", "dark_color": "#000080", "due_at":"2019-01-03T11:00:00Z"}
+-              ] |]
+-                { matchStatus  = 200
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8",
+-                                  "Content-Range" <:> "0-0/*"]
+-                }
+-
+-          it "fails if at least one specified column doesn't exist" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2&columns=label_color,helicopters" [("Prefer", "return=representation")]
+-              [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-              `shouldRespondWith`
+-              [json| {"code":"PGRST204","message":"Column 'helicopters' of relation 'datarep_todos_computed' does not exist","details":null,"hint":null} |]
+-                { matchStatus  = 400
+-                , matchHeaders = ["Content-Type" <:> "application/json; charset=utf-8"]
+-                }
+-
+-          it "ignores json keys and gives 200 if no record updated" $
+-            request methodPatch "/datarep_todos_computed?id=eq.2001&columns=label_color" [("Prefer", "return=representation")]
+-             [json| {"due_at": "2019-01-03T11:00:00Z", "smth": "here", "label_color": "invalid", "fake_id": 13} |]
+-             `shouldRespondWith` 200
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index c99c1e80..917a0c1c 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -139,7 +139,7 @@ main = do
+         , ("Feature.Query.RawOutputTypesSpec"            , Feature.Query.RawOutputTypesSpec.spec)
+         , ("Feature.Query.RpcSpec"                       , Feature.Query.RpcSpec.spec actualPgVersion)
+         , ("Feature.Query.SingularSpec"                  , Feature.Query.SingularSpec.spec)
+-        , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec actualPgVersion)
++        , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec)
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+         , ("Feature.Query.RelatedQueriesSpec"            , Feature.Query.RelatedQueriesSpec.spec)
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index d4d23d37..d2e6cb56 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -839,13 +839,3 @@ INSERT INTO posters(id,name) VALUES (1,'Mark'), (2,'Elon'), (3,'Bill'), (4,'Jeff
+ 
+ TRUNCATE TABLE subscriptions CASCADE;
+ INSERT INTO subscriptions(subscriber,subscribed) VALUES (3,1), (4,1), (1,2);
+-
+-TRUNCATE TABLE datarep_todos CASCADE;
+-INSERT INTO datarep_todos VALUES (1, 'Report', 0, '2018-01-02', '\x89504e470d0a1a0a0000000d4948445200000001000000010100000000376ef924000000001049444154789c62600100000000ffff03000000060005057bfabd400000000049454e44ae426082', '2017-12-14 01:02:30', 12.50); -- smallest possible PNG
+-INSERT INTO datarep_todos VALUES (2, 'Essay', 256, '2018-01-03', NULL, '2017-12-14 01:02:30', 100000000000000.13); -- a number which can't be represented by a 64-bit float
+-INSERT INTO datarep_todos VALUES (3, 'Algebra', 123456, '2018-01-01 14:12:34.123456');
+-INSERT INTO datarep_todos VALUES (4, 'Opus Magnum', NULL, NULL);
+-
+-TRUNCATE TABLE datarep_next_two_todos CASCADE;
+-INSERT INTO datarep_next_two_todos VALUES (1, 2, 3, 'school related');
+-INSERT INTO datarep_next_two_todos VALUES (2, 1, 3, 'do these first');
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 34f2a5b6..d78f0eac 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2774,20 +2774,9 @@ BEGIN
+   LOAD 'safeupdate';
+ END; $$ LANGUAGE plpgsql SECURITY DEFINER;
+ 
+--- This tests data representations over computed joins: even a lower case title should come back title cased.
+-DROP DOMAIN IF EXISTS public.titlecasetext CASCADE;
+-CREATE DOMAIN public.titlecasetext AS text;
+-
+-CREATE OR REPLACE FUNCTION json(public.titlecasetext) RETURNS json AS $$
+-  SELECT to_json(INITCAP($1::text));
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE CAST (public.titlecasetext AS json) WITH FUNCTION json(public.titlecasetext) AS IMPLICIT;
+--- End of data representations specific stuff except for where the domain is used in the table.
+-
+ CREATE TABLE designers (
+   id int primary key
+-, name public.titlecasetext
++, name text
+ );
+ 
+ CREATE TABLE videogames (
+@@ -3102,136 +3091,6 @@ create table test.subscriptions(
+   primary key(subscriber, subscribed)
+ );
+ 
+--- Data representations feature
+-DROP DOMAIN IF EXISTS public.color CASCADE;
+-CREATE DOMAIN public.color AS INTEGER CHECK (VALUE >= 0 AND VALUE <= 16777215);
+-
+-CREATE OR REPLACE FUNCTION color(json) RETURNS public.color AS $$
+-  SELECT color($1 #>> '{}');
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION color(text) RETURNS public.color AS $$
+-  SELECT (('x' || lpad((CASE WHEN SUBSTRING($1::text, 1, 1) = '#' THEN SUBSTRING($1::text, 2) ELSE $1::text END), 8, '0'))::bit(32)::int)::public.color;
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION json(public.color) RETURNS json AS $$
+-  SELECT
+-    CASE WHEN $1 IS NULL THEN to_json(''::text)
+-    ELSE to_json('#' || lpad(upper(to_hex($1)), 6, '0'))
+-  END;
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE CAST (public.color AS json) WITH FUNCTION json(public.color) AS IMPLICIT;
+-CREATE CAST (json AS public.color) WITH FUNCTION color(json) AS IMPLICIT;
+-CREATE CAST (text AS public.color) WITH FUNCTION color(text) AS IMPLICIT;
+-
+-DROP DOMAIN IF EXISTS public.isodate CASCADE;
+-CREATE DOMAIN public.isodate AS timestamp with time zone;
+-
+-CREATE OR REPLACE FUNCTION isodate(json) RETURNS public.isodate AS $$
+-  SELECT isodate($1 #>> '{}');
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION isodate(text) RETURNS public.isodate AS $$
+-  SELECT (replace($1, 'Z', '+00:00')::timestamp with time zone)::public.isodate;
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION json(public.isodate) RETURNS json AS $$
+-  SELECT to_json(replace(to_json($1)#>>'{}', '+00:00', 'Z'));
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE CAST (public.isodate AS json) WITH FUNCTION json(public.isodate) AS IMPLICIT;
+-CREATE CAST (json AS public.isodate) WITH FUNCTION isodate(json) AS IMPLICIT;
+--- We intentionally don't have this in order to test query string parsing doesn't try to fall back on JSON parsing.
+--- CREATE CAST (text AS public.isodate) WITH FUNCTION isodate(text) AS IMPLICIT;
+-
+--- bytea_b64 is a base64-encoded binary string
+-DROP DOMAIN IF EXISTS public.bytea_b64 CASCADE;
+-CREATE DOMAIN public.bytea_b64 AS bytea;
+-
+-CREATE OR REPLACE FUNCTION bytea_b64(json) RETURNS public.bytea_b64 AS $$
+-  SELECT bytea_b64($1 #>> '{}');
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION bytea_b64(text) RETURNS public.bytea_b64 AS $$
+-  -- allow unpadded base64
+-  SELECT decode($1 || repeat('=', 4 - (length($1) % 4)), 'base64')::public.bytea_b64;
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION json(public.bytea_b64) RETURNS json AS $$
+-  SELECT to_json(translate(encode($1, 'base64'), E'\n', ''));
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE CAST (public.bytea_b64 AS json) WITH FUNCTION json(public.bytea_b64) AS IMPLICIT;
+-CREATE CAST (json AS public.bytea_b64) WITH FUNCTION bytea_b64(json) AS IMPLICIT;
+-CREATE CAST (text AS public.bytea_b64) WITH FUNCTION bytea_b64(text) AS IMPLICIT;
+-
+--- unixtz is a timestamptz represented as an integer number of seconds since the Unix epoch
+-DROP DOMAIN IF EXISTS public.unixtz CASCADE;
+-CREATE DOMAIN public.unixtz AS timestamp with time zone;
+-
+-CREATE OR REPLACE FUNCTION unixtz(json) RETURNS public.unixtz AS $$
+-  SELECT unixtz($1 #>> '{}');
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION unixtz(text) RETURNS public.unixtz AS $$
+-  SELECT (to_timestamp($1::numeric)::public.unixtz);
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION json(public.unixtz) RETURNS json AS $$
+-  SELECT to_json(extract(epoch from $1)::bigint);
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-
+-CREATE CAST (public.unixtz AS json) WITH FUNCTION json(public.unixtz) AS IMPLICIT;
+-CREATE CAST (json AS public.unixtz) WITH FUNCTION unixtz(json) AS IMPLICIT;
+-CREATE CAST (text AS public.unixtz) WITH FUNCTION unixtz(text) AS IMPLICIT;
+-
+-DROP DOMAIN IF EXISTS public.monetary CASCADE;
+-CREATE DOMAIN public.monetary AS numeric(17,2);
+-
+-CREATE OR REPLACE FUNCTION monetary(json) RETURNS public.monetary AS $$
+-  SELECT monetary($1 #>> '{}');
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION monetary(text) RETURNS public.monetary AS $$
+-  SELECT ($1::numeric)::public.monetary;
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE OR REPLACE FUNCTION json(public.monetary) RETURNS json AS $$
+-  SELECT to_json($1::text);
+-$$ LANGUAGE SQL IMMUTABLE;
+-
+-CREATE CAST (public.monetary AS json) WITH FUNCTION json(public.monetary) AS IMPLICIT;
+-CREATE CAST (json AS public.monetary) WITH FUNCTION monetary(json) AS IMPLICIT;
+-CREATE CAST (text AS public.monetary) WITH FUNCTION monetary(text) AS IMPLICIT;
+-
+-CREATE TABLE datarep_todos (
+-  id bigint primary key,
+-  name text,
+-  label_color public.color default 0,
+-  due_at public.isodate default '2018-01-01'::date,
+-  icon_image public.bytea_b64,
+-  created_at public.unixtz default '2017-12-14 01:02:30'::timestamptz,
+-  budget public.monetary default 0
+-);
+-
+-CREATE TABLE datarep_next_two_todos (
+-  id bigint primary key,
+-  first_item_id bigint references datarep_todos(id),
+-  second_item_id bigint references datarep_todos(id),
+-  name text
+-);
+-
+-CREATE VIEW datarep_todos_computed as (
+-  SELECT id,
+-    name,
+-    label_color,
+-    due_at,
+-    (label_color / 2)::public.color as dark_color
+-  FROM datarep_todos
+-);
+-
+ -- view's name is alphabetically before projects
+ create view test.alpha_projects as
+   select c.id, p.name as pro_name, c.name as cli_name

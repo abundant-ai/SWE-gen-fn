@@ -1,0 +1,92 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ac0a68d6..780317cc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,7 +25,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #2821, Fix OPTIONS not accepting all available media types - @steve-chavez
+  - #2834, Fix compilation on Ubuntu by being compatible with GHC 9.0.2 - @steve-chavez
+- - #2840, Fix `Prefer: missing=default` with DOMAIN default values - @steve-chavez
+ 
+ ## [11.1.0] - 2023-06-07
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 19d2815b..37ef6333 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -571,7 +571,8 @@ tablesSqlQuery pgVer =
+           c.relname::name AS table_name,
+           a.attname::name AS column_name,
+           d.description AS description,
+-  |] <> columnDefault <> [q| AS column_default,
++  |] <> columnDefault <>
++  [q|
+           not (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
+               CASE
+                   WHEN t.typtype = 'd' THEN
+@@ -759,25 +760,19 @@ tablesSqlQuery pgVer =
+   "ORDER BY table_schema, table_name"
+   where
+     relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+-    columnDefault -- typbasetype and typdefaultbin handles `CREATE DOMAIN .. DEFAULT val`,  attidentity/attgenerated handles generated columns, pg_get_expr gets the default of a column
++    columnDefault
+       | pgVer >= pgVersion120 = [q|
+           CASE
+-            WHEN t.typbasetype  != 0  THEN pg_get_expr(t.typdefaultbin, 0)
+             WHEN a.attidentity  = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
+             WHEN a.attgenerated = 's' THEN null
+             ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
+-          END|]
++          END AS column_default,|]
+       | pgVer >= pgVersion100 = [q|
+           CASE
+-            WHEN t.typbasetype  != 0  THEN pg_get_expr(t.typdefaultbin, 0)
+             WHEN a.attidentity = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
+             ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
+-          END|]
+-      | otherwise  = [q|
+-          CASE
+-            WHEN t.typbasetype  != 0  THEN pg_get_expr(t.typdefaultbin, 0)
+-            ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
+-          END|]
++          END AS column_default,|]
++      | otherwise  = "pg_get_expr(ad.adbin, ad.adrelid)::text as column_default,"
+ 
+ -- | Gets many-to-one relationships and one-to-one(O2O) relationships, which are a refinement of the many-to-one's
+ allM2OandO2ORels :: PgVersion -> Bool -> SQL.Statement () [Relationship]
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index c98bd48f..1eb438eb 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -529,15 +529,6 @@ spec actualPgVersion = do
+                   }|])
+                 { matchStatus  = 400 }
+ 
+-        it "inserts a default on a DOMAIN with default" $
+-          request methodPost "/evil_friends?columns=id,name" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
+-              [json| { "name": "Lu" } |]
+-            `shouldRespondWith`
+-              [json| [{"id": 666, "name": "Lu"}] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Preference-Applied" <:> "missing=default"]
+-              }
+-
+     it "inserts json that has duplicate keys" $ do
+       request methodPost "/tbl_w_json" [("Prefer", "return=representation")]
+           [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index ccbf9c63..34f2a5b6 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3285,11 +3285,3 @@ BEGIN
+   END IF;
+ END
+ $do$;
+-
+-create domain devil_int as int
+-  default 666;
+-
+-create table evil_friends(
+-  id   devil_int
+-, name text
+-);

@@ -1,0 +1,457 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 581fdd74..d3711238 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,7 +26,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Fixed `"column <json_aggregate>.<alias> does not exist"` error when selecting `?select=...table(aias:count())`
+  - #3727, Clarify "listening" logs - @steve-chavez
+  - #3795, Clarify `Accept: vnd.pgrst.object` error message - @steve-chavez
+- - #3697, #3602, Handle queries on non-existing table gracefully - @taimoorzaeem
+ 
+ ### Changed
+ 
+@@ -41,7 +40,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + This preference was deprecated in favor of Functions with an array of JSON objects
+  - #3013, Drop support for Limited updates/deletes
+    + The feature was complicated and largely unused.
+- - #3697, #3602, Querying non-existent table now returns `PGRST205` error instead of empty json - @taimoorzaeem
+ 
+ ## [12.2.8] - 2025-02-10
+ 
+diff --git a/docs/references/errors.rst b/docs/references/errors.rst
+index 20091a7c..8977f847 100644
+--- a/docs/references/errors.rst
++++ b/docs/references/errors.rst
+@@ -286,10 +286,6 @@ Related to a :ref:`schema_cache`. Most of the time, these errors are solved by :
+ |               |             | in the ``columns`` query parameter is not found.            |
+ | PGRST204      |             |                                                             |
+ +---------------+-------------+-------------------------------------------------------------+
+-| .. _pgrst205: | 404         | Caused when the :ref:`table specified <tables_views>` in    |
+-|               |             | the URI is not found.                                       |
+-| PGRST205      |             |                                                             |
+-+---------------+-------------+-------------------------------------------------------------+
+ 
+ .. _pgrst3**:
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 59e40253..f9093b6d 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -45,7 +45,6 @@ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            RelationshipsMap)
+ import PostgREST.SchemaCache.Routine      (Routine (..),
+                                            RoutineParam (..))
+-import PostgREST.SchemaCache.Table        (Table (..))
+ import Protolude
+ 
+ 
+@@ -83,7 +82,6 @@ data ApiRequestError
+   | UnacceptableSchema [Text]
+   | UnsupportedMethod ByteString
+   | ColumnNotFound Text Text
+-  | TableNotFound Text Text [Table]
+   | GucHeadersError
+   | GucStatusError
+   | PutMatchingPkError
+@@ -130,7 +128,6 @@ instance PgrstError ApiRequestError where
+   status UnacceptableSchema{}        = HTTP.status406
+   status UnsupportedMethod{}         = HTTP.status405
+   status ColumnNotFound{}            = HTTP.status400
+-  status TableNotFound{}             = HTTP.status404
+   status GucHeadersError             = HTTP.status500
+   status GucStatusError              = HTTP.status500
+   status PutMatchingPkError          = HTTP.status400
+@@ -288,12 +285,6 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON (ColumnNotFound relName colName) = toJsonPgrstError
+     SchemaCacheErrorCode04 ("Could not find the '" <> colName <> "' column of '" <> relName <> "' in the schema cache") Nothing Nothing
+ 
+-  toJSON (TableNotFound schemaName relName tbls) = toJsonPgrstError
+-    SchemaCacheErrorCode05
+-    ("Could not find the table '" <> schemaName <> "." <> relName <> "' in the schema cache")
+-    Nothing
+-    (JSON.String <$> tableNotFoundHint schemaName relName tbls)
+-
+ -- |
+ -- If no relationship is found then:
+ --
+@@ -391,16 +382,6 @@ noRpcHint schema procName params allProcs overloadedProcs =
+       | null overloadedProcs = Fuzzy.getOne fuzzySetOfProcs procName
+       | otherwise            = (procName <>) <$> Fuzzy.getOne fuzzySetOfParams (listToText params)
+ 
+--- |
+--- Do a fuzzy search in all tables in the same schema and return closest result
+-tableNotFoundHint :: Text -> Text -> [Table] -> Maybe Text
+-tableNotFoundHint schema tblName tblList
+-  = fmap (\tbl -> "Perhaps you meant the table '" <> schema <> "." <> tbl <> "'") perhapsTable
+-    where
+-      perhapsTable = Fuzzy.getOne fuzzyTableSet tblName
+-      fuzzyTableSet = Fuzzy.fromList [ tableName tbl | tbl <- tblList, tableSchema tbl == schema]
+-
+-
+ compressedRel :: Relationship -> JSON.Value
+ -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+ compressedRel ComputedRelationship{} = JSON.object mempty
+@@ -691,7 +672,6 @@ data ErrorCode
+   | SchemaCacheErrorCode02
+   | SchemaCacheErrorCode03
+   | SchemaCacheErrorCode04
+-  | SchemaCacheErrorCode05
+   -- JWT authentication errors
+   | JWTErrorCode00
+   | JWTErrorCode01
+@@ -739,7 +719,6 @@ buildErrorCode code = case code of
+   SchemaCacheErrorCode02 -> "PGRST202"
+   SchemaCacheErrorCode03 -> "PGRST203"
+   SchemaCacheErrorCode04 -> "PGRST204"
+-  SchemaCacheErrorCode05 -> "PGRST205"
+ 
+   JWTErrorCode00         -> "PGRST300"
+   JWTErrorCode01         -> "PGRST301"
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 17ba08ab..1d067aea 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -153,20 +153,18 @@ dbActionPlan dbAct conf apiReq sCache = case dbAct of
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Bool -> Either Error CrudPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} headersOnly = do
+-  qi <- mapLeft ApiRequestError $ findTable identifier (dbTables sCache)
+-  rPlan <- readPlan qi conf sCache apiRequest
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  rPlan <- readPlan identifier conf sCache apiRequest
++  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  return $ WrappedReadPlan rPlan SQL.Read handler mediaType headersOnly qi
++  return $ WrappedReadPlan rPlan SQL.Read handler mediaType headersOnly identifier
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error CrudPlan
+ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+-  qi <- mapLeft ApiRequestError $ findTable identifier (dbTables sCache)
+-  rPlan <- readPlan qi conf sCache apiRequest
+-  mPlan <- mutatePlan mutation qi apiRequest sCache rPlan
++  rPlan <- readPlan identifier conf sCache apiRequest
++  mPlan <- mutatePlan mutation identifier apiRequest sCache rPlan
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+-  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+-  return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation qi
++  (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest identifier iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
++  return $ MutateReadPlan rPlan mPlan SQL.Write handler mediaType mutation identifier
+ 
+ callReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> InvokeMethod -> Either Error CallReadPlan
+ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{preferHandling, invalidPrefs},..} invMethod = do
+@@ -747,13 +745,6 @@ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+   | not aggFunctionsAllowed && any (isJust . csAggFunction) select = Left AggregatesNotAllowed
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
+--- | Lookup table in the schema cache before creating read plan
+-findTable :: QualifiedIdentifier -> TablesMap -> Either ApiRequestError QualifiedIdentifier
+-findTable qi@QualifiedIdentifier{..} tableMap =
+-  case HM.lookup qi tableMap of
+-    Nothing -> Left (TableNotFound qiSchema qiName (HM.elems tableMap))
+-    Just _ -> Right qi
+-
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either ApiRequestError ReadPlanTree
+ addFilters ctx ApiRequest{..} rReq =
+   foldr addFilterToNode (Right rReq) flts
+@@ -976,7 +967,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} SchemaCache{
+     typedColumnsOrError = resolveOrError ctx tbl `traverse` S.toList iColumns
+ 
+ resolveOrError :: ResolverContext -> Maybe Table -> FieldName -> Either ApiRequestError CoercibleField
+-resolveOrError _ Nothing _ = Left NotFound -- TODO: control never reaches here since #3869, should be fixed when fixing #3906
++resolveOrError _ Nothing _ = Left NotFound
+ resolveOrError ctx (Just table) field =
+   case resolveTableFieldName table field Nothing of
+     CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+diff --git a/src/PostgREST/SchemaCache/Identifiers.hs b/src/PostgREST/SchemaCache/Identifiers.hs
+index 6d2a4cff..2cc01f2e 100644
+--- a/src/PostgREST/SchemaCache/Identifiers.hs
++++ b/src/PostgREST/SchemaCache/Identifiers.hs
+@@ -25,7 +25,6 @@ instance Hashable RelIdentifier
+ 
+ -- | Represents a pg identifier with a prepended schema name "schema.table".
+ -- When qiSchema is "", the schema is defined by the pg search_path.
+--- TODO: Refactor this, we also use QI for procedure names
+ data QualifiedIdentifier = QualifiedIdentifier
+   { qiSchema :: Schema
+   , qiName   :: TableName
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index a1022df4..1e6ecf6c 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -7,8 +7,8 @@ from util import *
+ from postgrest import *
+ 
+ 
+-def test_requests_with_resource_embedding_wait_for_schema_cache_reload(defaultenv):
+-    "requests that use the schema cache with resource embedding wait long for the schema cache to reload"
++def test_requests_wait_for_schema_cache_reload(defaultenv):
++    "requests that use the schema cache (e.g. resource embedding) wait for the schema cache to reload"
+ 
+     env = {
+         **defaultenv,
+@@ -34,33 +34,6 @@ def test_requests_with_resource_embedding_wait_for_schema_cache_reload(defaulten
+         assert plan_dur > 10000.0
+ 
+ 
+-def test_requests_without_resource_embedding_wait_for_schema_cache_reload(defaultenv):
+-    "requests that use the schema cache without resource embedding wait less for the schema cache to reload"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_SCHEMAS": "apflora",
+-        "PGRST_DB_POOL": "2",
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
+-    }
+-
+-    with run(env=env, wait_max_seconds=30) as postgrest:
+-        # reload the schema cache
+-        response = postgrest.session.get("/rpc/notify_pgrst")
+-        assert response.status_code == 204
+-
+-        postgrest.wait_until_scache_starts_loading()
+-
+-        response = postgrest.session.get("/tpopmassn")
+-        assert response.status_code == 200
+-
+-        plan_dur = parse_server_timings_header(response.headers["Server-Timing"])[
+-            "plan"
+-        ]
+-        assert plan_dur < 10000.0
+-
+-
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122
+ # The stack size of 1K(-with-rtsopts=-K1K) is not enough and this fails with "stack overflow"
+ # A stack size of 200K seems to be enough for succeess
+@@ -92,6 +65,6 @@ def test_should_not_fail_with_stack_overflow(defaultenv):
+ 
+     with run(env=env, wait_max_seconds=30) as postgrest:
+         response = postgrest.session.get("/unknown-table?select=unknown-rel(*)")
+-        assert response.status_code == 404
++        assert response.status_code == 400
+         data = response.json()
+-        assert data["code"] == "PGRST205"
++        assert data["code"] == "PGRST200"
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 39f188b8..b7d9d912 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -973,10 +973,11 @@ def test_log_level(level, defaultenv):
+                 r'- - postgrest_test_anonymous \[.+\] "GET /unknown HTTP/1.1" 404 - "" "python-requests/.+"',
+                 output[2],
+             )
+-
+-            assert len(output) == 5
+             assert "Connection" and "is available" in output[3]
+-            assert "Connection" and "is used" in output[4]
++            assert "Connection" and "is available" in output[4]
++            assert "Connection" and "is used" in output[5]
++            assert "Connection" and "is used" in output[6]
++            assert len(output) == 7
+ 
+ 
+ @pytest.mark.parametrize("level", ["crit", "error", "warn", "info", "debug"])
+@@ -998,11 +999,15 @@ def test_log_query(level, defaultenv):
+         response = postgrest.session.get("/projects")
+         assert response.status_code == 200
+ 
++        response = postgrest.session.get("/unknown")
++        assert response.status_code == 404
++
+         response = postgrest.session.get("/infinite_recursion")
+         assert response.status_code == 500
+ 
+         root_2xx_regx = r'.+: WITH pgrst_source AS.+SELECT "public"\."root"\(\) pgrst_scalar.+_postgrest_t'
+         get_2xx_regx = r'.+: WITH pgrst_source AS.+SELECT "public"\."projects"\.\* FROM "public"\."projects".+_postgrest_t'
++        unknown_4xx_regx = r'.+: WITH pgrst_source AS.+SELECT "public"\."unknown"\.\* FROM "public"\."unknown".+_postgrest_t'
+         infinite_recursion_5xx_regx = r'.+: WITH pgrst_source AS.+SELECT "public"\."infinite_recursion"\.\* FROM "public"\."infinite_recursion".+_postgrest_t'
+ 
+         if level == "crit":
+@@ -1013,23 +1018,26 @@ def test_log_query(level, defaultenv):
+             assert re.match(infinite_recursion_5xx_regx, output[1])
+             assert len(output) == 3
+         elif level == "warn":
+-            output = postgrest.read_stdout(nlines=2)
+-            assert re.match(infinite_recursion_5xx_regx, output[1])
+-            assert len(output) == 2
+-        elif level == "info":
+             output = postgrest.read_stdout(nlines=6)
++            assert re.match(unknown_4xx_regx, output[0])
++            assert re.match(infinite_recursion_5xx_regx, output[3])
++            assert len(output) == 5
++        elif level == "info":
++            output = postgrest.read_stdout(nlines=10)
+             assert re.match(root_2xx_regx, output[0])
+             assert re.match(get_2xx_regx, output[2])
+-            assert re.match(infinite_recursion_5xx_regx, output[5])
+-            assert len(output) == 6
++            assert re.match(unknown_4xx_regx, output[4])
++            assert re.match(infinite_recursion_5xx_regx, output[7])
++            assert len(output) == 9
+         elif level == "debug":
+             output_ok = postgrest.read_stdout(nlines=8)
+             assert re.match(root_2xx_regx, output_ok[2])
+             assert re.match(get_2xx_regx, output_ok[6])
+             assert len(output_ok) == 8
+-            output_err = postgrest.read_stdout(nlines=4)
+-            assert re.match(infinite_recursion_5xx_regx, output_err[3])
+-            assert len(output_err) == 4
++            output_err = postgrest.read_stdout(nlines=10)
++            assert re.match(unknown_4xx_regx, output_err[2])
++            assert re.match(infinite_recursion_5xx_regx, output_err[7])
++            assert len(output_err) == 9
+ 
+ 
+ def test_no_pool_connection_required_on_bad_http_logic(defaultenv):
+diff --git a/test/spec/Feature/ConcurrentSpec.hs b/test/spec/Feature/ConcurrentSpec.hs
+index 0c77a060..d52d5466 100644
+--- a/test/spec/Feature/ConcurrentSpec.hs
++++ b/test/spec/Feature/ConcurrentSpec.hs
+@@ -24,8 +24,12 @@ spec =
+     it "should not raise 'transaction in progress' error" $
+       raceTest 10 $
+         get "/fakefake"
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.factories'","message":"Could not find the table 'test.fakefake' in the schema cache"} |]
++          `shouldRespondWith` [json|
++              { "hint": null,
++                "details":null,
++                "code":"42P01",
++                "message":"relation \"test.fakefake\" does not exist"
++              } |]
+           { matchStatus  = 404
+           , matchHeaders = []
+           }
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 788482c8..7e3c83d1 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -109,12 +109,7 @@ spec =
+ 
+     context "totally unknown route" $
+       it "fails with 404" $
+-        request methodDelete "/foozle?id=eq.101" [] ""
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.foo'","message":"Could not find the table 'test.foozle' in the schema cache"} |]
+-          { matchStatus = 404
+-          , matchHeaders = []
+-          }
++        request methodDelete "/foozle?id=eq.101" [] "" `shouldRespondWith` 404
+ 
+     context "table with limited privileges" $ do
+       it "fails deleting the row when return=representation and selecting all the columns" $
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 6d070ca0..0f6a1b6e 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -477,7 +477,7 @@ spec actualPgVersion = do
+             {"id": 204, "body": "yyy"},
+             {"id": 205, "body": "zzz"}]|]
+           `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.articles'","message":"Could not find the table 'test.garlic' in the schema cache"} |]
++          [json|{} |]
+           { matchStatus  = 404
+           , matchHeaders = []
+           }
+diff --git a/test/spec/Feature/Query/MultipleSchemaSpec.hs b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+index b52095bc..7b25e2ff 100644
+--- a/test/spec/Feature/Query/MultipleSchemaSpec.hs
++++ b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+@@ -64,13 +64,7 @@ spec =
+           }
+ 
+       it "doesn't find another_table in schema v1" $
+-        request methodGet "/another_table"
+-          [("Accept-Profile", "v1")] ""
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":null,"message":"Could not find the table 'v1.another_table' in the schema cache"} |]
+-          { matchStatus = 404
+-          , matchHeaders = []
+-          }
++        request methodGet "/another_table" [("Accept-Profile", "v1")] "" `shouldRespondWith` 404
+ 
+       it "fails trying to read table from unkown schema" $
+         request methodGet "/parents" [("Accept-Profile", "unkown")] "" `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 682ca7f3..c0bda5a6 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -24,12 +24,7 @@ spec = do
+ 
+   describe "Querying a nonexistent table" $
+     it "causes a 404" $
+-      get "/faketable"
+-      `shouldRespondWith`
+-      [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.private_table'","message":"Could not find the table 'test.faketable' in the schema cache"} |]
+-      { matchStatus = 404
+-      , matchHeaders = []
+-      }
++      get "/faketable" `shouldRespondWith` 404
+ 
+   describe "Filtering response" $ do
+     it "matches with equality" $
+@@ -824,12 +819,14 @@ spec = do
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+-      -- we only search for foreign key relationships after checking the
+-      -- the existence of first table, #3869
+-      it "table not found error if first table does not exist" $
++      it "cannot request a partitioned table as parent from a partition" $
+         get "/car_model_sales_202101?select=id,name,car_models(id,name)&order=id.asc" `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.car_model_sales'","message":"Could not find the table 'test.car_model_sales_202101' in the schema cache"} |]
+-          { matchStatus  = 404
++          [json|
++            {"hint":"Perhaps you meant 'car_model_sales' instead of 'car_model_sales_202101'.",
++             "details":"Searched for a foreign key relationship between 'car_model_sales_202101' and 'car_models' in the schema 'test', but no matches were found.",
++             "code":"PGRST200",
++             "message":"Could not find a relationship between 'car_model_sales_202101' and 'car_models' in the schema cache"} |]
++          { matchStatus  = 400
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+@@ -844,10 +841,14 @@ spec = do
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+-      it "table not found error if first table does not exist" $
++      it "cannot request partitioned tables as children from a partition" $
+         get "/car_models_default?select=id,name,car_model_sales(id,name)&order=id.asc" `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.car_model_sales'","message":"Could not find the table 'test.car_models_default' in the schema cache"} |]
+-          { matchStatus  = 404
++          [json|
++            {"hint":"Perhaps you meant 'car_model_sales' instead of 'car_models_default'.",
++             "details":"Searched for a foreign key relationship between 'car_models_default' and 'car_model_sales' in the schema 'test', but no matches were found.",
++             "code":"PGRST200",
++             "message":"Could not find a relationship between 'car_models_default' and 'car_model_sales' in the schema cache"} |]
++          { matchStatus  = 400
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 7b285a62..21d688de 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -17,12 +17,7 @@ spec = do
+       it "indicates no table found by returning 404" $
+         request methodPatch "/fake" []
+           [json| { "real": false } |]
+-          `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.factories'","message":"Could not find the table 'test.fake' in the schema cache"} |]
+-          { matchStatus = 404
+-          , matchHeaders = []
+-          }
+-
++            `shouldRespondWith` 404
+ 
+     context "on an empty table" $
+       it "succeeds with status code 204" $
+@@ -348,7 +343,7 @@ spec = do
+             {"id": 204, "body": "yyy"},
+             {"id": 205, "body": "zzz"}]|]
+           `shouldRespondWith`
+-          [json| {"code":"PGRST205","details":null,"hint":"Perhaps you meant the table 'test.articles'","message":"Could not find the table 'test.garlic' in the schema cache"} |]
++          [json|{} |]
+           { matchStatus  = 404
+           , matchHeaders = []
+           }

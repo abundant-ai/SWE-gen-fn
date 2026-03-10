@@ -1,0 +1,612 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dd27258c..ec77faee 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,7 +6,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ## Unreleased
+ 
+ ### Added
+-
++ 
+  - #1614, Add `db-pool-automatic-recovery` configuration to disable connection retrying - @taimoorzaeem
+  - #2492, Allow full response control when raising exceptions - @taimoorzaeem, @laurenceisla
+ 
+@@ -16,8 +16,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2524, Fix schema cache and configuration reloading with `NOTIFY` not working on Windows - @diogob, @laurenceisla
+  - #2915, Fix duplicate headers in response - @taimoorzaeem
+  - #2824, Fix range request with first position same as length return status 206 - @taimoorzaeem
+- - #2939, Fix wrong `Preference-Applied` with `Prefer: tx=commit` when transaction is rollbacked - @steve-chavez
+- - #2939, Fix `count=exact` not being included in `Preference-Applied` - @steve-chavez
+ 
+ ## [11.2.0] - 2023-08-10
+ 
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 15c40c1d..26724acf 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -153,7 +153,7 @@ userApiRequest conf req reqBody = do
+   , iRange = ranges
+   , iTopLevelRange = topLevelRange
+   , iPayload = payload
+-  , iPreferences = Preferences.fromHeaders (configDbTxAllowOverride conf) hdrs
++  , iPreferences = Preferences.fromHeaders hdrs
+   , iQueryParams = qPrms
+   , iColumns = columns
+   , iHeaders = iHdrs
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 4d0f91a1..b0846b2f 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -6,7 +6,6 @@
+ --
+ -- [1] https://datatracker.ietf.org/doc/html/rfc7240
+ --
+-{-# LANGUAGE NamedFieldPuns #-}
+ module PostgREST.ApiRequest.Preferences
+   ( Preferences(..)
+   , PreferCount(..)
+@@ -16,8 +15,8 @@ module PostgREST.ApiRequest.Preferences
+   , PreferResolution(..)
+   , PreferTransaction(..)
+   , fromHeaders
++  , ToAppliedHeader(..)
+   , shouldCount
+-  , prefAppliedHeader
+   ) where
+ 
+ import qualified Data.ByteString.Char8     as BS
+@@ -54,7 +53,7 @@ data Preferences
+ --
+ -- One header with comma-separated values can be used to set multiple preferences:
+ --
+--- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates, count=exact")]
++-- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates, count=exact")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+@@ -66,7 +65,7 @@ data Preferences
+ --
+ -- Multiple headers can also be used:
+ --
+--- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
++-- >>> pPrint $ fromHeaders [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+@@ -78,13 +77,13 @@ data Preferences
+ --
+ -- If a preference is set more than once, only the first is used:
+ --
+--- >>> preferTransaction $ fromHeaders True [("Prefer", "tx=commit, tx=rollback")]
++-- >>> preferTransaction $ fromHeaders [("Prefer", "tx=commit, tx=rollback")]
+ -- Just Commit
+ --
+ -- This is also the case across multiple headers:
+ --
+ -- >>> :{
+---   preferResolution . fromHeaders True $
++--   preferResolution . fromHeaders $
+ --     [ ("Prefer", "resolution=ignore-duplicates")
+ --     , ("Prefer", "resolution=merge-duplicates")
+ --     ]
+@@ -93,12 +92,12 @@ data Preferences
+ --
+ -- Preferences not recognized by the application are ignored:
+ --
+--- >>> preferResolution $ fromHeaders True [("Prefer", "resolution=foo")]
++-- >>> preferResolution $ fromHeaders [("Prefer", "resolution=foo")]
+ -- Nothing
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders True [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
++-- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Just Full
+@@ -108,14 +107,14 @@ data Preferences
+ --     , preferMissing = Just ApplyDefaults
+ --     }
+ --
+-fromHeaders :: Bool -> [HTTP.Header] -> Preferences
+-fromHeaders allowTxEndOverride headers =
++fromHeaders :: [HTTP.Header] -> Preferences
++fromHeaders headers =
+   Preferences
+     { preferResolution     = parsePrefs [MergeDuplicates, IgnoreDuplicates]
+     , preferRepresentation = parsePrefs [Full, None, HeadersOnly]
+     , preferParameters     = parsePrefs [SingleObject]
+     , preferCount          = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+-    , preferTransaction    = if allowTxEndOverride then parsePrefs [Commit, Rollback] else Nothing
++    , preferTransaction    = parsePrefs [Commit, Rollback]
+     , preferMissing        = parsePrefs [ApplyDefaults, ApplyNulls]
+     }
+   where
+@@ -129,22 +128,6 @@ fromHeaders allowTxEndOverride headers =
+     prefMap :: ToHeaderValue a => [a] -> Map.Map ByteString a
+     prefMap = Map.fromList . fmap (\pref -> (toHeaderValue pref, pref))
+ 
+-prefAppliedHeader :: Preferences -> Maybe HTTP.Header
+-prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing } =
+-  if null prefsVals
+-    then Nothing
+-    else Just (HTTP.hPreferenceApplied, combined)
+-  where
+-    combined = BS.intercalate ", " prefsVals
+-    prefsVals = catMaybes [
+-        toHeaderValue <$> preferResolution
+-      , toHeaderValue <$> preferMissing
+-      , toHeaderValue <$> preferRepresentation
+-      , toHeaderValue <$> preferParameters
+-      , toHeaderValue <$> preferCount
+-      , toHeaderValue <$> preferTransaction
+-      ]
+-
+ -- |
+ -- Convert a preference into the value that we look for in the 'Prefer' headers.
+ --
+@@ -154,6 +137,16 @@ prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferPar
+ class ToHeaderValue a where
+   toHeaderValue :: a -> ByteString
+ 
++-- |
++-- Header to indicate that a preference has been applied.
++--
++-- >>> toAppliedHeader MergeDuplicates
++-- ("Preference-Applied","resolution=merge-duplicates")
++--
++class ToHeaderValue a => ToAppliedHeader a where
++  toAppliedHeader :: a -> HTTP.Header
++  toAppliedHeader x = (HTTP.hPreferenceApplied, toHeaderValue x)
++
+ -- | How to handle duplicate values.
+ data PreferResolution
+   = MergeDuplicates
+@@ -163,6 +156,8 @@ instance ToHeaderValue PreferResolution where
+   toHeaderValue MergeDuplicates  = "resolution=merge-duplicates"
+   toHeaderValue IgnoreDuplicates = "resolution=ignore-duplicates"
+ 
++instance ToAppliedHeader PreferResolution
++
+ -- |
+ -- How to return the mutated data.
+ --
+@@ -173,6 +168,8 @@ data PreferRepresentation
+   | None        -- ^ Return nothing from the mutated data.
+   deriving Eq
+ 
++instance ToAppliedHeader PreferRepresentation
++
+ instance ToHeaderValue PreferRepresentation where
+   toHeaderValue Full        = "return=representation"
+   toHeaderValue None        = "return=minimal"
+@@ -212,6 +209,8 @@ instance ToHeaderValue PreferTransaction where
+   toHeaderValue Commit   = "tx=commit"
+   toHeaderValue Rollback = "tx=rollback"
+ 
++instance ToAppliedHeader PreferTransaction
++
+ -- |
+ -- How to handle the insertion/update when the keys specified in ?columns are not present
+ -- in the json body.
+@@ -223,3 +222,5 @@ data PreferMissing
+ instance ToHeaderValue PreferMissing where
+   toHeaderValue ApplyDefaults = "missing=default"
+   toHeaderValue ApplyNulls    = "missing=null"
++
++instance ToAppliedHeader PreferMissing
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 96d68a50..e8e71e01 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -150,7 +150,8 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf req body
+ 
+-  handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
++  Response.optionalRollback conf apiRequest $
++    handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache
+ 
+ runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState isoLvl mode authenticated prepared handler = do
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 0323d75d..7623c0a0 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -226,9 +226,9 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+     SQL.condemn
+   where
+     shouldCommit =
+-      preferTransaction == Just Commit
++      configDbTxAllowOverride && preferTransaction == Just Commit
+     shouldRollback =
+-      preferTransaction == Just Rollback
++      configDbTxAllowOverride && preferTransaction == Just Rollback
+ 
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 13e57e76..36374fb5 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -17,6 +17,9 @@ module PostgREST.Response
+   , updateResponse
+   , addRetryHint
+   , isServiceUnavailable
++  , optionalRollback
++  , concatPrefAppsHeaders
++  , addPrefToHeaders
+   , traceHeaderMiddleware
+   ) where
+ 
+@@ -39,9 +42,10 @@ import qualified PostgREST.Response.OpenAPI as OpenAPI
+ import PostgREST.ApiRequest              (ApiRequest (..),
+                                           InvokeMethod (..))
+ import PostgREST.ApiRequest.Preferences  (PreferRepresentation (..),
++                                          PreferTransaction (..),
+                                           Preferences (..),
+-                                          prefAppliedHeader,
+-                                          shouldCount)
++                                          shouldCount,
++                                          toAppliedHeader)
+ import PostgREST.ApiRequest.QueryParams  (QueryParams (..))
+ import PostgREST.Config                  (AppConfig (..))
+ import PostgREST.MediaType               (MediaType (..))
+@@ -64,12 +68,11 @@ import Protolude.Conv (toS)
+ 
+ 
+ readResponse :: Bool -> QualifiedIdentifier -> ApiRequest -> ResultSet -> Wai.Response
+-readResponse headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Preferences{..},..} resultSet = case resultSet of
++readResponse headersOnly identifier ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard{..} -> do
+     let
+       (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+       response = gucResponse rsGucStatus rsGucHeaders
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing
+       headers =
+         [ contentRange
+         , ( "Content-Location"
+@@ -79,7 +82,6 @@ readResponse headersOnly identifier ctxApiRequest@ApiRequest{iPreferences=Prefer
+           )
+         ]
+         ++ contentTypeHeaders ctxApiRequest
+-        ++ prefHeader
+       rsOrErrBody = if status == HTTP.status416
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+@@ -96,9 +98,6 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+     let
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+       response = gucResponse rsGucStatus rsGucHeaders
+-      prefHeader = prefAppliedHeader $
+-        Preferences (if null pkCols && isNothing (qsOnConflict iQueryParams) then Nothing else preferResolution)
+-        preferRepresentation Nothing preferCount preferTransaction preferMissing
+       headers =
+         catMaybes
+           [ if null rsLocation then
+@@ -112,15 +111,20 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+                 )
+           , Just . RangeQuery.contentRangeH 1 0 $
+               if shouldCount preferCount then Just rsQueryTotal else Nothing
+-          , prefHeader
++          , if null pkCols && isNothing (qsOnConflict iQueryParams) then
++              Nothing
++            else
++              toAppliedHeader <$> preferResolution
++          , toAppliedHeader <$> preferMissing
+           ]
+ 
+     case preferRepresentation of
+-      Just Full -> response HTTP.status201 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+-      Just None -> response HTTP.status201 headers mempty
+-      Just HeadersOnly -> response HTTP.status201 headers mempty
++      Just Full -> response HTTP.status201 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
++      Just None -> response HTTP.status201 (addPrefToHeaders headers None) mempty
++      Just HeadersOnly -> response HTTP.status201 (addPrefToHeaders headers HeadersOnly) mempty
+       Nothing -> response HTTP.status201 headers mempty
+ 
++
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+ 
+@@ -133,12 +137,12 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing
+-      headers = catMaybes [contentRangeHeader, prefHeader]
++      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferMissing]
+ 
+     case preferRepresentation of
+-        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+-        Just None -> response HTTP.status204 headers mempty
++        Just Full -> response HTTP.status200 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest)
++          (LBS.fromStrict rsBody)
++        Just None -> response HTTP.status204 (addPrefToHeaders headers None) mempty
+         _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+@@ -149,12 +153,11 @@ singleUpsertResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resu
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
+ 
+     case preferRepresentation of
+-      Just Full -> response HTTP.status200 (contentTypeHeaders ctxApiRequest ++ prefHeader) (LBS.fromStrict rsBody)
+-      Just None -> response HTTP.status204 prefHeader mempty
+-      _ -> response HTTP.status204 prefHeader mempty
++      Just Full -> response HTTP.status200 (contentTypeHeaders ctxApiRequest ++ [toAppliedHeader Full]) (LBS.fromStrict rsBody)
++      Just None -> response HTTP.status204 [toAppliedHeader None] mempty
++      _ -> response HTTP.status204 [] mempty
+ 
+   RSPlan plan ->
+     Wai.responseLBS HTTP.status200 (contentTypeHeaders ctxApiRequest) $ LBS.fromStrict plan
+@@ -167,12 +170,12 @@ deleteResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+       contentRangeHeader =
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing
+-      headers = contentRangeHeader : prefHeader
++      headers = [contentRangeHeader]
+ 
+     case preferRepresentation of
+-        Just Full -> response HTTP.status200 (headers ++ contentTypeHeaders ctxApiRequest) (LBS.fromStrict rsBody)
+-        Just None -> response HTTP.status204 headers mempty
++        Just Full -> response HTTP.status200 (addPrefToHeaders headers Full ++ contentTypeHeaders ctxApiRequest)
++          (LBS.fromStrict rsBody)
++        Just None -> response HTTP.status204 (addPrefToHeaders headers None) mempty
+         _ -> response HTTP.status204 headers mempty
+ 
+   RSPlan plan ->
+@@ -206,7 +209,7 @@ respondInfo allowHeader =
+   Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
+ 
+ invokeResponse :: InvokeMethod -> Routine -> ApiRequest -> ResultSet -> Wai.Response
+-invokeResponse invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{..}, ..} resultSet = case resultSet of
++invokeResponse invMethod proc ctxApiRequest@ApiRequest{..} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+@@ -216,8 +219,7 @@ invokeResponse invMethod proc ctxApiRequest@ApiRequest{iPreferences=Preferences{
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing
+-      headers = contentRange : prefHeader
++      headers = [contentRange]
+ 
+     if Routine.funcReturnsVoid proc then
+         response HTTP.status204 headers mempty
+@@ -276,11 +278,86 @@ addRetryHint delay response = do
+ isServiceUnavailable :: Wai.Response -> Bool
+ isServiceUnavailable response = Wai.responseStatus response == HTTP.status503
+ 
+--- | Add headers not already included to allow the user to override them instead of duplicating them
++optionalRollback :: AppConfig -> ApiRequest -> ExceptT Error.Error IO Wai.Response -> ExceptT Error.Error IO Wai.Response
++optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} resp = do
++  newRes <- catchError resp $ return . Error.errorResponseFor
++  return $ Wai.mapResponseHeaders preferenceApplied newRes
++  where
++    shouldCommit =
++      configDbTxAllowOverride && preferTransaction == Just Commit
++    shouldRollback =
++      configDbTxAllowOverride && preferTransaction == Just Rollback
++    preferenceApplied
++      | shouldCommit =
++          addHeadersIfNotIncluded
++            [toAppliedHeader Commit]
++      | shouldRollback =
++          addHeadersIfNotIncluded
++            [toAppliedHeader Rollback]
++      | otherwise =
++          identity
++
++-- | Add headers not already included to allow the user to override them instead of duplicating them. The exception here is the Preference-Applied header, which will be duplicated here, but later get combined into a single header
++--
++-- >>> :{
++--  addHeadersIfNotIncluded
++--     [("Content-Type","application/json"),
++--      ("Preference-Applied","tx=commit"),
++--      ("Content-Range","*/*")]
++--     [("Content-Type","custom/type"),
++--      ("Preference-Applied","return=representation")]
++-- :}
++-- [("Preference-Applied","tx=commit"),("Content-Range","*/*"),("Content-Type","custom/type"),("Preference-Applied","return=representation")]
++--
++-- | Hmm, below seems like a problem, however this won't happen practically
++--   because preferRepresentation is only added once in the request processing
++--   pipeline. Thus, no need to add an extra filter. In case this becomes a
++--   problem in the future, we can always change this
++--
++-- >>> :{
++--  addHeadersIfNotIncluded
++--      [("Preference-Applied","return=minimal")]
++--      [("Preference-Applied","return=representation")]
++-- :}
++-- [("Preference-Applied","return=minimal"),("Preference-Applied","return=representation")]
++
+ addHeadersIfNotIncluded :: [HTTP.Header] -> [HTTP.Header] -> [HTTP.Header]
+ addHeadersIfNotIncluded newHeaders initialHeaders =
+-  filter (\(nk, _) -> isNothing $ find (\(ik, _) -> ik == nk) initialHeaders) newHeaders ++
+-  initialHeaders
++  filter (keyNotSameOrPrefApp . fst) newHeaders ++ initialHeaders
++    where
++      keyNotSameOrPrefApp k = isNothing (find ((== k) . fst) initialHeaders) ||
++                              (k == HTTP.hPreferenceApplied)
++
++-- |  Filters out multiple Preference-Applied Headers from the list and concatenate them into a single Preference-Applied header:
++--
++-- >>> :{
++--  concatPrefAppsHeaders
++--     [("Content-Type","application/json")
++--     , ("Preference-Applied","tx=commit")
++--     , ("Preference-Applied","return=minimal")]
++-- :}
++-- [("Content-Type","application/json"),("Preference-Applied","tx=commit, return=minimal")]
++
++concatPrefAppsHeaders :: [HTTP.Header] -> [HTTP.Header]
++concatPrefAppsHeaders headers = otherHeaders ++ [(HTTP.hPreferenceApplied, combinedPrefApps)]
++  where
++  (prefApps, otherHeaders) = L.partition (\(k, _) -> k == HTTP.hPreferenceApplied) headers
++  prefAppsValues = [ v | (_,v) <- prefApps]
++  combinedPrefApps = BS.intercalate ", " prefAppsValues
++
++-- | Given response headers and a preferRepresentation value, add
++--   preferRepresentation to Preference-Applied
++--
++-- >>> :{
++--  addPrefToHeaders
++--      [("Content-Type", "application/json")
++--      , ("Preference-Applied", "tx=commit")]
++--      None
++-- :}
++-- [("Content-Type","application/json"),("Preference-Applied","tx=commit, return=minimal")]
++
++addPrefToHeaders :: [HTTP.Header] -> PreferRepresentation -> [HTTP.Header]
++addPrefToHeaders headers pref = concatPrefAppsHeaders (headers ++ [toAppliedHeader pref])
+ 
+ traceHeaderMiddleware :: AppConfig -> Wai.Middleware
+ traceHeaderMiddleware AppConfig{configServerTraceHeader} app req respond =
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 0dfbc9e2..c36ed208 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -38,7 +38,7 @@ spec =
+           `shouldRespondWith` [json|[{"id":2}]|]
+           { matchStatus  = 200
+           , matchHeaders = ["Content-Range" <:> "*/1"
+-                           , "Preference-Applied" <:> "return=representation, count=exact"]
++                           , "Preference-Applied" <:> "return=representation"]
+           }
+ 
+       it "ignores ?select= when return not set or return=minimal" $ do
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 83695e1a..c5a8eb9d 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -102,7 +102,7 @@ spec actualPgVersion = do
+           , matchHeaders = [ matchContentTypeJson
+                            , matchHeaderAbsent hLocation
+                            , "Content-Range" <:> "*/1"
+-                           , "Preference-Applied" <:> "return=representation, count=exact"]
++                           , "Preference-Applied" <:> "return=representation"]
+           }
+ 
+       it "can rename and cast the selected columns" $
+diff --git a/test/spec/Feature/Query/SingularSpec.hs b/test/spec/Feature/Query/SingularSpec.hs
+index 5b5e1a3e..aa83d10d 100644
+--- a/test/spec/Feature/Query/SingularSpec.hs
++++ b/test/spec/Feature/Query/SingularSpec.hs
+@@ -72,7 +72,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 4 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should not be updated, either
+@@ -87,7 +88,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 4 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should not be updated, either
+@@ -143,7 +145,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 2 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should not exist, either
+@@ -158,7 +161,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 2 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should not exist, either
+@@ -173,7 +177,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 2 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should not exist, either
+@@ -221,7 +226,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 5 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should still exist
+@@ -238,7 +244,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 5 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular ]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- the rows should still exist
+@@ -311,7 +318,8 @@ spec =
+           `shouldRespondWith`
+             [json|{"details":"The result contains 2 rows","message":"JSON object requested, multiple (or no) rows returned","code":"PGRST116","hint":null}|]
+             { matchStatus  = 406
+-            , matchHeaders = [ matchContentTypeSingular]
++            , matchHeaders = [ matchContentTypeSingular
++                             , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+         -- should rollback function
+diff --git a/test/spec/Feature/RollbackSpec.hs b/test/spec/Feature/RollbackSpec.hs
+index 40620460..a2f96d6e 100644
+--- a/test/spec/Feature/RollbackSpec.hs
++++ b/test/spec/Feature/RollbackSpec.hs
+@@ -37,8 +37,8 @@ preferCommit   = [("Prefer", "return=representation"), ("Prefer", "tx=commit")]
+ preferRollback = [("Prefer", "return=representation"), ("Prefer", "tx=rollback")]
+ 
+ withoutPreferenceApplied      = []
+-withPreferenceCommitApplied   = [ matchHeaderValuePresent "Preference-Applied" "tx=commit" ]
+-withPreferenceRollbackApplied = [ matchHeaderValuePresent "Preference-Applied" "tx=rollback" ]
++withPreferenceCommitApplied   = [ "Preference-Applied" <:> "tx=commit" ]
++withPreferenceRollbackApplied = [ "Preference-Applied" <:> "tx=rollback" ]
+ 
+ shouldRespondToReads reqHeaders respHeaders = do
+   it "responds to GET" $ do
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index bc0b0074..5ef0cd6d 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -46,12 +46,6 @@ matchCTArrayStrip = "Content-Type" <:> "application/vnd.pgrst.array+json;nulls=s
+ matchCTSingularStrip :: MatchHeader
+ matchCTSingularStrip = "Content-Type" <:> "application/vnd.pgrst.object+json;nulls=stripped; charset=utf-8"
+ 
+-matchHeaderValuePresent :: HeaderName -> BS.ByteString -> MatchHeader
+-matchHeaderValuePresent name val = MatchHeader $ \headers _ ->
+-  case lookup name headers of
+-    Just hdr -> if val `BS.isInfixOf` hdr then Nothing else Just $ "missing header value: " <> toS val <> "\n"
+-    Nothing  -> Just $ "missing header: " <> toS (original name) <> "\n"
+-
+ matchHeaderAbsent :: HeaderName -> MatchHeader
+ matchHeaderAbsent name = MatchHeader $ \headers _body ->
+   case lookup name headers of

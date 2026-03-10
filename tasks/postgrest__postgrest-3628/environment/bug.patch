@@ -1,0 +1,222 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d1f65f61..d423e1d9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,7 +8,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Added
+ 
+  - #3558, Add the `admin-server-host` config to set the host for the admin server - @develop7
+- - #3607, Log to stderr when the JWT secret is less than 32 characters long - @laurenceisla
+ 
+ ### Changed
+ 
+@@ -16,7 +15,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2052, Dropped support for PostgreSQL 10 - @wolfgangwalther
+  - #2052, Dropped support for PostgreSQL 11 - @wolfgangwalther
+  - #3508, PostgREST now fails to start when `server-port` and `admin-server-port` config options are the same - @develop7
+- - #3607, PostgREST now fails to start when the JWT secret is less than 32 characters long - @laurenceisla
+ 
+ ## [12.2.1] - 2024-06-27
+ 
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 57276ef6..9e7d4884 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -220,20 +220,18 @@ readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
+ 
+   case C.runParser (parser optPath env dbSettings roleSettings roleIsolationLvl) =<< mapLeft show conf of
+     Left err ->
+-      return . Left $ "Error in config " <> err
+-    Right parsedConfig ->
+-      mapLeft show <$> decodeLoadFiles parsedConfig
++      return . Left $ "Error in config: " <> err
++    Right config ->
++      Right <$> decodeLoadFiles config
+   where
+     -- Both C.ParseError and IOError are shown here
+     loadConfig :: FilePath -> IO (Either SomeException C.Config)
+     loadConfig = try . C.load
+ 
+-    decodeLoadFiles :: AppConfig -> IO (Either IOException AppConfig)
+-    decodeLoadFiles parsedConfig = try $
+-      decodeJWKS =<<
+-      decodeSecret =<<
+-      readSecretFile =<<
+-      readDbUriFile prevDbUri parsedConfig
++    decodeLoadFiles :: AppConfig -> IO AppConfig
++    decodeLoadFiles parsedConfig =
++      decodeJWKS <$>
++        (decodeSecret =<< readSecretFile =<< readDbUriFile prevDbUri parsedConfig)
+ 
+ parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> RoleIsolationLvl -> C.Parser C.Config AppConfig
+ parser optPath env dbSettings roleSettings roleIsolationLvl =
+@@ -461,25 +459,18 @@ decodeSecret conf@AppConfig{..} =
+ -- There are three ways to specify `jwt-secret`: text secret, JSON Web Key
+ -- (JWK), or JSON Web Key Set (JWKS). The first two are converted into a JwkSet
+ -- with one key and the last is converted as is.
+-decodeJWKS :: AppConfig -> IO AppConfig
+-decodeJWKS conf = do
+-  jwks <- case configJwtSecret conf of
+-    Just s  -> either fail (pure . Just) $ parseSecret s
+-    Nothing -> pure Nothing
+-  return $ conf { configJWKS = jwks }
+-
+-parseSecret :: ByteString -> Either [Char] JwkSet
++decodeJWKS :: AppConfig -> AppConfig
++decodeJWKS conf =
++  conf { configJWKS = parseSecret <$> configJwtSecret conf }
++
++parseSecret :: ByteString -> JwkSet
+ parseSecret bytes =
+-  case maybeJWKSet of
+-    Just jwk -> Right jwk
+-    Nothing  -> maybe validateSecret (\jwk' -> Right $ JWT.JwkSet [jwk']) maybeJWK
++  fromMaybe (maybe secret (\jwk' -> JWT.JwkSet [jwk']) maybeJWK)
++    maybeJWKSet
+   where
+     maybeJWKSet = JSON.decodeStrict bytes :: Maybe JwkSet
+     maybeJWK = JSON.decodeStrict bytes :: Maybe Jwk
+     secret = JWT.JwkSet [JWT.SymmetricJwk bytes Nothing (Just JWT.Sig) (Just $ JWT.Signed JWT.HS256)]
+-    validateSecret
+-      | BS.length bytes < 32 = Left "The JWT secret must be at least 32 characters long."
+-      | otherwise = Right secret
+ 
+ -- | Read database uri from a separate file if `db-uri` is a filepath.
+ readDbUriFile :: Maybe Text -> AppConfig -> IO AppConfig
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index c2d33c50..e362e40c 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -21,7 +21,7 @@ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".\"user\"[0].\"real-role\""
+-jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5aW5iYXNlNjQ="
++jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+ jwt-secret-is-base64 = true
+ jwt-cache-max-lifetime = 86400
+ log-level = "info"
+diff --git a/test/io/configs/no-defaults-env.yaml b/test/io/configs/no-defaults-env.yaml
+index 0ab82a3c..459f788a 100644
+--- a/test/io/configs/no-defaults-env.yaml
++++ b/test/io/configs/no-defaults-env.yaml
+@@ -24,7 +24,7 @@ PGRST_DB_URI: tmp_db
+ PGRST_DB_USE_LEGACY_GUCS: false
+ PGRST_JWT_AUD: 'https://postgrest.org'
+ PGRST_JWT_ROLE_CLAIM_KEY: '.user[0]."real-role"'
+-PGRST_JWT_SECRET: c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5aW5iYXNlNjQ=
++PGRST_JWT_SECRET: c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5
+ PGRST_JWT_SECRET_IS_BASE64: true
+ PGRST_JWT_CACHE_MAX_LIFETIME: 86400
+ PGRST_LOG_LEVEL: info
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index 5859d6b2..02566183 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -21,7 +21,7 @@ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".user[0].\"real-role\""
+-jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5aW5iYXNlNjQ="
++jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+ jwt-secret-is-base64 = true
+ jwt-cache-max-lifetime = 86400
+ log-level = "info"
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 9eb2a892..f71e1594 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -66,19 +66,6 @@ def test_read_secret_from_stdin_dbconfig(defaultenv):
+         assert response.status_code == 200
+ 
+ 
+-def test_secret_min_length(defaultenv):
+-    "Should log error and not load the config when the secret is shorter than the minimum admitted length"
+-
+-    env = {**defaultenv, "PGRST_JWT_SECRET": "short_secret"}
+-
+-    with run(env=env, no_startup_stdout=False, wait_for_readiness=False) as postgrest:
+-        exitCode = wait_until_exit(postgrest)
+-        assert exitCode == 1
+-
+-        output = postgrest.read_stdout(nlines=1)
+-        assert "The JWT secret must be at least 32 characters long." in output[0]
+-
+-
+ def test_jwt_errors(defaultenv):
+     "invalid JWT should throw error"
+ 
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 7e64d9e4..0ee23780 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -108,7 +108,7 @@ validateOpenApiResponse headers = do
+ 
+ 
+ baseCfg :: AppConfig
+-baseCfg = let secret = encodeUtf8 "reallyreallyreallyreallyverysafe" in
++baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   AppConfig {
+     configAppSettings               = [ ("app.settings.app_host", "localhost") , ("app.settings.external_api_secret", "0123456789abcdef") ]
+   , configDbAggregates              = False
+@@ -132,10 +132,10 @@ baseCfg = let secret = encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbPreConfig               = Nothing
+   , configDbUri                     = "postgresql://"
+   , configFilePath                  = Nothing
+-  , configJWKS                      = rightToMaybe $ parseSecret secret
++  , configJWKS                      = parseSecret <$> secret
+   , configJwtAudience               = Nothing
+   , configJwtRoleClaimKey           = [JSPKey "role"]
+-  , configJwtSecret                 = Just secret
++  , configJwtSecret                 = secret
+   , configJwtSecretIsBase64         = False
+   , configJwtCacheMaxLifetime       = 0
+   , configLogLevel                  = LogCrit
+@@ -196,35 +196,35 @@ testPlanEnabledCfg = baseCfg { configDbPlanEnabled = True }
+ 
+ testCfgBinaryJWT :: AppConfig
+ testCfgBinaryJWT =
+-  let secret = B64.decodeLenient "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
++  let secret = Just . B64.decodeLenient $ "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+   baseCfg {
+-    configJwtSecret = Just secret
+-  , configJWKS = rightToMaybe $ parseSecret secret
++    configJwtSecret = secret
++  , configJWKS = parseSecret <$> secret
+   }
+ 
+ testCfgAudienceJWT :: AppConfig
+ testCfgAudienceJWT =
+-  let secret = B64.decodeLenient "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
++  let secret = Just . B64.decodeLenient $ "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+   baseCfg {
+-    configJwtSecret = Just secret
++    configJwtSecret = secret
+   , configJwtAudience = Just "youraudience"
+-  , configJWKS = rightToMaybe $ parseSecret secret
++  , configJWKS = parseSecret <$> secret
+   }
+ 
+ testCfgAsymJWK :: AppConfig
+ testCfgAsymJWK =
+-  let secret = encodeUtf8 [str|{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}|]
++  let secret = Just $ encodeUtf8 [str|{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}|]
+   in baseCfg {
+-    configJwtSecret = Just secret
+-  , configJWKS = rightToMaybe $ parseSecret secret
++    configJwtSecret = secret
++  , configJWKS = parseSecret <$> secret
+   }
+ 
+ testCfgAsymJWKSet :: AppConfig
+ testCfgAsymJWKSet =
+-  let secret = encodeUtf8 [str|{"keys": [{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}]}|]
++  let secret = Just $ encodeUtf8 [str|{"keys": [{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}]}|]
+   in baseCfg {
+-    configJwtSecret = Just secret
+-  , configJWKS = rightToMaybe $ parseSecret secret
++    configJwtSecret = secret
++  , configJWKS = parseSecret <$> secret
+   }
+ 
+ testNonexistentSchemaCfg :: AppConfig

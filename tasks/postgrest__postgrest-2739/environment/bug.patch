@@ -1,0 +1,131 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 697898c5..7d85fc97 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,7 +25,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2694, Make `db-root-spec` stable. - @steve-chavez
+    + This can be used to override the OpenAPI spec with a custom database function
+  - #1567, On bulk inserts, missing values can get the column DEFAULT by using the `Prefer: missing=default` header - @steve-chavez
+- - #2501, Allow filtering by`IS DISTINCT FROM` using the `isdistinct` operator, e.g. `/people?alias=isdistinct.foo`
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index 6114307c..aafa4411 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -589,13 +589,11 @@ pOpExpr pSVal = do
+   OpExpr boolExpr <$> pOperation
+   where
+     pOperation :: Parser Operation
+-    pOperation = pIn <|> pIs <|> pIsDist <|> try pFts <|> try pOp <?> "operator (eq, gt, ...)"
++    pOperation = pIn <|> pIs <|> try pFts <|> try pOp <?> "operator (eq, gt, ...)"
+ 
+     pIn = In <$> (try (string "in" *> pDelimiter) *> pListVal)
+     pIs = Is <$> (try (string "is" *> pDelimiter) *> pTriVal)
+ 
+-    pIsDist = IsDistinctFrom <$> (try (string "isdistinct" *> pDelimiter) *> pSVal)
+-
+     pOp = do
+       opStr <- try (P.manyTill anyChar (try pDelimiter))
+       op <- parseMaybe ("unknown single value operator " <> opStr) . operator $ toS opStr
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 207e773b..e7acc071 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -191,7 +191,6 @@ data Operation
+   = Op SimpleOperator SingleVal
+   | In ListVal
+   | Is TrileanVal
+-  | IsDistinctFrom SingleVal
+   | Fts FtsOperator (Maybe Language) SingleVal
+   deriving (Eq)
+ 
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index aef561a3..71cb23d9 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -305,8 +305,6 @@ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper
+      TriNull    -> "NULL"
+      TriUnknown -> "UNKNOWN"
+ 
+-   IsDistinctFrom val -> pgFmtField table fld <> " IS DISTINCT FROM " <> unknownLiteral val
+-
+    -- We don't use "IN", we use "= ANY". IN has the following disadvantages:
+    -- + No way to use an empty value on IN: "col IN ()" is invalid syntax. With ANY we can do "= ANY('{}')"
+    -- + Can invalidate prepared statements: multiple parameters on an IN($1, $2, $3) will lead to using different prepared statements and not take advantage of caching.
+diff --git a/test/spec/Feature/Query/AndOrParamsSpec.hs b/test/spec/Feature/Query/AndOrParamsSpec.hs
+index aa6e5051..da76e7f4 100644
+--- a/test/spec/Feature/Query/AndOrParamsSpec.hs
++++ b/test/spec/Feature/Query/AndOrParamsSpec.hs
+@@ -92,9 +92,6 @@ spec actualPgVersion =
+               {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
+               {"text_search_vector": "'art':4 'spass':5 'unmog':7"}
+             ]|] { matchHeaders = [matchContentTypeJson] }
+-        it "can handle isdistinct" $
+-          get "/entities?and=(id.gte.2,arr.isdistinct.{1,2})&select=id" `shouldRespondWith`
+-            [json|[{ "id": 3 }, { "id": 4 }]|] { matchHeaders = [matchContentTypeJson] }
+ 
+         when (actualPgVersion >= pgVersion112) $
+           it "can handle wfts (websearch_to_tsquery)" $
+@@ -141,8 +138,6 @@ spec actualPgVersion =
+             [json|[{ "id": 3 }, { "id": 4 }]|] { matchHeaders = [matchContentTypeJson] }
+           get "/ranges?range=adj.(3,10]&select=id" `shouldRespondWith`
+             [json|[{ "id": 1 }]|] { matchHeaders = [matchContentTypeJson] }
+-          get "/ranges?range=isdistinct.[1,3]&select=id" `shouldRespondWith`
+-            [json|[{ "id": 2 }, { "id": 3 }, { "id": 4 }, {"id": 5}]|] { matchHeaders = [matchContentTypeJson] }
+ 
+         it "can handle array operators" $ do
+           get "/entities?arr=eq.{1,2,3}&select=id" `shouldRespondWith`
+@@ -171,8 +166,6 @@ spec actualPgVersion =
+             [json|[{ "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+           get "/entities?arr=ov.{2,3}&select=id" `shouldRespondWith`
+             [json|[{ "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+-          get "/entities?arr=isdistinct.{1,2}&select=id" `shouldRespondWith`
+-            [json|[{ "id": 1 }, { "id": 3 }, { "id": 4 }]|] { matchHeaders = [matchContentTypeJson] }
+ 
+         context "operators with not" $ do
+           it "eq, cs, like can be negated" $
+@@ -187,9 +180,6 @@ spec actualPgVersion =
+           it "gt, lte, ilike can be negated" $
+             get "/entities?and=(name.not.ilike.*ITY2,or(id.not.gt.4,id.not.lte.1))&select=id" `shouldRespondWith`
+               [json|[{"id": 1}, {"id": 2}, {"id": 3}]|] { matchHeaders = [matchContentTypeJson] }
+-          it "isdistinct can be negated" $
+-            get "/entities?and=(id.not.eq.2,arr.not.isdistinct.{1,2,3})&select=id" `shouldRespondWith`
+-              [json|[{"id": 3}]|] { matchHeaders = [matchContentTypeJson] }
+ 
+       context "and/or params with quotes" $ do
+         it "eq can have quotes" $
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index e4d29f7d..93419051 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -324,16 +324,6 @@ spec actualPgVersion = do
+         [json|[{"id":1},{"id":2}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    it "matches with IS DISTINCT FROM" $
+-      get "/no_pk?select=a&a=isdistinct.2" `shouldRespondWith`
+-        [json|[{"a":null},{"a":"1"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "matches with IS DISTINCT FROM using not operator" $
+-      get "/no_pk?select=a&a=not.isdistinct.2" `shouldRespondWith`
+-        [json|[{"a":"2"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+   describe "Shaping response with select parameter" $ do
+     it "selectStar works in absense of parameter" $
+       get "/complex_items?id=eq.3" `shouldRespondWith`
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index d2e6cb56..cb2e219b 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -379,7 +379,6 @@ INSERT INTO ranges VALUES (1, '[1,3]');
+ INSERT INTO ranges VALUES (2, '[3,6]');
+ INSERT INTO ranges VALUES (3, '[6,9]');
+ INSERT INTO ranges VALUES (4, '[9,12]');
+-INSERT INTO ranges VALUES (5, null);
+ 
+ TRUNCATE TABLE being CASCADE;
+ INSERT INTO being VALUES (1), (2), (3), (4);

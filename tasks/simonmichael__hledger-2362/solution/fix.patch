@@ -1,0 +1,303 @@
+diff --git a/hledger-lib/Hledger/Data/Timeclock.hs b/hledger-lib/Hledger/Data/Timeclock.hs
+index 54895adc2..ad1f76a37 100644
+--- a/hledger-lib/Hledger/Data/Timeclock.hs
++++ b/hledger-lib/Hledger/Data/Timeclock.hs
+@@ -10,10 +10,12 @@ converted to 'Transactions' and queried like a ledger.
+ 
+ module Hledger.Data.Timeclock (
+    timeclockEntriesToTransactions
++  ,timeclockEntriesToTransactionsSingle
+   ,tests_Timeclock
+ )
+ where
+ 
++import Data.List (partition, sortBy, uncons)
+ import Data.Maybe (fromMaybe)
+ import qualified Data.Text as T
+ import Data.Time.Calendar (addDays)
+@@ -47,12 +49,97 @@ instance Read TimeclockCode where
+     readsPrec _ ('O' : xs) = [(FinalOut, xs)]
+     readsPrec _ _ = []
+ 
++data Session = Session
++    { in' :: TimeclockEntry,
++      out :: TimeclockEntry
++    }
++
++data Sessions = Sessions
++    { completed :: [Session],
++      active :: [TimeclockEntry]
++    }
++
++-- Find the relevant clockin in the actives list that should be paired with this clockout.
++-- If there is a session that has the same account name, then use that.
++-- Otherwise, if there is an active anonymous session, use that.
++-- Otherwise, raise an error.
++findInForOut :: TimeclockEntry -> ([TimeclockEntry], [TimeclockEntry]) -> (TimeclockEntry, [TimeclockEntry])
++findInForOut _ (matchingout : othermatches, rest) = (matchingout, othermatches <> rest)
++findInForOut o ([], activeins) =
++    if emptyname then (first, rest) else error' errmsg
++    where
++        l = show $ unPos $ sourceLine $ tlsourcepos o
++        c = unPos $ sourceColumn $ tlsourcepos o
++        emptyname = tlaccount o == ""
++        (first, rest) = case uncons activeins of
++            Just (hd, tl) -> (hd, tl)
++            Nothing -> error' errmsg
++        errmsg =
++            printf
++              "%s:\n%s\n%s\n\nCould not find previous clockin to match this clockout."
++              (sourcePosPretty $ tlsourcepos o)
++              (l ++ " | " ++ show o)
++              (replicate (length l) ' ' ++ " |" ++ replicate c ' ' ++ "^")
++
++-- Assuming that entries has been sorted, we go through each time log entry.
++-- We collect all of the "i" in the list "actives," and each time we encounter
++-- an "o," we look for the corresponding "i" in actives.
++-- If we cannot find it, then it is an error (since the list is sorted).
++-- If the "o" is recorded on a different day than the "i," then we close the
++-- active entry at the end of its day, replace it in the active list
++-- with a start at midnight on the next day, and try again.
++-- This raises an error if any outs cannot be paired with an in.
++pairClockEntries :: [TimeclockEntry] -> [TimeclockEntry] -> [Session] -> Sessions
++pairClockEntries [] actives sessions = Sessions {completed = sessions, active = actives}
++pairClockEntries (entry : rest) actives sessions
++    | tlcode entry == In = pairClockEntries rest inentries sessions
++    | tlcode entry == Out = pairClockEntries rest' actives' sessions'
++    | otherwise = pairClockEntries rest actives sessions
++    where
++        (inentry, newactive) = findInForOut entry (partition (\e -> tlaccount e == tlaccount entry) actives)
++        (itime, otime) = (tldatetime inentry, tldatetime entry)
++        (idate, odate) = (localDay itime, localDay otime)
++        omidnight = entry {tldatetime = itime {localDay = idate, localTimeOfDay = TimeOfDay 23 59 59}}
++        imidnight = inentry {tldatetime = itime {localDay = addDays 1 idate, localTimeOfDay = midnight}}
++        (sessions', actives', rest') = if odate > idate then
++              (Session {in' = inentry, out = omidnight} : sessions, imidnight : newactive, entry : rest)
++            else
++              (Session {in' = inentry, out = entry} : sessions, newactive, rest)
++        l = show $ unPos $ sourceLine $ tlsourcepos entry
++        c = unPos $ sourceColumn $ tlsourcepos entry
++        inentries =
++          if any (\e -> tlaccount e == tlaccount entry) actives
++            then error' $
++                printf
++                  "%s:\n%s\n%s\n\nEncountered clockin entry for session \"%s\" that is already active."
++                  (sourcePosPretty $ tlsourcepos entry)
++                  (l ++ " | " ++ show entry)
++                  (replicate (length l) ' ' ++ " |" ++ replicate c ' ' ++ "^")
++                  (tlaccount entry)
++            else entry : actives
++
+ -- | Convert time log entries to journal transactions. When there is no
+ -- clockout, add one with the provided current time. Sessions crossing
+ -- midnight are split into days to give accurate per-day totals.
++-- If any entries cannot be paired as expected, then an error is raised.
+ timeclockEntriesToTransactions :: LocalTime -> [TimeclockEntry] -> [Transaction]
+-timeclockEntriesToTransactions _ [] = []
+-timeclockEntriesToTransactions now [i]
++timeclockEntriesToTransactions now entries = transactions
++  where
++    sessions = pairClockEntries (sortBy (\e1 e2 -> compare (tldatetime e1) (tldatetime e2)) entries) [] []
++    transactionsFromSession s = entryFromTimeclockInOut (in' s) (out s)
++    -- If any "in" sessions are in the future, then set their out time to the initial time
++    outtime te = max now (tldatetime te)
++    createout te = TimeclockEntry (tlsourcepos te) Out (outtime te) (tlaccount te) "" "" []
++    outs = map createout (active sessions)
++    stillopen = pairClockEntries ((active sessions) <> outs) [] []
++    transactions = map transactionsFromSession $ sortBy (\s1 s2 -> compare (in' s1) (in' s2)) (completed sessions ++ completed stillopen)
++
++-- | Convert time log entries to journal transactions, expecting the entries to be
++-- a strict in/out cycle. When there is no clockout, add one with the provided current time. 
++-- Sessions crossing midnight are split into days to give accurate per-day totals.
++timeclockEntriesToTransactionsSingle :: LocalTime -> [TimeclockEntry] -> [Transaction]
++timeclockEntriesToTransactionsSingle _ [] = []
++timeclockEntriesToTransactionsSingle now [i]
+     | tlcode i /= In = errorExpectedCodeButGot In i
+     | odate > idate = entryFromTimeclockInOut i o' : timeclockEntriesToTransactions now [i',o]
+     | otherwise = [entryFromTimeclockInOut i o]
+@@ -63,7 +150,7 @@ timeclockEntriesToTransactions now [i]
+       (idate,odate) = (localDay itime,localDay otime)
+       o' = o{tldatetime=itime{localDay=idate, localTimeOfDay=TimeOfDay 23 59 59}}
+       i' = i{tldatetime=itime{localDay=addDays 1 idate, localTimeOfDay=midnight}}
+-timeclockEntriesToTransactions now (i:o:rest)
++timeclockEntriesToTransactionsSingle now (i:o:rest)
+     | tlcode i /= In  = errorExpectedCodeButGot In i
+     | tlcode o /= Out = errorExpectedCodeButGot Out o
+     | odate > idate   = entryFromTimeclockInOut i o' : timeclockEntriesToTransactions now (i':o:rest)
+@@ -98,6 +185,8 @@ entryFromTimeclockInOut i o
+     | otherwise =
+       -- Clockout time earlier than clockin is an error.
+       -- (Clockin earlier than preceding clockin/clockout is allowed.)
++      -- We should never encounter this case now that we sort the entries,
++      -- but let's leave it in case of error.
+       error' $ printf
+         ("%s:\n%s\nThis clockout time (%s) is earlier than the previous clockin.\n"
+         ++"Please adjust it to be later than %s.")
+@@ -155,6 +244,7 @@ tests_Timeclock = testGroup "Timeclock" [
+           nowstr = showtime now
+           yesterday = prevday today
+           clockin = TimeclockEntry (initialPos "") In
++          clockout = TimeclockEntry (initialPos "") Out
+           mktime d = LocalTime d . fromMaybe midnight .
+                      parseTimeM True defaultTimeLocale "%H:%M:%S"
+           showtime = formatTime defaultTimeLocale "%H:%M"
+@@ -169,4 +259,14 @@ tests_Timeclock = testGroup "Timeclock" [
+       txndescs [clockin (mktime today "00:00:00") "" "" "" []] @?= ["00:00-"++nowstr]
+       step "use the clockin time for auto-clockout if it's in the future"
+       txndescs [clockin future "" "" "" []] @?= [printf "%s-%s" futurestr futurestr]
++      step "multiple open sessions"
++      txndescs
++        [ clockin (mktime today "00:00:00") "a" "" "" [],
++          clockin (mktime today "01:00:00") "b" "" "" [],
++          clockin (mktime today "02:00:00") "c" "" "" [],
++          clockout (mktime today "03:00:00") "b" "" "" [],
++          clockout (mktime today "04:00:00") "a" "" "" [],
++          clockout (mktime today "05:00:00") "c" "" "" []
++        ]
++        @?= ["00:00-04:00", "01:00-03:00", "02:00-05:00"]
+  ]
+diff --git a/hledger-lib/Hledger/Read/Common.hs b/hledger-lib/Hledger/Read/Common.hs
+index d54776efd..9cb9d2bbe 100644
+--- a/hledger-lib/Hledger/Read/Common.hs
++++ b/hledger-lib/Hledger/Read/Common.hs
+@@ -231,6 +231,7 @@ rawOptsToInputOpts day usecoloronstdout postingaccttags rawopts =
+                                }
+       ,strict_            = boolopt "strict" rawopts
+       ,_ioDay             = day
++      ,_oldtimeclock      = boolopt "oldtimeclock" rawopts
+       }
+ 
+ handleReadFnToTextReadFn :: (InputOpts -> FilePath -> Text -> ExceptT String IO Journal) -> InputOpts -> FilePath -> Handle -> ExceptT String IO Journal
+diff --git a/hledger-lib/Hledger/Read/InputOptions.hs b/hledger-lib/Hledger/Read/InputOptions.hs
+index 1c57e653d..d06e3c8b6 100644
+--- a/hledger-lib/Hledger/Read/InputOptions.hs
++++ b/hledger-lib/Hledger/Read/InputOptions.hs
+@@ -44,6 +44,7 @@ data InputOpts = InputOpts {
+     ,strict_            :: Bool                 -- ^ do extra correctness checks ?
+     ,_defer             :: Bool                 -- ^ internal flag: postpone checks, because we are processing multiple files ?
+     ,_ioDay             :: Day                  -- ^ today's date, for use with forecast transactions  XXX this duplicates _rsDay, and should eventually be removed when it's not needed anymore.
++    ,_oldtimeclock      :: Bool                 -- ^ parse with the old timeclock pairing rules?
+  } deriving (Eq, Ord, Show)
+ 
+ definputopts :: InputOpts
+@@ -66,6 +67,7 @@ definputopts = InputOpts
+     , strict_            = False
+     , _defer             = False
+     , _ioDay             = nulldate
++    , _oldtimeclock      = False
+     }
+ 
+ -- | Get the Maybe the DateSpan to generate forecast options from.
+diff --git a/hledger-lib/Hledger/Read/TimeclockReader.hs b/hledger-lib/Hledger/Read/TimeclockReader.hs
+index 3160e9fd2..ad953219e 100644
+--- a/hledger-lib/Hledger/Read/TimeclockReader.hs
++++ b/hledger-lib/Hledger/Read/TimeclockReader.hs
+@@ -80,32 +80,41 @@ reader = Reader
+   {rFormat     = Timeclock
+   ,rExtensions = ["timeclock"]
+   ,rReadFn     = handleReadFnToTextReadFn parse
+-  ,rParser    = timeclockfilep
++  ,rParser     = timeclockfilep definputopts
+   }
+ 
+ -- | Parse and post-process a "Journal" from timeclock.el's timeclock
+ -- format, saving the provided file path and the current time, or give an
+ -- error.
+ parse :: InputOpts -> FilePath -> Text -> ExceptT String IO Journal
+-parse iopts fp t = initialiseAndParseJournal timeclockfilep iopts fp t
++parse iopts fp t = initialiseAndParseJournal (timeclockfilep iopts) iopts fp t
+                    >>= liftEither . journalApplyAliases (aliasesFromOpts iopts)
+                    >>= journalFinalise iopts fp t
+ 
+ --- ** parsers
+ 
+-timeclockfilep :: MonadIO m => JournalParser m ParsedJournal
+-timeclockfilep = do many timeclockitemp
+-                    eof
+-                    j@Journal{jparsetimeclockentries=es} <- get
+-                    -- Convert timeclock entries in this journal to transactions, closing any unfinished sessions.
+-                    -- Doing this here rather than in journalFinalise means timeclock sessions can't span file boundaries,
+-                    -- but it simplifies code above.
+-                    now <- liftIO getCurrentLocalTime
+-                    -- entries have been parsed in reverse order. timeclockEntriesToTransactions
+-                    -- expects them to be in normal order, then we must reverse again since
+-                    -- journalFinalise expects them in reverse order
+-                    let j' = j{jtxns = reverse $ timeclockEntriesToTransactions now $ reverse es, jparsetimeclockentries = []}
+-                    return j'
++-- timeclockfilepspecial :: InputOpts -> JournalParser m ParsedJournal
++-- timeclockfilepspecial args = 
++-- timeclockfilep args
++
++timeclockfilep :: MonadIO m => InputOpts -> JournalParser m ParsedJournal
++timeclockfilep iopts = do many timeclockitemp
++                          eof
++                          j@Journal{jparsetimeclockentries=es} <- get
++                          -- Convert timeclock entries in this journal to transactions, closing any unfinished sessions.
++                          -- Doing this here rather than in journalFinalise means timeclock sessions can't span file boundaries,
++                          -- but it simplifies code above.
++                          now <- liftIO getCurrentLocalTime
++                          -- journalFinalise expects the transactions in reverse order, so reverse the output in either case
++                          let j' = if (_oldtimeclock iopts) then 
++                                -- timeclockEntriesToTransactionsSingle expects the entries to be in normal order, 
++                                -- but they have been parsed in reverse order, so reverse them before calling
++                                j{jtxns = reverse $ timeclockEntriesToTransactionsSingle now $ reverse es, jparsetimeclockentries = []}
++                              else 
++                                -- We don't need to reverse these transactions 
++                                -- since they are sorted inside of timeclockEntiresToTransactions
++                                j{jtxns = reverse $ timeclockEntriesToTransactions now es, jparsetimeclockentries = []}
++                          return j'
+     where
+       -- As all ledger line types can be distinguished by the first
+       -- character, excepting transactions versus empty (blank or
+diff --git a/hledger/Hledger/Cli/CliOptions.hs b/hledger/Hledger/Cli/CliOptions.hs
+index a11fc8ce4..04c26d98d 100644
+--- a/hledger/Hledger/Cli/CliOptions.hs
++++ b/hledger/Hledger/Cli/CliOptions.hs
+@@ -283,6 +283,7 @@ hiddenflagsformainmode = [
+   ,flagNone ["pretty-tables"]        (setopt "pretty" "always") "legacy flag that was renamed"
+   ,flagNone ["anon"]                 (setboolopt "anon") "deprecated, renamed to --obfuscate"  -- #2133, handled by anonymiseByOpts
+   ,flagNone ["obfuscate"]            (setboolopt "obfuscate") "slightly obfuscate hledger's output. Warning, does not give privacy. Formerly --anon."  -- #2133, handled by maybeObfuscate
++  ,flagNone ["timeclock-old"]        (setboolopt "oldtimeclock") "don't pair timeclock entries by account name"
+   ,flagReq  ["rules-file"]           (\s opts -> Right $ setopt "rules" s opts) "RULESFILE" "was renamed to --rules"
+   ]
+ 
+diff --git a/hledger/hledger.m4.md b/hledger/hledger.m4.md
+index 684e76793..6d06aa59b 100644
+--- a/hledger/hledger.m4.md
++++ b/hledger/hledger.m4.md
+@@ -4606,12 +4606,19 @@ i 2015/03/30 09:00:00 some account  optional description after 2 spaces ; option
+ o 2015/03/30 09:20:00
+ i 2015/03/31 22:21:45 another:account
+ o 2015/04/01 02:00:34
++i 2015/04/02 12:00:00 another:account  ; this demonstrates multple sessions being clocked in
++i 2015/04/02 13:00:00 some account
++o 2015/04/02 14:00:00
++o 2015/04/02 15:00:00 another:account
+ ```
+ 
+ hledger treats each clock-in/clock-out pair as a transaction posting
+-some number of hours to an account. Or if the session spans more than
+-one day, it is split into several transactions, one for each day. For
+-the above time log, `hledger print` generates these journal entries:
++some number of hours to an account. Entries are paired by the account
++name if the same name is given for a clock-in/clock-out pair. If no 
++name is given for a clock-out, then it is paired with the most recent 
++clock-in entry. If the session spans more than one day, it is split into 
++several transactions, one for each day. For the above time log, 
++`hledger print` generates these journal entries:
+ 
+ ```cli
+ $ hledger -f t.timeclock print
+@@ -4624,6 +4631,12 @@ $ hledger -f t.timeclock print
+ 2015-04-01 * 00:00-02:00
+     (another:account)           2.01h
+ 
++2015-04-02 * 12:00-15:00  ; this demonstrates multiple sessions being clocked in
++    (another:account)           3.00h
++
++2015-04-02 * 13:00-14:00
++    (some account)           1.00h
++
+ ```
+ 
+ Here is a

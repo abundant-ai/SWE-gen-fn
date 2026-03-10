@@ -1,0 +1,144 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index d0270bb5..17bf4a16 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -291,9 +291,13 @@ handleRead headersOnly identifier context@RequestContext{..} = do
+             )
+           ]
+           ++ contentTypeHeaders context
++        rsOrErrBody = if status == HTTP.status416
++          then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
++            $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show total)
++          else LBS.fromStrict rsBody
+ 
+       failNotSingular iAcceptMediaType rsQueryTotal . response status headers $
+-        if headersOnly then mempty else LBS.fromStrict rsBody
++        if headersOnly then mempty else rsOrErrBody
+ 
+     RSPlan plan ->
+       pure $ Wai.responseLBS HTTP.status200 (contentTypeHeaders context) $ LBS.fromStrict plan
+@@ -501,6 +505,10 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       let
+         (status, contentRange) =
+           RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
++        rsOrErrBody = if status == HTTP.status416
++          then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
++            $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
++          else LBS.fromStrict rsBody
+ 
+       failNotSingular iAcceptMediaType rsQueryTotal $
+         if Proc.procReturnsVoid proc then
+@@ -508,7 +516,7 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+         else
+           response status
+             (contentTypeHeaders context ++ [contentRange])
+-            (if invMethod == InvHead then mempty else LBS.fromStrict rsBody)
++            (if invMethod == InvHead then mempty else rsOrErrBody)
+ 
+     RSPlan plan ->
+       pure $ Wai.responseLBS HTTP.status200 (contentTypeHeaders context) $ LBS.fromStrict plan
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 27930ad2..985b7b3a 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -32,7 +32,8 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.MediaType     (MediaType (..))
+ import qualified PostgREST.MediaType     as MediaType
+ import           PostgREST.Request.Types (ApiRequestError (..),
+-                                          QPError (..))
++                                          QPError (..),
++                                          RangeError (..))
+ 
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+@@ -60,7 +61,7 @@ instance PgrstError ApiRequestError where
+   status InvalidBody{}           = HTTP.status400
+   status InvalidFilters          = HTTP.status405
+   status InvalidRpcMethod{}      = HTTP.status405
+-  status InvalidRange            = HTTP.status416
++  status InvalidRange{}          = HTTP.status416
+   status NotFound                = HTTP.status404
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+@@ -90,10 +91,13 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= T.decodeUtf8 errorMessage,
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+-  toJSON InvalidRange = JSON.object [
++  toJSON (InvalidRange rangeError) = JSON.object [
+     "code"    .= ApiRequestErrorCode03,
+-    "message" .= ("HTTP Range error" :: Text),
+-    "details" .= JSON.Null,
++    "message" .= ("Requested range not satisfiable" :: Text),
++    "details" .= (case rangeError of
++                   NegativeLimit           -> "Limit should be greater than or equal to zero."
++                   LowerGTUpper            -> "The lower boundary must be lower than or equal to the upper boundary in the Range header."
++                   OutOfBounds lower total -> "An offset of " <> lower <> " was requested, but there are only " <> total <> " rows."),
+     "hint"    .= JSON.Null]
+   toJSON (ParseRequestError message details) = JSON.object [
+     "code"    .= ApiRequestErrorCode04,
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index f067cf74..cea2625c 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -36,7 +36,8 @@ import Control.Arrow             ((***))
+ import Data.Aeson.Types          (emptyArray, emptyObject)
+ import Data.List                 (lookup, union)
+ import Data.Maybe                (fromJust)
+-import Data.Ranged.Ranges        (emptyRange, rangeIntersection)
++import Data.Ranged.Ranges        (emptyRange, rangeIntersection,
++                                  rangeIsEmpty)
+ import Network.HTTP.Types.Header (hCookie)
+ import Network.HTTP.Types.URI    (parseSimpleQuery)
+ import Network.Wai               (Request (..))
+@@ -64,7 +65,8 @@ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferResolution (..),
+                                           PreferTransaction (..))
+ import PostgREST.Request.QueryParams     (QueryParams (..))
+-import PostgREST.Request.Types           (ApiRequestError (..))
++import PostgREST.Request.Types           (ApiRequestError (..),
++                                          RangeError (..))
+ 
+ import qualified PostgREST.MediaType           as MediaType
+ import qualified PostgREST.Request.Preferences as Preferences
+@@ -217,7 +219,7 @@ getAction PathInfo{pathIsProc, pathIsDefSpec} method =
+ apiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> QueryParams.QueryParams -> PathInfo -> Action -> Either ApiRequestError ApiRequest
+ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..} path@PathInfo{pathName, pathIsProc, pathIsRootSpec, pathIsDefSpec} action
+   | isJust profile && fromJust profile `notElem` configDbSchemas = Left $ UnacceptableSchema $ toList configDbSchemas
+-  | isInvalidRange = Left InvalidRange
++  | isInvalidRange = Left $ InvalidRange (if rangeIsEmpty headerRange then LowerGTUpper else NegativeLimit)
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
+   | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+   | method `elem` ["PATCH", "DELETE"] && not (null qsRanges) && null qsOrder = Left LimitNoOrderError
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index cf828793..0dd1d893 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -27,6 +27,7 @@ module PostgREST.Request.Types
+   , OrderNulls(..)
+   , OrderTerm(..)
+   , QPError(..)
++  , RangeError(..)
+   , SingleVal
+   , TrileanVal(..)
+   , SimpleOperator(..)
+@@ -52,7 +53,7 @@ data ApiRequestError
+   | MediaTypeError [ByteString]
+   | InvalidBody ByteString
+   | InvalidFilters
+-  | InvalidRange
++  | InvalidRange RangeError
+   | InvalidRpcMethod ByteString
+   | LimitNoOrderError
+   | NotFound
+@@ -66,6 +67,10 @@ data ApiRequestError
+   | UnsupportedMethod ByteString
+ 
+ data QPError = QPError Text Text
++data RangeError
++  = NegativeLimit
++  | LowerGTUpper
++  | OutOfBounds Text Text
+ 
+ type CallRequest = CallQuery
+ 

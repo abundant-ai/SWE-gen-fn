@@ -1,0 +1,592 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f68f8d2f..7b58559a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + When the client sends the request header specified in the config it will be included in the response headers.
+  - #2694, Make `db-root-spec` stable. - @steve-chavez
+    + This can be used to override the OpenAPI spec with a custom database function
+- - #1567, On bulk inserts with `?columns`, undefined json keys can get columns' DEFAULT values by using the `Prefer: undefined-keys=apply-defaults` header - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index c70fddfd..aba31f98 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -9,7 +9,6 @@
+ module PostgREST.ApiRequest.Preferences
+   ( Preferences(..)
+   , PreferCount(..)
+-  , PreferUndefinedKeys(..)
+   , PreferParameters(..)
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+@@ -34,7 +33,6 @@ import Protolude
+ -- >>> deriving instance Show PreferParameters
+ -- >>> deriving instance Show PreferCount
+ -- >>> deriving instance Show PreferTransaction
+--- >>> deriving instance Show PreferUndefinedKeys
+ -- >>> deriving instance Show Preferences
+ 
+ -- | Preferences recognized by the application.
+@@ -45,7 +43,6 @@ data Preferences
+     , preferParameters     :: Maybe PreferParameters
+     , preferCount          :: Maybe PreferCount
+     , preferTransaction    :: Maybe PreferTransaction
+-    , preferUndefinedKeys  :: Maybe PreferUndefinedKeys
+     }
+ 
+ -- |
+@@ -60,7 +57,6 @@ data Preferences
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferUndefinedKeys = Nothing
+ --     }
+ --
+ -- Multiple headers can also be used:
+@@ -72,7 +68,6 @@ data Preferences
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Nothing
+---     , preferUndefinedKeys = Nothing
+ --     }
+ --
+ -- If a preference is set more than once, only the first is used:
+@@ -97,14 +92,13 @@ data Preferences
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation , undefined-keys=apply-defaults")]
++-- >>> pPrint $ fromHeaders [("prefer", "count=exact,    tx=commit   ,return=representation")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Full
+ --     , preferParameters = Nothing
+ --     , preferCount = Just ExactCount
+ --     , preferTransaction = Just Commit
+---     , preferUndefinedKeys = Just ApplyDefaults
+ --     }
+ --
+ fromHeaders :: [HTTP.Header] -> Preferences
+@@ -115,7 +109,6 @@ fromHeaders headers =
+     , preferParameters = parsePrefs [SingleObject, MultipleObjects]
+     , preferCount = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+     , preferTransaction = parsePrefs [Commit, Rollback]
+-    , preferUndefinedKeys = parsePrefs [ApplyDefaults, IgnoreDefaults]
+     }
+   where
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+@@ -211,17 +204,3 @@ instance ToHeaderValue PreferTransaction where
+   toHeaderValue Rollback = "tx=rollback"
+ 
+ instance ToAppliedHeader PreferTransaction
+-
+--- |
+--- How to handle the insertion/update when the keys specified in ?columns are not present
+--- in the json body.
+-data PreferUndefinedKeys
+-  = ApplyDefaults  -- ^ Use the default column value for the unspecified keys.
+-  | IgnoreDefaults -- ^ Inserts: null values / Updates: the keys are not SET to any value
+-  deriving Eq
+-
+-instance ToHeaderValue PreferUndefinedKeys where
+-  toHeaderValue ApplyDefaults  = "undefined-keys=apply-defaults"
+-  toHeaderValue IgnoreDefaults = "undefined-keys=ignore-defaults"
+-
+-instance ToAppliedHeader PreferUndefinedKeys
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index e52fc72a..c15f50be 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -13,7 +13,6 @@ resource.
+ {-# LANGUAGE DuplicateRecordFields #-}
+ {-# LANGUAGE LambdaCase            #-}
+ {-# LANGUAGE NamedFieldPuns        #-}
+-{-# LANGUAGE OverloadedRecordDot   #-}
+ {-# LANGUAGE RecordWildCards       #-}
+ 
+ module PostgREST.Plan
+@@ -502,12 +501,12 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+     findNode = find (\(Node ReadPlan{relName, relAlias} _) -> relName == targetNodeName || relAlias == Just targetNodeName) forest
+ 
+ mutatePlan :: Mutation -> QualifiedIdentifier -> ApiRequest -> SchemaCache -> ReadPlanTree -> Either Error MutatePlan
+-mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq = mapLeft ApiRequestError $
++mutatePlan mutation qi ApiRequest{iPreferences=Preferences{..}, ..} sCache readReq = mapLeft ApiRequestError $
+   case mutation of
+     MutationCreate ->
+-      mapRight (\typedColumns -> Insert qi typedColumns body ((,) <$> preferences.preferResolution <*> Just confCols) [] returnings pkCols applyDefaults) typedColumnsOrError
++      mapRight (\typedColumns -> Insert qi typedColumns body ((,) <$> preferResolution <*> Just confCols) [] returnings pkCols) typedColumnsOrError
+     MutationUpdate ->
+-      mapRight (\typedColumns -> Update qi typedColumns body combinedLogic iTopLevelRange rootOrder returnings applyDefaults) typedColumnsOrError
++      mapRight (\typedColumns -> Update qi typedColumns body combinedLogic iTopLevelRange rootOrder returnings) typedColumnsOrError
+     MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+@@ -515,7 +514,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+            all (\case
+               Filter _ (OpExpr False (Op OpEqual _)) -> True
+               _                                      -> False) qsFiltersRoot
+-          then mapRight (\typedColumns -> Insert qi typedColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings mempty False) typedColumnsOrError
++          then mapRight (\typedColumns -> Insert qi typedColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings mempty) typedColumnsOrError
+         else
+           Left InvalidFilters
+     MutationDelete -> Right $ Delete qi combinedLogic iTopLevelRange rootOrder returnings
+@@ -523,7 +522,7 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+     returnings =
+-      if preferences.preferRepresentation == None
++      if preferRepresentation == None
+         then []
+         else inferColsEmbedNeeds readReq pkCols
+     pkCols = maybe mempty tablePKCols $ HM.lookup qi $ dbTables sCache
+@@ -533,7 +532,6 @@ mutatePlan mutation qi ApiRequest{iPreferences=preferences, ..} sCache readReq =
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+     tbl = HM.lookup qi $ dbTables sCache
+     typedColumnsOrError = resolveOrError tbl `traverse` S.toList iColumns
+-    applyDefaults = preferences.preferUndefinedKeys == Just ApplyDefaults
+ 
+ resolveOrError :: Maybe Table -> FieldName -> Either ApiRequestError TypedField
+ resolveOrError Nothing _ = Left NotFound
+diff --git a/src/PostgREST/Plan/MutatePlan.hs b/src/PostgREST/Plan/MutatePlan.hs
+index ffb0b8e5..0c9eaa0e 100644
+--- a/src/PostgREST/Plan/MutatePlan.hs
++++ b/src/PostgREST/Plan/MutatePlan.hs
+@@ -24,7 +24,6 @@ data MutatePlan
+       , where_     :: [LogicTree]
+       , returning  :: [FieldName]
+       , insPkCols  :: [FieldName]
+-      , applyDefs  :: Bool
+       }
+   | Update
+       { in_       :: QualifiedIdentifier
+@@ -34,7 +33,6 @@ data MutatePlan
+       , mutRange  :: NonnegRange
+       , mutOrder  :: [OrderTerm]
+       , returning :: [FieldName]
+-      , applyDefs :: Bool
+       }
+   | Delete
+       { in_       :: QualifiedIdentifier
+diff --git a/src/PostgREST/Plan/Types.hs b/src/PostgREST/Plan/Types.hs
+index bd863738..8e4a41f1 100644
+--- a/src/PostgREST/Plan/Types.hs
++++ b/src/PostgREST/Plan/Types.hs
+@@ -13,13 +13,12 @@ import Protolude
+ 
+ -- | A TypedField is a field with sufficient information to be read from JSON with `json_to_recordset`.
+ data TypedField = TypedField
+-   { tfName    :: FieldName
+-   , tfIRType  :: Text -- ^ The initial type of the field, before any casting.
+-   , tfDefault :: Maybe Text
++   { tfName   :: FieldName
++   , tfIRType :: Text -- ^ The initial type of the field, before any casting.
+    } deriving (Eq)
+ 
+ resolveTableField :: Table -> FieldName -> Maybe TypedField
+ resolveTableField table fieldName =
+   case HMI.lookup fieldName (tableColumns table) of
+-    Just column -> Just $ TypedField (colName column) (colNominalType column) (colDefault column)
++    Just column -> Just $ TypedField (colName column) (colNominalType column)
+     Nothing     -> Nothing
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 88304c9a..b6ec51d9 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -81,9 +81,9 @@ getSelectsJoins rr@(Node ReadPlan{select, relName, relToParent=Just rel, relAggA
+   (if null select && null forest then selects else sel:selects, joi:joins)
+ 
+ mutatePlanToQuery :: MutatePlan -> SQL.Snippet
+-mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _ applyDefaults) =
++mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _) =
+   "INSERT INTO " <> SQL.sql (fromQi mainQi) <> SQL.sql (if null iCols then " " else "(" <> cols <> ") ") <>
+-  fromJsonBodyF body iCols True False applyDefaults <>
++  fromJsonBodyF body iCols True False <>
+   -- Only used for PUT
+   (if null putConditions then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree (QualifiedIdentifier mempty "pgrst_body") <$> putConditions)) <>
+   SQL.sql (BS.unwords [
+@@ -105,7 +105,7 @@ mutatePlanToQuery (Insert mainQi iCols body onConflct putConditions returnings _
+     cols = BS.intercalate ", " $ pgFmtIdent . tfName <$> iCols
+ 
+ -- An update without a limit is always filtered with a WHERE
+-mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings applyDefaults)
++mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings)
+   | null uCols =
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+@@ -114,13 +114,13 @@ mutatePlanToQuery (Update mainQi uCols body logicForest range ordts returnings a
+ 
+   | range == allRange =
+     "UPDATE " <> mainTbl <> " SET " <> SQL.sql nonRangeCols <> " " <>
+-    fromJsonBodyF body uCols False False applyDefaults <>
++    fromJsonBodyF body uCols False False <>
+     whereLogic <> " " <>
+     SQL.sql (returningF mainQi returnings)
+ 
+   | otherwise =
+     "WITH " <>
+-    "pgrst_update_body AS (" <> fromJsonBodyF body uCols True True applyDefaults <> "), " <>
++    "pgrst_update_body AS (" <> fromJsonBodyF body uCols True True <> "), " <>
+     "pgrst_affected_rows AS (" <>
+       "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
+       whereLogic <> " " <>
+@@ -171,7 +171,7 @@ callPlanToQuery (FunctionCall qi params args returnsScalar multipleCall returnin
+     fromCall = case params of
+       OnePosParam prm -> "FROM " <> callIt (singleParameter args $ encodeUtf8 $ ppType prm)
+       KeyParams []    -> "FROM " <> callIt mempty
+-      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p) Nothing) <$> prms) False (not multipleCall) False <> ", " <>
++      KeyParams prms  -> fromJsonBodyF args ((\p -> TypedField (ppName p) (ppType p)) <$> prms) False (not multipleCall) <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 87c8b02e..704350be 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -143,16 +143,6 @@ pgBuildArrayLiteral vals =
+ pgFmtIdent :: Text -> SqlFragment
+ pgFmtIdent x = encodeUtf8 $ "\"" <> T.replace "\"" "\"\"" (trimNullChars x) <> "\""
+ 
+--- Only use it if the input comes from the database itself, like on `jsonb_build_object('column_from_a_table', val)..`
+-pgFmtLit :: Text -> Text
+-pgFmtLit x =
+-  let trimmed = trimNullChars x
+-      escaped = "'" <> T.replace "'" "''" trimmed <> "'"
+-      slashed = T.replace "\\" "\\\\" escaped in
+-  if "\\" `T.isInfixOf` escaped
+-    then "E" <> slashed
+-    else slashed
+-
+ trimNullChars :: Text -> Text
+ trimNullChars = T.takeWhile (/= '\x0')
+ 
+@@ -231,40 +221,28 @@ pgFmtSelectItem table (f@(fName, jp), Nothing, alias) = pgFmtField table f <> SQ
+ pgFmtSelectItem table (f@(fName, jp), Just cast, alias) = "CAST (" <> pgFmtField table f <> " AS " <> SQL.sql (encodeUtf8 cast) <> " )" <> SQL.sql (pgFmtAs fName jp alias)
+ 
+ -- TODO: At this stage there shouldn't be a Maybe since ApiRequest should ensure that an INSERT/UPDATE has a body
+-fromJsonBodyF :: Maybe LBS.ByteString -> [TypedField] -> Bool -> Bool -> Bool -> SQL.Snippet
+-fromJsonBodyF body fields includeSelect includeLimitOne includeDefaults =
++fromJsonBodyF :: Maybe LBS.ByteString -> [TypedField] -> Bool -> Bool -> SQL.Snippet
++fromJsonBodyF body fields includeSelect includeLimitOne =
+   SQL.sql
+   (if includeSelect then "SELECT " <> parsedCols <> " " else mempty) <>
+   "FROM (SELECT " <> jsonPlaceHolder <> " AS json_data) pgrst_payload, " <>
+   -- convert a json object into a json array, this way we can use json_to_recordset for all json payloads
+   -- Otherwise we'd have to use json_to_record for json objects and json_to_recordset for json arrays
+   -- We do this in SQL to avoid processing the JSON in application code
+-  "LATERAL (SELECT CASE WHEN " <> jsonTypeofF <> "(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE " <> jsonBuildArrayF <> "(pgrst_payload.json_data) END AS val) pgrst_uniform_json, " <>
+-  (if includeDefaults
+-    then "LATERAL (SELECT jsonb_agg(jsonb_build_object(" <> defsJsonb <> ") || elem) AS val from jsonb_array_elements(pgrst_uniform_json.val) elem) pgrst_json_defs, "
+-    else mempty) <>
++  "LATERAL (SELECT CASE WHEN json_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE json_build_array(pgrst_payload.json_data) END AS val) pgrst_uniform_json, " <>
+   "LATERAL (SELECT * FROM " <>
+     (if null fields
+       -- When we are inserting no columns (e.g. using default values), we can't use our ordinary `json_to_recordset`
+       -- because it can't extract records with no columns (there's no valid syntax for the `AS (colName colType,...)`
+       -- part). But we still need to ensure as many rows are created as there are array elements.
+-      then SQL.sql $ jsonArrayElementsF <> "(" <> finalBodyF <> ") _ "
+-      else SQL.sql $ jsonToRecordsetF <> "(" <> finalBodyF <> ") AS _(" <> typedCols <> ") " <> if includeLimitOne then "LIMIT 1" else mempty
++      then SQL.sql "json_array_elements(pgrst_uniform_json.val) _ "
++      else SQL.sql ("json_to_recordset(pgrst_uniform_json.val) AS _(" <> typedCols <> ") " <> if includeLimitOne then "LIMIT 1" else mempty)
+     ) <>
+   ") pgrst_body "
+   where
+     parsedCols = BS.intercalate ", " $ fromQi  . QualifiedIdentifier "pgrst_body" . tfName <$> fields
+     typedCols = BS.intercalate ", " $ pgFmtIdent . tfName <> const " " <> encodeUtf8 . tfIRType <$> fields
+-    defsJsonb = SQL.sql $ BS.intercalate "," fieldsWDefaults
+-    fieldsWDefaults = mapMaybe (\case
+-        TypedField{tfName=nam, tfDefault=Just def} -> Just $ encodeUtf8 (pgFmtLit nam <> ", " <> def)
+-        TypedField{tfDefault=Nothing} -> Nothing
+-      ) fields
+-    (finalBodyF, jsonTypeofF, jsonBuildArrayF, jsonArrayElementsF, jsonToRecordsetF) =
+-      if includeDefaults
+-        then ("pgrst_json_defs.val", "jsonb_typeof", "jsonb_build_array", "jsonb_array_elements", "jsonb_to_recordset")
+-        else ("pgrst_uniform_json.val", "json_typeof", "json_build_array", "json_array_elements", "json_to_recordset")
+-    jsonPlaceHolder = SQL.encoderAndParam (HE.nullable $ if includeDefaults then HE.jsonbLazyBytes else HE.jsonLazyBytes) body
++    jsonPlaceHolder = SQL.encoderAndParam (HE.nullable HE.jsonLazyBytes) body
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> SQL.Snippet
+ pgFmtOrderTerm qi ot =
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 57f3ded0..44c7fc11 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -109,7 +109,6 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan} ctxApiReques
+               Nothing
+             else
+               toAppliedHeader <$> preferResolution
+-          , toAppliedHeader <$> preferUndefinedKeys
+           ]
+ 
+     if preferRepresentation == Full then
+@@ -126,9 +125,9 @@ updateResponse ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet
+     let
+       response = gucResponse rsGucStatus rsGucHeaders
+       contentRangeHeader =
+-        Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
++        RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      headers = catMaybes [contentRangeHeader, toAppliedHeader <$> preferUndefinedKeys]
++      headers = [contentRangeHeader]
+ 
+     if preferRepresentation == Full then
+         response HTTP.status200
+diff --git a/test/pgbench/1567/new.sql b/test/pgbench/1567/new.sql
+deleted file mode 100644
+index 83ca4dd3..00000000
+--- a/test/pgbench/1567/new.sql
++++ /dev/null
+@@ -1,15 +0,0 @@
+-INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-SELECT pgrst_body."arr_data", pgrst_body."field-with_sep", pgrst_body."id", pgrst_body."name"
+-FROM (
+-  SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::jsonb as json_data
+-) pgrst_payload,
+-LATERAL (
+-  SELECT CASE WHEN jsonb_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE jsonb_build_array(pgrst_payload.json_data) END AS val
+-) pgrst_uniform_json,
+-LATERAL (
+-  SELECT jsonb_agg(jsonb_build_object('field-with_sep', 1) || elem) AS vals from jsonb_array_elements(pgrst_uniform_json.val) elem
+-) pgrst_json_defs,
+-LATERAL (
+-  SELECT * FROM jsonb_to_recordset (pgrst_json_defs.vals) AS _ ("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text)
+-) pgrst_body
+-RETURNING "test"."complex_items".*;
+diff --git a/test/pgbench/1567/old.sql b/test/pgbench/1567/old.sql
+deleted file mode 100644
+index 74032504..00000000
+--- a/test/pgbench/1567/old.sql
++++ /dev/null
+@@ -1,12 +0,0 @@
+-INSERT INTO "test"."complex_items"("arr_data", "field-with_sep", "id", "name")
+-SELECT pgrst_body."arr_data", pgrst_body."field-with_sep", pgrst_body."id", pgrst_body."name"
+-FROM (
+-  SELECT '[{"id": 4, "name": "Vier"}, {"id": 5, "name": "Funf", "arr_data": null}, {"id": 6, "name": "Sechs", "arr_data": [1, 2, 3], "field-with_sep": 6}]'::jsonb as json_data
+-) pgrst_payload,
+-LATERAL (
+-  SELECT CASE WHEN jsonb_typeof(pgrst_payload.json_data) = 'array' THEN pgrst_payload.json_data ELSE jsonb_build_array(pgrst_payload.json_data) END AS val
+-) pgrst_uniform_json,
+-LATERAL (
+-  SELECT * FROM jsonb_to_recordset (pgrst_uniform_json.val) AS _ ("arr_data" integer[], "field-with_sep" integer, "id" bigint, "name" text)
+-) pgrst_body
+-RETURNING "test"."complex_items".*
+diff --git a/test/pgbench/README.md b/test/pgbench/README.md
+index 7b143f4e..da8fa974 100644
+--- a/test/pgbench/README.md
++++ b/test/pgbench/README.md
+@@ -3,11 +3,6 @@
+ Can be used as:
+ 
+ ```
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/1567/old.sql
+-
+-postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/1567/new.sql
++postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/2677/old.sql
++postgrest-with-postgresql-15 -f test/pgbench/fixtures.sql pgbench -n -T 10 -f test/pgbench/2677/new.sql
+ ```
+-
+-## Directory structure
+-
+-The directory name is the issue number on github.
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index f1f17f01..db1def44 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -11,9 +11,8 @@ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ import Text.Heredoc
+ 
+-import PostgREST.Config.PgVersion (PgVersion, pgVersion100,
+-                                   pgVersion110, pgVersion112,
+-                                   pgVersion130)
++import PostgREST.Config.PgVersion (PgVersion, pgVersion110,
++                                   pgVersion112, pgVersion130)
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
+@@ -449,64 +448,14 @@ spec actualPgVersion = do
+             {"id": 204, "body": "yyy"},
+             333,
+             "asdf",
+-            {"id": 205, "body": "zzz"}]|] `shouldRespondWith` 400
+-
+-      context "apply defaults on undefined keys" $ do
+-        -- inserting the array fails on pg 9.6, but the feature should work normally
+-        when (actualPgVersion >= pgVersion100) $
+-          it "inserts table default values(field-with_sep) when json keys are undefined" $
+-            request methodPost "/complex_items?columns=id,name,field-with_sep,arr_data" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-                [json|[
+-                  {"id": 4, "name": "Vier"},
+-                  {"id": 5, "name": "Funf", "arr_data": null},
+-                  {"id": 6, "name": "Sechs", "field-with_sep": 6, "arr_data": "{1,2,3}"}
+-                ]|]
+-              `shouldRespondWith`
+-                [json|[
+-                  {"id": 4, "name": "Vier", "field-with_sep": 1, "settings":null,"arr_data":null},
+-                  {"id": 5, "name": "Funf", "field-with_sep": 1, "settings":null,"arr_data":null},
+-                  {"id": 6, "name": "Sechs", "field-with_sep": 6, "settings":null,"arr_data":[1,2,3]}
+-                ]|]
+-                { matchStatus  = 201
+-                , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-                }
+-
+-        it "inserts view default values(field-with_sep) when json keys are undefined" $
+-          request methodPost "/complex_items_view?columns=id,name" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-              [json|[
+-                {"id": 7, "name": "Sieben"},
+-                {"id": 8}
+-              ]|]
+-            `shouldRespondWith`
+-              [json|[
+-                {"id": 7, "name": "Sieben", "field-with_sep": 1, "settings":null,"arr_data":null},
+-                {"id": 8, "name": "Default", "field-with_sep": 1, "settings":null,"arr_data":null}
+-              ]|]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-              }
+-
+-        it "doesn't insert json duplicate keys(since it uses jsonb)" $
+-          request methodPost "/tbl_w_json?columns=id,data" [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-              [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+-            `shouldRespondWith`
+-              [json| [ { "data": { "a": 2 }, "id": 3 } ] |]
+-              { matchStatus  = 201
+-              , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-              }
+-
+-    it "inserts json that has duplicate keys" $ do
+-      request methodPost "/tbl_w_json" [("Prefer", "return=representation")]
+-          [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+-        `shouldRespondWith`
+-          [json| [ { "data": { "a": 1, "a": 2 }, "id": 3 } ] |]
+-          { matchStatus  = 201
+-          }
+-      request methodPost "/tbl_w_json?columns=id,data" [("Prefer", "return=representation")]
+-          [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+-        `shouldRespondWith`
+-          [json| [ { "data": { "a": 1, "a": 2 }, "id": 3 } ] |]
+-          { matchStatus  = 201
++            {"id": 205, "body": "zzz"}]|] `shouldRespondWith`
++          [json|{
++              "code": "22023",
++              "details": null,
++              "hint": null,
++              "message": "argument of json_to_recordset must be an array of objects"}|]
++          { matchStatus  = 400
++          , matchHeaders = []
+           }
+ 
+     context "with unicode values" $ do
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 93419051..b995dfe7 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -327,11 +327,11 @@ spec actualPgVersion = do
+   describe "Shaping response with select parameter" $ do
+     it "selectStar works in absense of parameter" $
+       get "/complex_items?id=eq.3" `shouldRespondWith`
+-        [json|[{"id":3,"name":"Three","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":3}]|]
++        [json|[{"id":3,"name":"Three","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":1}]|]
+ 
+     it "dash `-` in column names is accepted" $
+       get "/complex_items?id=eq.3&select=id,field-with_sep" `shouldRespondWith`
+-        [json|[{"id":3,"field-with_sep":3}]|]
++        [json|[{"id":3,"field-with_sep":1}]|]
+ 
+     it "one simple column" $
+       get "/complex_items?select=id" `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 4274ccf6..33061c91 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -330,57 +330,6 @@ spec = do
+           , matchHeaders = []
+           }
+ 
+-      context "apply defaults on undefined keys" $ do
+-        it "updates table using default values(field-with_sep) when json keys are undefined" $ do
+-          request methodPatch "/complex_items?id=eq.3&columns=name,field-with_sep"
+-            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-            [json|{"name": "Tres"}|]
+-            `shouldRespondWith`
+-            [json|[
+-              {"id":3,"name":"Tres","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":1}
+-            ]|]
+-            { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-            }
+-
+-        it "updates with limit/offset using table default values(field-with_sep) when json keys are undefined" $ do
+-          request methodPatch "/complex_items?select=id,name&columns=name,field-with_sep&limit=1&offset=2&order=id"
+-            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-            [json|{"name": "Tres"}|]
+-            `shouldRespondWith`
+-            [json|[
+-              {"id":3,"name":"Tres"}
+-            ]|]
+-            { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-            }
+-
+-        it "updates table default values(field-with_sep) when json keys are undefined" $ do
+-          request methodPatch "/complex_items?id=eq.3&columns=name,field-with_sep"
+-            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-            [json|{"name": "Tres"}|]
+-            `shouldRespondWith`
+-            [json|[
+-              {"id":3,"name":"Tres","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":[1,2,3],"field-with_sep":1}
+-            ]|]
+-            { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-            }
+-
+-        it "updates view default values(field-with_sep) when json keys are undefined" $
+-          request methodPatch "/complex_items_view?id=eq.3&columns=arr_data,name"
+-            [("Prefer", "return=representation"), ("Prefer", "undefined-keys=apply-defaults")]
+-            [json|
+-              {"arr_data":null}
+-            |]
+-            `shouldRespondWith`
+-            [json|[
+-              {"id":3,"name":"Default","settings":{"foo":{"int":1,"bar":"baz"}},"arr_data":null,"field-with_sep":3}
+-            ]|]
+-            { matchStatus  = 200
+-            , matchHeaders = ["Preference-Applied" <:> "undefined-keys=apply-defaults"]
+-            }
+-
+   context "tables with self reference foreign keys" $ do
+     it "embeds children after update" $
+       request methodPatch "/web_content?id=eq.0&select=id,name,web_content(name)"
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index cb2e219b..dd32ae9d 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -168,7 +168,7 @@ INSERT INTO touched_files VALUES
+ TRUNCATE TABLE complex_items CASCADE;
+ INSERT INTO complex_items VALUES (1, 'One', '{"foo":{"int":1,"bar":"baz"}}', '{1}');
+ INSERT INTO complex_items VALUES (2, 'Two', '{"foo":{"int":1,"bar":"baz"}}', '{1,2}');
+-INSERT INTO complex_items VALUES (3, 'Three', '{"foo":{"int":1,"bar":"baz"}}', '{1,2,3}', 3);
++INSERT INTO complex_items VALUES (3, 'Three', '{"foo":{"int":1,"bar":"baz"}}', '{1,2,3}');
+ 
+ 
+ --
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 3dffb555..37ec19f0 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3100,13 +3100,3 @@ create view test.alpha_projects as
+ create view test.zeta_projects as
+   select c.id, p.name as pro_name, c.name as cli_name
+   from projects p join clients c on p.client_id = c.id;
+-
+-CREATE VIEW test.complex_items_view AS
+-SELECT * FROM test.complex_items;
+-
+-ALTER VIEW test.complex_items_view ALTER COLUMN name SET DEFAULT 'Default';
+-
+-create table test.tbl_w_json(
+-  id int,
+-  data json
+-);

@@ -1,0 +1,256 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 85ce1ba0..21cf719e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3171, #3046, Log schema cache stats to stderr - @steve-chavez
+  - #3210, Dump schema cache through admin API - @taimoorzaeem
+  - #2676, Performance improvement on bulk json inserts, around 10% increase on requests per second by removing `json_typeof` from write queries - @steve-chavez
++ - #3214, Log connection pool events on log-level=info - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/cabal.project.freeze b/cabal.project.freeze
+index 71a64777..e0a62e96 100644
+--- a/cabal.project.freeze
++++ b/cabal.project.freeze
+@@ -1 +1 @@
+-index-state: hackage.haskell.org 2024-03-13T22:43:26Z
++index-state: hackage.haskell.org 2024-04-15T20:28:44Z
+diff --git a/nix/overlays/haskell-packages.nix b/nix/overlays/haskell-packages.nix
+index 744fb231..5bc0c067 100644
+--- a/nix/overlays/haskell-packages.nix
++++ b/nix/overlays/haskell-packages.nix
+@@ -35,11 +35,14 @@ let
+       # - <subpath> is usually "."
+       # - When adding a new library version here, postgrest.cabal and stack.yaml must also be updated
+       #
+-      # Note:
++      # Notes:
+       # - This should NOT be the first place to start managing dependencies. Check postgrest.cabal.
++      # - When adding a new package version here, you have to update stack:
++      #   + For stack.yml add:
++      #   extra-deps:
++      #     - <package>-<ver>
++      #   + For stack.yml.lock, CI should report an error with the correct lock, copy/paste that one into the file
+       # - To modify and try packages locally, see "Working with locally modified Haskell packages" in the Nix README.
+-      #
+-
+ 
+       configurator-pg =
+         prev.callHackageDirect
+@@ -60,18 +63,26 @@ let
+           }
+           { };
+ 
++      hasql-pool =
++        lib.dontCheck (prev.callHackageDirect
++          {
++            pkg = "hasql-pool";
++            ver = "1.0.1";
++            sha256 = "sha256-Hf1f7lX0LWkjrb25SDBovCYPRdmUP1H6pAxzi7kT4Gg=";
++          }
++          { }
++        );
++
+       postgresql-libpq = lib.dontCheck
+         (prev.postgresql-libpq_0_10_0_0.override {
+           postgresql = super.libpq;
+         });
+ 
+-      hasql-pool = lib.dontCheck prev.hasql-pool_0_10;
+-
+       hasql-notifications = lib.dontCheck (prev.callHackageDirect
+         {
+           pkg = "hasql-notifications";
+-          ver = "0.2.1.0";
+-          sha256 = "sha256-MEIirDKR81KpiBOnWJbVInWevL6Kdb/XD1Qtd8e6KsQ=";
++          ver = "0.2.1.1";
++          sha256 = "sha256-oPhKA/pSQGJvgQyhsi7CVr9iDT7uWpKUz0iJfXsaxXo=";
+         }
+         { }
+       );
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 3f77bca6..1893f263 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -108,8 +108,8 @@ library
+                     , gitrev                    >= 1.2 && < 1.4
+                     , hasql                     >= 1.6.1.1 && < 1.7
+                     , hasql-dynamic-statements  >= 0.3.1 && < 0.4
+-                    , hasql-notifications       >= 0.2.1.0 && < 0.3
+-                    , hasql-pool                >= 0.10 && < 0.11
++                    , hasql-notifications       >= 0.2.1.1 && < 0.3
++                    , hasql-pool                >= 1.0.1 && < 1.1
+                     , hasql-transaction         >= 1.0.1 && < 1.1
+                     , heredoc                   >= 0.2 && < 0.3
+                     , http-types                >= 0.12.2 && < 0.13
+@@ -254,7 +254,7 @@ test-suite spec
+                     , bytestring        >= 0.10.8 && < 0.13
+                     , case-insensitive  >= 1.2 && < 1.3
+                     , containers        >= 0.5.7 && < 0.7
+-                    , hasql-pool        >= 0.10 && < 0.11
++                    , hasql-pool        >= 1.0.1 && < 1.1
+                     , hasql-transaction >= 1.0.1 && < 1.1
+                     , heredoc           >= 0.2 && < 0.3
+                     , hspec             >= 2.3 && < 2.12
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index cbea46e4..76c8e4a3 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -39,6 +39,7 @@ import qualified Data.Text                  as T (unpack)
+ import           Hasql.Connection           (acquire)
+ import qualified Hasql.Notifications        as SQL
+ import qualified Hasql.Pool                 as SQL
++import qualified Hasql.Pool.Config          as SQL
+ import qualified Hasql.Session              as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.HTTP.Types.Status  as HTTP
+@@ -122,7 +123,7 @@ init :: AppConfig -> IO AppState
+ init conf@AppConfig{configLogLevel} = do
+   loggerState <- Logger.init
+   let observer = Logger.observationLogger loggerState configLogLevel
+-  pool <- initPool conf
++  pool <- initPool conf observer
+   (sock, adminSock) <- initSockets conf
+   state' <- initWithPool (sock, adminSock) pool conf loggerState observer
+   pure state' { stateSocketREST = sock, stateSocketAdmin = adminSock}
+@@ -193,14 +194,16 @@ initSockets AppConfig{..} = do
+ 
+   pure (sock, adminSock)
+ 
+-initPool :: AppConfig -> IO SQL.Pool
+-initPool AppConfig{..} =
+-  SQL.acquire
+-    configDbPoolSize
+-    (fromIntegral configDbPoolAcquisitionTimeout)
+-    (fromIntegral configDbPoolMaxLifetime)
+-    (fromIntegral configDbPoolMaxIdletime)
+-    (toUtf8 $ addFallbackAppName prettyVersion configDbUri)
++initPool :: AppConfig -> ObservationHandler -> IO SQL.Pool
++initPool AppConfig{..} observer =
++  SQL.acquire $ SQL.settings
++    [ SQL.size configDbPoolSize
++    , SQL.acquisitionTimeout $ fromIntegral configDbPoolAcquisitionTimeout
++    , SQL.agingTimeout $ fromIntegral configDbPoolMaxLifetime
++    , SQL.idlenessTimeout $ fromIntegral configDbPoolMaxIdletime
++    , SQL.staticConnectionSettings (toUtf8 $ addFallbackAppName prettyVersion configDbUri)
++    , SQL.observationHandler $ observer . HasqlPoolObs
++    ]
+ 
+ -- | Run an action with a database connection.
+ usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index dcee2d0e..55ab16a6 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -81,6 +81,9 @@ observationLogger loggerState logLevel obs = case obs of
+   o@(QueryErrorCodeHighObs _) -> do
+     when (logLevel >= LogError) $ do
+       logWithZTime loggerState $ observationMessage o
++  o@(HasqlPoolObs _) -> do
++    when (logLevel >= LogInfo) $ do
++      logWithZTime loggerState $ observationMessage o
+   o ->
+     logWithZTime loggerState $ observationMessage o
+ 
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 3cb86358..afefbe0a 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -9,14 +9,15 @@ module PostgREST.Observation
+   , ObservationHandler
+   ) where
+ 
+-import qualified Data.ByteString.Lazy as LBS
+-import qualified Data.Text            as T
+-import qualified Data.Text.Encoding   as T
+-import qualified Hasql.Connection     as SQL
+-import qualified Hasql.Pool           as SQL
+-import qualified Network.Socket       as NS
+-import           Numeric              (showFFloat)
+-import qualified PostgREST.Error      as Error
++import qualified Data.ByteString.Lazy   as LBS
++import qualified Data.Text              as T
++import qualified Data.Text.Encoding     as T
++import qualified Hasql.Connection       as SQL
++import qualified Hasql.Pool             as SQL
++import qualified Hasql.Pool.Observation as SQL
++import qualified Network.Socket         as NS
++import           Numeric                (showFFloat)
++import qualified PostgREST.Error        as Error
+ 
+ import Protolude
+ import Protolude.Partial (fromJust)
+@@ -50,6 +51,7 @@ data Observation
+   | QueryRoleSettingsErrorObs SQL.UsageError
+   | QueryErrorCodeHighObs SQL.UsageError
+   | PoolAcqTimeoutObs SQL.UsageError
++  | HasqlPoolObs SQL.Observation
+ 
+ type ObservationHandler = Observation -> IO ()
+ 
+@@ -111,6 +113,18 @@ observationMessage = \case
+      "Config reloaded"
+   PoolAcqTimeoutObs usageErr ->
+     jsonMessage usageErr
++  HasqlPoolObs (SQL.ConnectionObservation uuid status) ->
++    "Connection " <> show uuid <> (
++      case status of
++        SQL.ConnectingConnectionStatus   -> " is being established"
++        SQL.ReadyForUseConnectionStatus  -> " is available"
++        SQL.InUseConnectionStatus        -> " is used"
++        SQL.TerminatedConnectionStatus reason -> " is terminated due to " <> case reason of
++          SQL.AgingConnectionTerminationReason          -> "max lifetime"
++          SQL.IdlenessConnectionTerminationReason       -> "max idletime"
++          SQL.ReleaseConnectionTerminationReason        -> "release"
++          SQL.NetworkErrorConnectionTerminationReason _ -> "network error" -- usage error is already logged, no need to repeat the same message.
++    )
+   where
+     showMillis :: Double -> Text
+     showMillis x = toS $ showFFloat (Just 1) (x * 1000) ""
+diff --git a/stack.yaml b/stack.yaml
+index 686545af..c0669dda 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -12,7 +12,7 @@ nix:
+ extra-deps:
+   - configurator-pg-0.2.7
+   - fuzzyset-0.2.4
+-  - hasql-notifications-0.2.1.0
+-  - hasql-pool-0.10
++  - hasql-notifications-0.2.1.1
++  - hasql-pool-1.0.1
+   - megaparsec-9.2.2
+   - postgresql-libpq-0.10.0.0
+diff --git a/stack.yaml.lock b/stack.yaml.lock
+index 75fe2347..48af0300 100644
+--- a/stack.yaml.lock
++++ b/stack.yaml.lock
+@@ -19,19 +19,19 @@ packages:
+   original:
+     hackage: fuzzyset-0.2.4
+ - completed:
+-    hackage: hasql-notifications-0.2.1.0@sha256:c9c0ba3ac0866142836d2d0a08a0d10a945bcbe1c163ee1ef6aed407d046a24e,2022
++    hackage: hasql-notifications-0.2.1.1@sha256:e4f41f462e96f3af3f088b747daeeb2275ceaebd0e4b0d05187bd10d329afada,2021
+     pantry-tree:
+-      sha256: 65a646ed0a77ee1dfe902faedc590103ee385eaa78f407c4cf02a1eb5783d464
++      sha256: f9041b1c242436324372f6be9a4f2e5cf70203c3efad36a4e9ea4cca5113a2ec
+       size: 452
+   original:
+-    hackage: hasql-notifications-0.2.1.0
++    hackage: hasql-notifications-0.2.1.1
+ - completed:
+-    hackage: hasql-pool-0.10@sha256:912197a328acb85505f98bb9700d61f366b87659ca45126c5c2d636687b801c3,2112
++    hackage: hasql-pool-1.0.1@sha256:3cfb4c7153a6c536ac7e126c17723e6d26ee03794954deed2d72bcc826d05a40,2302
+     pantry-tree:
+-      sha256: b655c540a49764a8d16b62941137e295b936b96edc0785eb9250972f0f92dc47
+-      size: 346
++      sha256: d98e1269bdd60989b0eb0b84e1d5357eaa9f92821439d9f206663b7251ee95b2
++      size: 799
+   original:
+-    hackage: hasql-pool-0.10
++    hackage: hasql-pool-1.0.1
+ - completed:
+     hackage: megaparsec-9.2.2@sha256:c306a135ec25d91d252032c6128f03598a00e87ea12fcf5fc4878fdffc75c768,3219
+     pantry-tree:

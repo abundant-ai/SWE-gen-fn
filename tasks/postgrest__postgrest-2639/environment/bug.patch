@@ -1,0 +1,101 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 501a58cc..7949575b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,7 +30,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2569, Replace misleading error message when no relationship is found with a hint containing parent/child names suggestions - @laurenceisla
+  - #1405, Add the required OpenAPI items object when the parameter is an array - @laurenceisla
+  - #2592, Add upsert headers for POST requests to the OpenAPI output - @laurenceisla
+- - #2620, Fix `NOTIFY pgrst` not reloading the db connections catalog cache - @steve-chavez
+ 
+ ## [10.1.1] - 2022-11-08
+ 
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 463b4c12..a57e6c80 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -230,15 +230,16 @@ listener appState = do
+       listener appState
+ 
+     handleNotification _ msg
+-      | BS.null msg            = cacheReloader
+-      | msg == "reload schema" = cacheReloader
+-      | msg == "reload config" = reReadConfig False appState
++      | BS.null msg            = scLoader -- reload the schema cache
++      | msg == "reload schema" = scLoader -- reload the schema cache
++      | msg == "reload config" = reReadConfig False appState -- reload the config
+       | otherwise              = pure () -- Do nothing if anything else than an empty message is sent
+ 
+-    cacheReloader =
+-      -- reloads the schema cache + restarts pool connections
+-      -- it's necessary to restart the pg connections because they cache the pg catalog(see #2620)
+-      connectionWorker appState
++    scLoader =
++      -- It's not necessary to check the loadSchemaCache success
++      -- here. If the connection drops, the thread will die and
++      -- proceed to recover.
++      void $ loadSchemaCache appState
+ 
+ -- | Re-reads the config plus config options from the db
+ reReadConfig :: Bool -> AppState -> IO ()
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index e557a649..bbe02987 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -86,15 +86,3 @@ $$ language sql;
+ create or replace function hello() returns text as $$
+   select 'hello';
+ $$ language sql;
+-
+-create table cats(id uuid primary key, name text);
+-grant all on cats to postgrest_test_anonymous;
+-
+-create function drop_change_cats() returns void
+-language sql security definer
+-as $$
+-  drop table cats;
+-  create table cats(id bigint primary key, name text);
+-  grant all on table cats to postgrest_test_anonymous;
+-  notify pgrst, 'reload schema';
+-$$;
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index f3c4dd47..e5bbf443 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -334,7 +334,7 @@ def test_db_schema_notify_reload(defaultenv):
+             "/rpc/change_db_schema_and_full_reload", data={"schemas": "v1"}
+         )
+ 
+-        time.sleep(0.2)
++        time.sleep(0.1)
+ 
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+         assert response.text == '"\\"v1\\", \\"public\\""'
+@@ -827,27 +827,6 @@ def test_no_pool_connection_required_on_bad_embedding(defaultenv):
+         assert response.status_code == 400
+ 
+ 
+-def test_notify_reloading_catalog_cache(defaultenv):
+-    "notify should reload the connection catalog cache"
+-
+-    with run(env=defaultenv) as postgrest:
+-
+-        # first the id col is an uuid
+-        response = postgrest.session.get(
+-            "/cats?id=eq.dea27321-f988-4a57-93e4-8eeb38f3cf1e"
+-        )
+-        assert response.status_code == 200
+-
+-        # change it to a bigint
+-        response = postgrest.session.post("/rpc/drop_change_cats")
+-        assert response.status_code == 204
+-        time.sleep(0.1)
+-
+-        # next request should succeed with a bigint value
+-        response = postgrest.session.get("/cats?id=eq.1")
+-        assert response.status_code == 200
+-
+-
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122
+ # The stack size of 1K(-with-rtsopts=-K1K) is not enough and this fails with "stack overflow"
+ # A stack size of 200K seems to be enough for succeess

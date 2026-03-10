@@ -1,0 +1,329 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ee83aebe..8bfba2ae 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,7 +26,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2475, Disallow !inner on computed columns - @wolfgangwalther
+  - #2285, Ignore leading and trailing spaces in column names when parsing the query string - @wolfgangwalther
+  - #2545, Fix UPSERT with PostgreSQL 15 - @wolfgangwalther
+- - #2459, Fix embedding views with multiple references to the same base column - @wolfgangwalther
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 4c6fbc47..534659b5 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -66,33 +66,12 @@ data SchemaCache = SchemaCache
+   deriving (Generic, JSON.ToJSON)
+ 
+ -- | A view foreign key or primary key dependency detected on its source table
+--- Each column of the key could be referenced multiple times in the view, e.g.
+---
+--- create view projects_view as
+--- select
+---   id as id_1,
+---   id as id_2,
+---   id as id_3,
+---   name
+--- from projects
+---
+--- In this case, the keyDepCols mapping maps projects.id to all three of the columns:
+---
+--- [('id', ['id_1', 'id_2', 'id_3'])]
+---
+--- Depending on key type, we can then choose how to handle this case. Primary keys
+--- can arbitrarily choose one of the columns, but for foreign keys we need to create
+--- relationships for each possible mutations.
+---
+--- Previously, we stored a (FieldName, FieldName) tuple only, but then we had no
+--- way to make a difference between a multi-column-key and a single-column-key with multiple
+--- references in the view. Or even worse in the multi-column-key-multi-reference case...
+ data ViewKeyDependency = ViewKeyDependency {
+   keyDepTable :: QualifiedIdentifier
+ , keyDepView  :: QualifiedIdentifier
+ , keyDepCons  :: Text
+ , keyDepType  :: KeyDep
+-, keyDepCols  :: [(FieldName, [FieldName])] -- ^ First element is the table column, second is a list of view columns
++, keyDepCols  :: [(FieldName, FieldName)] -- ^ First element is the table column, second is the view column
+ } deriving (Eq)
+ data KeyDep
+   = PKDep    -- ^ PK dependency
+@@ -213,9 +192,9 @@ decodeViewKeyDeps =
+     <*> compositeArrayColumn
+         ((,)
+         <$> compositeField HD.text
+-        <*> compositeFieldArray HD.text)
++        <*> compositeField HD.text)
+ 
+-viewKeyDepFromRow :: (Text,Text,Text,Text,Text,Text,[(Text, [Text])]) -> ViewKeyDependency
++viewKeyDepFromRow :: (Text,Text,Text,Text,Text,Text,[(Text, Text)]) -> ViewKeyDependency
+ viewKeyDepFromRow (s1,t1,s2,v2,cons,consType,sCols) = ViewKeyDependency (QualifiedIdentifier s1 t1) (QualifiedIdentifier s2 v2) cons keyDep sCols
+   where
+     keyDep | consType == "p" = PKDep
+@@ -415,21 +394,19 @@ addViewM2OAndO2ORels keyDeps rels =
+             (keyDepView vwTbl)
+             relForeignTable
+             False
+-            ((if isM2O card then M2O else O2O) cons $ zipWith (\(_, vCol) (_, fCol)-> (vCol, fCol)) keyDepColsVwTbl relCols)
++            ((if isM2O card then M2O else O2O) cons $ zipWith (\(_, vCol) (_, fCol)-> (vCol, fCol)) (keyDepCols vwTbl) relCols)
+             True
+             False
+-        | vwTbl <- viewTableRels
+-        , keyDepColsVwTbl <- expandKeyDepCols $ keyDepCols vwTbl ]
++        | vwTbl <- viewTableRels ]
+         ++
+         [ Relationship
+             relTable
+             (keyDepView tblVw)
+             False
+-            ((if isM2O card then M2O else O2O) cons $ zipWith (\(tCol, _) (_, vCol) -> (tCol, vCol)) relCols keyDepColsTblVw)
++            ((if isM2O card then M2O else O2O) cons $ zipWith (\(tCol, _) (_, vCol) -> (tCol, vCol)) relCols (keyDepCols tblVw))
+             False
+             True
+-        | tblVw <- tableViewRels
+-        , keyDepColsTblVw <- expandKeyDepCols $ keyDepCols tblVw ]
++        | tblVw <- tableViewRels ]
+         ++
+         [
+           let
+@@ -440,16 +417,13 @@ addViewM2OAndO2ORels keyDeps rels =
+             vw1
+             vw2
+             (vw1 == vw2)
+-            ((if isM2O card then M2O else O2O) cons $ zipWith (\(_, vcol1) (_, vcol2) -> (vcol1, vcol2)) keyDepColsVwTbl keyDepColsTblVw)
++            ((if isM2O card then M2O else O2O) cons $ zipWith (\(_, vcol1) (_, vcol2) -> (vcol1, vcol2)) (keyDepCols vwTbl) (keyDepCols tblVw))
+             True
+             True
+         | vwTbl <- viewTableRels
+-        , keyDepColsVwTbl <- expandKeyDepCols $ keyDepCols vwTbl
+-        , tblVw <- tableViewRels
+-        , keyDepColsTblVw <- expandKeyDepCols $ keyDepCols tblVw ]
++        , tblVw <- tableViewRels ]
+       else []
+     viewRels _ = []
+-    expandKeyDepCols kdc = zip (fst <$> kdc) <$> sequenceA (snd <$> kdc)
+ 
+ addInverseRels :: [Relationship] -> [Relationship]
+ addInverseRels rels =
+@@ -478,14 +452,8 @@ addViewPrimaryKeys tabs keyDeps =
+     else tbl) <$> tabs
+   where
+     findViewPKCols sch vw =
+-      concatMap (\(ViewKeyDependency _ _ _ _ pkCols) -> takeFirstPK pkCols) $
++      concatMap (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
+       filter (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
+-    -- In the case of multiple reference to the same PK (see comment for ViewKeyDependency) we take the first reference available.
+-    -- We assume this to be safe to do, because:
+-    -- * We don't have any logic that requires the client to name a PK column (compared to the column hints in embedding for FKs),
+-    --   so we don't need to know about the other references.
+-    -- * We need to choose a single reference for each column, otherwise we'd output too many columns in location headers etc.
+-    takeFirstPK pkCols = catMaybes $ head . snd <$> pkCols
+ 
+ allTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
+ allTables pgVer =
+@@ -949,38 +917,22 @@ allViewsKeyDependencies =
+         from recursion view
+         join results tab on view.resorigtbl=tab.view_id and view.resorigcol=tab.view_column
+         where not is_cycle
+-      ),
+-      repeated_references as(
+-        select
+-          view_id,
+-          view_schema,
+-          view_name,
+-          resorigtbl,
+-          resorigcol,
+-          array_agg(attname) as view_columns
+-        from recursion
+-        join pg_attribute vcol on vcol.attrelid = view_id and vcol.attnum = view_column
+-        group by
+-          view_id,
+-          view_schema,
+-          view_name,
+-          resorigtbl,
+-          resorigcol
+       )
+       select
+         sch.nspname as table_schema,
+         tbl.relname as table_name,
+-        rep.view_schema,
+-        rep.view_name,
++        rec.view_schema,
++        rec.view_name,
+         pks_fks.conname as constraint_name,
+         pks_fks.contype as constraint_type,
+-        array_agg(row(col.attname, view_columns) order by pks_fks.ord) as column_dependencies
+-      from repeated_references rep
+-      join pks_fks using (resorigtbl, resorigcol)
+-      join pg_class tbl on tbl.oid = rep.resorigtbl
+-      join pg_attribute col on col.attrelid = tbl.oid and col.attnum = rep.resorigcol
++        array_agg(row(col.attname, vcol.attname) order by pks_fks.ord) as column_dependencies
++      from recursion rec
++      join pg_class tbl on tbl.oid = rec.resorigtbl
++      join pg_attribute col on col.attrelid = tbl.oid and col.attnum = rec.resorigcol
++      join pg_attribute vcol on vcol.attrelid = rec.view_id and vcol.attnum = rec.view_column
+       join pg_namespace sch on sch.oid = tbl.relnamespace
+-      group by sch.nspname, tbl.relname,  rep.view_schema, rep.view_name, pks_fks.conname, pks_fks.contype
++      join pks_fks using (resorigtbl, resorigcol)
++      group by sch.nspname, tbl.relname,  rec.view_schema, rec.view_name, pks_fks.conname, pks_fks.contype
+       |]
+ 
+ param :: HE.Value a -> HE.Params a
+diff --git a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+index 1535ed4e..18ecb693 100644
+--- a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
++++ b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+@@ -120,41 +120,6 @@ spec =
+           , matchHeaders = [matchContentTypeJson]
+           }
+ 
+-      it "errs with multiple references to the same composite key columns in a view" $
+-        get "/i2459_composite_v2?select=*,i2459_composite_v1(*)" `shouldRespondWith`
+-          [json|
+-            {
+-              "code": "PGRST201",
+-              "details": [
+-                {
+-                  "cardinality": "many-to-one",
+-                  "embedding": "i2459_composite_v2 with i2459_composite_v1",
+-                  "relationship": "i2459_composite_t2_t1_a_t1_b_fkey using i2459_composite_v2(t1_a1, t1_b1) and i2459_composite_v1(a, b)"
+-                },
+-                {
+-                  "cardinality": "many-to-one",
+-                  "embedding": "i2459_composite_v2 with i2459_composite_v1",
+-                  "relationship": "i2459_composite_t2_t1_a_t1_b_fkey using i2459_composite_v2(t1_a1, t1_b2) and i2459_composite_v1(a, b)"
+-                },
+-                {
+-                  "cardinality": "many-to-one",
+-                  "embedding": "i2459_composite_v2 with i2459_composite_v1",
+-                  "relationship": "i2459_composite_t2_t1_a_t1_b_fkey using i2459_composite_v2(t1_a2, t1_b1) and i2459_composite_v1(a, b)"
+-                },
+-                {
+-                  "cardinality": "many-to-one",
+-                  "embedding": "i2459_composite_v2 with i2459_composite_v1",
+-                  "relationship": "i2459_composite_t2_t1_a_t1_b_fkey using i2459_composite_v2(t1_a2, t1_b2) and i2459_composite_v1(a, b)"
+-                }
+-              ],
+-              "hint": "Try changing 'i2459_composite_v1' to one of the following: 'i2459_composite_v1!i2459_composite_t2_t1_a_t1_b_fkey', 'i2459_composite_v1!i2459_composite_t2_t1_a_t1_b_fkey', 'i2459_composite_v1!i2459_composite_t2_t1_a_t1_b_fkey', 'i2459_composite_v1!i2459_composite_t2_t1_a_t1_b_fkey'. Find the desired relationship in the 'details' key.",
+-              "message": "Could not embed because more than one relationship was found for 'i2459_composite_v2' and 'i2459_composite_v1'"
+-            }
+-          |]
+-          { matchStatus  = 300
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+     context "disambiguating requests with embed hints" $ do
+ 
+       context "using FK to specify the relationship" $ do
+@@ -275,20 +240,6 @@ spec =
+             [json| [ { "name": "site 1", "main_project_id": { "name": "big project 1" } } ] |]
+             { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "can specify all view column names that reference the same base column" $ do
+-          get "/i2459_simple_v1?select=*,i2459_simple_v2!t1_id1(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/i2459_simple_v1?select=*,i2459_simple_v2!t1_id2(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/i2459_simple_v2?select=*,i2459_simple_v1!t1_id1(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/i2459_simple_v2?select=*,i2459_simple_v1!t1_id2(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+       context "using the junction to disambiguate the request" $
+         it "can specify the junction of an m2m relationship" $ do
+           get "/sites?select=*,big_projects!jobs(name)&site_id=in.(1,2)" `shouldRespondWith`
+@@ -390,14 +341,6 @@ spec =
+               }
+             ]|] { matchHeaders = [matchContentTypeJson] }
+ 
+-        it "can specify all view column names that reference the same base column" $ do
+-          get "/i2459_self_v1?select=*,parent(*),grandparent(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-          get "/i2459_self_v2?select=*,parent(*),grandparent(*)" `shouldRespondWith`
+-            [json| [] |]
+-            { matchHeaders = [matchContentTypeJson] }
+-
+       context "two self reference foreign keys" $ do
+         it "embeds parents" $
+           get "/organizations?select=id,name,referee(id,name),auditor(id,name)&id=eq.3" `shouldRespondWith`
+@@ -563,3 +506,4 @@ spec =
+               }
+             ]|]
+           { matchHeaders = [matchContentTypeJson] }
++
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index e94621ba..c528bbf1 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2918,65 +2918,3 @@ $$ LANGUAGE sql STABLE;
+ CREATE FUNCTION test.computed_projects(test.clients) RETURNS SETOF test.projects ROWS 1 AS $$
+   SELECT * FROM test.projects WHERE client_id = $1.id;
+ $$ LANGUAGE sql STABLE;
+-
+--- issue https://github.com/PostgREST/postgrest/issues/2459
+-create table public.i2459_simple_t1 (
+-  id int primary key
+-);
+-
+-create table public.i2459_simple_t2 (
+-  t1_id int references public.i2459_simple_t1
+-);
+-
+-create view i2459_simple_v1 as table public.i2459_simple_t1;
+-
+-create view i2459_simple_v2 as
+-  select t1_id as t1_id1, t1_id as t1_id2 from public.i2459_simple_t2;
+-
+-
+-create table public.i2459_composite_t1 (
+-  primary key (a,b),
+-  a int,
+-  b int
+-);
+-
+-create table public.i2459_composite_t2 (
+-  t1_a int,
+-  t1_b int,
+-  constraint i2459_composite_t2_t1_a_t1_b_fkey foreign key (t1_a, t1_b) references public.i2459_composite_t1
+-);
+-
+-create view i2459_composite_v1 as table public.i2459_composite_t1;
+-
+-create view i2459_composite_v2 as
+-  select t1_a as t1_a1,
+-         t1_b as t1_b1,
+-         t1_a as t1_a2,
+-         t1_b as t1_b2
+-    from public.i2459_composite_t2;
+-
+-
+-create table public.i2459_self_t (
+-  id int primary key,
+-  parent int references public.i2459_self_t,
+-  type text
+-);
+-
+-
+-create view i2459_self_v1 as
+-select parent.parent as grandparent,
+-       child.parent,
+-       child.id
+-  from public.i2459_self_t as parent
+-       join public.i2459_self_t as child
+-         on child.parent = parent.id
+- where child.type = 'A';
+-
+-create view i2459_self_v2 as
+-select parent.parent as grandparent,
+-       child.parent,
+-       child.id
+-  from public.i2459_self_t as parent
+-       join public.i2459_self_t as child
+-         on child.parent = parent.id
+- where child.type = 'B';

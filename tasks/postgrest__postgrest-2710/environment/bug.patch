@@ -1,0 +1,724 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 829cd58f..7b58559a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -33,15 +33,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + `PGRST003`: Timed out when acquiring connection to db
+  - #2667, Fix `db-pool-acquisition-timeout` not logging to stderr when the timeout is reached - @steve-chavez
+  - #1652, Fix function call with arguments not inlining - @steve-chavez
+- - #2705, Fix bug when using the `Range` header on `PATCH/DELETE` - @laurenceisla
+-   + Fix the`"message": "syntax error at or near \"RETURNING\""` error
+-   + Fix doing a limited update/delete when an `order` query parameter was present
+-    
+-### Changed
+-
+- - #2705, The `Range` header is now only considered on `GET` requests and is ignored for any other method - @laurenceisla
+-   + Other methods should use the `limit/offset` query parameters for sub-ranges
+-   + `PUT` requests no longer return an error when this header is present (using `limit/offset` still triggers the error)
+ 
+ ## [10.1.2] - 2023-02-01
+ 
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 2532cd02..5da127cc 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -237,12 +237,10 @@ getRanges :: ByteString -> QueryParams -> RequestHeaders -> Either ApiRequestErr
+ getRanges method QueryParams{qsOrder,qsRanges} hdrs
+   | isInvalidRange = Left $ InvalidRange (if rangeIsEmpty headerRange then LowerGTUpper else NegativeLimit)
+   | method `elem` ["PATCH", "DELETE"] && not (null qsRanges) && null qsOrder = Left LimitNoOrderError
+-  | method == "PUT" && topLevelRange /= allRange = Left PutLimitNotAllowedError
++  | method == "PUT" && topLevelRange /= allRange = Left PutRangeNotAllowedError
+   | otherwise = Right (topLevelRange, ranges)
+   where
+-    -- According to the RFC (https://www.rfc-editor.org/rfc/rfc9110.html#name-range),
+-    -- the Range header must be ignored for all methods other than GET
+-    headerRange = if method == "GET" then rangeRequested hdrs else allRange
++    headerRange = rangeRequested hdrs
+     limitRange = fromMaybe allRange (HM.lookup "limit" qsRanges)
+     headerAndLimitRange = rangeIntersection headerRange limitRange
+     -- Bypass all the ranges and send only the limit zero range (0 <= x <= -1) if
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index e7acc071..df373dac 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -76,7 +76,7 @@ data ApiRequestError
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] Bool MediaType Bool [QualifiedIdentifier] [ProcDescription]
+   | NotEmbedded Text
+-  | PutLimitNotAllowedError
++  | PutRangeNotAllowedError
+   | QueryParamError QPError
+   | RelatedOrderNotToOne Text Text
+   | SpreadNotToOne Text Text
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index a02629b5..6682f898 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -72,7 +72,7 @@ instance PgrstError ApiRequestError where
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+   status NotEmbedded{}           = HTTP.status400
+-  status PutLimitNotAllowedError = HTTP.status400
++  status PutRangeNotAllowedError = HTTP.status400
+   status QueryParamError{}       = HTTP.status400
+   status RelatedOrderNotToOne{}  = HTTP.status400
+   status SpreadNotToOne{}        = HTTP.status400
+@@ -142,9 +142,9 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON PutLimitNotAllowedError = JSON.object [
++  toJSON PutRangeNotAllowedError = JSON.object [
+     "code"    .= ApiRequestErrorCode14,
+-    "message" .= ("limit/offset querystring parameters are not allowed for PUT" :: Text),
++    "message" .= ("Range header and limit/offset querystring parameters are not allowed for PUT" :: Text),
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 698c7ea4..772c7d49 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -154,7 +154,7 @@ spec =
+       it "works with the limit and offset query params" $
+         baseTable "limited_delete_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/limited_delete_items?order=id&limit=1&offset=1" mempty mempty
++        requestMutation methodDelete "/limited_delete_items?order=id&limit=1&offset=1" mempty
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "item-1" }
+@@ -164,7 +164,7 @@ spec =
+       it "works with the limit query param plus a filter" $
+         baseTable "limited_delete_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/limited_delete_items?order=id&limit=1&id=gt.1" mempty mempty
++        requestMutation methodDelete "/limited_delete_items?order=id&limit=1&id=gt.1" mempty
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "item-1" }
+@@ -200,7 +200,7 @@ spec =
+       it "works with views with an explicit order by unique col" $
+         baseTable "limited_delete_items_view" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/limited_delete_items_view?order=id&limit=1&offset=1" mempty mempty
++        requestMutation methodDelete "/limited_delete_items_view?order=id&limit=1&offset=1" mempty
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "item-1" }
+@@ -210,7 +210,7 @@ spec =
+       it "works with views with an explicit order by composite pk" $
+         baseTable "limited_delete_items_cpk_view" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/limited_delete_items_cpk_view?order=id,name&limit=1&offset=1" mempty mempty
++        requestMutation methodDelete "/limited_delete_items_cpk_view?order=id,name&limit=1&offset=1" mempty
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "item-1" }
+@@ -220,53 +220,9 @@ spec =
+       it "works on a table without a pk by ordering by 'ctid'" $
+         baseTable "limited_delete_items_no_pk" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/limited_delete_items_no_pk?order=ctid&limit=1&offset=1" mempty mempty
++        requestMutation methodDelete "/limited_delete_items_no_pk?order=ctid&limit=1&offset=1" mempty
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "item-1" }
+         , { "id": 3, "name": "item-3" }
+         ]|]
+-
+-      it "ignores the Range header" $ do
+-        baseTable "limited_delete_items" "id" tblDataBefore
+-         `mutatesWith`
+-         requestMutation methodDelete "/limited_delete_items"
+-          (rangeHdrs (ByteRangeFromTo 0 0)) mempty
+-         `shouldMutateInto`
+-         [json|[]|]
+-
+-        baseTable "limited_delete_items" "id" tblDataBefore
+-         `mutatesWith`
+-         requestMutation methodDelete "/limited_delete_items?id=gte.2"
+-          (rangeHdrs (ByteRangeFromTo 0 0)) mempty
+-         `shouldMutateInto`
+-         [json|[ { "id": 1, "name": "item-1" } ]|]
+-
+-      it "ignores the Range header and does not do a limited delete" $
+-        baseTable "limited_delete_items" "id" tblDataBefore
+-         `mutatesWith`
+-         requestMutation methodDelete "/limited_delete_items?order=id"
+-          (rangeHdrs (ByteRangeFromTo 0 0)) mempty
+-         `shouldMutateInto`
+-         [json|[]|]
+-
+-      it "ignores the Range header and does not throw an invalid range error" $
+-        baseTable "limited_delete_items" "id" tblDataBefore
+-         `mutatesWith`
+-         requestMutation methodDelete "/limited_delete_items?order=id&limit=1&offset=1"
+-          (rangeHdrs (ByteRangeFromTo 0 0)) mempty
+-         `shouldMutateInto`
+-         [json|[
+-           { "id": 1, "name": "item-1" }
+-         , { "id": 3, "name": "item-3" }
+-         ]|]
+-
+-      it "ignores the Range header but not the limit and offset params" $
+-        baseTable "limited_delete_items" "id" tblDataBefore
+-         `mutatesWith`
+-         requestMutation methodDelete "/limited_delete_items?order=id&limit=2&offset=1"
+-          (rangeHdrs (ByteRangeFromTo 1 1)) mempty
+-         `shouldMutateInto`
+-         [json|[
+-           { "id": 1, "name": "item-1" }
+-         ]|]
+diff --git a/test/spec/Feature/Query/PgSafeUpdateSpec.hs b/test/spec/Feature/Query/PgSafeUpdateSpec.hs
+index 7415c1a7..452133a6 100644
+--- a/test/spec/Feature/Query/PgSafeUpdateSpec.hs
++++ b/test/spec/Feature/Query/PgSafeUpdateSpec.hs
+@@ -38,7 +38,7 @@ spec =
+       it "allows full table update if a filter is present" $
+         baseTable "safe_update_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodPatch "/safe_update_items?id=gt.0" mempty [json| {"name": "updated-item"} |]
++        requestMutation methodPatch "/safe_update_items?id=gt.0" [json| {"name": "updated-item"} |]
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "updated-item", "observation": null }
+@@ -61,7 +61,7 @@ spec =
+       it "allows full table delete if a filter is present" $
+         baseTable "safe_delete_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/safe_delete_items?id=gt.0" mempty mempty
++        requestMutation methodDelete "/safe_delete_items?id=gt.0" mempty
+         `shouldMutateInto`
+         [json|[]|]
+ 
+@@ -72,7 +72,7 @@ disabledSpec =
+       it "works if no condition is present" $
+         baseTable "unsafe_update_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodPatch "/unsafe_update_items" mempty [json| {"name": "updated-item"} |]
++        requestMutation methodPatch "/unsafe_update_items" [json| {"name": "updated-item"} |]
+         `shouldMutateInto`
+         [json|[
+           { "id": 1, "name": "updated-item", "observation": null }
+@@ -84,6 +84,6 @@ disabledSpec =
+       it "works if no condition is present" $
+         baseTable "unsafe_delete_items" "id" tblDataBefore
+         `mutatesWith`
+-        requestMutation methodDelete "/unsafe_delete_items" mempty mempty
++        requestMutation methodDelete "/unsafe_delete_items" mempty
+         `shouldMutateInto`
+         [json|[]|]
+diff --git a/test/spec/Feature/Query/RangeSpec.hs b/test/spec/Feature/Query/RangeSpec.hs
+index 5fa2dcf7..c2481b15 100644
+--- a/test/spec/Feature/Query/RangeSpec.hs
++++ b/test/spec/Feature/Query/RangeSpec.hs
+@@ -1,5 +1,7 @@
+ module Feature.Query.RangeSpec where
+ 
++import qualified Data.ByteString.Lazy as BL
++
+ import Network.Wai      (Application)
+ import Network.Wai.Test (SResponse (simpleHeaders, simpleStatus))
+ 
+@@ -11,29 +13,36 @@ import Test.Hspec.Wai.JSON
+ import Protolude  hiding (get)
+ import SpecHelper
+ 
++defaultRange :: BL.ByteString
++defaultRange = [json| { "min": 0, "max": 15 } |]
++
++emptyRange :: BL.ByteString
++emptyRange = [json| { "min": 2, "max": 2 } |]
++
+ spec :: SpecWith ((), Application)
+ spec = do
+-  describe "GET /rpc/getitemrange" $ do
++  describe "POST /rpc/getitemrange" $ do
+     context "without range headers" $ do
+       context "with response under server size limit" $
+         it "returns whole range with status 200" $
+-           get "/rpc/getitemrange?min=0&max=15" `shouldRespondWith` 200
++           post "/rpc/getitemrange" defaultRange `shouldRespondWith` 200
+ 
+       context "when I don't want the count" $ do
+         it "returns range Content-Range with */* for empty range" $
+-          get "/rpc/getitemrange?min=2&max=2"
++          request methodPost "/rpc/getitemrange" [] emptyRange
+             `shouldRespondWith` [json| [] |] {matchHeaders = ["Content-Range" <:> "*/*"]}
+ 
+         it "returns range Content-Range with range/*" $
+-          get "/rpc/getitemrange?order=id&min=0&max=15"
++          post "/rpc/getitemrange?order=id"
++              defaultRange
+             `shouldRespondWith`
+               [json| [{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}] |]
+               { matchHeaders = ["Content-Range" <:> "0-14/*"] }
+ 
+       context "of invalid range" $ do
+         it "refuses a range with nonzero start when there are no items" $
+-          request methodGet "/rpc/getitemrange?offset=1&min=2&max=2"
+-                  [("Prefer", "count=exact")] mempty
++          request methodPost "/rpc/getitemrange?offset=1"
++                  [("Prefer", "count=exact")] emptyRange
+             `shouldRespondWith`
+               [json| {
+                 "message":"Requested range not satisfiable",
+@@ -46,8 +55,8 @@ spec = do
+             }
+ 
+         it "refuses a range requesting start past last item" $
+-          request methodGet "/rpc/getitemrange?offset=100&min=0&max=15"
+-                  [("Prefer", "count=exact")] mempty
++          request methodPost "/rpc/getitemrange?offset=100"
++                  [("Prefer", "count=exact")] defaultRange
+             `shouldRespondWith`
+               [json| {
+                 "message":"Requested range not satisfiable",
+@@ -62,37 +71,37 @@ spec = do
+     context "with range headers" $ do
+       context "of acceptable range" $ do
+         it "succeeds with partial content" $ do
+-          r <- request methodGet  "/rpc/getitemrange?min=0&max=15"
+-                       (rangeHdrs $ ByteRangeFromTo 0 1) mempty
++          r <- request methodPost  "/rpc/getitemrange"
++                       (rangeHdrs $ ByteRangeFromTo 0 1) defaultRange
+           liftIO $ do
+             simpleHeaders r `shouldSatisfy`
+               matchHeader "Content-Range" "0-1/*"
+             simpleStatus r `shouldBe` ok200
+ 
+         it "understands open-ended ranges" $
+-          request methodGet "/rpc/getitemrange?min=0&max=15"
+-                  (rangeHdrs $ ByteRangeFrom 0) mempty
++          request methodPost "/rpc/getitemrange"
++                  (rangeHdrs $ ByteRangeFrom 0) defaultRange
+             `shouldRespondWith` 200
+ 
+         it "returns an empty body when there are no results" $
+-          request methodGet "/rpc/getitemrange?min=2&max=2"
+-                  (rangeHdrs $ ByteRangeFromTo 0 1) mempty
++          request methodPost "/rpc/getitemrange"
++                  (rangeHdrs $ ByteRangeFromTo 0 1) emptyRange
+             `shouldRespondWith` "[]"
+             { matchStatus  = 200
+             , matchHeaders = ["Content-Range" <:> "*/*"]
+             }
+ 
+         it "allows one-item requests" $ do
+-          r <- request methodGet  "/rpc/getitemrange?min=0&max=15"
+-                       (rangeHdrs $ ByteRangeFromTo 0 0) mempty
++          r <- request methodPost  "/rpc/getitemrange"
++                       (rangeHdrs $ ByteRangeFromTo 0 0) defaultRange
+           liftIO $ do
+             simpleHeaders r `shouldSatisfy`
+               matchHeader "Content-Range" "0-0/*"
+             simpleStatus r `shouldBe` ok200
+ 
+         it "handles ranges beyond collection length via truncation" $ do
+-          r <- request methodGet  "/rpc/getitemrange?min=0&max=15"
+-                       (rangeHdrs $ ByteRangeFromTo 10 100) mempty
++          r <- request methodPost  "/rpc/getitemrange"
++                       (rangeHdrs $ ByteRangeFromTo 10 100) defaultRange
+           liftIO $ do
+             simpleHeaders r `shouldSatisfy`
+               matchHeader "Content-Range" "10-14/*"
+@@ -100,8 +109,8 @@ spec = do
+ 
+       context "of invalid range" $ do
+         it "fails with 416 for offside range" $
+-          request methodGet  "/rpc/getitemrange?min=2&max=2"
+-                  (rangeHdrs $ ByteRangeFromTo 1 0) mempty
++          request methodPost  "/rpc/getitemrange"
++                  (rangeHdrs $ ByteRangeFromTo 1 0) emptyRange
+             `shouldRespondWith`
+               [json| {
+                 "message":"Requested range not satisfiable",
+@@ -112,8 +121,8 @@ spec = do
+             { matchStatus = 416 }
+ 
+         it "refuses a range with nonzero start when there are no items" $
+-          request methodGet "/rpc/getitemrange?min=2&max=2"
+-                  (rangeHdrsWithCount $ ByteRangeFromTo 1 2) mempty
++          request methodPost "/rpc/getitemrange"
++                  (rangeHdrsWithCount $ ByteRangeFromTo 1 2) emptyRange
+             `shouldRespondWith`
+               [json| {
+                 "message":"Requested range not satisfiable",
+@@ -126,8 +135,8 @@ spec = do
+             }
+ 
+         it "refuses a range requesting start past last item" $
+-          request methodGet "/rpc/getitemrange?min=0&max=15"
+-                  (rangeHdrsWithCount $ ByteRangeFromTo 100 199) mempty
++          request methodPost "/rpc/getitemrange"
++                  (rangeHdrsWithCount $ ByteRangeFromTo 100 199) defaultRange
+             `shouldRespondWith`
+               [json| {
+                 "message":"Requested range not satisfiable",
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 54c65baf..3b95e5db 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -24,65 +24,50 @@ spec :: PgVersion -> SpecWith ((), Application)
+ spec actualPgVersion =
+   describe "remote procedure call" $ do
+     context "a proc that returns a set" $ do
+-      context "returns paginated results" $ do
+-        it "using the Range header" $
+-          request methodGet "/rpc/getitemrange?min=2&max=4"
+-                  (rangeHdrs (ByteRangeFromTo 1 1)) mempty
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 200
+-              , matchHeaders = ["Content-Range" <:> "1-1/*"]
+-              }
+-
+-        it "using limit and offset" $ do
+-          post "/rpc/getitemrange?limit=1&offset=1" [json| { "min": 2, "max": 4 } |]
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 200
+-              , matchHeaders = ["Content-Range" <:> "1-1/*"]
+-              }
+-          get "/rpc/getitemrange?min=2&max=4&limit=1&offset=1"
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 200
+-              , matchHeaders = ["Content-Range" <:> "1-1/*"]
+-              }
+-          request methodHead "/rpc/getitemrange?min=2&max=4&limit=1&offset=1" mempty mempty
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus = 200
+-              , matchHeaders = [ matchContentTypeJson
+-                               , "Content-Range" <:> "1-1/*" ]
+-              }
+-
+-      context "includes total count if requested" $ do
+-        it "using the Range header" $
+-          request methodGet "/rpc/getitemrange?min=2&max=4"
+-                  (rangeHdrsWithCount (ByteRangeFromTo 1 1)) ""
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 206 -- it now knows the response is partial
+-              , matchHeaders = ["Content-Range" <:> "1-1/2"]
+-              }
++      it "returns paginated results" $ do
++        request methodPost "/rpc/getitemrange"
++                (rangeHdrs (ByteRangeFromTo 0 0))  [json| { "min": 2, "max": 4 } |]
++           `shouldRespondWith` [json| [{"id":3}] |]
++            { matchStatus = 200
++            , matchHeaders = ["Content-Range" <:> "0-0/*"]
++            }
++        request methodGet "/rpc/getitemrange?min=2&max=4"
++                (rangeHdrs (ByteRangeFromTo 0 0)) ""
++           `shouldRespondWith` [json| [{"id":3}] |]
++            { matchStatus = 200
++            , matchHeaders = ["Content-Range" <:> "0-0/*"]
++            }
++        request methodHead "/rpc/getitemrange?min=2&max=4"
++            (rangeHdrs (ByteRangeFromTo 0 0)) ""
++          `shouldRespondWith`
++            ""
++            { matchStatus = 200
++            , matchHeaders = [ matchContentTypeJson
++                             , "Content-Range" <:> "0-0/*" ]
++            }
+ 
+-        it "using limit and offset" $ do
+-          request methodPost "/rpc/getitemrange?limit=1&offset=1"
+-                  [("Prefer", "count=exact")]
+-                  [json| { "min": 2, "max": 4 } |]
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 206 -- it now knows the response is partial
+-              , matchHeaders = ["Content-Range" <:> "1-1/2"]
+-              }
+-          request methodGet "/rpc/getitemrange?min=2&max=4&limit=1&offset=1"
+-                  [("Prefer", "count=exact")] mempty
+-             `shouldRespondWith` [json| [{"id":4}] |]
+-              { matchStatus = 206
+-              , matchHeaders = ["Content-Range" <:> "1-1/2"]
+-              }
+-          request methodHead "/rpc/getitemrange?min=2&max=4&limit=1&offset=1"
+-              [("Prefer", "count=exact")] mempty
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus = 206
+-              , matchHeaders = [ matchContentTypeJson
+-                               , "Content-Range" <:> "1-1/2" ]
+-              }
++      it "includes total count if requested" $ do
++        request methodPost "/rpc/getitemrange"
++                (rangeHdrsWithCount (ByteRangeFromTo 0 0))
++                [json| { "min": 2, "max": 4 } |]
++           `shouldRespondWith` [json| [{"id":3}] |]
++            { matchStatus = 206 -- it now knows the response is partial
++            , matchHeaders = ["Content-Range" <:> "0-0/2"]
++            }
++        request methodGet "/rpc/getitemrange?min=2&max=4"
++                (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
++           `shouldRespondWith` [json| [{"id":3}] |]
++            { matchStatus = 206
++            , matchHeaders = ["Content-Range" <:> "0-0/2"]
++            }
++        request methodHead "/rpc/getitemrange?min=2&max=4"
++            (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
++          `shouldRespondWith`
++            ""
++            { matchStatus = 206
++            , matchHeaders = [ matchContentTypeJson
++                             , "Content-Range" <:> "0-0/2" ]
++            }
+ 
+       it "includes exact count if requested" $ do
+         request methodHead "/rpc/getallprojects"
+@@ -128,58 +113,6 @@ spec actualPgVersion =
+             , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
+             }
+ 
+-      context "ignores Range header when method is different than GET" $ do
+-        it "without limit and offset" $ do
+-          request methodPost "/rpc/getitemrange"
+-                  (rangeHdrsWithCount (ByteRangeFromTo 1 1))
+-                  [json| { "min": 2, "max": 4 } |]
+-             `shouldRespondWith` [json| [{"id": 3}, {"id": 4}] |]
+-              { matchStatus = 200
+-              , matchHeaders = ["Content-Range" <:> "0-1/2"]
+-              }
+-          request methodHead "/rpc/getitemrange?min=2&max=4"
+-              (rangeHdrsWithCount (ByteRangeFromTo 1 1)) ""
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus = 200
+-              , matchHeaders = [ matchContentTypeJson
+-                               , "Content-Range" <:> "0-1/2" ]
+-              }
+-
+-        it "with limit and offset" $ do
+-          request methodPost "/rpc/getitemrange?limit=2&offset=1"
+-                  (rangeHdrsWithCount (ByteRangeFromTo 1 1))
+-                  [json| { "min": 2, "max": 5 } |]
+-             `shouldRespondWith` [json| [{"id": 4}, {"id": 5}] |]
+-              { matchStatus = 206
+-              , matchHeaders = ["Content-Range" <:> "1-2/3"]
+-              }
+-          request methodHead "/rpc/getitemrange?min=2&max=5&limit=2&offset=1"
+-              (rangeHdrsWithCount (ByteRangeFromTo 1 1)) ""
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus = 206
+-              , matchHeaders = [ matchContentTypeJson
+-                               , "Content-Range" <:> "1-2/3" ]
+-              }
+-
+-        it "does not throw an invalid range error" $ do
+-          request methodPost "/rpc/getitemrange?limit=2&offset=1"
+-                  (rangeHdrsWithCount (ByteRangeFromTo 0 0))
+-                  [json| { "min": 2, "max": 5 } |]
+-             `shouldRespondWith` [json| [{"id": 4}, {"id": 5}] |]
+-              { matchStatus = 206
+-              , matchHeaders = ["Content-Range" <:> "1-2/3"]
+-              }
+-          request methodHead "/rpc/getitemrange?min=2&max=5&limit=2&offset=1"
+-              (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus = 206
+-              , matchHeaders = [ matchContentTypeJson
+-                               , "Content-Range" <:> "1-2/3" ]
+-              }
+-
+     context "unknown function" $ do
+       it "returns 404" $
+         post "/rpc/fakefunc" [json| {} |] `shouldRespondWith` 404
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 52a650c5..33061c91 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -449,7 +449,7 @@ spec = do
+     it "works with the limit query param" $
+       baseTable "limited_update_items" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items?order=id&limit=2" mempty
++      requestMutation methodPatch "/limited_update_items?order=id&limit=2"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -461,7 +461,7 @@ spec = do
+     it "works with the limit query param plus a filter" $
+       baseTable "limited_update_items" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items?order=id&limit=1&id=gt.2" mempty
++      requestMutation methodPatch "/limited_update_items?order=id&limit=1&id=gt.2"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -473,7 +473,7 @@ spec = do
+     it "works with the limit and offset query params" $
+       baseTable "limited_update_items" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items?order=id&limit=1&offset=1" mempty
++      requestMutation methodPatch "/limited_update_items?order=id&limit=1&offset=1"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -511,7 +511,7 @@ spec = do
+     it "works with views with an explicit order by unique col" $
+       baseTable "limited_update_items_view" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items_view?order=id&limit=1&offset=1" mempty
++      requestMutation methodPatch "/limited_update_items_view?order=id&limit=1&offset=1"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -523,7 +523,7 @@ spec = do
+     it "works with views with an explicit order by composite pk" $
+       baseTable "limited_update_items_cpk_view" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items_cpk_view?order=id,name&limit=1&offset=1" mempty
++      requestMutation methodPatch "/limited_update_items_cpk_view?order=id,name&limit=1&offset=1"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -535,7 +535,7 @@ spec = do
+     it "works on a table without a pk by ordering by 'ctid'" $
+       baseTable "limited_update_items_no_pk" "id" tblDataBefore
+       `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items_no_pk?order=ctid&limit=1" mempty
++      requestMutation methodPatch "/limited_update_items_no_pk?order=ctid&limit=1"
+         [json| {"name": "updated-item"} |]
+       `shouldMutateInto`
+       [json|[
+@@ -543,67 +543,3 @@ spec = do
+       , { "id": 2, "name": "item-2" }
+       , { "id": 3, "name": "item-3" }
+       ]|]
+-
+-    it "ignores the Range header" $ do
+-      baseTable "limited_update_items" "id" tblDataBefore
+-       `mutatesWith`
+-       requestMutation methodPatch "/limited_update_items"
+-        (rangeHdrs (ByteRangeFromTo 0 0))
+-        [json| {"name": "updated-item"} |]
+-       `shouldMutateInto`
+-       [json|[
+-         { "id": 1, "name": "updated-item" }
+-       , { "id": 2, "name": "updated-item" }
+-       , { "id": 3, "name": "updated-item" }
+-       ]|]
+-
+-      baseTable "limited_update_items" "id" tblDataBefore
+-       `mutatesWith`
+-       requestMutation methodPatch "/limited_update_items?id=gte.2"
+-        (rangeHdrs (ByteRangeFromTo 0 0))
+-        [json| {"name": "updated-item"} |]
+-       `shouldMutateInto`
+-       [json|[
+-         { "id": 1, "name": "item-1" }
+-       , { "id": 2, "name": "updated-item" }
+-       , { "id": 3, "name": "updated-item" }
+-       ]|]
+-
+-    it "ignores the Range header and does not do a limited update" $
+-      baseTable "limited_update_items" "id" tblDataBefore
+-       `mutatesWith`
+-       requestMutation methodPatch "/limited_update_items?order=id"
+-        (rangeHdrs (ByteRangeFromTo 0 0))
+-        [json| {"name": "updated-item"} |]
+-       `shouldMutateInto`
+-       [json|[
+-         { "id": 1, "name": "updated-item" }
+-       , { "id": 2, "name": "updated-item" }
+-       , { "id": 3, "name": "updated-item" }
+-       ]|]
+-
+-    it "ignores the Range header and does not throw an invalid range error" $
+-      baseTable "limited_update_items" "id" tblDataBefore
+-      `mutatesWith`
+-      requestMutation methodPatch "/limited_update_items?order=id&limit=1&offset=1"
+-        (rangeHdrs (ByteRangeFromTo 0 0))
+-        [json| {"name": "updated-item"} |]
+-      `shouldMutateInto`
+-      [json|[
+-       { "id": 1, "name": "item-1" }
+-      , { "id": 2, "name": "updated-item" }
+-      , { "id": 3, "name": "item-3" }
+-      ]|]
+-
+-    it "ignores the Range header but not the limit and offset params" $
+-      baseTable "limited_update_items" "id" tblDataBefore
+-       `mutatesWith`
+-       requestMutation methodPatch "/limited_update_items?order=id&limit=2&offset=1"
+-         (rangeHdrs (ByteRangeFromTo 1 1))
+-         [json| {"name": "updated-item"} |]
+-       `shouldMutateInto`
+-       [json|[
+-         { "id": 1, "name": "item-1" }
+-       , { "id": 2, "name": "updated-item" }
+-       , { "id": 3, "name": "updated-item" }
+-       ]|]
+diff --git a/test/spec/Feature/Query/UpsertSpec.hs b/test/spec/Feature/Query/UpsertSpec.hs
+index 4aa39619..590be3a7 100644
+--- a/test/spec/Feature/Query/UpsertSpec.hs
++++ b/test/spec/Feature/Query/UpsertSpec.hs
+@@ -195,18 +195,25 @@ spec actualPgVersion =
+ 
+     context "with PUT" $ do
+       context "Restrictions" $ do
++        it "fails if Range is specified" $
++          request methodPut "/tiobe_pls?name=eq.Javascript" [("Range", "0-5")]
++            [json| [ { "name": "Javascript", "rank": 1 } ]|]
++            `shouldRespondWith`
++            [json|{"message":"Range header and limit/offset querystring parameters are not allowed for PUT","code":"PGRST114","details":null,"hint":null}|]
++            { matchStatus = 400 , matchHeaders = [matchContentTypeJson] }
++
+         it "fails if limit is specified" $
+           put "/tiobe_pls?name=eq.Javascript&limit=1"
+             [json| [ { "name": "Javascript", "rank": 1 } ]|]
+             `shouldRespondWith`
+-            [json|{"message":"limit/offset querystring parameters are not allowed for PUT","code":"PGRST114","details":null,"hint":null}|]
++            [json|{"message":"Range header and limit/offset querystring parameters are not allowed for PUT","code":"PGRST114","details":null,"hint":null}|]
+             { matchStatus = 400 , matchHeaders = [matchContentTypeJson] }
+ 
+         it "fails if offset is specified" $
+           put "/tiobe_pls?name=eq.Javascript&offset=1"
+             [json| [ { "name": "Javascript", "rank": 1 } ]|]
+             `shouldRespondWith`
+-            [json|{"message":"limit/offset querystring parameters are not allowed for PUT","code":"PGRST114","details":null,"hint":null}|]
++            [json|{"message":"Range header and limit/offset querystring parameters are not allowed for PUT","code":"PGRST114","details":null,"hint":null}|]
+             { matchStatus = 400 , matchHeaders = [matchContentTypeJson] }
+ 
+         it "rejects every other filter than pk cols eq's" $ do
+@@ -375,18 +382,6 @@ spec actualPgVersion =
+             `shouldRespondWith`
+               [json|[ { "id": 1 } ]|]
+ 
+-        it "ignores the Range header" $ do
+-          -- assert that the next request will indeed be an update
+-          get "/tiobe_pls?name=eq.Java"
+-            `shouldRespondWith`
+-              [json|[ { "name": "Java", "rank": 1 } ]|]
+-
+-          request methodPut "/tiobe_pls?name=eq.Java"
+-              [("Prefer", "return=representation"), ("Range", "1-1")]
+-              [json| [ { "name": "Java", "rank": 5 } ]|]
+-            `shouldRespondWith`
+-              [json| [ { "name": "Java", "rank": 5 } ]|]
+-
+       -- TODO: move this to SingularSpec?
+       it "works with return=representation and vnd.pgrst.object+json" $
+         request methodPut "/tiobe_pls?name=eq.Ruby"
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 3ea2a083..6ba07903 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -280,9 +280,9 @@ baseTable :: ByteString -> ByteString -> Value -> BaseTable
+ baseTable = BaseTable
+ 
+ -- | The mutation (update/delete) that will be applied to the base table
+-requestMutation :: Method -> ByteString -> [Header] -> BL.ByteString -> WaiExpectation ()
+-requestMutation method path headers body =
+-  request method path (("Prefer", "tx=commit") : headers) body `shouldRespondWith` 204
++requestMutation :: Method -> ByteString -> BL.ByteString -> WaiExpectation ()
++requestMutation method path body =
++  request method path [("Prefer", "tx=commit")] body `shouldRespondWith` 204
+ 
+ data BaseTable = BaseTable ByteString ByteString Value
+ data MutationCheck = MutationCheck BaseTable (WaiExpectation ())

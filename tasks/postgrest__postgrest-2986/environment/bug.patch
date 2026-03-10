@@ -1,0 +1,427 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8ed7c15f..1d472992 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,7 +13,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2698, Add config `jwt-cache-max-lifetime` and implement JWT caching - @taimoorzaeem
+  - #2943, Add `handling=strict/lenient` for Prefer header - @taimoorzaeem
+  - #2983, Add more data to `Server-Timing` header - @develop7
+- - #2441, Add config `server-cors-allowed-origins` to specify CORS origins - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index c8239db0..ba1e5895 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -110,7 +110,7 @@ serverSettings AppConfig{..} =
+ postgrest :: AppConfig -> AppState.AppState -> IO () -> Wai.Application
+ postgrest conf appState connWorker =
+   traceHeaderMiddleware conf .
+-  Cors.middleware (configServerCorsAllowedOrigins conf) .
++  Cors.middleware .
+   Auth.middleware appState .
+   Logger.middleware (configLogLevel conf) $
+     -- fromJust can be used, because the auth middleware will **always** add
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 510d5e9d..2bbd9072 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -221,9 +221,6 @@ exampleConfigFile =
+       |## Content types to produce raw output
+       |# raw-media-types="image/png, image/jpg"
+       |
+-      |## Configurable CORS origins
+-      |# server-cors-allowed-origins = ""
+-      |
+       |server-host = "!4"
+       |server-port = 3000
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 4cfc059a..73f28481 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -103,7 +103,6 @@ data AppConfig = AppConfig
+   , configOpenApiSecurityActive    :: Bool
+   , configOpenApiServerProxyUri    :: Maybe Text
+   , configRawMediaTypes            :: [MediaType]
+-  , configServerCorsAllowedOrigins :: Maybe [Text]
+   , configServerHost               :: Text
+   , configServerPort               :: Int
+   , configServerTraceHeader        :: Maybe (CI.CI BS.ByteString)
+@@ -170,7 +169,6 @@ toText conf =
+       ,("openapi-security-active",       T.toLower . show . configOpenApiSecurityActive)
+       ,("openapi-server-proxy-uri",  q . fromMaybe mempty . configOpenApiServerProxyUri)
+       ,("raw-media-types",           q . T.decodeUtf8 . BS.intercalate "," . fmap toMime . configRawMediaTypes)
+-      ,("server-cors-allowed-origins",      q . maybe "" (T.intercalate ",") . configServerCorsAllowedOrigins)
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
+       ,("server-trace-header",       q . T.decodeUtf8 . maybe mempty CI.original . configServerTraceHeader)
+@@ -275,7 +273,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> (fromMaybe False <$> optBool "openapi-security-active")
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+     <*> (maybe [] (fmap (MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
+-    <*> (fmap splitOnCommas <$> optValue "server-cors-allowed-origins")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap (CI.mk . encodeUtf8) <$> optString "server-trace-header")
+diff --git a/src/PostgREST/Cors.hs b/src/PostgREST/Cors.hs
+index fea3733d..df38f1d9 100644
+--- a/src/PostgREST/Cors.hs
++++ b/src/PostgREST/Cors.hs
+@@ -2,14 +2,10 @@
+ Module      : PostgREST.Cors
+ Description : Wai Middleware to set cors policy.
+ -}
+-
+-{-# LANGUAGE TupleSections #-}
+-
+ module PostgREST.Cors (middleware) where
+ 
+ import qualified Data.ByteString.Char8       as BS
+ import qualified Data.CaseInsensitive        as CI
+-import qualified Data.Text.Encoding          as T
+ import qualified Network.Wai                 as Wai
+ import qualified Network.Wai.Middleware.Cors as Wai
+ 
+@@ -17,15 +13,15 @@ import Data.List (lookup)
+ 
+ import Protolude
+ 
+-middleware :: Maybe [Text] -> Wai.Middleware
+-middleware corsAllowedOrigins = Wai.cors $ corsPolicy corsAllowedOrigins
++middleware :: Wai.Middleware
++middleware = Wai.cors corsPolicy
+ 
+ -- | CORS policy to be used in by Wai Cors middleware
+-corsPolicy :: Maybe [Text] -> Wai.Request -> Maybe Wai.CorsResourcePolicy
+-corsPolicy corsAllowedOrigins req = case lookup "origin" headers of
+-  Just _ ->
++corsPolicy :: Wai.Request -> Maybe Wai.CorsResourcePolicy
++corsPolicy req = case lookup "origin" headers of
++  Just origin ->
+     Just Wai.CorsResourcePolicy
+-    { Wai.corsOrigins = (, True) . map T.encodeUtf8 <$> corsAllowedOrigins
++    { Wai.corsOrigins = Just ([origin], True)
+     , Wai.corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
+     , Wai.corsRequestHeaders = "Authorization" : accHeaders
+     , Wai.corsExposedHeaders = Just
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index 9b749acb..3e1df885 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -28,7 +28,6 @@ openapi-mode = "follow-privileges"
+ openapi-security-active = false
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+-server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index f13ec050..1b86f251 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -28,7 +28,6 @@ openapi-mode = "follow-privileges"
+ openapi-security-active = false
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+-server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index f13ec050..1b86f251 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -28,7 +28,6 @@ openapi-mode = "follow-privileges"
+ openapi-security-active = false
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+-server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index e060aa32..d4f6a962 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -28,7 +28,6 @@ openapi-mode = "follow-privileges"
+ openapi-security-active = false
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+-server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index fc3bbc70..856a109a 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -28,7 +28,6 @@ openapi-mode = "disabled"
+ openapi-security-active = false
+ openapi-server-proxy-uri = "https://otherexample.org/api"
+ raw-media-types = "application/vnd.pgrst.other-db-config"
+-server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "traceparent"
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index 6e281b04..9cab547f 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -28,7 +28,6 @@ openapi-mode = "ignore-privileges"
+ openapi-security-active = true
+ openapi-server-proxy-uri = "https://example.org/api"
+ raw-media-types = "application/vnd.pgrst.db-config"
+-server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "CF-Ray"
+diff --git a/test/io/configs/expected/no-defaults.config b/test/io/configs/expected/no-defaults.config
+index 21e80ba5..1e84858d 100644
+--- a/test/io/configs/expected/no-defaults.config
++++ b/test/io/configs/expected/no-defaults.config
+@@ -28,7 +28,6 @@ openapi-mode = "ignore-privileges"
+ openapi-security-active = true
+ openapi-server-proxy-uri = "https://postgrest.org"
+ raw-media-types = "application/vnd.pgrst.config"
+-server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "X-Request-Id"
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index 34f7d457..40bda26d 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -28,7 +28,6 @@ openapi-mode = "follow-privileges"
+ openapi-security-active = false
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+-server-cors-allowed-origins = ""
+ server-host = "!4"
+ server-port = 3000
+ server-trace-header = ""
+diff --git a/test/io/configs/no-defaults-env.yaml b/test/io/configs/no-defaults-env.yaml
+index 768208c6..d3cd013e 100644
+--- a/test/io/configs/no-defaults-env.yaml
++++ b/test/io/configs/no-defaults-env.yaml
+@@ -30,7 +30,6 @@ PGRST_OPENAPI_MODE: 'ignore-privileges'
+ PGRST_OPENAPI_SECURITY_ACTIVE: true
+ PGRST_OPENAPI_SERVER_PROXY_URI: 'https://postgrest.org'
+ PGRST_RAW_MEDIA_TYPES: application/vnd.pgrst.config
+-PGRST_SERVER_CORS_ALLOWED_ORIGINS: "http://example.com"
+ PGRST_SERVER_HOST: 0.0.0.0
+ PGRST_SERVER_PORT: 80
+ PGRST_SERVER_TRACE_HEADER: X-Request-Id
+diff --git a/test/io/configs/no-defaults.config b/test/io/configs/no-defaults.config
+index 7aba37ca..5488b065 100644
+--- a/test/io/configs/no-defaults.config
++++ b/test/io/configs/no-defaults.config
+@@ -28,7 +28,6 @@ openapi-mode = "ignore-privileges"
+ openapi-security-active = true
+ openapi-server-proxy-uri = "https://postgrest.org"
+ raw-media-types = "application/vnd.pgrst.config"
+-server-cors-allowed-origins = "http://example.com"
+ server-host = "0.0.0.0"
+ server-port = 80
+ server-trace-header = "X-Request-Id"
+diff --git a/test/io/db_config.sql b/test/io/db_config.sql
+index 0adc8187..a9f5c147 100644
+--- a/test/io/db_config.sql
++++ b/test/io/db_config.sql
+@@ -18,7 +18,6 @@ ALTER ROLE db_config_authenticator SET pgrst.db_pre_request = 'test.custom_heade
+ ALTER ROLE db_config_authenticator SET pgrst.db_max_rows = '1000';
+ ALTER ROLE db_config_authenticator SET pgrst.db_extra_search_path = 'public, extensions';
+ ALTER ROLE db_config_authenticator SET pgrst.not_existing = 'should be ignored';
+-ALTER ROLE db_config_authenticator SET pgrst.server_cors_allowed_origins = 'http://example.com';
+ ALTER ROLE db_config_authenticator SET pgrst.server_trace_header = 'CF-Ray';
+ 
+ -- override with database specific setting
+@@ -63,7 +62,6 @@ ALTER ROLE other_authenticator SET pgrst.db_max_rows = '100';
+ ALTER ROLE other_authenticator SET pgrst.db_extra_search_path = 'public, extensions, other';
+ ALTER ROLE other_authenticator SET pgrst.openapi_mode = 'disabled';
+ ALTER ROLE other_authenticator SET pgrst.openapi_security_active = 'false';
+-ALTER ROLE other_authenticator SET pgrst.server_cors_allowed_origins = 'http://example.com';
+ ALTER ROLE other_authenticator SET pgrst.server_trace_header = 'traceparent';
+ ALTER ROLE other_authenticator SET pgrst.db_pre_config = 'postgrest.pre_config';
+ 
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index fb818dcc..ae010d20 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1214,62 +1214,3 @@ def test_jwt_cache_with_no_exp_claim(defaultenv):
+         # their difference should be atleast 300, implying
+         # that JWT Caching is working as expected
+         assert (first_dur - second_dur) > 300.0
+-
+-
+-def test_preflight_request_with_cors_allowed_origin_config(defaultenv):
+-    "OPTIONS preflight request should return Access-Control-Allow-Origin equal to origin"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_SERVER_CORS_ALLOWED_ORIGINS": "http://example.com, http://example2.com",
+-    }
+-
+-    headers = {
+-        "Accept": "*/*",
+-        "Origin": "http://example.com",
+-        "Access-Control-Request-Method": "POST",
+-        "Access-Control-Request-Headers": "Content-Type",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.options("/items", headers=headers)
+-        assert (
+-            response.headers["Access-Control-Allow-Origin"] == "http://example.com"
+-            and response.headers["Access-Control-Allow-Credentials"] == "true"
+-        )
+-
+-
+-def test_no_preflight_request_with_CORS_config_should_return_header(defaultenv):
+-    "GET no preflight request should return Access-Control-Allow-Origin equal to origin"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_SERVER_CORS_ALLOWED_ORIGINS": "http://example.com, http://example2.com",
+-    }
+-
+-    headers = {
+-        "Accept": "*/*",
+-        "Origin": "http://example.com",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/items", headers=headers)
+-        assert response.headers["Access-Control-Allow-Origin"] == "http://example.com"
+-
+-
+-def test_no_preflight_request_with_CORS_config_should_not_return_header(defaultenv):
+-    "GET no preflight request should not return Access-Control-Allow-Origin"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_SERVER_CORS_ALLOWED_ORIGINS": "http://example.com, http://example2.com",
+-    }
+-
+-    headers = {
+-        "Accept": "*/*",
+-        "Origin": "http://invalid.com",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/items", headers=headers)
+-        assert "Access-Control-Allow-Origin" not in response.headers
+diff --git a/test/spec/Feature/CorsSpec.hs b/test/spec/Feature/CorsSpec.hs
+index 977c8df3..f25f2bbe 100644
+--- a/test/spec/Feature/CorsSpec.hs
++++ b/test/spec/Feature/CorsSpec.hs
+@@ -20,7 +20,8 @@ spec =
+           ""
+         `shouldRespondWith`
+           ""
+-          { matchHeaders = [ "Access-Control-Allow-Origin" <:> "*"
++          { matchHeaders = [ "Access-Control-Allow-Origin" <:> "http://example.com"
++                           , "Access-Control-Allow-Credentials" <:> "true"
+                            , "Access-Control-Allow-Methods" <:> "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
+                            , "Access-Control-Allow-Headers" <:> "Authorization, Foo, Bar, Accept, Accept-Language, Content-Language"
+                            , "Access-Control-Max-Age" <:> "86400" ]
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 1626169c..1fcdb8f5 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -97,50 +97,49 @@ validateOpenApiResponse headers = do
+ baseCfg :: AppConfig
+ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   AppConfig {
+-    configAppSettings               = [ ("app.settings.app_host", "localhost") , ("app.settings.external_api_secret", "0123456789abcdef") ]
+-  , configDbAnonRole                = Just "postgrest_test_anonymous"
+-  , configDbChannel                 = mempty
+-  , configDbChannelEnabled          = True
+-  , configDbExtraSearchPath         = []
+-  , configDbMaxRows                 = Nothing
+-  , configDbPlanEnabled             = False
+-  , configDbPoolSize                = 10
+-  , configDbPoolAcquisitionTimeout  = 10
+-  , configDbPoolMaxLifetime         = 1800
+-  , configDbPoolMaxIdletime         = 600
+-  , configDbPoolAutomaticRecovery   = True
+-  , configDbPreRequest              = Just $ QualifiedIdentifier "test" "switch_role"
+-  , configDbPreparedStatements      = True
+-  , configDbRootSpec                = Nothing
+-  , configDbSchemas                 = fromList ["test"]
+-  , configDbConfig                  = False
+-  , configDbPreConfig               = Nothing
+-  , configDbUri                     = "postgresql://"
+-  , configDbUseLegacyGucs           = True
+-  , configFilePath                  = Nothing
+-  , configJWKS                      = parseSecret <$> secret
+-  , configJwtAudience               = Nothing
+-  , configJwtRoleClaimKey           = [JSPKey "role"]
+-  , configJwtSecret                 = secret
+-  , configJwtSecretIsBase64         = False
+-  , configJwtCacheMaxLifetime       = 0
+-  , configLogLevel                  = LogCrit
+-  , configOpenApiMode               = OAFollowPriv
+-  , configOpenApiSecurityActive     = False
+-  , configOpenApiServerProxyUri     = Nothing
+-  , configRawMediaTypes             = []
+-  , configServerCorsAllowedOrigins  = Nothing
+-  , configServerHost                = "localhost"
+-  , configServerPort                = 3000
+-  , configServerTraceHeader         = Nothing
+-  , configServerUnixSocket          = Nothing
+-  , configServerUnixSocketMode      = 432
+-  , configDbTxAllowOverride         = True
+-  , configDbTxRollbackAll           = True
+-  , configAdminServerPort           = Nothing
+-  , configRoleSettings              = mempty
+-  , configRoleIsoLvl                = mempty
+-  , configInternalSCSleep           = Nothing
++    configAppSettings           = [ ("app.settings.app_host", "localhost") , ("app.settings.external_api_secret", "0123456789abcdef") ]
++  , configDbAnonRole            = Just "postgrest_test_anonymous"
++  , configDbChannel             = mempty
++  , configDbChannelEnabled      = True
++  , configDbExtraSearchPath     = []
++  , configDbMaxRows             = Nothing
++  , configDbPlanEnabled         = False
++  , configDbPoolSize            = 10
++  , configDbPoolAcquisitionTimeout = 10
++  , configDbPoolMaxLifetime     = 1800
++  , configDbPoolMaxIdletime     = 600
++  , configDbPoolAutomaticRecovery = True
++  , configDbPreRequest          = Just $ QualifiedIdentifier "test" "switch_role"
++  , configDbPreparedStatements  = True
++  , configDbRootSpec            = Nothing
++  , configDbSchemas             = fromList ["test"]
++  , configDbConfig              = False
++  , configDbPreConfig           = Nothing
++  , configDbUri                 = "postgresql://"
++  , configDbUseLegacyGucs       = True
++  , configFilePath              = Nothing
++  , configJWKS                  = parseSecret <$> secret
++  , configJwtAudience           = Nothing
++  , configJwtRoleClaimKey       = [JSPKey "role"]
++  , configJwtSecret             = secret
++  , configJwtSecretIsBase64     = False
++  , configJwtCacheMaxLifetime   = 0
++  , configLogLevel              = LogCrit
++  , configOpenApiMode           = OAFollowPriv
++  , configOpenApiSecurityActive = False
++  , configOpenApiServerProxyUri = Nothing
++  , configRawMediaTypes         = []
++  , configServerHost            = "localhost"
++  , configServerPort            = 3000
++  , configServerTraceHeader     = Nothing
++  , configServerUnixSocket      = Nothing
++  , configServerUnixSocketMode  = 432
++  , configDbTxAllowOverride     = True
++  , configDbTxRollbackAll       = True
++  , configAdminServerPort       = Nothing
++  , configRoleSettings          = mempty
++  , configRoleIsoLvl            = mempty
++  , configInternalSCSleep       = Nothing
+   }
+ 
+ testCfg :: AppConfig

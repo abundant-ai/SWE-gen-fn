@@ -1,0 +1,90 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 26f1d7eb..55f30899 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3237, Dump media handlers and timezones with --dump-schema - @wolfgangwalther
+  - #3323, #3324, Don't hide error on LISTEN channel failure - @steve-chavez
+  - #3330, Incorrect admin server `/ready` response on slow schema cache loads - @steve-chavez
+- - #3327, Fix slow responses on schema cache reloads - @steve-chavez
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 4ec78f69..e05e777f 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -319,12 +319,10 @@ loadSchemaCache appState observer = do
+           return SCOnRetry
+ 
+     Right sCache -> do
++      putSchemaCache appState $ Just sCache
+       observer $ SchemaCacheQueriedObs resultTime
+       (t, _) <- timeItT $ observer $ SchemaCacheSummaryObs sCache
+       observer $ SchemaCacheLoadedObs t
+-      -- it's important to update AppState schema cache only once it has been fully evaluated before (this will be done by the observer above)
+-      -- otherwise requests will wait for the schema cache to be loaded
+-      putSchemaCache appState $ Just sCache
+       putSchemaCacheLoaded appState True
+       return SCLoaded
+ 
+diff --git a/test/io/big_schema.sql b/test/io/big_schema.sql
+index 4b3afb3e..a12fa5de 100644
+--- a/test/io/big_schema.sql
++++ b/test/io/big_schema.sql
+@@ -11384,7 +11384,3 @@ GRANT USAGE ON SCHEMA apflora TO postgrest_test_anonymous;
+ 
+ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA apflora
+ TO postgrest_test_anonymous;
+-
+-create or replace function apflora.notify_pgrst() returns void as $$
+-  notify pgrst;
+-$$ language sql;
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index 45d657f7..403232bd 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -18,7 +18,7 @@ def test_first_request_succeeds(defaultenv):
+         "PGRST_SERVER_TIMING_ENABLED": "true",
+     }
+ 
+-    with run(env=env, wait_max_seconds=30) as postgrest:
++    with run(env=env, wait_max_seconds=20) as postgrest:
+         response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+         assert response.status_code == 200
+ 
+@@ -27,8 +27,8 @@ def test_first_request_succeeds(defaultenv):
+         assert plan_dur < 2.0
+ 
+ 
+-def test_requests_do_not_wait_for_schema_cache_reload(defaultenv):
+-    "requests that use the schema cache (e.g. resource embedding) do not wait for the schema cache to reload"
++def test_requests_wait_for_schema_cache_to_be_loaded(defaultenv):
++    "requests that use the schema cache (e.g. resource embedding) wait for schema cache to be loaded"
+ 
+     env = {
+         **defaultenv,
+@@ -38,20 +38,15 @@ def test_requests_do_not_wait_for_schema_cache_reload(defaultenv):
+         "PGRST_SERVER_TIMING_ENABLED": "true",
+     }
+ 
+-    with run(env=env, wait_max_seconds=30) as postgrest:
+-        # reload the schema cache
+-        response = postgrest.session.get("/rpc/notify_pgrst")
+-        assert response.status_code == 204
+-
+-        time.sleep(1.5)  # wait for schema cache to start reloading
++    with run(env=env, wait_for_readiness=False) as postgrest:
++        time.sleep(1.5)  # manually wait for schema cache to start loading
+ 
+         response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+         assert response.status_code == 200
+ 
+-        # response should be fast
+         server_timings = parse_server_timings_header(response.headers["Server-Timing"])
+         plan_dur = server_timings["plan"]
+-        assert plan_dur < 2.0
++        assert plan_dur > 10000.0
+ 
+ 
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122

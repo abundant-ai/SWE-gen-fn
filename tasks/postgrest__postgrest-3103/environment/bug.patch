@@ -1,0 +1,258 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a9a2f8ef..d8b2227f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,7 +10,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3054, Fix not allowing special characters in JSON keys - @laurenceisla
+  - #2344, Replace JSON parser error with a clearer generic message - @develop7
+  - #3100, Add missing in-database configuration option for `jwt-cache-max-lifetime` - @laurenceisla
+- - #3089, The any media type handler now sets `Content-Type: application/octet-stream` by default instead of `Content-Type: application/json` - @steve-chavez
+ 
+ ## [12.0.0] - 2023-12-01
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index b948c88b..09361bc9 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -63,7 +63,6 @@ import PostgREST.SchemaCache.Representations (DataRepresentation (..),
+                                               RepresentationsMap)
+ import PostgREST.SchemaCache.Routine         (MediaHandler (..),
+                                               MediaHandlerMap,
+-                                              ResolvedHandler,
+                                               Routine (..),
+                                               RoutineMap,
+                                               RoutineParam (..),
+@@ -993,9 +992,9 @@ addFilterToLogicForest :: CoercibleFilter -> [CoercibleLogicTree] -> [CoercibleL
+ addFilterToLogicForest flt lf = CoercibleStmnt flt : lf
+ 
+ -- | Do content negotiation. i.e. choose a media type based on the intersection of accepted/produced media types.
+-negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] -> MediaHandlerMap -> Either ApiRequestError ResolvedHandler
++negotiateContent :: AppConfig -> ApiRequest -> QualifiedIdentifier -> [MediaType] -> MediaHandlerMap -> Either ApiRequestError (MediaHandler, MediaType)
+ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRepresentation=rep}} identifier accepts produces =
+-  case (act, firstAcceptedPick) of
++  defaultMTAnyToMTJSON $ case (act, firstAcceptedPick) of
+     (_, Nothing)                         -> Left . MediaTypeError $ map MediaType.toMime accepts
+     (ActionMutate _, Just (x, mt))       -> Right (if rep == Just Full then x else NoAgg, mt)
+     -- no need for an aggregate on HEAD https://github.com/PostgREST/postgrest/issues/2849
+@@ -1004,6 +1003,11 @@ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRep
+     (ActionInvoke InvHead, Just (_, mt)) -> Right (NoAgg, mt)
+     (_, Just (x, mt))                    -> Right (x, mt)
+   where
++    -- the initial handler in the schema cache has a */* to BuiltinAggJson but it doesn't preserve the media type (application/json)
++    -- we just convert the default */* to application/json here
++    -- TODO resolving to "application/json" for "*/*" is not correct when using a "*/*" custom handler media type.
++    -- We should return "application/octet-stream" as the generic type instead.
++    defaultMTAnyToMTJSON = mapRight (\(x, y) -> (x, if y == MTAny then MTApplicationJSON else y))
+     firstAcceptedPick = listToMaybe $ mapMaybe matchMT accepts -- If there are multiple accepted media types, pick the first. This is usual in content negotiation.
+     matchMT mt = case mt of
+       -- all the vendored media types have special handling as they have media type parameters, they cannot be overridden
+@@ -1011,12 +1015,11 @@ negotiateContent conf ApiRequest{iAction=act, iPreferences=Preferences{preferRep
+       m@MTVndArrayJSONStrip                       -> Just (BuiltinAggArrayJsonStrip, m)
+       m@(MTVndPlan (MTVndSingularJSON strip) _ _) -> mtPlanToNothing $ Just (BuiltinAggSingleJson strip, m)
+       m@(MTVndPlan MTVndArrayJSONStrip _ _)       -> mtPlanToNothing $ Just (BuiltinAggArrayJsonStrip, m)
+-      -- TODO the plan should have its own MediaHandler instead of relying on MediaType
+-      m@(MTVndPlan mType _ _)                     -> mtPlanToNothing $ (,) <$> (fst <$> lookupHandler mType) <*> pure m
+       -- all the other media types can be overridden
+-      x                                           -> lookupHandler x
++      m@(MTVndPlan mType _ _)                     -> mtPlanToNothing $ (,) <$> lookupHandler mType <*> pure m
++      x                                           -> (,) <$> lookupHandler x <*> pure x
+     mtPlanToNothing x = if configDbPlanEnabled conf then x else Nothing -- don't find anything if the plan media type is not allowed
+     lookupHandler mt =
+-      HM.lookup (RelId identifier, MTAny) produces <|> -- lookup for identifier and `*/*`
+-      HM.lookup (RelId identifier, mt) produces <|>    -- lookup for identifier and a particular media type
+-      HM.lookup (RelAnyElement, mt) produces           -- lookup for anyelement and a particular media type
++      HM.lookup (RelId identifier, MTAny) produces <|> -- lookup handler that applies to `*/*` and identifier
++      HM.lookup (RelId identifier, mt) produces <|>    -- lookup handler that applies to a particular media type and identifier
++      HM.lookup (RelAnyElement, mt) produces           -- lookup handler that applies to a particular media type and anyelement
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 12b9a136..96ae93d3 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -1115,10 +1115,10 @@ allViewsKeyDependencies =
+ 
+ initialMediaHandlers :: MediaHandlerMap
+ initialMediaHandlers =
+-  HM.insert (RelAnyElement, MediaType.MTAny            ) (BuiltinOvAggJson,    MediaType.MTApplicationJSON) $
+-  HM.insert (RelAnyElement, MediaType.MTApplicationJSON) (BuiltinOvAggJson,    MediaType.MTApplicationJSON) $
+-  HM.insert (RelAnyElement, MediaType.MTTextCSV        ) (BuiltinOvAggCsv,     MediaType.MTTextCSV) $
+-  HM.insert (RelAnyElement, MediaType.MTGeoJSON        ) (BuiltinOvAggGeoJson, MediaType.MTGeoJSON)
++  HM.insert (RelAnyElement, MediaType.MTAny            ) BuiltinOvAggJson $
++  HM.insert (RelAnyElement, MediaType.MTApplicationJSON) BuiltinOvAggJson $
++  HM.insert (RelAnyElement, MediaType.MTTextCSV        ) BuiltinOvAggCsv $
++  HM.insert (RelAnyElement, MediaType.MTGeoJSON        ) BuiltinOvAggGeoJson
+   HM.empty
+ 
+ mediaHandlers :: PgVersion -> Bool -> SQL.Statement [Schema] MediaHandlerMap
+@@ -1142,11 +1142,7 @@ mediaHandlers pgVer =
+             lower(t.typname) as typname,
+             b.oid as base_oid,
+             b.typname AS basetypname,
+-            t.typnamespace,
+-            case t.typname
+-              when '*/*' then 'application/octet-stream'
+-              else t.typname
+-            end as resolved_media_type
++            t.typnamespace
+           FROM pg_type t
+           JOIN pg_type b ON t.typbasetype = b.oid
+           WHERE
+@@ -1158,8 +1154,7 @@ mediaHandlers pgVer =
+         proc.proname                  as handler_name,
+         arg_schema.nspname::text      as target_schema,
+         arg_name.typname::text        as target_name,
+-        media_types.typname           as media_type,
+-        media_types.resolved_media_type
++        media_types.typname           as media_type
+       from media_types
+         join pg_proc      proc         on proc.prorettype = media_types.oid
+         join pg_namespace proc_schema  on proc_schema.oid = proc.pronamespace
+@@ -1167,7 +1162,7 @@ mediaHandlers pgVer =
+         join pg_type      arg_name     on arg_name.oid = proc.proargtypes[0]
+         join pg_namespace arg_schema   on arg_schema.oid = arg_name.typnamespace
+       where
+-        proc_schema.nspname = ANY('{test}') and
++        proc_schema.nspname = ANY($1) and
+         proc.pronargs = 1 and
+         arg_name.oid in (select reltype from all_relations)
+       union
+@@ -1176,8 +1171,7 @@ mediaHandlers pgVer =
+           mtype.typname   as handler_name,
+           pro_sch.nspname as target_schema,
+           proname         as target_name,
+-          mtype.typname   as media_type,
+-          mtype.resolved_media_type
++          mtype.typname   as media_type
+       from pg_proc proc
+         join pg_namespace pro_sch on pro_sch.oid = proc.pronamespace
+         join media_types mtype on proc.prorettype = mtype.oid
+@@ -1187,13 +1181,12 @@ mediaHandlers pgVer =
+ 
+ decodeMediaHandlers :: HD.Result MediaHandlerMap
+ decodeMediaHandlers =
+-  HM.fromList . fmap (\(x, y, z, w) -> ((if isAnyElement y then RelAnyElement else RelId y, z), (CustomFunc x, w)) ) <$> HD.rowList caggRow
++  HM.fromList . fmap (\(x, y, z) -> ((if isAnyElement y then RelAnyElement else RelId y, z), CustomFunc x) ) <$> HD.rowList caggRow
+   where
+-    caggRow = (,,,)
++    caggRow = (,,)
+               <$> (QualifiedIdentifier <$> column HD.text <*> column HD.text)
+               <*> (QualifiedIdentifier <$> column HD.text <*> column HD.text)
+               <*> (MediaType.decodeMediaType . encodeUtf8 <$> column HD.text)
+-              <*> (MediaType.decodeMediaType . encodeUtf8 <$> column HD.text)
+ 
+ timezones :: Bool -> SQL.Statement () TimezoneNames
+ timezones = SQL.Statement sql HE.noParams decodeTimezones
+diff --git a/src/PostgREST/SchemaCache/Routine.hs b/src/PostgREST/SchemaCache/Routine.hs
+index e84d722b..8445ad2c 100644
+--- a/src/PostgREST/SchemaCache/Routine.hs
++++ b/src/PostgREST/SchemaCache/Routine.hs
+@@ -16,7 +16,6 @@ module PostgREST.SchemaCache.Routine
+   , funcReturnsCompositeAlias
+   , funcReturnsSingle
+   , MediaHandlerMap
+-  , ResolvedHandler
+   , MediaHandler(..)
+   ) where
+ 
+@@ -146,6 +145,4 @@ funcTableName proc = case pdReturnType proc of
+   Single (Composite qi _) -> Just $ qiName qi
+   _                       -> Nothing
+ 
+--- the resolved handler also carries the media type because MTAny (*/*) is resolved to a different media type
+-type ResolvedHandler = (MediaHandler, MediaType.MediaType)
+-type MediaHandlerMap = HM.HashMap (RelIdentifier, MediaType.MediaType) ResolvedHandler
++type MediaHandlerMap = HM.HashMap (RelIdentifier, MediaType.MediaType) MediaHandler
+diff --git a/test/spec/Feature/Query/CustomMediaSpec.hs b/test/spec/Feature/Query/CustomMediaSpec.hs
+index 0c4de99c..e07a77e2 100644
+--- a/test/spec/Feature/Query/CustomMediaSpec.hs
++++ b/test/spec/Feature/Query/CustomMediaSpec.hs
+@@ -225,30 +225,31 @@ spec = describe "custom media types" $ do
+ 
+   context "any media type" $ do
+     context "on functions" $ do
++      -- TODO not correct, it should return the generic "application/octet-stream"
+       it "returns application/json for */* if not explicitly set" $ do
+         request methodGet "/rpc/ret_any_mt" (acceptHdrs "*/*") ""
+           `shouldRespondWith` "any"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+-      it "accepts any media type and sets the generic octet-stream as content type" $ do
++      it "accepts any media type and sets it as a header" $ do
+         request methodGet "/rpc/ret_any_mt" (acceptHdrs "app/bingo") ""
+           `shouldRespondWith` "any"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = ["Content-Type" <:> "app/bingo"]
+           }
+ 
+         request methodGet "/rpc/ret_any_mt" (acceptHdrs "text/bango") ""
+           `shouldRespondWith` "any"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = ["Content-Type" <:> "text/bango"]
+           }
+ 
+         request methodGet "/rpc/ret_any_mt" (acceptHdrs "image/boingo") ""
+           `shouldRespondWith` "any"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = ["Content-Type" <:> "image/boingo"]
+           }
+ 
+       it "returns custom media type for */* if explicitly set" $ do
+@@ -275,11 +276,12 @@ spec = describe "custom media types" $ do
+           `shouldRespondWith` 415
+ 
+     context "on tables" $ do
++      -- TODO not correct, it should return the generic "application/octet-stream"
+       it "returns application/json for */* if not explicitly set" $ do
+         request methodGet "/some_numbers?val=eq.1" (acceptHdrs "*/*") ""
+           `shouldRespondWith` "anything\n1"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = [matchContentTypeJson]
+           }
+ 
+       it "accepts any media type and sets it as a header" $ do
+@@ -296,5 +298,5 @@ spec = describe "custom media types" $ do
+         request methodGet "/some_numbers?val=eq.4" (acceptHdrs "unknown/unknown") ""
+           `shouldRespondWith` "anything\n4"
+           { matchStatus  = 200
+-          , matchHeaders = ["Content-Type" <:> "application/octet-stream"]
++          , matchHeaders = ["Content-Type" <:> "unknown/unknown"]
+           }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 539e8e2a..dc36affe 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3663,14 +3663,10 @@ declare
+   resp bytea;
+ begin
+   case req_accept
+-    when 'app/chico'   then
+-      perform set_config('response.headers', json_build_array(json_build_object('Content-Type', req_accept))::text, true);
+-      resp := 'chico';
+-    when 'app/harpo'   then
+-      perform set_config('response.headers', json_build_array(json_build_object('Content-Type', req_accept))::text, true);
+-      resp := 'harpo';
++    when 'app/chico'   then resp := 'chico';
++    when 'app/harpo'   then resp := 'harpo';
+     when '*/*'         then
+-      perform set_config('response.headers', json_build_array(json_build_object('Content-Type', 'app/groucho'))::text, true);
++      perform set_config('response.headers', '[{"Content-Type": "app/groucho"}]', true);
+       resp := 'groucho';
+     else
+       raise sqlstate 'PT415' using message = 'Unsupported Media Type';
+@@ -3693,10 +3689,8 @@ declare
+ begin
+   case req_accept
+     when 'magic/number' then
+-      perform set_config('response.headers', json_build_array(json_build_object('Content-Type', req_accept))::text, true);
+       prefix := 'magic';
+     when 'crazy/bingo'  then
+-      perform set_config('response.headers', json_build_array(json_build_object('Content-Type', req_accept))::text, true);
+       prefix := 'crazy';
+     else
+       prefix := 'anything';

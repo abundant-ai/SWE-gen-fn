@@ -1,0 +1,167 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c3667ae6..357fcc9e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,8 +14,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Fixed
+ 
+- - #2565, Fix bad M2M embedding on RPC - @steve-chavez
+-
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index fa75a3bb..07accc74 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -209,7 +209,7 @@ compressedRel Relationship{..} =
+     : case relCardinality of
+         M2M Junction{..} -> [
+             "cardinality" .= ("many-to-many" :: Text)
+-          , "relationship" .= (qiName junTable <> " using " <> junConstraint1 <> fmtEls (snd <$> junColsSource) <> " and " <> junConstraint2 <> fmtEls (snd <$> junColsTarget))
++          , "relationship" .= (qiName junTable <> " using " <> junConstraint1 <> fmtEls (snd <$> junColumns1) <> " and " <> junConstraint2 <> fmtEls (snd <$> junColumns2))
+           ]
+         M2O cons relColumns -> [
+             "cardinality" .= ("many-to-one" :: Text)
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 86e61bbf..54c69f10 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -399,7 +399,7 @@ mutatePlan mutation qi ApiRequest{..} sCache readReq = mapLeft ApiRequestError $
+     returnings =
+       if iPreferRepresentation == None
+         then []
+-        else inferColsEmbedNeeds readReq pkCols
++        else returningCols readReq pkCols
+     pkCols = maybe mempty tablePKCols $ HM.lookup qi $ dbTables sCache
+     logic = map snd qsLogic
+     rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+@@ -413,7 +413,7 @@ callPlan proc apiReq readReq = FunctionCall {
+ , funCArgs = payRaw <$> iPayload apiReq
+ , funCScalar = procReturnsScalar proc
+ , funCMultipleCall = iPreferParameters apiReq == Just MultipleObjects
+-, funCReturning = inferColsEmbedNeeds readReq []
++, funCReturning = returningCols readReq []
+ }
+   where
+     paramsAsSingleObject = iPreferParameters apiReq == Just SingleObject
+@@ -424,15 +424,14 @@ callPlan proc apiReq readReq = FunctionCall {
+       prms  -> KeyParams $ specifiedParams prms
+     specifiedParams = filter (\x -> ppName x `S.member` iColumns apiReq)
+ 
+--- | Infers the columns needed for an embed to be successful after a mutation or a function call.
+-inferColsEmbedNeeds :: ReadPlanTree -> [FieldName] -> [FieldName]
+-inferColsEmbedNeeds (Node ReadPlan{select} forest) pkCols
++returningCols :: ReadPlanTree -> [FieldName] -> [FieldName]
++returningCols rr@(Node _ forest) pkCols
+   -- if * is part of the select, we must not add pk or fk columns manually -
+   -- otherwise those would be selected and output twice
+   | "*" `elem` fldNames = ["*"]
+   | otherwise           = returnings
+   where
+-    fldNames = (\((fld, _), _, _) -> fld) <$> select
++    fldNames = fstFieldNames rr
+     -- Without fkCols, when a mutatePlan to
+     -- /projects?select=name,clients(name) occurs, the RETURNING SQL part would
+     -- be `RETURNING name`(see QueryBuilder).  This would make the embedding
+@@ -446,8 +445,8 @@ inferColsEmbedNeeds (Node ReadPlan{select} forest) pkCols
+           Just $ fst <$> cols
+         Node ReadPlan{relToParent=Just Relationship{relCardinality=O2O _ cols}} _ ->
+           Just $ fst <$> cols
+-        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2M Junction{junColsSource=cols}}} _ ->
+-          Just $ fst <$> cols
++        Node ReadPlan{relToParent=Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}} _ ->
++          Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
+         Node ReadPlan{relToParent=Just ComputedRelationship{}} _ ->
+           Nothing
+         Node ReadPlan{relToParent=Nothing} _ ->
+diff --git a/src/PostgREST/Plan/ReadPlan.hs b/src/PostgREST/Plan/ReadPlan.hs
+index 94e181ca..e51170cd 100644
+--- a/src/PostgREST/Plan/ReadPlan.hs
++++ b/src/PostgREST/Plan/ReadPlan.hs
+@@ -1,6 +1,8 @@
++{-# LANGUAGE NamedFieldPuns #-}
+ module PostgREST.Plan.ReadPlan
+   ( ReadPlanTree
+   , ReadPlan(..)
++  , fstFieldNames
+   , JoinCondition(..)
+   ) where
+ 
+@@ -44,3 +46,8 @@ data ReadPlan = ReadPlan
+   -- ^ used for aliasing
+   }
+   deriving (Eq)
++
++-- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
++fstFieldNames :: ReadPlanTree -> [FieldName]
++fstFieldNames (Node ReadPlan{select} _) =
++  fst . (\(f, _, _) -> f) <$> select
+diff --git a/src/PostgREST/SchemaCache/Relationship.hs b/src/PostgREST/SchemaCache/Relationship.hs
+index db912faa..e8b18a64 100644
+--- a/src/PostgREST/SchemaCache/Relationship.hs
++++ b/src/PostgREST/SchemaCache/Relationship.hs
+@@ -56,8 +56,8 @@ data Junction = Junction
+   { junTable       :: QualifiedIdentifier
+   , junConstraint1 :: FKConstraint
+   , junConstraint2 :: FKConstraint
+-  , junColsSource  :: [(FieldName, FieldName)]
+-  , junColsTarget  :: [(FieldName, FieldName)]
++  , junColumns1    :: [(FieldName, FieldName)]
++  , junColumns2    :: [(FieldName, FieldName)]
+   }
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index fcd90f44..66cb1b98 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -246,17 +246,13 @@ spec actualPgVersion =
+           `shouldRespondWith`
+             [json|{"id": 2, "articleStars": [{"userId": 3}]}|]
+ 
+-      it "can embed an M2M relationship table" $ do
++      it "can embed an M2M relationship table" $
+         get "/rpc/getallusers?select=name,tasks(name)&id=gt.1"
+           `shouldRespondWith` [json|[
+             {"name":"Michael Scott", "tasks":[{"name":"Design IOS"}, {"name":"Code IOS"}, {"name":"Design OSX"}]},
+             {"name":"Dwight Schrute","tasks":[{"name":"Design w7"}, {"name":"Design IOS"}]}
+           ]|]
+           { matchHeaders = [matchContentTypeJson] }
+-        -- https://github.com/PostgREST/postgrest/issues/2565
+-        get "/rpc/get_yards?select=groups(*)"
+-          `shouldRespondWith` [json|[]|]
+-          { matchHeaders = [matchContentTypeJson] }
+ 
+       it "can embed an M2M relationship table that has a parent relationship table" $
+         get "/rpc/getallusers?select=name,tasks(name,project:projects(name))&id=gt.1"
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index ab448992..8fec1f12 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3005,24 +3005,3 @@ create table test.trash_details(
+   id int primary key references test.trash(id),
+   jsonb_col jsonb
+ );
+-
+-CREATE TABLE test.groups (
+-    name text PRIMARY KEY
+-);
+-
+-CREATE TABLE test.yards (
+-    id bigint PRIMARY KEY
+-);
+-
+-CREATE TABLE test.group_yard (
+-    id bigint NOT NULL,
+-    group_id text NOT NULL REFERENCES test.groups(name),
+-    yard_id bigint NOT NULL REFERENCES test.yards(id),
+-    PRIMARY KEY (id, group_id, yard_id)
+-);
+-
+-CREATE FUNCTION test.get_yards() RETURNS SETOF test.yards
+-LANGUAGE sql
+-AS $$
+-  select * from test.yards;
+-$$;

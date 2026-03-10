@@ -1,0 +1,91 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9627f4f8..20e3c60d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3237, Dump media handlers and timezones with --dump-schema - @wolfgangwalther
+  - #3323, #3324, Don't hide error on LISTEN channel failure - @steve-chavez
+  - #3330, Incorrect admin server `/ready` response on slow schema cache loads - @steve-chavez
++ - #3327, Fix slow responses on schema cache reloads - @steve-chavez
+  - #3340, Log when the LISTEN channel gets a notification - @steve-chavez
+  - #3345, Fix in-database configuration values not loading for `pgrst.server_trace_header` and `pgrst.server_cors_allowed_origins` - @laurenceisla
+  - #3361, Clarify PGRST204(column not found) error message - @steve-chavez
+diff --git a/docs/references/schema_cache.rst b/docs/references/schema_cache.rst
+index 68407ad3..a46c06c1 100644
+--- a/docs/references/schema_cache.rst
++++ b/docs/references/schema_cache.rst
+@@ -18,8 +18,8 @@ You can do this with UNIX signals or with PostgreSQL notifications. It's also po
+ 
+ .. note::
+ 
+-  - Requests will wait until the schema cache reload is done. This to prevent client errors due to an stale schema cache.
+   - If you are using the :ref:`in_db_config`, a schema cache reload will :ref:`reload the configuration<config_reloading>` as well.
++  - There’s no downtime when reloading the schema cache. The reloading will happen on a background thread while serving requests.
+ 
+ .. _schema_reloading_signals:
+ 
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 34713242..29059c07 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -320,10 +320,12 @@ loadSchemaCache appState observer = do
+           return SCOnRetry
+ 
+     Right sCache -> do
+-      putSchemaCache appState $ Just sCache
+       observer $ SchemaCacheQueriedObs resultTime
+       (t, _) <- timeItT $ observer $ SchemaCacheSummaryObs sCache
+       observer $ SchemaCacheLoadedObs t
++      -- it's important to update AppState schema cache only once it has been fully evaluated before (this will be done by the observer above)
++      -- otherwise requests will wait for the schema cache to be loaded
++      putSchemaCache appState $ Just sCache
+       putSchemaCacheLoaded appState True
+       return SCLoaded
+ 
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index 77b02ab0..45d657f7 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -7,8 +7,28 @@ from util import *
+ from postgrest import *
+ 
+ 
+-def test_requests__wait_for_schema_cache_reload(defaultenv):
+-    "requests that use the schema cache (e.g. resource embedding) wait for the schema cache to reload"
++def test_first_request_succeeds(defaultenv):
++    "the first request suceeds fast since the admin server readiness was checked before"
++
++    env = {
++        **defaultenv,
++        "PGRST_DB_SCHEMAS": "apflora",
++        "PGRST_DB_POOL": "2",
++        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
++        "PGRST_SERVER_TIMING_ENABLED": "true",
++    }
++
++    with run(env=env, wait_max_seconds=30) as postgrest:
++        response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
++        assert response.status_code == 200
++
++        server_timings = parse_server_timings_header(response.headers["Server-Timing"])
++        plan_dur = server_timings["plan"]
++        assert plan_dur < 2.0
++
++
++def test_requests_do_not_wait_for_schema_cache_reload(defaultenv):
++    "requests that use the schema cache (e.g. resource embedding) do not wait for the schema cache to reload"
+ 
+     env = {
+         **defaultenv,
+@@ -28,9 +48,10 @@ def test_requests__wait_for_schema_cache_reload(defaultenv):
+         response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+         assert response.status_code == 200
+ 
++        # response should be fast
+         server_timings = parse_server_timings_header(response.headers["Server-Timing"])
+         plan_dur = server_timings["plan"]
+-        assert plan_dur > 10000.0
++        assert plan_dur < 2.0
+ 
+ 
+ # TODO: This test fails now because of https://github.com/PostgREST/postgrest/pull/2122

@@ -1,0 +1,189 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 09e725cf..931b6b2a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #3558, Add the `admin-server-host` config to set the host for the admin server - @develop7
+  - #3607, Log to stderr when the JWT secret is less than 32 characters long - @laurenceisla
++ - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 4acedf42..4718b05e 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -25,7 +25,6 @@ module PostgREST.Plan
+   , CallReadPlan(..)
+   ) where
+ 
+-import qualified Data.ByteString.Lazy          as LBS
+ import qualified Data.HashMap.Strict           as HM
+ import qualified Data.HashMap.Strict.InsOrd    as HMI
+ import qualified Data.List                     as L
+@@ -176,9 +175,9 @@ callReadPlan identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferenc
+   let relIdentifier = QualifiedIdentifier pdSchema (fromMaybe pdName $ Routine.funcTableName proc) -- done so a set returning function can embed other relations
+   rPlan <- readPlan relIdentifier conf sCache apiRequest
+   let args = case (invMethod, iContentMediaType) of
+-        (InvRead _, _)      -> jsonRpcParams proc qsParams'
+-        (Inv, MTUrlEncoded) -> maybe mempty (jsonRpcParams proc . payArray) iPayload
+-        (Inv, _)            -> maybe mempty payRaw iPayload
++        (InvRead _, _)      -> DirectArgs $ toRpcParams proc qsParams'
++        (Inv, MTUrlEncoded) -> DirectArgs $ maybe mempty (toRpcParams proc . payArray) iPayload
++        (Inv, _)            -> JsonArgs $ payRaw <$> iPayload
+       txMode = case (invMethod, pdVolatility) of
+           (InvRead _,  _)          -> SQL.Read
+           (Inv, Routine.Stable)    -> SQL.Read
+@@ -955,11 +954,11 @@ resolveOrError ctx (Just table) field =
+     CoercibleField{cfIRType=""} -> Left $ ColumnNotFound (tableName table) field
+     cf                          -> Right $ withJsonParse ctx cf
+ 
+-callPlan :: Routine -> ApiRequest -> S.Set FieldName -> LBS.ByteString -> ReadPlanTree -> CallPlan
++callPlan :: Routine -> ApiRequest -> S.Set FieldName -> CallArgs -> ReadPlanTree -> CallPlan
+ callPlan proc ApiRequest{iPreferences=Preferences{..}} paramKeys args readReq = FunctionCall {
+   funCQi = QualifiedIdentifier (pdSchema proc) (pdName proc)
+ , funCParams = callParams
+-, funCArgs = Just args
++, funCArgs = args
+ , funCScalar = funcReturnsScalar proc
+ , funCSetOfScalar = funcReturnsSetOfScalar proc
+ , funCRetCompositeAlias = funcReturnsCompositeAlias proc
+diff --git a/src/PostgREST/Plan/CallPlan.hs b/src/PostgREST/Plan/CallPlan.hs
+index 76e3341f..32ef34c3 100644
+--- a/src/PostgREST/Plan/CallPlan.hs
++++ b/src/PostgREST/Plan/CallPlan.hs
+@@ -2,7 +2,9 @@
+ module PostgREST.Plan.CallPlan
+   ( CallPlan(..)
+   , CallParams(..)
+-  , jsonRpcParams
++  , CallArgs(..)
++  , RpcParamValue(..)
++  , toRpcParams
+   )
+ where
+ 
+@@ -19,7 +21,7 @@ import Protolude
+ data CallPlan = FunctionCall
+   { funCQi                :: QualifiedIdentifier
+   , funCParams            :: CallParams
+-  , funCArgs              :: Maybe LBS.ByteString
++  , funCArgs              :: CallArgs
+   , funCScalar            :: Bool
+   , funCSetOfScalar       :: Bool
+   , funCRetCompositeAlias :: Bool
+@@ -30,14 +32,26 @@ data CallParams
+   = KeyParams [RoutineParam] -- ^ Call with key params: func(a := val1, b:= val2)
+   | OnePosParam RoutineParam -- ^ Call with positional params(only one supported): func(val)
+ 
++data CallArgs
++  = DirectArgs (HM.HashMap Text RpcParamValue)
++  | JsonArgs (Maybe LBS.ByteString)
++
++-- | RPC query param value `/rpc/func?v=<value>`, used for VARIADIC functions on form-urlencoded POST and GETs
++-- | It can be fixed `?v=1` or repeated `?v=1&v=2&v=3.
++data RpcParamValue = Fixed Text | Variadic [Text]
++instance JSON.ToJSON RpcParamValue where
++  toJSON (Fixed    v) = JSON.toJSON v
++  -- Not possible to get here anymore. Variadic arguments are only supported for
++  -- true variadic arguments, but the toJSON instance is only used for the "single unnamed json argument" case.
++  toJSON (Variadic v) = JSON.toJSON v
++
+ -- | Convert rpc params `/rpc/func?a=val1&b=val2` to json `{"a": "val1", "b": "val2"}
+-jsonRpcParams :: Routine -> [(Text, Text)] -> LBS.ByteString
+-jsonRpcParams proc prms =
+-  if not $ pdHasVariadic proc then -- if proc has no variadic param, save steps and directly convert to json
+-    JSON.encode $ HM.fromList $ second JSON.toJSON <$> prms
++toRpcParams :: Routine -> [(Text, Text)] -> HM.HashMap Text RpcParamValue
++toRpcParams proc prms =
++  if not $ pdHasVariadic proc then -- if proc has no variadic param, save steps and directly convert to map
++    HM.fromList $ second Fixed <$> prms
+   else
+-    let paramsMap = HM.fromListWith mergeParams $ toRpcParamValue proc <$> prms in
+-    JSON.encode paramsMap
++    HM.fromListWith mergeParams $ toRpcParamValue proc <$> prms
+   where
+     mergeParams :: RpcParamValue -> RpcParamValue -> RpcParamValue
+     mergeParams (Variadic a) (Variadic b) = Variadic $ b ++ a
+@@ -48,10 +62,3 @@ toRpcParamValue proc (k, v) | prmIsVariadic k = (k, Variadic [v])
+                             | otherwise       = (k, Fixed v)
+   where
+     prmIsVariadic prm = isJust $ find (\RoutineParam{ppName, ppVar} -> ppName == prm && ppVar) $ pdParams proc
+-
+--- | RPC query param value `/rpc/func?v=<value>`, used for VARIADIC functions on form-urlencoded POST and GETs
+--- | It can be fixed `?v=1` or repeated `?v=1&v=2&v=3.
+-data RpcParamValue = Fixed Text | Variadic [Text]
+-instance JSON.ToJSON RpcParamValue where
+-  toJSON (Fixed    v) = JSON.toJSON v
+-  toJSON (Variadic v) = JSON.toJSON v
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 1729f0dc..dc96b4fe 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -1,5 +1,6 @@
+ {-# LANGUAGE DuplicateRecordFields #-}
+ {-# LANGUAGE NamedFieldPuns        #-}
++{-# LANGUAGE RecordWildCards       #-}
+ {-|
+ Module      : PostgREST.Query.QueryBuilder
+ Description : PostgREST SQL queries generating functions.
+@@ -16,8 +17,11 @@ module PostgREST.Query.QueryBuilder
+   , limitedQuery
+   ) where
+ 
++import qualified Data.Aeson                      as JSON
+ import qualified Data.ByteString.Char8           as BS
++import qualified Data.HashMap.Strict             as HM
+ import qualified Hasql.DynamicStatements.Snippet as SQL
++import qualified Hasql.Encoders                  as HE
+ 
+ import Data.Maybe (fromJust)
+ import Data.Tree  (Tree (..))
+@@ -190,14 +194,19 @@ mutatePlanToQuery (Delete mainQi logicForest range ordts returnings)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (cfName . coField <$> ordts)
+ 
+ callPlanToQuery :: CallPlan -> PgVersion -> SQL.Snippet
+-callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar returnsCompositeAlias returnings) pgVer =
++callPlanToQuery (FunctionCall qi params arguments returnsScalar returnsSetOfScalar returnsCompositeAlias returnings) pgVer =
+   "SELECT " <> (if returnsScalar || returnsSetOfScalar then "pgrst_call.pgrst_scalar" else returnedColumns) <> " " <>
+   fromCall
+   where
++    jsonArgs = case arguments of
++      DirectArgs args -> Just $ JSON.encode args
++      JsonArgs json   -> json
+     fromCall = case params of
+-      OnePosParam prm -> "FROM " <> callIt (singleParameter args $ encodeUtf8 $ ppType prm)
++      OnePosParam prm -> "FROM " <> callIt (singleParameter jsonArgs $ encodeUtf8 $ ppType prm)
+       KeyParams []    -> "FROM " <> callIt mempty
+-      KeyParams prms  -> fromJsonBodyF args ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing) <$> prms) False True False <> ", " <>
++      KeyParams prms  -> case arguments of
++        DirectArgs args -> "FROM " <> callIt (fmtArgs prms args)
++        JsonArgs json   -> fromJsonBodyF json ((\p -> CoercibleField (ppName p) mempty False (ppTypeMaxLength p) Nothing Nothing) <$> prms) False True False <> ", " <>
+                          "LATERAL " <> callIt (fmtParams prms)
+ 
+     callIt :: SQL.Snippet -> SQL.Snippet
+@@ -209,6 +218,23 @@ callPlanToQuery (FunctionCall qi params args returnsScalar returnsSetOfScalar re
+     fmtParams prms = intercalateSnippet ", "
+       ((\a -> (if ppVar a then "VARIADIC " else mempty) <> pgFmtIdent (ppName a) <> " := pgrst_body." <> pgFmtIdent (ppName a)) <$> prms)
+ 
++    fmtArgs :: [RoutineParam] -> HM.HashMap Text RpcParamValue -> SQL.Snippet
++    fmtArgs prms args = intercalateSnippet ", " $ fmtArg <$> prms
++      where
++        fmtArg RoutineParam{..} =
++          (if ppVar then "VARIADIC " else mempty) <>
++          pgFmtIdent ppName <>
++          " := " <>
++          encodeArg (HM.lookup ppName args) <>
++          "::" <>
++          SQL.sql (encodeUtf8 ppTypeMaxLength)
++        encodeArg :: Maybe RpcParamValue -> SQL.Snippet
++        encodeArg (Just (Variadic v)) = SQL.encoderAndParam (HE.nonNullable $ HE.foldableArray $ HE.nonNullable HE.text) v
++        encodeArg (Just (Fixed v)) = SQL.encoderAndParam (HE.nonNullable HE.unknown) $ encodeUtf8 v
++        -- Currently not supported: Calling functions without some of their arguments without DEFAULT.
++        -- We could fallback to providing this NULL value in those cases.
++        encodeArg Nothing = "NULL"
++
+     returnedColumns :: SQL.Snippet
+     returnedColumns
+       | null returnings = "*"

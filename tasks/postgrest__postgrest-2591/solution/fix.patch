@@ -1,0 +1,80 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8092f89e..82feceba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,6 +25,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2565, Fix bad M2M embedding on RPC - @steve-chavez
+  - #2575, Replace misleading error message when no function is found with a hint containing functions/parameters names suggestions - @laurenceisla
+  - #2569, Replace misleading error message when no relationship is found with a hint containing parent/child names suggestions - @laurenceisla
++ - #1405, Add the required OpenAPI items object when the parameter is an array - @laurenceisla
++
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/src/PostgREST/Response/OpenAPI.hs b/src/PostgREST/Response/OpenAPI.hs
+index 1d79068a..d159d3ba 100644
+--- a/src/PostgREST/Response/OpenAPI.hs
++++ b/src/PostgREST/Response/OpenAPI.hs
+@@ -66,10 +66,16 @@ toSwaggerType "bigint"            = Just SwaggerInteger
+ toSwaggerType "numeric"           = Just SwaggerNumber
+ toSwaggerType "real"              = Just SwaggerNumber
+ toSwaggerType "double precision"  = Just SwaggerNumber
+-toSwaggerType "ARRAY"             = Just SwaggerArray
+ toSwaggerType "json"              = Nothing
+ toSwaggerType "jsonb"             = Nothing
+-toSwaggerType _                   = Just SwaggerString
++toSwaggerType colType             = case T.takeEnd 2 colType of
++  "[]" -> Just SwaggerArray
++  _    -> Just SwaggerString
++
++makeSwaggerItemType :: Maybe (SwaggerType t) -> Text -> Maybe (Referenced Schema)
++makeSwaggerItemType itemType colType = case itemType of
++  Just SwaggerArray -> Just $ Inline (mempty & type_ .~ toSwaggerType (T.dropEnd 2 colType))
++  _                 -> Nothing
+ 
+ parseDefault :: Text -> Text -> Text
+ parseDefault colType colDefault =
+@@ -119,6 +125,7 @@ makeProperty tbl rels col = (colName col, Inline s)
+         Just $ T.append (maybe "" (`T.append` "\n\n") $ colDescription col) (T.intercalate "\n" n)
+       else
+         colDescription col
++    pType = toSwaggerType (colType col)
+     s =
+       (mempty :: Schema)
+         & default_ .~ (JSON.decode . toUtf8Lazy . parseDefault (colType col) =<< colDefault col)
+@@ -126,7 +133,8 @@ makeProperty tbl rels col = (colName col, Inline s)
+         & enum_ .~ e
+         & format ?~ colType col
+         & maxLength .~ (fromIntegral <$> colMaxLen col)
+-        & type_ .~ toSwaggerType (colType col)
++        & type_ .~ pType
++        & items .~ (SwaggerItemsObject <$> makeSwaggerItemType pType (colType col))
+ 
+ makeProcSchema :: ProcDescription -> Schema
+ makeProcSchema pd =
+@@ -141,6 +149,7 @@ makeProcProperty (ProcParam n t _ _) = (n, Inline s)
+   where
+     s = (mempty :: Schema)
+           & type_ .~ toSwaggerType t
++          & items .~ (SwaggerItemsObject <$> makeSwaggerItemType (toSwaggerType t) t)
+           & format ?~ t
+ 
+ makePreferParam :: [Text] -> Param
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index e6da29c6..31637b6d 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -512,13 +512,11 @@ tablesSqlQuery pgVer =
+               CASE
+                   WHEN t.typtype = 'd' THEN
+                   CASE
+-                      WHEN bt.typelem <> 0::oid AND bt.typlen = (-1) THEN 'ARRAY'::text
+                       WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
+                       ELSE format_type(a.atttypid, a.atttypmod)
+                   END
+                   ELSE
+                   CASE
+-                      WHEN t.typelem <> 0::oid AND t.typlen = (-1) THEN 'ARRAY'::text
+                       WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
+                       ELSE format_type(a.atttypid, a.atttypmod)
+                   END

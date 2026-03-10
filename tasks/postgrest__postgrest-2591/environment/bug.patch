@@ -1,0 +1,374 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 82feceba..8092f89e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -25,8 +25,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2565, Fix bad M2M embedding on RPC - @steve-chavez
+  - #2575, Replace misleading error message when no function is found with a hint containing functions/parameters names suggestions - @laurenceisla
+  - #2569, Replace misleading error message when no relationship is found with a hint containing parent/child names suggestions - @laurenceisla
+- - #1405, Add the required OpenAPI items object when the parameter is an array - @laurenceisla
+-
+ ## [10.1.1] - 2022-11-08
+ 
+ ### Fixed
+diff --git a/src/PostgREST/Response/OpenAPI.hs b/src/PostgREST/Response/OpenAPI.hs
+index d159d3ba..1d79068a 100644
+--- a/src/PostgREST/Response/OpenAPI.hs
++++ b/src/PostgREST/Response/OpenAPI.hs
+@@ -66,16 +66,10 @@ toSwaggerType "bigint"            = Just SwaggerInteger
+ toSwaggerType "numeric"           = Just SwaggerNumber
+ toSwaggerType "real"              = Just SwaggerNumber
+ toSwaggerType "double precision"  = Just SwaggerNumber
++toSwaggerType "ARRAY"             = Just SwaggerArray
+ toSwaggerType "json"              = Nothing
+ toSwaggerType "jsonb"             = Nothing
+-toSwaggerType colType             = case T.takeEnd 2 colType of
+-  "[]" -> Just SwaggerArray
+-  _    -> Just SwaggerString
+-
+-makeSwaggerItemType :: Maybe (SwaggerType t) -> Text -> Maybe (Referenced Schema)
+-makeSwaggerItemType itemType colType = case itemType of
+-  Just SwaggerArray -> Just $ Inline (mempty & type_ .~ toSwaggerType (T.dropEnd 2 colType))
+-  _                 -> Nothing
++toSwaggerType _                   = Just SwaggerString
+ 
+ parseDefault :: Text -> Text -> Text
+ parseDefault colType colDefault =
+@@ -125,7 +119,6 @@ makeProperty tbl rels col = (colName col, Inline s)
+         Just $ T.append (maybe "" (`T.append` "\n\n") $ colDescription col) (T.intercalate "\n" n)
+       else
+         colDescription col
+-    pType = toSwaggerType (colType col)
+     s =
+       (mempty :: Schema)
+         & default_ .~ (JSON.decode . toUtf8Lazy . parseDefault (colType col) =<< colDefault col)
+@@ -133,8 +126,7 @@ makeProperty tbl rels col = (colName col, Inline s)
+         & enum_ .~ e
+         & format ?~ colType col
+         & maxLength .~ (fromIntegral <$> colMaxLen col)
+-        & type_ .~ pType
+-        & items .~ (SwaggerItemsObject <$> makeSwaggerItemType pType (colType col))
++        & type_ .~ toSwaggerType (colType col)
+ 
+ makeProcSchema :: ProcDescription -> Schema
+ makeProcSchema pd =
+@@ -149,7 +141,6 @@ makeProcProperty (ProcParam n t _ _) = (n, Inline s)
+   where
+     s = (mempty :: Schema)
+           & type_ .~ toSwaggerType t
+-          & items .~ (SwaggerItemsObject <$> makeSwaggerItemType (toSwaggerType t) t)
+           & format ?~ t
+ 
+ makePreferParam :: [Text] -> Param
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 31637b6d..e6da29c6 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -512,11 +512,13 @@ tablesSqlQuery pgVer =
+               CASE
+                   WHEN t.typtype = 'd' THEN
+                   CASE
++                      WHEN bt.typelem <> 0::oid AND bt.typlen = (-1) THEN 'ARRAY'::text
+                       WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
+                       ELSE format_type(a.atttypid, a.atttypmod)
+                   END
+                   ELSE
+                   CASE
++                      WHEN t.typelem <> 0::oid AND t.typlen = (-1) THEN 'ARRAY'::text
+                       WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
+                       ELSE format_type(a.atttypid, a.atttypmod)
+                   END
+diff --git a/test/spec/Feature/OpenApi/OpenApiSpec.hs b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+index 31aedfb0..04f9198e 100644
+--- a/test/spec/Feature/OpenApi/OpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+@@ -490,117 +490,6 @@ spec actualPgVersion = describe "OpenAPI" $ do
+             }
+           |]
+ 
+-    it "array types to array" $ do
+-      r <- simpleBody <$> get "/"
+-
+-      let text_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_text_arr"
+-      let int_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_int_arr"
+-      let bool_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_bool_arr"
+-      let char_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_char_arr"
+-      let varchar_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_varchar_arr"
+-      let bigint_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_bigint_arr"
+-      let numeric_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_numeric_arr"
+-      let json_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_json_arr"
+-      let jsonb_arr_types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_jsonb_arr"
+-
+-      liftIO $ do
+-
+-        text_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "text[]",
+-              "type": "array",
+-              "items": {
+-                "type": "string"
+-              }
+-            }
+-          |]
+-
+-        int_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "integer[]",
+-              "type": "array",
+-              "items": {
+-                "type": "integer"
+-              }
+-            }
+-          |]
+-
+-        bool_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "boolean[]",
+-              "type": "array",
+-              "items": {
+-                "type": "boolean"
+-              }
+-            }
+-          |]
+-
+-        char_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "character[]",
+-              "type": "array",
+-              "items": {
+-                "type": "string"
+-              }
+-            }
+-          |]
+-
+-        varchar_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "character varying[]",
+-              "type": "array",
+-              "items": {
+-                "type": "string"
+-              }
+-            }
+-          |]
+-
+-        bigint_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "bigint[]",
+-              "type": "array",
+-              "items": {
+-                "type": "integer"
+-              }
+-            }
+-          |]
+-
+-        numeric_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "numeric[]",
+-              "type": "array",
+-              "items": {
+-                "type": "number"
+-              }
+-            }
+-          |]
+-
+-        json_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "json[]",
+-              "type": "array",
+-              "items": {}
+-            }
+-          |]
+-
+-        jsonb_arr_types `shouldBe` Just
+-          [aesonQQ|
+-            {
+-              "format": "jsonb[]",
+-              "type": "array",
+-              "items": {}
+-            }
+-          |]
+-
+-
+   describe "Detects default values" $ do
+ 
+     it "text" $ do
+@@ -680,7 +569,7 @@ spec actualPgVersion = describe "OpenAPI" $ do
+     it "includes function summary/description and body schema for arguments" $ do
+       r <- simpleBody <$> get "/"
+ 
+-      let method s = key "paths" . key "/rpc/varied_arguments_openapi" . key s
++      let method s = key "paths" . key "/rpc/varied_arguments" . key s
+           args = r ^? method "post" . key "parameters" . nth 0 . key "schema"
+           summary = r ^? method "post" . key "summary"
+           description = r ^? method "post" . key "description"
+@@ -701,15 +590,7 @@ spec actualPgVersion = describe "OpenAPI" $ do
+                 "date",
+                 "money",
+                 "enum",
+-                "text_arr",
+-                "int_arr",
+-                "bool_arr",
+-                "char_arr",
+-                "varchar_arr",
+-                "bigint_arr",
+-                "numeric_arr",
+-                "json_arr",
+-                "jsonb_arr"
++                "arr"
+               ],
+               "properties": {
+                 "double": {
+@@ -736,64 +617,9 @@ spec actualPgVersion = describe "OpenAPI" $ do
+                   "format": "enum_menagerie_type",
+                   "type": "string"
+                 },
+-                "text_arr": {
++                "arr": {
+                   "format": "text[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "string"
+-                  }
+-                },
+-                "int_arr": {
+-                  "format": "integer[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "integer"
+-                  }
+-                },
+-                "bool_arr": {
+-                  "format": "boolean[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "boolean"
+-                  }
+-                },
+-                "char_arr": {
+-                  "format": "character[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "string"
+-                  }
+-                },
+-                "varchar_arr": {
+-                  "format": "character varying[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "string"
+-                  }
+-                },
+-                "bigint_arr": {
+-                  "format": "bigint[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "integer"
+-                  }
+-                },
+-                "numeric_arr": {
+-                  "format": "numeric[]",
+-                  "type": "array",
+-                  "items": {
+-                    "type": "number"
+-                  }
+-                },
+-                "json_arr": {
+-                  "format": "json[]",
+-                  "type": "array",
+-                  "items": {}
+-                },
+-                "jsonb_arr": {
+-                  "format": "jsonb[]",
+-                  "type": "array",
+-                  "items": {}
++                  "type": "string"
+                 },
+                 "integer": {
+                   "format": "integer",
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index d42ca6a0..9298e3d1 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -272,56 +272,6 @@ $_$An RPC function
+ 
+ Just a test for RPC function arguments$_$;
+ 
+-CREATE FUNCTION varied_arguments_openapi(
+-  double double precision,
+-  "varchar" character varying,
+-  "boolean" boolean,
+-  date date,
+-  money money,
+-  enum enum_menagerie_type,
+-  text_arr text[],
+-  int_arr int[],
+-  bool_arr boolean[],
+-  char_arr char[],
+-  varchar_arr varchar[],
+-  bigint_arr bigint[],
+-  numeric_arr numeric[],
+-  json_arr json[],
+-  jsonb_arr jsonb[],
+-  "integer" integer default 42,
+-  json json default '{}',
+-  jsonb jsonb default '{}'
+-) RETURNS json
+-  LANGUAGE sql
+-  IMMUTABLE
+-AS $_$
+-SELECT json_build_object(
+-           'double', double,
+-           'varchar', "varchar",
+-           'boolean', "boolean",
+-           'date', date,
+-           'money', money,
+-           'enum', enum,
+-           'text_arr', text_arr,
+-           'int_arr', int_arr,
+-           'bool_arr', bool_arr,
+-           'char_arr', char_arr,
+-           'varchar_arr', varchar_arr,
+-           'bigint_arr', bigint_arr,
+-           'numeric_arr', numeric_arr,
+-           'json_arr', json_arr,
+-           'jsonb_arr', jsonb_arr,
+-           'integer', "integer",
+-           'json', json,
+-           'jsonb', jsonb
+-         );
+-$_$;
+-
+-COMMENT ON FUNCTION varied_arguments_openapi(double precision, character varying, boolean, date, money, enum_menagerie_type, text[], int[], boolean[], char[], varchar[], bigint[], numeric[], json[], jsonb[], integer, json, jsonb) IS
+-  $_$An RPC function
+-
+-Just a test for RPC function arguments$_$;
+-
+ 
+ CREATE FUNCTION json_argument(arg json) RETURNS text
+ LANGUAGE sql
+@@ -1864,16 +1814,7 @@ CREATE TABLE test.openapi_types(
+   "a_real" real,
+   "a_double_precision" double precision,
+   "a_json" json,
+-  "a_jsonb" jsonb,
+-  "a_text_arr" text[],
+-  "a_int_arr" int[],
+-  "a_bool_arr" boolean[],
+-  "a_char_arr" char[],
+-  "a_varchar_arr" varchar[],
+-  "a_bigint_arr" bigint[],
+-  "a_numeric_arr" numeric[],
+-  "a_json_arr" json[],
+-  "a_jsonb_arr" jsonb[]
++  "a_jsonb" jsonb
+ );
+ 
+ CREATE TABLE test.openapi_defaults(

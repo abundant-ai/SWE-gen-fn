@@ -1,0 +1,327 @@
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 2b4be203..3dbce3d8 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -182,9 +182,9 @@ data ApiRequest = ApiRequest {
+ -- | Examines HTTP request and translates it into user intent.
+ userApiRequest :: AppConfig -> SchemaCache -> Request -> RequestBody -> Either ApiRequestError ApiRequest
+ userApiRequest conf sCache req reqBody = do
++  qPrms <- first QueryParamError $ QueryParams.parse $ rawQueryString req
+   pInfo <- getPathInfo conf $ pathInfo req
+   act <- getAction pInfo $ requestMethod req
+-  qPrms <- first QueryParamError $ QueryParams.parse (pathIsProc pInfo && act `elem` [ActionInvoke InvGet, ActionInvoke InvHead]) $ rawQueryString req
+   mediaTypes <- getMediaTypes conf (requestHeaders req) act pInfo
+   negotiatedSchema <- getSchema conf (requestHeaders req) (requestMethod req)
+   apiRequest conf sCache req reqBody qPrms pInfo act mediaTypes negotiatedSchema
+@@ -253,6 +253,7 @@ apiRequest :: AppConfig -> SchemaCache -> Request -> RequestBody -> QueryParams.
+ apiRequest conf sCache req reqBody queryparams@QueryParams{..} PathInfo{pathName, pathIsProc, pathIsRootSpec, pathIsDefSpec} action (acceptMediaType, contentMediaType) (schema, negotiatedByProfile)
+   | isInvalidRange = Left $ InvalidRange (if rangeIsEmpty headerRange then LowerGTUpper else NegativeLimit)
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
++  | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+   | method `elem` ["PATCH", "DELETE"] && not (null qsRanges) && null qsOrder = Left LimitNoOrderError
+   | method == "PUT" && topLevelRange /= allRange = Left PutRangeNotAllowedError
+   | otherwise = do
+@@ -281,6 +282,8 @@ apiRequest conf sCache req reqBody queryparams@QueryParams{..} PathInfo{pathName
+       , iBinaryField = bField
+       }
+  where
++  expectParams = pathIsProc && method /= "POST"
++
+   columns = case action of
+     ActionMutate MutationCreate -> qsColumns
+     ActionMutate MutationUpdate -> qsColumns
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index aafa4411..97d9fa8b 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -114,45 +114,39 @@ data QueryParams =
+ --
+ -- The canonical representation of the query string has parameters sorted alphabetically:
+ --
+--- >>> qsCanonical <$> parse True "a=1&c=3&b=2&d"
++-- >>> qsCanonical <$> parse "a=1&c=3&b=2&d"
+ -- Right "a=1&b=2&c=3&d="
+ --
+ -- 'select' is a reserved parameter that selects the fields to be returned:
+ --
+--- >>> qsSelect <$> parse False "select=name,location"
++-- >>> qsSelect <$> parse "select=name,location"
+ -- Right [Node {rootLabel = SelectField {selField = ("name",[]), selCast = Nothing, selAlias = Nothing}, subForest = []},Node {rootLabel = SelectField {selField = ("location",[]), selCast = Nothing, selAlias = Nothing}, subForest = []}]
+ --
+ -- Filters are parameters whose value contains an operator, separated by a '.' from its value:
+ --
+--- >>> qsFilters <$> parse False "a.b=eq.0"
++-- >>> qsFilters <$> parse "a.b=eq.0"
+ -- Right [(["a"],Filter {field = ("b",[]), opExpr = OpExpr False (Op OpEqual "0")})]
+ --
+ -- If the operator specified in a filter does not exist, parsing the query string fails:
+ --
+--- >>> qsFilters <$> parse False "a.b=noop.0"
+--- Left (QPError "\"failed to parse filter (noop.0)\" (line 1, column 6)" "expecting operator (eq, gt, ...) unknown single value operator noop")
+-parse :: Bool -> ByteString -> Either QPError QueryParams
+-parse isRpcGet qs = do
+-  rOrd                      <- pRequestOrder `traverse` order
+-  rLogic                    <- pRequestLogicTree `traverse` logic
+-  rCols                     <- pRequestColumns columns
+-  rSel                      <- pRequestSelect select
+-  (rFlts, params)           <- L.partition hasOp <$> pRequestFilter isRpcGet `traverse` filters
+-  (rFltsRoot, rFltsNotRoot) <- pure $ L.partition hasRootFilter rFlts
+-  rOnConflict               <- pRequestOnConflict `traverse` onConflict
+-
+-  let rFltsFields           = S.fromList (fst <$> filters)
+-      params'               = mapMaybe (\case {(_, Filter (fld, _) (NoOpExpr v)) -> Just (fld,v); _ -> Nothing}) params
+-      rFltsRoot'            = snd <$> rFltsRoot
+-
+-  return $ QueryParams canonical params' ranges rOrd rLogic rCols rSel rFlts rFltsRoot' rFltsNotRoot rFltsFields rOnConflict
++-- >>> qsFilters <$> parse "a.b=noop.0"
++-- Left (QPError "\"failed to parse filter (noop.0)\" (line 1, column 6)" "unknown single value operator noop")
++parse :: ByteString -> Either QPError QueryParams
++parse qs =
++  QueryParams
++    canonical
++    params
++    ranges
++    <$> pRequestOrder `traverse` order
++    <*> pRequestLogicTree `traverse` logic
++    <*> pRequestColumns columns
++    <*> pRequestSelect select
++    <*> pRequestFilter `traverse` filters
++    <*> (fmap snd <$> (pRequestFilter `traverse` filtersRoot))
++    <*> pRequestFilter `traverse` filtersNotRoot
++    <*> pure (S.fromList (fst <$> filters))
++    <*> pRequestOnConflict `traverse` onConflict
+   where
+-    hasRootFilter, hasOp :: (EmbedPath, Filter) -> Bool
+-    hasRootFilter ([], _) = True
+-    hasRootFilter _       = False
+-    hasOp (_, Filter (_, _) (NoOpExpr _)) = False
+-    hasOp _                               = True
+-
+     logic = filter (endingIn ["and", "or"] . fst) nonemptyParams
+     select = fromMaybe "*" $ lookupParam "select"
+     onConflict = lookupParam "on_conflict"
+@@ -179,11 +173,32 @@ parse isRpcGet qs = do
+     endingIn xx key = lastWord `elem` xx
+       where lastWord = L.last $ T.split (== '.') key
+ 
+-    filters = filter (isFilter . fst) nonemptyParams
+-    isFilter k = not (endingIn reservedEmbeddable k) && notElem k reserved
++    (filters, params) = L.partition isParam filtersAndParams
++    isParam (k, v) = isEmbedPath k || hasOperator v || hasFtsOperator v
++
++    filtersAndParams = filter (isFilterOrParam . fst)  nonemptyParams
++    isFilterOrParam k = not (endingIn reservedEmbeddable k) && notElem k reserved
+     reserved = ["select", "columns", "on_conflict"]
+     reservedEmbeddable = ["order", "limit", "offset", "and", "or"]
+ 
++    (filtersNotRoot, filtersRoot) = L.partition isNotRoot filters
++    isNotRoot = flip T.isInfixOf "." . fst
++
++    -- TODO: These checks are redundant to the parsers, should use parsers to differentiate params
++    hasOperator val =
++      case T.splitOn "." val of
++        "not" : _ : _ -> True
++        "is" : _      -> True
++        "in" : _      -> True
++        x : _         -> isJust (operator x) || isJust (ftsOperator x)
++        _             -> False
++
++    hasFtsOperator val =
++      case T.splitOn "(" val of
++        x : _ : _ -> isJust $ ftsOperator x
++        _         -> False
++
++    isEmbedPath = T.isInfixOf "."
+     replaceLast x s = T.intercalate "." $ L.init (T.split (=='.') s) <> [x]
+ 
+     ranges :: HM.HashMap Text (Range Integer)
+@@ -222,8 +237,18 @@ operator = \case
+   "imatch" -> Just OpIMatch
+   _        -> Nothing
+ 
++ftsOperator :: Text -> Maybe FtsOperator
++ftsOperator = \case
++  "fts"   -> Just FilterFts
++  "plfts" -> Just FilterFtsPlain
++  "phfts" -> Just FilterFtsPhrase
++  "wfts"  -> Just FilterFtsWebsearch
++  _       -> Nothing
++
++
+ -- PARSERS
+ 
++
+ pRequestSelect :: Text -> Either QPError [Tree SelectItem]
+ pRequestSelect selStr =
+   mapError $ P.parse pFieldForest ("failed to parse select parameter (" <> toS selStr <> ")") (toS selStr)
+@@ -232,25 +257,11 @@ pRequestOnConflict :: Text -> Either QPError [FieldName]
+ pRequestOnConflict oncStr =
+   mapError $ P.parse pColumns ("failed to parse on_conflict parameter (" <> toS oncStr <> ")") (toS oncStr)
+ 
+--- |
+--- Parse `id=eq.1`(id, eq.1) into (EmbedPath, Filter)
+---
+--- >>> pRequestFilter False ("id", "eq.1")
+--- Right ([],Filter {field = ("id",[]), opExpr = OpExpr False (Op OpEqual "1")})
+---
+--- >>> pRequestFilter False ("id", "val")
+--- Left (QPError "\"failed to parse filter (val)\" (line 1, column 4)" "unexpected end of input expecting operator (eq, gt, ...)")
+---
+--- >>> pRequestFilter True ("id", "val")
+--- Right ([],Filter {field = ("id",[]), opExpr = NoOpExpr "val"})
+-pRequestFilter :: Bool -> (Text, Text) -> Either QPError (EmbedPath, Filter)
+-pRequestFilter isRpcGet (k, v) = mapError $ (,) <$> path <*> (Filter <$> fld <*> oper)
++pRequestFilter :: (Text, Text) -> Either QPError (EmbedPath, Filter)
++pRequestFilter (k, v) = mapError $ (,) <$> path <*> (Filter <$> fld <*> oper)
+   where
+     treePath = P.parse pTreePath ("failed to parse tree path (" ++ toS k ++ ")") $ toS k
+-    oper = P.parse parseFlt ("failed to parse filter (" ++ toS v ++ ")") $ toS v
+-    parseFlt = if isRpcGet
+-      then pOpExpr pSingleVal <|> pure (NoOpExpr v)
+-      else pOpExpr pSingleVal
++    oper = P.parse (pOpExpr pSingleVal) ("failed to parse filter (" ++ toS v ++ ")") $ toS v
+     path = fst <$> treePath
+     fld = snd <$> treePath
+ 
+@@ -581,15 +592,12 @@ pEmbedParams = do
+ --
+ -- >>> P.parse (pOpExpr pSingleVal) "" "fts().value"
+ -- Left (line 1, column 7):
+--- expecting operator (eq, gt, ...)
+ -- unknown single value operator fts()
+ pOpExpr :: Parser SingleVal -> Parser OpExpr
+-pOpExpr pSVal = do
+-  boolExpr <- try (string "not" *> pDelimiter $> True) <|> pure False
+-  OpExpr boolExpr <$> pOperation
++pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)) <|> OpExpr False <$> pOperation
+   where
+     pOperation :: Parser Operation
+-    pOperation = pIn <|> pIs <|> try pFts <|> try pOp <?> "operator (eq, gt, ...)"
++    pOperation = pIn <|> pIs <|> try pFts <|> pOp <?> "operator (eq, gt, ...)"
+ 
+     pIn = In <$> (try (string "in" *> pDelimiter) *> pListVal)
+     pIs = Is <$> (try (string "is" *> pDelimiter) *> pTriVal)
+@@ -606,11 +614,8 @@ pOpExpr pSVal = do
+           <?> "null or trilean value (unknown, true, false)"
+ 
+     pFts = do
+-      op <-  try (string "fts"   $> FilterFts)
+-         <|> try (string "plfts" $> FilterFtsPlain)
+-         <|> try (string "phfts" $> FilterFtsPhrase)
+-         <|> try (string "wfts"  $> FilterFtsWebsearch)
+-
++      opStr <- try (P.many (noneOf ".("))
++      op <- parseMaybe ("unknown fts operator " <> opStr) . ftsOperator $ toS opStr
+       lang <- optionMaybe $ try (between (char '(') (char ')') pIdentifier)
+       pDelimiter >> Fts op (toS <$> lang) <$> pSVal
+ 
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index df373dac..0dc49ce7 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -76,6 +76,7 @@ data ApiRequestError
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] Bool MediaType Bool [QualifiedIdentifier] [ProcDescription]
+   | NotEmbedded Text
++  | ParseRequestError Text Text
+   | PutRangeNotAllowedError
+   | QueryParamError QPError
+   | RelatedOrderNotToOne Text Text
+@@ -182,9 +183,8 @@ data Filter
+   | FilterNullEmbed Bool FieldName
+   deriving (Eq)
+ 
+-data OpExpr
+-  = OpExpr Bool Operation
+-  | NoOpExpr Text
++data OpExpr =
++  OpExpr Bool Operation
+   deriving (Eq)
+ 
+ data Operation
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 45c4ae8a..b484f54c 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -72,6 +72,7 @@ instance PgrstError ApiRequestError where
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+   status NotEmbedded{}           = HTTP.status400
++  status ParseRequestError{}     = HTTP.status400
+   status PutRangeNotAllowedError = HTTP.status400
+   status QueryParamError{}       = HTTP.status400
+   status RelatedOrderNotToOne{}  = HTTP.status400
+@@ -108,6 +109,11 @@ instance JSON.ToJSON ApiRequestError where
+                    LowerGTUpper            -> "The lower boundary must be lower than or equal to the upper boundary in the Range header."
+                    OutOfBounds lower total -> "An offset of " <> lower <> " was requested, but there are only " <> total <> " rows."),
+     "hint"    .= JSON.Null]
++  toJSON (ParseRequestError message details) = JSON.object [
++    "code"    .= ApiRequestErrorCode04,
++    "message" .= message,
++    "details" .= details,
++    "hint"    .= JSON.Null]
+   toJSON InvalidFilters = JSON.object [
+     "code"    .= ApiRequestErrorCode05,
+     "message" .= ("Filters must include all and only primary key columns with 'eq' operators" :: Text),
+@@ -580,7 +586,7 @@ data ErrorCode
+   | ApiRequestErrorCode01
+   | ApiRequestErrorCode02
+   | ApiRequestErrorCode03
+-  | ApiRequestErrorCode04 -- no longer used (used to be mapped to ParseRequestError)
++  | ApiRequestErrorCode04
+   | ApiRequestErrorCode05
+   | ApiRequestErrorCode06
+   | ApiRequestErrorCode07
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 55c2afd8..dee719d9 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -33,6 +33,7 @@ import Data.Tree               (Tree (..))
+ 
+ import PostgREST.ApiRequest               (Action (..),
+                                            ApiRequest (..),
++                                           InvokeMethod (..),
+                                            Mutation (..),
+                                            Payload (..))
+ import PostgREST.Config                   (AppConfig (..))
+@@ -290,9 +291,11 @@ addFilters ApiRequest{..} rReq =
+     QueryParams.QueryParams{..} = iQueryParams
+     flts =
+       case iAction of
+-        ActionInvoke _ -> qsFilters
+-        ActionRead _   -> qsFilters
+-        _              -> qsFiltersNotRoot
++        ActionInvoke InvGet  -> qsFilters
++        ActionInvoke InvHead -> qsFilters
++        ActionInvoke _       -> qsFilters
++        ActionRead _         -> qsFilters
++        _                    -> qsFiltersNotRoot
+ 
+     addFilterToNode :: (EmbedPath, Filter) -> Either ApiRequestError ReadPlanTree ->  Either ApiRequestError ReadPlanTree
+     addFilterToNode =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 4548911a..237a163f 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -278,7 +278,6 @@ pgFmtOrderTerm qi ot =
+ 
+ pgFmtFilter :: QualifiedIdentifier -> Filter -> SQL.Snippet
+ pgFmtFilter _ (FilterNullEmbed hasNot fld) = SQL.sql (pgFmtIdent fld) <> " IS " <> (if hasNot then "NOT" else mempty) <> " NULL"
+-pgFmtFilter _ (Filter _ (NoOpExpr _)) = mempty -- TODO unreachable because NoOpExpr is filtered on QueryParams
+ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper of
+    Op op val  -> pgFmtFieldOp op <> " " <> case op of
+      OpLike  -> unknownLiteral (T.map star val)
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index b995dfe7..7b4997aa 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1002,8 +1002,7 @@ spec actualPgVersion = do
+         { matchHeaders = [matchContentTypeJson] }
+ 
+     it "fails if an operator is not given" $
+-      get "/ghostBusters?id=0" `shouldRespondWith`
+-        [json| {"code":"PGRST100","details":"unexpected end of input expecting operator (eq, gt, ...)","hint":null,"message":"\"failed to parse filter (0)\" (line 1, column 2)"} |]
++      get "/ghostBusters?id=0" `shouldRespondWith` [json| {"details":"Failed to parse [(\"id\",\"0\")]","message":"Unexpected param or filter missing operator","code":"PGRST104","hint":null} |]
+         { matchStatus  = 400
+         , matchHeaders = [matchContentTypeJson]
+         }

@@ -1,0 +1,162 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index be3d696c..e76b14a1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
++### Fixed
++
++ - #2762, Fixes "permission denied for schema" error during schema cache load - @steve-chavez
++ - #2756, Fix bad error message on generated columns when using `Prefer: missing=default` - @steve-chavez
++
+ ## [11.0.0] - 2023-04-16
+ 
+ ### Added
+diff --git a/nix/tools/cabalTools.nix b/nix/tools/cabalTools.nix
+index 7557d650..03911acc 100644
+--- a/nix/tools/cabalTools.nix
++++ b/nix/tools/cabalTools.nix
+@@ -38,11 +38,17 @@ let
+       {
+         name = "postgrest-run";
+         docs = "Run PostgREST after building it interactively with cabal-install";
+-        args = [ "ARG_LEFTOVERS([PostgREST arguments])" ];
++        args =
++          [
++            "ARG_USE_ENV([PGRST_DB_ANON_ROLE], [postgrest_test_anonymous], [PostgREST anonymous role])"
++            "ARG_LEFTOVERS([PostgREST arguments])"
++          ];
+         inRootDir = true;
+         withEnv = postgrest.env;
+       }
+       ''
++        export PGRST_DB_ANON_ROLE
++
+         exec ${cabal-install}/bin/cabal v2-run ${devCabalOptions} --verbose=0 -- \
+           postgrest "''${_arg_leftovers[@]}"
+       '';
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+index eba52d60..de36204d 100644
+--- a/nix/tools/withTools.nix
++++ b/nix/tools/withTools.nix
+@@ -15,11 +15,14 @@
+ let
+   withTmpDb =
+     { name, postgresql }:
+-    let commandName = "postgrest-with-${name}"; in
++    let
++      commandName = "postgrest-with-${name}";
++      superuserRole = "postgres";
++    in
+     checkedShellScript
+       {
+         name = commandName;
+-        docs = "Run the given command in a temporary database with ${name}";
++        docs = "Run the given command in a temporary database with ${name}. If you wish to mutate the database, login with the '${superuserRole}' role.";
+         args =
+           [
+             "ARG_OPTIONAL_SINGLE([fixtures], [f], [SQL file to load fixtures from], [test/spec/fixtures/load.sql])"
+@@ -66,7 +69,8 @@ let
+         log "Initializing database cluster..."
+         # We try to make the database cluster as independent as possible from the host
+         # by specifying the timezone, locale and encoding.
+-        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "$PGUSER" --auth=trust \
++        # initdb -U creates a superuser(man initdb)
++        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "${superuserRole}" --auth=trust \
+           >> "$setuplog"
+ 
+         log "Starting the database cluster..."
+@@ -82,8 +86,11 @@ let
+         }
+         trap stop EXIT
+ 
+-        log "Loading fixtures..."
+-        psql -v ON_ERROR_STOP=1 -f "$_arg_fixtures" >> "$setuplog"
++        log "Creating a minimally privileged $PGUSER connection role..."
++        createuser "$PGUSER" -U "${superuserRole}" --host="$tmpdir/socket" --no-createdb --no-inherit --no-superuser --no-createrole --no-replication --login
++
++        log "Loading fixtures under the ${superuserRole} role..."
++        psql -U "${superuserRole}" -v PGUSER="$PGUSER" -v ON_ERROR_STOP=1 -f "$_arg_fixtures" >> "$setuplog"
+ 
+         log "Done. Running command..."
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 642c4128..f9425f23 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -187,6 +187,7 @@ test-suite spec
+                       Feature.CorsSpec
+                       Feature.ExtraSearchPathSpec
+                       Feature.LegacyGucsSpec
++                      Feature.NoSuperuserSpec
+                       Feature.ObservabilitySpec
+                       Feature.OpenApi.DisabledOpenApiSpec
+                       Feature.OpenApi.IgnorePrivOpenApiSpec
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 9ac260d9..b86eded9 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -40,7 +40,7 @@ import Text.InterpolatedString.Perl6 (q)
+ 
+ import PostgREST.Config.Database          (pgVersionStatement)
+ import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+-                                           pgVersion110)
++                                           pgVersion110, pgVersion120)
+ import PostgREST.SchemaCache.Identifiers  (AccessSet, FieldName,
+                                            QualifiedIdentifier (..),
+                                            Schema)
+@@ -506,6 +506,8 @@ tablesSqlQuery pgVer =
+   -- the tbl_constraints/key_col_usage CTEs are based on the standard "information_schema.table_constraints"/"information_schema.key_column_usage" views,
+   -- we cannot use those directly as they include the following privilege filter:
+   -- (pg_has_role(ss.relowner, 'USAGE'::text) OR has_column_privilege(ss.roid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'::text));
++  -- on the "columns" CTE, left joining on pg_depend and pg_class is used to obtain the sequence name as a column default in case there are GENERATED .. AS IDENTITY,
++  -- generated columns are only available from pg >= 10 but the query is agnostic to versions. dep.deptype = 'i' is done because there are other 'a' dependencies on PKs
+   [q|
+   WITH
+   columns AS (
+@@ -549,6 +551,12 @@ tablesSqlQuery pgVer =
+               ON t.typtype = 'd' AND t.typbasetype = bt.oid
+           LEFT JOIN (pg_collation co JOIN pg_namespace nco ON co.collnamespace = nco.oid)
+               ON a.attcollation = co.oid AND (nco.nspname <> 'pg_catalog'::name OR co.collname <> 'default'::name)
++          LEFT JOIN pg_depend dep
++              ON dep.refobjid = a.attrelid and dep.refobjsubid = a.attnum and dep.deptype = 'i'
++          LEFT JOIN pg_class seqclass
++              ON seqclass.oid = dep.objid
++          LEFT JOIN pg_namespace seqsch
++              ON seqsch.oid = seqclass.relnamespace
+       WHERE
+           NOT pg_is_other_temp_schema(nc.oid)
+           AND a.attnum > 0
+@@ -697,17 +705,19 @@ tablesSqlQuery pgVer =
+   "ORDER BY table_schema, table_name"
+   where
+     relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+-    -- detect default values on columns that have GENERATED .. AS IDENTITY
+-    columnDefault =
+-      if pgVer >= pgVersion100
+-        then [q|
+-        CASE
+-           WHEN nullif(a.attidentity, '') is null
+-             THEN pg_get_expr(ad.adbin, ad.adrelid)::text
+-             ELSE format('nextval(%s)', quote_literal(pg_get_serial_sequence(a.attrelid::regclass::text, a.attname::text)))
+-        END AS column_default,|]
+-        else "pg_get_expr(ad.adbin, ad.adrelid)::text AS column_default,"
+-
++    columnDefault
++      | pgVer >= pgVersion120 = [q|
++          CASE
++            WHEN a.attidentity  = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
++            WHEN a.attgenerated = 's' THEN null
++            ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
++          END AS column_default,|]
++      | pgVer >= pgVersion100 = [q|
++          CASE
++            WHEN a.attidentity = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
++            ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
++          END AS column_default,|]
++      | otherwise  = "pg_get_expr(ad.adbin, ad.adrelid)::text as column_default,"
+ 
+ -- | Gets many-to-one relationships and one-to-one(O2O) relationships, which are a refinement of the many-to-one's
+ allM2OandO2ORels :: PgVersion -> Bool -> SQL.Statement () [Relationship]

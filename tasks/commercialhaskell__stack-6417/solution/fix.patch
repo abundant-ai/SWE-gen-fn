@@ -1,0 +1,174 @@
+diff --git a/src/Stack/Config.hs b/src/Stack/Config.hs
+index d24330f75..bfa87c238 100644
+--- a/src/Stack/Config.hs
++++ b/src/Stack/Config.hs
+@@ -122,7 +122,7 @@ import           Stack.Types.Casa ( CasaOptsMonoid (..) )
+ import           Stack.Types.Docker ( DockerOptsMonoid (..), dockerEnable )
+ import           Stack.Types.DumpLogs ( DumpLogs (..) )
+ import           Stack.Types.GlobalOpts (  GlobalOpts (..) )
+-import           Stack.Types.Nix ( nixEnable )
++import           Stack.Types.Nix ( NixOpts (..) )
+ import           Stack.Types.Platform
+                    ( PlatformVariant (..), platformOnlyRelDir )
+ import           Stack.Types.Project ( Project (..) )
+@@ -331,13 +331,13 @@ configFromConfigMonoid
+       dockerOptsFromMonoid (fmap fst mproject) resolver configMonoid.configMonoidDockerOpts
+     nix <- nixOptsFromMonoid configMonoid.configMonoidNixOpts os
+     systemGHC <-
+-      case (getFirst configMonoid.configMonoidSystemGHC, nix.nixEnable) of
++      case (getFirst configMonoid.configMonoidSystemGHC, nix.enable) of
+         (Just False, True) ->
+           throwM NixRequiresSystemGhc
+         _ ->
+           pure
+             (fromFirst
+-              (docker.dockerEnable || nix.nixEnable)
++              (docker.dockerEnable || nix.enable)
+               configMonoid.configMonoidSystemGHC)
+     when (isJust ghcVariant && systemGHC) $
+       throwM ManualGHCVariantSettingsAreIncompatibleWithSystemGHC
+diff --git a/src/Stack/Config/Nix.hs b/src/Stack/Config/Nix.hs
+index 11bc32280..054d3b539 100644
+--- a/src/Stack/Config/Nix.hs
++++ b/src/Stack/Config/Nix.hs
+@@ -50,19 +50,19 @@ nixOptsFromMonoid nixMonoid os = do
+   let defaultPure = case os of
+         OSX -> False
+         _ -> True
+-      nixPureShell = fromFirst defaultPure nixMonoid.nixMonoidPureShell
+-      nixPackages = fromFirst [] nixMonoid.nixMonoidPackages
+-      nixInitFile = getFirst nixMonoid.nixMonoidInitFile
+-      nixShellOptions =
++      pureShell = fromFirst defaultPure nixMonoid.nixMonoidPureShell
++      packages = fromFirst [] nixMonoid.nixMonoidPackages
++      initFile = getFirst nixMonoid.nixMonoidInitFile
++      shellOptions =
+            fromFirst [] nixMonoid.nixMonoidShellOptions
+         ++ prefixAll (T.pack "-I") (fromFirst [] nixMonoid.nixMonoidPath)
+-      nixAddGCRoots   = fromFirstFalse nixMonoid.nixMonoidAddGCRoots
++      addGCRoots   = fromFirstFalse nixMonoid.nixMonoidAddGCRoots
+ 
+   -- Enable Nix-mode by default on NixOS, unless Docker-mode was specified
+   osIsNixOS <- isNixOS
+   let nixEnable0 = fromFirst osIsNixOS nixMonoid.nixMonoidEnable
+ 
+-  nixEnable <-
++  enable <-
+     if nixEnable0 && osIsWindows
+       then do
+         prettyNoteS
+@@ -70,15 +70,15 @@ nixOptsFromMonoid nixMonoid os = do
+         pure False
+       else pure nixEnable0
+ 
+-  when (not (null nixPackages) && isJust nixInitFile) $
++  when (not (null packages) && isJust initFile) $
+     throwIO NixCannotUseShellFileAndPackagesException
+   pure $ NixOpts
+-    { nixEnable
+-    , nixPureShell
+-    , nixPackages
+-    , nixInitFile
+-    , nixShellOptions
+-    , nixAddGCRoots
++    { enable
++    , pureShell
++    , packages
++    , initFile
++    , shellOptions
++    , addGCRoots
+     }
+  where
+   prefixAll p (x:xs) = p : x : prefixAll p xs
+diff --git a/src/Stack/Nix.hs b/src/Stack/Nix.hs
+index a7a21531f..9a2de6794 100644
+--- a/src/Stack/Nix.hs
++++ b/src/Stack/Nix.hs
+@@ -58,7 +58,7 @@ runShellAndExit = do
+ 
+     mshellFile <- case configProjectRoot config of
+       Just projectRoot ->
+-        traverse (resolveFile projectRoot) config.nix.nixInitFile
++        traverse (resolveFile projectRoot) config.nix.initFile
+       Nothing -> pure Nothing
+ 
+     -- This will never result in double loading the build config, since:
+@@ -71,11 +71,11 @@ runShellAndExit = do
+ 
+     ghc <- either throwIO pure $ nixCompiler compilerVersion
+     ghcVersion <- either throwIO pure $ nixCompilerVersion compilerVersion
+-    let pkgsInConfig = config.nix.nixPackages
++    let pkgsInConfig = config.nix.packages
+         pkgs = pkgsInConfig ++ [ghc, "git", "gcc", "gmp"]
+         pkgsStr = "[" <> T.intercalate " " pkgs <> "]"
+-        pureShell = config.nix.nixPureShell
+-        addGCRoots = config.nix.nixAddGCRoots
++        pureShell = config.nix.pureShell
++        addGCRoots = config.nix.addGCRoots
+         nixopts = case mshellFile of
+           Just fp ->
+             [ toFilePath fp
+@@ -127,7 +127,7 @@ runShellAndExit = do
+                        F.</> "gc-root"
+                    ]
+               else []
+-          , map T.unpack config.nix.nixShellOptions
++          , map T.unpack config.nix.shellOptions
+           , nixopts
+           , ["--run", unwords (cmnd:"$STACK_IN_NIX_EXTRA_ARGS":args')]
+             -- Using --run instead of --command so we cannot end up in the
+diff --git a/src/Stack/Runners.hs b/src/Stack/Runners.hs
+index ba6a4824d..ee1caadd4 100644
+--- a/src/Stack/Runners.hs
++++ b/src/Stack/Runners.hs
+@@ -48,7 +48,7 @@ import           Stack.Types.ConfigMonoid ( ConfigMonoid (..) )
+ import           Stack.Types.Docker ( dockerEnable )
+ import           Stack.Types.EnvConfig ( EnvConfig )
+ import           Stack.Types.GlobalOpts ( GlobalOpts (..) )
+-import           Stack.Types.Nix ( nixEnable )
++import           Stack.Types.Nix ( NixOpts (..) )
+ import           Stack.Types.Runner
+                    ( Runner (..), globalOptsL, reExecL, stackYamlLocL )
+ import           Stack.Types.StackYamlLoc ( StackYamlLoc (..) )
+@@ -146,7 +146,7 @@ withConfig shouldReexec inner =
+ -- action.
+ reexec :: RIO Config a -> RIO Config a
+ reexec inner = do
+-  nixEnable' <- asks $ (.nix.nixEnable)
++  nixEnable' <- asks $ (.nix.enable)
+   notifyIfNixOnPath <- asks (.notifyIfNixOnPath)
+   when (not nixEnable' && notifyIfNixOnPath) $ do
+     eNix <- findExecutable nixProgName
+diff --git a/src/Stack/Types/Nix.hs b/src/Stack/Types/Nix.hs
+index dc08cabff..309e3045e 100644
+--- a/src/Stack/Types/Nix.hs
++++ b/src/Stack/Types/Nix.hs
+@@ -1,4 +1,5 @@
+ {-# LANGUAGE NoImplicitPrelude #-}
++{-# LANGUAGE NoFieldSelectors  #-}
+ {-# LANGUAGE OverloadedStrings #-}
+ 
+ -- | Nix types.
+@@ -23,16 +24,16 @@ import           Stack.Prelude
+ -- | Nix configuration. Parameterize by resolver type to avoid cyclic
+ -- dependency.
+ data NixOpts = NixOpts
+-  { nixEnable :: !Bool
+-  , nixPureShell :: !Bool
+-  , nixPackages :: ![Text]
++  { enable :: !Bool
++  , pureShell :: !Bool
++  , packages :: ![Text]
+     -- ^ The system packages to be installed in the environment before it runs
+-  , nixInitFile :: !(Maybe FilePath)
++  , initFile :: !(Maybe FilePath)
+     -- ^ The path of a file containing preconfiguration of the environment
+     -- (e.g shell.nix)
+-  , nixShellOptions :: ![Text]
++  , shellOptions :: ![Text]
+     -- ^ Options to be given to the nix-shell command line
+-  , nixAddGCRoots :: !Bool
++  , addGCRoots :: !Bool
+     -- ^ Should we register gc roots so running nix-collect-garbage doesn't
+     -- remove nix dependencies
+   }

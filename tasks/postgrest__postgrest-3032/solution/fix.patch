@@ -1,0 +1,244 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b4f603a2..d2999442 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,12 +23,16 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1070, Fix HTTP status responses for upserts - @taimoorzaeem
+    + `PUT` returns `201` instead of `200` when rows are inserted
+    + `POST` with `Prefer: resolution=merge-duplicates` returns `200` instead of `201` when no rows are inserted
++ - #3019, Transaction-Scoped Settings are now shown clearly in the Postgres logs - @laurenceisla
++   + Shows `set_config('pgrst.setting_name', $1)` instead of `setconfig($1, $2)`
++   + Does not apply to role settings and `app.settings.*`
+ 
+ ### Changed
+ 
+  - Removed [raw-media-types config](https://postgrest.org/en/v11.1/references/configuration.html#raw-media-types) - @steve-chavez
+  - Removed `application/octet-stream`, `text/plain`, `text/xml` [builtin support for scalar results](https://postgrest.org/en/v11.1/references/api/resource_representation.html#scalar-function-response-format) - @steve-chavez
+  - Removed default `application/openapi+json` media type for [db-root-spec](https://postgrest.org/en/v11.1/references/configuration.html#db-root-spec) - @steve-chavez
++ - Removed [db-use-legacy-gucs](https://postgrest.org/en/v11.2/references/configuration.html#db-use-legacy-gucs) - @laurenceisla
+ 
+ ## [11.2.2] - 2023-10-25
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 2d2f3a7b..80601ebf 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -192,7 +192,6 @@ test-suite spec
+                       Feature.ConcurrentSpec
+                       Feature.CorsSpec
+                       Feature.ExtraSearchPathSpec
+-                      Feature.LegacyGucsSpec
+                       Feature.NoSuperuserSpec
+                       Feature.ObservabilitySpec
+                       Feature.OpenApi.DisabledOpenApiSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index aa175ff6..d886a81c 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -251,7 +251,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     roleIsoLvl = HM.findWithDefault SQL.ReadCommitted authRole $ configRoleIsoLvl conf
+     runQuery isoLvl mode query =
+       runDbHandler appState isoLvl mode authenticated prepared $ do
+-        Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq pgVer
++        Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq
+         Query.runPreReq conf
+         query
+ 
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 268b9492..9120d3e5 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -191,10 +191,6 @@ exampleConfigFile =
+       |## https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+       |db-uri = "postgresql://"
+       |
+-      |## Determine if GUC request settings for headers, cookies and jwt claims use the legacy names (string with dashes, invalid starting from PostgreSQL v14) with text values instead of the new names (string without dashes, valid on all PostgreSQL versions) with json values.
+-      |## For PostgreSQL v14 and up, this setting will be ignored.
+-      |db-use-legacy-gucs = true
+-      |
+       |# jwt-aud = "your_audience_claim"
+       |
+       |## Jspath to the role claim key
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 8c6aa24e..8e20719f 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -89,7 +89,6 @@ data AppConfig = AppConfig
+   , configDbTxAllowOverride        :: Bool
+   , configDbTxRollbackAll          :: Bool
+   , configDbUri                    :: Text
+-  , configDbUseLegacyGucs          :: Bool
+   , configFilePath                 :: Maybe FilePath
+   , configJWKS                     :: Maybe JWKSet
+   , configJwtAudience              :: Maybe StringOrURI
+@@ -157,7 +156,6 @@ toText conf =
+       ,("db-pre-config",             q . maybe mempty dumpQi . configDbPreConfig)
+       ,("db-tx-end",                 q . showTxEnd)
+       ,("db-uri",                    q . configDbUri)
+-      ,("db-use-legacy-gucs",            T.toLower . show . configDbUseLegacyGucs)
+       ,("jwt-aud",                       T.decodeUtf8 . LBS.toStrict . JSON.encode . maybe "" toJSON . configJwtAudience)
+       ,("jwt-role-claim-key",        q . T.intercalate mempty . fmap dumpJSPath . configJwtRoleClaimKey)
+       ,("jwt-secret",                q . T.decodeUtf8 . showJwtSecret)
+@@ -257,7 +255,6 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+     <*> (fromMaybe "postgresql://" <$> optString "db-uri")
+-    <*> (fromMaybe True <$> optBool "db-use-legacy-gucs")
+     <*> pure optPath
+     <*> pure Nothing
+     <*> parseJwtAudience "jwt-aud"
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index ef0af795..67dba009 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -53,7 +53,6 @@ dbSettingsNames =
+   ,"db_root_spec"
+   ,"db_schemas"
+   ,"db_tx_end"
+-  ,"db_use_legacy_gucs"
+   ,"jwt_aud"
+   ,"jwt_role_claim_key"
+   ,"jwt_secret"
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 1b154461..16ed0c2a 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -14,13 +14,11 @@ module PostgREST.Query
+   ) where
+ 
+ import qualified Data.Aeson                        as JSON
+-import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+ import qualified Data.ByteString                   as BS
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
+ import qualified Data.Set                          as S
+-import qualified Data.Text.Encoding                as T
+ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL (Snippet)
+ import qualified Hasql.DynamicStatements.Statement as SQL
+@@ -33,8 +31,6 @@ import qualified PostgREST.Query.Statements   as Statements
+ import qualified PostgREST.RangeQuery         as RangeQuery
+ import qualified PostgREST.SchemaCache        as SchemaCache
+ 
+-import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+-
+ import PostgREST.ApiRequest              (ApiRequest (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           PreferTransaction (..),
+@@ -42,8 +38,7 @@ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+                                           shouldCount)
+ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+-import PostgREST.Config.PgVersion        (PgVersion (..),
+-                                          pgVersion140)
++import PostgREST.Config.PgVersion        (PgVersion (..))
+ import PostgREST.Error                   (Error)
+ import PostgREST.MediaType               (MediaType (..))
+ import PostgREST.Plan                    (CallReadPlan (..),
+@@ -52,8 +47,9 @@ import PostgREST.Plan                    (CallReadPlan (..),
+ import PostgREST.Plan.MutatePlan         (MutatePlan (..))
+ import PostgREST.Query.SqlFragment       (escapeIdentList, fromQi,
+                                           intercalateSnippet,
+-                                          setConfigLocal,
+-                                          setConfigLocalJson)
++                                          setConfigWithConstantName,
++                                          setConfigWithConstantNameJSON,
++                                          setConfigWithDynamicName)
+ import PostgREST.Query.Statements        (ResultSet (..))
+ import PostgREST.SchemaCache             (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier (..),
+@@ -238,37 +234,23 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+ 
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
+-               ApiRequest -> PgVersion -> DbHandler ()
+-setPgLocals AppConfig{..} claims role roleSettings req actualPgVersion = lift $
++               ApiRequest -> DbHandler ()
++setPgLocals AppConfig{..} claims role roleSettings req = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+     ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
+     HD.noResult configDbPreparedStatements
+   where
+-    methodSql = setConfigLocal mempty ("request.method", iMethod req)
+-    pathSql = setConfigLocal mempty ("request.path", iPath req)
+-    headersSql = if usesLegacyGucs
+-                   then setConfigLocal "request.header." <$> iHeaders req
+-                   else setConfigLocalJson "request.headers" (iHeaders req)
+-    cookiesSql = if usesLegacyGucs
+-                   then setConfigLocal "request.cookie." <$> iCookies req
+-                   else setConfigLocalJson "request.cookies" (iCookies req)
+-    claimsSql = if usesLegacyGucs
+-                  then setConfigLocal "request.jwt.claim." <$> [(toUtf8 $ K.toText c, toUtf8 $ unquoted v) | (c,v) <- KM.toList claims]
+-                  else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+-    roleSql = [setConfigLocal mempty ("role", role)]
+-    roleSettingsSql = setConfigLocal mempty <$> roleSettings
+-    appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings)
++    methodSql = setConfigWithConstantName ("request.method", iMethod req)
++    pathSql = setConfigWithConstantName ("request.path", iPath req)
++    headersSql = setConfigWithConstantNameJSON "request.headers" (iHeaders req)
++    cookiesSql = setConfigWithConstantNameJSON "request.cookies" (iCookies req)
++    claimsSql = [setConfigWithConstantName ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
++    roleSql = [setConfigWithConstantName ("role", role)]
++    roleSettingsSql = setConfigWithDynamicName <$> roleSettings
++    appSettingsSql = setConfigWithDynamicName <$> (join bimap toUtf8 <$> configAppSettings)
+     searchPathSql =
+       let schemas = escapeIdentList (iSchema req : configDbExtraSearchPath) in
+-      setConfigLocal mempty ("search_path", schemas)
+-    usesLegacyGucs = configDbUseLegacyGucs && actualPgVersion < pgVersion140
+-
+-    unquoted :: JSON.Value -> Text
+-    unquoted (JSON.String t) = t
+-    unquoted (JSON.Number n) =
+-      toS $ formatScientific Fixed (if isInteger n then Just 0 else Nothing) n
+-    unquoted (JSON.Bool b) = show b
+-    unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
++      setConfigWithConstantName ("search_path", schemas)
+ 
+ -- | Runs the pre-request function.
+ runPreReq :: AppConfig -> DbHandler ()
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 02abb947..94cafa95 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -33,8 +33,9 @@ module PostgREST.Query.SqlFragment
+   , unknownEncoder
+   , intercalateSnippet
+   , explainF
+-  , setConfigLocal
+-  , setConfigLocalJson
++  , setConfigWithConstantName
++  , setConfigWithDynamicName
++  , setConfigWithConstantNameJSON
+   , escapeIdent
+   , escapeIdentList
+   ) where
+@@ -484,14 +485,23 @@ explainF fmt opts snip =
+     fmtPlanFmt PlanJSON = "FORMAT JSON"
+ 
+ -- | Do a pg set_config(setting, value, true) call. This is equivalent to a SET LOCAL.
+-setConfigLocal :: ByteString -> (ByteString, ByteString) -> SQL.Snippet
+-setConfigLocal prefix (k, v) =
+-  "set_config(" <> unknownEncoder (prefix <> k) <> ", " <> unknownEncoder v <> ", true)"
++setConfigLocal :: (SQL.Snippet, ByteString) -> SQL.Snippet
++setConfigLocal (k, v) =
++  "set_config(" <> k <> ", " <> unknownEncoder v <> ", true)"
++
++-- | For when the settings are hardcoded and not parameterized
++setConfigWithConstantName :: (SQL.Snippet, ByteString) -> SQL.Snippet
++setConfigWithConstantName (k, v) = setConfigLocal ("'" <> k <> "'", v)
++
++-- | For when the settings need to be parameterized
++setConfigWithDynamicName :: (ByteString, ByteString) -> SQL.Snippet
++setConfigWithDynamicName (k, v) =
++  setConfigLocal (unknownEncoder k, v)
+ 
+ -- | Starting from PostgreSQL v14, some characters are not allowed for config names (mostly affecting headers with "-").
+ -- | A JSON format string is used to avoid this problem. See https://github.com/PostgREST/postgrest/issues/1857
+-setConfigLocalJson :: ByteString -> [(ByteString, ByteString)] -> [SQL.Snippet]
+-setConfigLocalJson prefix keyVals = [setConfigLocal mempty (prefix, gucJsonVal keyVals)]
++setConfigWithConstantNameJSON :: SQL.Snippet -> [(ByteString, ByteString)] -> [SQL.Snippet]
++setConfigWithConstantNameJSON prefix keyVals = [setConfigWithConstantName (prefix, gucJsonVal keyVals)]
+   where
+     gucJsonVal :: [(ByteString, ByteString)] -> ByteString
+     gucJsonVal = LBS.toStrict . JSON.encode . HM.fromList . arrayByteStringToText

@@ -1,0 +1,350 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e76b14a1..be3d696c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,11 +5,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Fixed
+-
+- - #2762, Fixes "permission denied for schema" error during schema cache load - @steve-chavez
+- - #2756, Fix bad error message on generated columns when using `Prefer: missing=default` - @steve-chavez
+-
+ ## [11.0.0] - 2023-04-16
+ 
+ ### Added
+diff --git a/nix/tools/cabalTools.nix b/nix/tools/cabalTools.nix
+index 03911acc..7557d650 100644
+--- a/nix/tools/cabalTools.nix
++++ b/nix/tools/cabalTools.nix
+@@ -38,17 +38,11 @@ let
+       {
+         name = "postgrest-run";
+         docs = "Run PostgREST after building it interactively with cabal-install";
+-        args =
+-          [
+-            "ARG_USE_ENV([PGRST_DB_ANON_ROLE], [postgrest_test_anonymous], [PostgREST anonymous role])"
+-            "ARG_LEFTOVERS([PostgREST arguments])"
+-          ];
++        args = [ "ARG_LEFTOVERS([PostgREST arguments])" ];
+         inRootDir = true;
+         withEnv = postgrest.env;
+       }
+       ''
+-        export PGRST_DB_ANON_ROLE
+-
+         exec ${cabal-install}/bin/cabal v2-run ${devCabalOptions} --verbose=0 -- \
+           postgrest "''${_arg_leftovers[@]}"
+       '';
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+index de36204d..eba52d60 100644
+--- a/nix/tools/withTools.nix
++++ b/nix/tools/withTools.nix
+@@ -15,14 +15,11 @@
+ let
+   withTmpDb =
+     { name, postgresql }:
+-    let
+-      commandName = "postgrest-with-${name}";
+-      superuserRole = "postgres";
+-    in
++    let commandName = "postgrest-with-${name}"; in
+     checkedShellScript
+       {
+         name = commandName;
+-        docs = "Run the given command in a temporary database with ${name}. If you wish to mutate the database, login with the '${superuserRole}' role.";
++        docs = "Run the given command in a temporary database with ${name}";
+         args =
+           [
+             "ARG_OPTIONAL_SINGLE([fixtures], [f], [SQL file to load fixtures from], [test/spec/fixtures/load.sql])"
+@@ -69,8 +66,7 @@ let
+         log "Initializing database cluster..."
+         # We try to make the database cluster as independent as possible from the host
+         # by specifying the timezone, locale and encoding.
+-        # initdb -U creates a superuser(man initdb)
+-        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "${superuserRole}" --auth=trust \
++        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "$PGUSER" --auth=trust \
+           >> "$setuplog"
+ 
+         log "Starting the database cluster..."
+@@ -86,11 +82,8 @@ let
+         }
+         trap stop EXIT
+ 
+-        log "Creating a minimally privileged $PGUSER connection role..."
+-        createuser "$PGUSER" -U "${superuserRole}" --host="$tmpdir/socket" --no-createdb --no-inherit --no-superuser --no-createrole --no-replication --login
+-
+-        log "Loading fixtures under the ${superuserRole} role..."
+-        psql -U "${superuserRole}" -v PGUSER="$PGUSER" -v ON_ERROR_STOP=1 -f "$_arg_fixtures" >> "$setuplog"
++        log "Loading fixtures..."
++        psql -v ON_ERROR_STOP=1 -f "$_arg_fixtures" >> "$setuplog"
+ 
+         log "Done. Running command..."
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index f9425f23..642c4128 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -187,7 +187,6 @@ test-suite spec
+                       Feature.CorsSpec
+                       Feature.ExtraSearchPathSpec
+                       Feature.LegacyGucsSpec
+-                      Feature.NoSuperuserSpec
+                       Feature.ObservabilitySpec
+                       Feature.OpenApi.DisabledOpenApiSpec
+                       Feature.OpenApi.IgnorePrivOpenApiSpec
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index b86eded9..9ac260d9 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -40,7 +40,7 @@ import Text.InterpolatedString.Perl6 (q)
+ 
+ import PostgREST.Config.Database          (pgVersionStatement)
+ import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+-                                           pgVersion110, pgVersion120)
++                                           pgVersion110)
+ import PostgREST.SchemaCache.Identifiers  (AccessSet, FieldName,
+                                            QualifiedIdentifier (..),
+                                            Schema)
+@@ -506,8 +506,6 @@ tablesSqlQuery pgVer =
+   -- the tbl_constraints/key_col_usage CTEs are based on the standard "information_schema.table_constraints"/"information_schema.key_column_usage" views,
+   -- we cannot use those directly as they include the following privilege filter:
+   -- (pg_has_role(ss.relowner, 'USAGE'::text) OR has_column_privilege(ss.roid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'::text));
+-  -- on the "columns" CTE, left joining on pg_depend and pg_class is used to obtain the sequence name as a column default in case there are GENERATED .. AS IDENTITY,
+-  -- generated columns are only available from pg >= 10 but the query is agnostic to versions. dep.deptype = 'i' is done because there are other 'a' dependencies on PKs
+   [q|
+   WITH
+   columns AS (
+@@ -551,12 +549,6 @@ tablesSqlQuery pgVer =
+               ON t.typtype = 'd' AND t.typbasetype = bt.oid
+           LEFT JOIN (pg_collation co JOIN pg_namespace nco ON co.collnamespace = nco.oid)
+               ON a.attcollation = co.oid AND (nco.nspname <> 'pg_catalog'::name OR co.collname <> 'default'::name)
+-          LEFT JOIN pg_depend dep
+-              ON dep.refobjid = a.attrelid and dep.refobjsubid = a.attnum and dep.deptype = 'i'
+-          LEFT JOIN pg_class seqclass
+-              ON seqclass.oid = dep.objid
+-          LEFT JOIN pg_namespace seqsch
+-              ON seqsch.oid = seqclass.relnamespace
+       WHERE
+           NOT pg_is_other_temp_schema(nc.oid)
+           AND a.attnum > 0
+@@ -705,19 +697,17 @@ tablesSqlQuery pgVer =
+   "ORDER BY table_schema, table_name"
+   where
+     relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+-    columnDefault
+-      | pgVer >= pgVersion120 = [q|
+-          CASE
+-            WHEN a.attidentity  = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
+-            WHEN a.attgenerated = 's' THEN null
+-            ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
+-          END AS column_default,|]
+-      | pgVer >= pgVersion100 = [q|
+-          CASE
+-            WHEN a.attidentity = 'd' THEN format('nextval(%s)', quote_literal(seqsch.nspname || '.' || seqclass.relname))
+-            ELSE pg_get_expr(ad.adbin, ad.adrelid)::text
+-          END AS column_default,|]
+-      | otherwise  = "pg_get_expr(ad.adbin, ad.adrelid)::text as column_default,"
++    -- detect default values on columns that have GENERATED .. AS IDENTITY
++    columnDefault =
++      if pgVer >= pgVersion100
++        then [q|
++        CASE
++           WHEN nullif(a.attidentity, '') is null
++             THEN pg_get_expr(ad.adbin, ad.adrelid)::text
++             ELSE format('nextval(%s)', quote_literal(pg_get_serial_sequence(a.attrelid::regclass::text, a.attname::text)))
++        END AS column_default,|]
++        else "pg_get_expr(ad.adbin, ad.adrelid)::text AS column_default,"
++
+ 
+ -- | Gets many-to-one relationships and one-to-one(O2O) relationships, which are a refinement of the many-to-one's
+ allM2OandO2ORels :: PgVersion -> Bool -> SQL.Statement () [Relationship]
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index 638466d2..f96237c7 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -4,7 +4,7 @@
+ set search_path to public;
+ 
+ CREATE ROLE postgrest_test_anonymous;
+-ALTER ROLE :PGUSER SET pgrst.db_anon_role = 'postgrest_test_anonymous';
++ALTER ROLE :USER SET pgrst.db_anon_role = 'postgrest_test_anonymous';
+ 
+ CREATE ROLE postgrest_test_author;
+ 
+@@ -14,7 +14,7 @@ alter role postgrest_test_serializable set default_transaction_isolation = 'seri
+ CREATE ROLE postgrest_test_repeatable_read;
+ alter role postgrest_test_repeatable_read set default_transaction_isolation = 'REPEATABLE READ';
+ 
+-GRANT postgrest_test_anonymous, postgrest_test_author, postgrest_test_serializable, postgrest_test_repeatable_read TO :PGUSER;
++GRANT postgrest_test_anonymous, postgrest_test_author, postgrest_test_serializable, postgrest_test_repeatable_read TO :USER;
+ 
+ CREATE SCHEMA v1;
+ GRANT USAGE ON SCHEMA v1 TO postgrest_test_anonymous;
+diff --git a/test/load/fixtures.sql b/test/load/fixtures.sql
+index 72cf1e3e..48862048 100644
+--- a/test/load/fixtures.sql
++++ b/test/load/fixtures.sql
+@@ -1,5 +1,5 @@
+ CREATE ROLE postgrest_test_anonymous;
+-GRANT postgrest_test_anonymous TO :PGUSER;
++GRANT postgrest_test_anonymous TO :USER;
+ CREATE SCHEMA test;
+ 
+ -- PUT+PATCH target needs one record and column to modify
+diff --git a/test/spec/Feature/NoSuperuserSpec.hs b/test/spec/Feature/NoSuperuserSpec.hs
+deleted file mode 100644
+index 85738643..00000000
+--- a/test/spec/Feature/NoSuperuserSpec.hs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-module Feature.NoSuperuserSpec where
+-
+-import Network.Wai (Application)
+-
+-import Network.HTTP.Types
+-import Test.Hspec
+-import Test.Hspec.Wai
+-
+-import Protolude
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "No Superuser" $ do
+-    it "proves that the authenticator role is not a superuser" $ do
+-      request methodGet "/rpc/is_superuser"
+-          mempty
+-          ""
+-        `shouldRespondWith`
+-          "false"
+-          { matchStatus = 200 }
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 9babe03e..fbb933d1 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -13,8 +13,7 @@ import Text.Heredoc
+ 
+ import PostgREST.Config.PgVersion (PgVersion, pgVersion100,
+                                    pgVersion110, pgVersion112,
+-                                   pgVersion120, pgVersion130,
+-                                   pgVersion140)
++                                   pgVersion130)
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
+@@ -497,7 +496,7 @@ spec actualPgVersion = do
+               }
+ 
+         when (actualPgVersion >= pgVersion100) $
+-          it "inserts a default on a generated by default as identity column" $
++          it "inserts a default on a generated by default as identity column" $ do
+             request methodPost "/channels?columns=id,data,slug&select=data,slug" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
+                 [json| { "slug": "foo" } |]
+               `shouldRespondWith`
+@@ -506,29 +505,6 @@ spec actualPgVersion = do
+                 , matchHeaders = ["Preference-Applied" <:> "missing=default"]
+                 }
+ 
+-        when (actualPgVersion >= pgVersion120) $
+-          it "fails with a good error message on generated always columns" $
+-            request methodPost "/foo?columns=a,b" [("Prefer", "return=representation"), ("Prefer", "missing=default")]
+-                [json| [
+-                  {"a": "val"},
+-                  {"a": "val", "b": "val"}
+-                ]|]
+-              `shouldRespondWith`
+-                (if actualPgVersion < pgVersion140
+-                  then [json| {
+-                    "code": "42601",
+-                    "details": "Column \"b\" is a generated column.",
+-                    "hint": null,
+-                    "message": "cannot insert into column \"b\""
+-                  }|]
+-                  else [json| {
+-                    "code": "428C9",
+-                    "details": "Column \"b\" is a generated column.",
+-                    "hint": null,
+-                    "message": "cannot insert a non-DEFAULT value into column \"b\""
+-                  }|])
+-                { matchStatus  = 400 }
+-
+     it "inserts json that has duplicate keys" $ do
+       request methodPost "/tbl_w_json" [("Prefer", "return=representation")]
+           [json| { "data": { "a": 1, "a": 2 }, "id": 3 } |]
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index b590a67c..d54bde93 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -27,7 +27,6 @@ import qualified Feature.ConcurrentSpec
+ import qualified Feature.CorsSpec
+ import qualified Feature.ExtraSearchPathSpec
+ import qualified Feature.LegacyGucsSpec
+-import qualified Feature.NoSuperuserSpec
+ import qualified Feature.ObservabilitySpec
+ import qualified Feature.OpenApi.DisabledOpenApiSpec
+ import qualified Feature.OpenApi.IgnorePrivOpenApiSpec
+@@ -150,7 +149,6 @@ main = do
+         , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+         , ("Feature.Query.RelatedQueriesSpec"            , Feature.Query.RelatedQueriesSpec.spec)
+         , ("Feature.Query.SpreadQueriesSpec"             , Feature.Query.SpreadQueriesSpec.spec)
+-        , ("Feature.NoSuperuserSpec"                     , Feature.NoSuperuserSpec.spec)
+         ]
+ 
+   hspec $ do
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 1c7d49bb..64d09b3b 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -211,7 +211,7 @@ testObservabilityCfg = baseCfg { configServerTraceHeader = Just $ mk "X-Request-
+ 
+ analyzeTable :: Text -> IO ()
+ analyzeTable tableName =
+-  void $ readProcess "psql" ["-U", "postgres", "--set", "ON_ERROR_STOP=1", "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []
++  void $ readProcess "psql" ["--set", "ON_ERROR_STOP=1", "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []
+ 
+ rangeHdrs :: ByteRange -> [Header]
+ rangeHdrs r = [rangeUnit, (hRange, renderByteRange r)]
+diff --git a/test/spec/fixtures/roles.sql b/test/spec/fixtures/roles.sql
+index a628bf1e..93b962d8 100644
+--- a/test/spec/fixtures/roles.sql
++++ b/test/spec/fixtures/roles.sql
+@@ -1,6 +1,7 @@
++\set AUTHENTICATOR current_user
+ DROP ROLE IF EXISTS postgrest_test_anonymous, postgrest_test_default_role, postgrest_test_author;
+ CREATE ROLE postgrest_test_anonymous;
+ CREATE ROLE postgrest_test_default_role;
+ CREATE ROLE postgrest_test_author;
+ 
+-GRANT postgrest_test_anonymous, postgrest_test_default_role, postgrest_test_author TO :PGUSER;
++GRANT postgrest_test_anonymous, postgrest_test_default_role, postgrest_test_author TO :USER;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index d78f0eac..3ec8aa93 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3122,25 +3122,3 @@ BEGIN
+   END IF;
+ END
+ $do$;
+-
+-CREATE FUNCTION test.is_superuser() RETURNS boolean
+-LANGUAGE sql
+-AS $$
+-  select current_setting('is_superuser')::boolean;
+-$$;
+-
+-DO $do$
+-BEGIN
+-  IF current_setting('server_version_num')::INT >= 120000 THEN
+-    CREATE TABLE test.foo (
+-      a text,
+-      b text GENERATED ALWAYS AS (
+-          case WHEN a = 'telegram' THEN 'im'
+-               WHEN a = 'proton' THEN 'email'
+-               WHEN a = 'infinity' THEN 'idea'
+-               ELSE 'bad idea'
+-          end) stored
+-    );
+-  END IF;
+-END
+-$do$;

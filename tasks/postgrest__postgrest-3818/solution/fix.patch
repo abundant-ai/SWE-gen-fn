@@ -1,0 +1,194 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e767eef..0bdd3ba9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3560, Log resolved host in "Listening on ..." messages - @develop7
+  - #3727, Log maximum pool size - @steve-chavez
+  - #1536, Add string comparison feature for jwt-role-claim-key - @taimoorzaeem
++ - #3747, Allow `not_null` value for the `is` operator - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/references/api/tables_views.rst b/docs/references/api/tables_views.rst
+index cc714871..519c3c0e 100644
+--- a/docs/references/api/tables_views.rst
++++ b/docs/references/api/tables_views.rst
+@@ -72,7 +72,7 @@ imatch        :code:`~*`                ~* operator, see :ref:`pattern_matching`
+ in            :code:`IN`                one of a list of values, e.g. :code:`?a=in.(1,2,3)`
+                                         – also supports commas in quoted strings like
+                                         :code:`?a=in.("hi,there","yes,you")`
+-is            :code:`IS`                checking for exact equality (null,true,false,unknown)
++is            :code:`IS`                checking for exact equality (null,not_null,true,false,unknown)
+ isdistinct    :code:`IS DISTINCT FROM`  not equal, treating :code:`NULL` as a comparable value
+ fts           :code:`@@`                :ref:`fts` using to_tsquery
+ plfts         :code:`@@`                :ref:`fts` using plainto_tsquery
+diff --git a/src/PostgREST/ApiRequest/QueryParams.hs b/src/PostgREST/ApiRequest/QueryParams.hs
+index f9150e04..a969bcad 100644
+--- a/src/PostgREST/ApiRequest/QueryParams.hs
++++ b/src/PostgREST/ApiRequest/QueryParams.hs
+@@ -46,7 +46,7 @@ import PostgREST.SchemaCache.Identifiers (FieldName)
+ import PostgREST.ApiRequest.Types (AggregateFunction (..),
+                                    EmbedParam (..), EmbedPath, Field,
+                                    Filter (..), FtsOperator (..),
+-                                   Hint, JoinType (..),
++                                   Hint, IsVal (..), JoinType (..),
+                                    JsonOperand (..),
+                                    JsonOperation (..), JsonPath,
+                                    ListVal, LogicOperator (..),
+@@ -56,8 +56,7 @@ import PostgREST.ApiRequest.Types (AggregateFunction (..),
+                                    OrderNulls (..), OrderTerm (..),
+                                    QPError (..), QuantOperator (..),
+                                    SelectItem (..),
+-                                   SimpleOperator (..), SingleVal,
+-                                   TrileanVal (..))
++                                   SimpleOperator (..), SingleVal)
+ 
+ import Protolude hiding (Sum, try)
+ 
+@@ -640,7 +639,7 @@ pOpExpr pSVal = do
+     pOperation = pIn <|> pIs <|> pIsDist <|> try pFts <|> try pSimpleOp <|> try pQuantOp <?> "operator (eq, gt, ...)"
+ 
+     pIn = In <$> (try (string "in" *> pDelimiter) *> pListVal)
+-    pIs = Is <$> (try (string "is" *> pDelimiter) *> pTriVal)
++    pIs = Is <$> (try (string "is" *> pDelimiter) *> pIsVal)
+ 
+     pIsDist = IsDistinctFrom <$> (try (string "isdistinct" *> pDelimiter) *> pSVal)
+ 
+@@ -653,11 +652,12 @@ pOpExpr pSVal = do
+       quant <- optionMaybe $ try (between (char '(') (char ')') (try (string "any" $> QuantAny) <|> string "all" $> QuantAll))
+       pDelimiter *> (OpQuant op quant <$> pSVal)
+ 
+-    pTriVal = try (ciString "null"    $> TriNull)
+-          <|> try (ciString "unknown" $> TriUnknown)
+-          <|> try (ciString "true"    $> TriTrue)
+-          <|> try (ciString "false"   $> TriFalse)
+-          <?> "null or trilean value (unknown, true, false)"
++    pIsVal =  try (ciString "null"     $> IsNull)
++          <|> try (ciString "not_null" $> IsNotNull)
++          <|> try (ciString "true"     $> IsTriTrue)
++          <|> try (ciString "false"    $> IsTriFalse)
++          <|> try (ciString "unknown"  $> IsTriUnknown)
++          <?> "isVal: (null, not_null, true, false, unknown)"
+ 
+     pFts = do
+       op <-  try (string "fts"   $> FilterFts)
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 77bccbe7..9bebcd2c 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -28,7 +28,7 @@ module PostgREST.ApiRequest.Types
+   , RaiseError(..)
+   , RangeError(..)
+   , SingleVal
+-  , TrileanVal(..)
++  , IsVal(..)
+   , SimpleOperator(..)
+   , QuantOperator(..)
+   , FtsOperator(..)
+@@ -218,7 +218,7 @@ data Operation
+   = Op SimpleOperator SingleVal
+   | OpQuant QuantOperator (Maybe OpQuantifier) SingleVal
+   | In ListVal
+-  | Is TrileanVal
++  | Is IsVal
+   | IsDistinctFrom SingleVal
+   | Fts FtsOperator (Maybe Language) SingleVal
+   deriving (Eq, Show)
+@@ -231,12 +231,13 @@ type SingleVal = Text
+ -- | Represents a list value in a filter, e.g. id=in.(val1,val2,val3)
+ type ListVal = [Text]
+ 
+--- | Three-valued logic values
+-data TrileanVal
+-  = TriTrue
+-  | TriFalse
+-  | TriNull
+-  | TriUnknown
++data IsVal
++  = IsNull
++  | IsNotNull
++  -- Trilean values
++  | IsTriTrue
++  | IsTriFalse
++  | IsTriUnknown
+   deriving (Eq, Show)
+ 
+ -- Operators that are quantifiable, i.e. they can be used with the any/all modifiers
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 2d30e207..3a31d72a 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -795,8 +795,8 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ --
+ -- Setup:
+ --
+--- >>> let nullOp    = OpExpr True (Is TriNull)
+--- >>> let nonNullOp = OpExpr False (Is TriNull)
++-- >>> let nullOp    = OpExpr True (Is IsNull)
++-- >>> let nonNullOp = OpExpr False (Is IsNull)
+ -- >>> let notEqOp   = OpExpr True (Op OpNotEqual "val")
+ -- >>> :{
+ -- -- this represents the `projects(*)` part on `/clients?select=*,projects(*)`
+@@ -847,7 +847,7 @@ addRelatedOrders (Node rp@ReadPlan{order,from} forest) = do
+ -- Don't do anything to the filter if there's no embedding (a subtree) on projects. Assume it's a normal filter.
+ --
+ -- >>> ReadPlan.where_ . rootLabel <$> addNullEmbedFilters (readPlanTree nullOp [])
+--- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is TriNull)})]
++-- Right [CoercibleStmnt (CoercibleFilter {field = CoercibleField {cfName = "projects", cfJsonPath = [], cfToJson = False, cfIRType = "", cfTransform = Nothing, cfDefault = Nothing, cfFullRow = False}, opExpr = OpExpr True (Is IsNull)})]
+ --
+ -- If there's an embedding on projects, then change the filter to use the internal aggregate name (`clients_projects_1`) so the filter can succeed later.
+ --
+@@ -869,7 +869,7 @@ addNullEmbedFilters (Node rp@ReadPlan{where_=curLogic} forest) = do
+       flt@(CoercibleStmnt (CoercibleFilter (CoercibleField fld [] _ _ _ _ _) opExpr)) ->
+         let foundRP = find (\ReadPlan{relName, relAlias} -> fld == fromMaybe relName relAlias) rPlans in
+         case (foundRP, opExpr) of
+-          (Just ReadPlan{relAggAlias}, OpExpr b (Is TriNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
++          (Just ReadPlan{relAggAlias}, OpExpr b (Is IsNull)) -> Right $ CoercibleStmnt $ CoercibleFilterNullEmbed b relAggAlias
+           _                                                   -> Right flt
+       flt@(CoercibleStmnt _) ->
+         Right flt
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index b2e58841..fa79a564 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -59,6 +59,7 @@ import NeatInterpolation (trimming)
+ import PostgREST.ApiRequest.Types        (AggregateFunction (..),
+                                           Alias, Cast,
+                                           FtsOperator (..),
++                                          IsVal (..),
+                                           JsonOperand (..),
+                                           JsonOperation (..),
+                                           JsonPath,
+@@ -69,8 +70,7 @@ import PostgREST.ApiRequest.Types        (AggregateFunction (..),
+                                           OrderDirection (..),
+                                           OrderNulls (..),
+                                           QuantOperator (..),
+-                                          SimpleOperator (..),
+-                                          TrileanVal (..))
++                                          SimpleOperator (..))
+ import PostgREST.MediaType               (MTVndPlanFormat (..),
+                                           MTVndPlanOption (..))
+ import PostgREST.Plan.ReadPlan           (JoinCondition (..))
+@@ -380,13 +380,15 @@ pgFmtFilter table (CoercibleFilter fld (OpExpr hasNot oper)) = notOp <> " " <> p
+ 
+    -- IS cannot be prepared. `PREPARE boolplan AS SELECT * FROM projects where id IS $1` will give a syntax error.
+    -- The above can be fixed by using `PREPARE boolplan AS SELECT * FROM projects where id IS NOT DISTINCT FROM $1;`
+-   -- However that would not accept the TRUE/FALSE/NULL/UNKNOWN keywords. See: https://stackoverflow.com/questions/6133525/proper-way-to-set-preparedstatement-parameter-to-null-under-postgres.
++   -- However that would not accept the TRUE/FALSE/NULL/"NOT NULL"/UNKNOWN keywords. See: https://stackoverflow.com/questions/6133525/proper-way-to-set-preparedstatement-parameter-to-null-under-postgres.
+    -- This is why `IS` operands are whitelisted at the Parsers.hs level
+-   Is triVal -> " IS " <> case triVal of
+-     TriTrue    -> "TRUE"
+-     TriFalse   -> "FALSE"
+-     TriNull    -> "NULL"
+-     TriUnknown -> "UNKNOWN"
++   Is isVal -> " IS " <>
++      case isVal of
++        IsNull       -> "NULL"
++        IsNotNull    -> "NOT NULL"
++        IsTriTrue    -> "TRUE"
++        IsTriFalse   -> "FALSE"
++        IsTriUnknown -> "UNKNOWN"
+ 
+    IsDistinctFrom val -> " IS DISTINCT FROM " <> unknownLiteral val
+ 

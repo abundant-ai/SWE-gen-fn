@@ -1,0 +1,90 @@
+diff --git a/Changes b/Changes
+index 61675f6e0b..35ce38355d 100644
+--- a/Changes
++++ b/Changes
+@@ -334,11 +334,6 @@ Working version
+ - #14297, #14299: Avoid iterating on hash tables to produce types or terms
+   (Vincent Laviron, review by Nicolás Ojeda Bär and Gabriel Scherer)
+ 
+-* #14322: Remove leftover hacks for handling pattern constraints
+-  As a side effect, `let rec (_ as x) = ...` is now always rejected instead of
+-  being treated as equivalent to `let rec x = ...`
+-  (Vincent Laviron, review by Alistair O'Brien and Florian Angeletti)
+-
+ ### Build system:
+ 
+ - #13810: Support build of cross compilers to native freestanding targets
+diff --git a/lambda/matching.ml b/lambda/matching.ml
+index f4ae0ec289..e3b25373d7 100644
+--- a/lambda/matching.ml
++++ b/lambda/matching.ml
+@@ -4240,8 +4240,14 @@ let for_let ~scopes loc param pat body =
+       (* This eliminates a useless variable (and stack slot in bytecode)
+          for "let _ = ...". See #6865. *)
+       Lsequence (param, body)
+-  | Tpat_var (id, _, _) ->
+-      (* Fast path, and keep track of simple bindings to unboxable numbers. *)
++  | Tpat_var (id, _, _) | Tpat_alias ({ pat_desc = Tpat_any }, id, _, _, _) ->
++      (* Fast path, and keep track of simple bindings to unboxable numbers.
++
++         Note: the (Tpat_alias (Tpat_any, id)) case needs to be
++         supported as well because the type-checker emits a typedtree
++         of this shape in presence of type constraints -- see the
++         non-polymorphic Ppat_constraint case in type_pat_aux.
++      *)
+       let k = Typeopt.value_kind pat.pat_env pat.pat_type in
+       Llet (Strict, k, id, param, body)
+   | _ ->
+diff --git a/testsuite/tests/typing-misc/typecore_errors.ml b/testsuite/tests/typing-misc/typecore_errors.ml
+index a3ca955e62..21d657fc37 100644
+--- a/testsuite/tests/typing-misc/typecore_errors.ml
++++ b/testsuite/tests/typing-misc/typecore_errors.ml
+@@ -307,17 +307,6 @@ Line 2, characters 8-11:
+ Error: Only variables are allowed as left-hand side of "let rec"
+ |}]
+ 
+-(** Alias pattern in let rec
+-    (accepted in OCaml versions up to and including 5.4) *)
+-let rec (_ as f) = fun () -> f ()
+-
+-[%%expect {|
+-Line 1, characters 8-16:
+-1 | let rec (_ as f) = fun () -> f ()
+-            ^^^^^^^^
+-Error: Only variables are allowed as left-hand side of "let rec"
+-|}]
+-
+ (** Non-linear pattern *)
+ 
+ let quadratic (x,x) = x * x
+diff --git a/typing/typecore.ml b/typing/typecore.ml
+index bb29529499..2fccf5b64b 100644
+--- a/typing/typecore.ml
++++ b/typing/typecore.ml
+@@ -6679,6 +6679,7 @@ and type_let ?check ?check_strict
+     List.iter
+       (fun {vb_pat=pat} -> match pat.pat_desc with
+            Tpat_var _ -> ()
++         | Tpat_alias ({pat_desc=Tpat_any}, _, _, _, _) -> ()
+          | _ -> raise(Error(pat.pat_loc, env, Illegal_letrec_pat)))
+       l;
+   List.iter (fun vb ->
+diff --git a/typing/untypeast.ml b/typing/untypeast.ml
+index 6933940b9a..67edf15374 100644
+--- a/typing/untypeast.ml
++++ b/typing/untypeast.ml
+@@ -310,6 +310,14 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
+               Ppat_var name
+         end
+ 
++    (* We transform (_ as x) in x if _ and x have the same location.
++       The compiler transforms (x:t) into (_ as x : t).
++       This avoids transforming a warning 27 into a 26.
++     *)
++    | Tpat_alias ({pat_desc = Tpat_any; pat_loc}, _id, name, _, _ty)
++         when pat_loc = pat.pat_loc ->
++       Ppat_var name
++
+     | Tpat_alias (pat, _id, name, _, _ty) ->
+         Ppat_alias (sub.pat sub pat, name)
+     | Tpat_constant cst -> Ppat_constant (constant cst)

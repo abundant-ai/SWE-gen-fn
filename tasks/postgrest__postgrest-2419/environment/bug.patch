@@ -1,0 +1,680 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index aec2dd57..1f67a1d9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -40,7 +40,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Can generate the plan for different media types using the `for` parameter: `Accept: application/vnd.pgrst.plan; for="application/vnd.pgrst.object"`
+    + Different options for the plan can be used with the `options` parameter: `Accept: application/vnd.pgrst.plan; options=analyze|verbose|settings|buffers|wal`
+    + The plan can be obtained in text or json by using different media type suffixes: `Accept: application/vnd.pgrst.plan+text` and `Accept: application/vnd.pgrst.plan+json`.
+- - #2144, Allow extending/overriding relationships for resource embedding - @steve-chavez
++ - #2397, Fix race conditions managing database connection helper - @robx
+ 
+ ### Fixed
+ 
+@@ -65,7 +65,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2376, OPTIONS requests no longer start an empty database transaction - @steve-chavez
+  - #2395, Allow using columns with dollar sign($) without double quoting in filters and `select` - @steve-chavez
+  - #2410, Fix loop crash error on startup in Postgres 15 beta 2. Log: "UNION types \"char\" and text cannot be matched". - @yevon
+- - #2397, Fix race conditions managing database connection helper - @robx
+ 
+ ### Changed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index d24c1b9f..9c04aed3 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -192,7 +192,6 @@ test-suite spec
+                       Feature.OpenApi.SecurityOpenApiSpec
+                       Feature.OptionsSpec
+                       Feature.Query.AndOrParamsSpec
+-                      Feature.Query.ComputedRelsSpec
+                       Feature.Query.DeleteSpec
+                       Feature.Query.EmbedDisambiguationSpec
+                       Feature.Query.EmbedInnerJoinSpec
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 5c5cd545..3d69a584 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -90,36 +90,18 @@ queryDbStructure schemas extraSearchPath prepared = do
+   keyDeps <- SQL.statement (schemas, extraSearchPath) $ allViewsKeyDependencies prepared
+   m2oRels <- SQL.statement mempty $ allM2ORels pgVer prepared
+   procs   <- SQL.statement schemas $ allProcs pgVer prepared
+-  cRels   <- SQL.statement mempty $ allComputedRels prepared
+ 
+   let tabsWViewsPks = addViewPrimaryKeys tabs keyDeps
+-      rels          = addO2MRels $ addM2MRels tabsWViewsPks $ addViewM2ORels keyDeps m2oRels
++      rels          = relsToMap $ addO2MRels $ addM2MRels tabsWViewsPks $ addViewM2ORels keyDeps m2oRels
+ 
+   return $ removeInternal schemas $ DbStructure {
+       dbTables = tabsWViewsPks
+-    , dbRelationships = getOverrideRelationshipsMap rels cRels
++    , dbRelationships = rels
+     , dbProcs = procs
+     }
+-
+--- | overrides detected relationships with the computed relationships and gets the RelationshipsMap
+-getOverrideRelationshipsMap :: [Relationship] -> [Relationship] -> RelationshipsMap
+-getOverrideRelationshipsMap rels cRels =
+-  sort <$> deformedRelMap patchedRels
+   where
+-    -- there can only be a single (table_type, func_name) pair in a function definition `test.function(table_type)`, so we use HM.fromList to disallow duplicates
+-    computedRels  = HM.fromList $ relMapKey <$> cRels
+-    -- here we override the detected relationships with the user computed relationships, HM.union makes sure computedRels prevail
+-    patchedRels   = HM.union computedRels (relsMap rels)
+-    relsMap = HM.fromListWith (++) . fmap relMapKey
+-    relMapKey rel = case rel of
+-      Relationship{relTable,relForeignTable} -> ((relTable, relForeignTable), [rel])
+-      -- we use (relTable, relFunction) as key to override detected relationships with the function name
+-      ComputedRelationship{relTable,relFunction} -> ((relTable, relFunction), [rel])
+-    -- Since a relationship is between a table and foreign table, the logical way to index/search is by their table/ftable QualifiedIdentifier
+-    -- However, because we allow searching a relationship by the columns of the foreign key(using the "column as target" disambiguation) we lose the
+-    -- ability to index by the foreign table name, so we deform the key. TODO remove once support for "column as target" is gone.
+-    deformedRelMap = HM.fromListWith (++) . fmap addDeformedRelKey . HM.toList
+-    addDeformedRelKey ((relT, relFT), rls) = ((relT, qiSchema relFT), rls)
++    relsToMap = map sort . HM.fromListWith (++) . map ((\(x, fSch, y) -> ((x, fSch), [y])) . addKey)
++    addKey rel = (relTable rel, qiSchema $ relForeignTable rel, rel)
+ 
+ -- | Remove db objects that belong to an internal schema(not exposed through the API) from the DbStructure.
+ removeInternal :: [Schema] -> DbStructure -> DbStructure
+@@ -131,8 +113,7 @@ removeInternal schemas dbStruct =
+     , dbProcs         = dbProcs dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+     }
+   where
+-    hasInternalJunction ComputedRelationship{} = False
+-    hasInternalJunction Relationship{relCardinality=card} = case card of
++    hasInternalJunction rel = case relCardinality rel of
+       M2M Junction{junTable} -> qiSchema junTable `notElem` schemas
+       _                      -> False
+ 
+@@ -662,50 +643,6 @@ allM2ORels pgVer =
+       else mempty) <>
+     "ORDER BY conrelid, conname"
+ 
+-allComputedRels :: Bool -> SQL.Statement () [Relationship]
+-allComputedRels =
+-  SQL.Statement sql HE.noParams (HD.rowList cRelRow)
+- where
+-  sql = [q|
+-    with
+-    all_relations as (
+-      select reltype
+-      from pg_class
+-      where relkind in ('v','r','m','f','p')
+-    ),
+-    computed_rels as (
+-      select
+-        p.pronamespace::regnamespace::text as schema,
+-        p.proname::text                    as name,
+-        arg_schema.nspname::text           as rel_table_schema,
+-        arg_name.typname::text             as rel_table_name,
+-        ret_schema.nspname::text           as rel_ftable_schema,
+-        ret_name.typname::text             as rel_ftable_name,
+-        p.prorows = 1                      as single_row
+-      from pg_proc p
+-        join pg_type      arg_name   on arg_name.oid = p.proargtypes[0]
+-        join pg_namespace arg_schema on arg_schema.oid = arg_name.typnamespace
+-        join pg_type      ret_name   on ret_name.oid = p.prorettype
+-        join pg_namespace ret_schema on ret_schema.oid = ret_name.typnamespace
+-      where
+-        p.pronargs = 1
+-        and p.proargtypes[0] in (select reltype from all_relations)
+-        and p.prorettype in (select reltype from all_relations)
+-    )
+-    select
+-      *,
+-      row(rel_table_schema, rel_table_name) = row(rel_ftable_schema, rel_ftable_name) as is_self
+-    from computed_rels;
+-  |]
+-
+-  cRelRow =
+-    ComputedRelationship <$>
+-    (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    column HD.bool <*>
+-    column HD.bool
+-
+ -- | Returns all the views' primary keys and foreign keys dependencies
+ allViewsKeyDependencies :: Bool -> SQL.Statement ([Schema], [Schema]) [ViewKeyDependency]
+ allViewsKeyDependencies =
+diff --git a/src/PostgREST/DbStructure/Relationship.hs b/src/PostgREST/DbStructure/Relationship.hs
+index b8d4b1f6..37f839db 100644
+--- a/src/PostgREST/DbStructure/Relationship.hs
++++ b/src/PostgREST/DbStructure/Relationship.hs
+@@ -26,13 +26,6 @@ data Relationship = Relationship
+   , relTableIsView  :: Bool
+   , relFTableIsView :: Bool
+   }
+-  | ComputedRelationship
+-  { relFunction     :: QualifiedIdentifier
+-  , relTable        :: QualifiedIdentifier
+-  , relForeignTable :: QualifiedIdentifier
+-  , relToOne        :: Bool
+-  , relIsSelf       :: Bool
+-  }
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 
+ -- | The relationship cardinality
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index ed083699..c8f80e26 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -171,8 +171,6 @@ instance JSON.ToJSON ApiRequestError where
+     "hint"    .= ("Try renaming the parameters or the function itself in the database so function overloading can be resolved" :: Text)]
+ 
+ compressedRel :: Relationship -> JSON.Value
+--- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+-compressedRel ComputedRelationship{} = JSON.object mempty
+ compressedRel Relationship{..} =
+   let
+     fmtEls els = "(" <> T.intercalate ", " els <> ")"
+@@ -202,8 +200,6 @@ relHint rels = T.intercalate ", " (hintList <$> rels)
+         M2M Junction{..} -> buildHint (qiName junTable)
+         M2O cons _       -> buildHint cons
+         O2M cons _       -> buildHint cons
+-    -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+-    hintList ComputedRelationship{} = mempty
+ 
+ data PgError = PgError Authenticated SQL.UsageError
+ type Authenticated = Bool
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 6ac9f2ac..56295e13 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -1,5 +1,4 @@
+ {-# LANGUAGE DuplicateRecordFields #-}
+-{-# LANGUAGE NamedFieldPuns        #-}
+ {-|
+ Module      : PostgREST.Query.QueryBuilder
+ Description : PostgREST SQL queries generating functions.
+@@ -25,7 +24,6 @@ import Data.Tree (Tree (..))
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.DbStructure.Proc         (ProcParam (..))
+ import PostgREST.DbStructure.Relationship (Cardinality (..),
+-                                           Junction (..),
+                                            Relationship (..))
+ import PostgREST.Request.Preferences      (PreferResolution (..))
+ 
+@@ -38,10 +36,10 @@ import PostgREST.Request.Types
+ import Protolude
+ 
+ readRequestToQuery :: ReadRequest -> SQL.Snippet
+-readRequestToQuery (Node (Select colSelects mainQi tblAlias logicForest joinConditions_ ordts range, (_, rel, _, _, _, _)) forest) =
++readRequestToQuery (Node (Select colSelects mainQi tblAlias implJoins logicForest joinConditions_ ordts range, _) forest) =
+   "SELECT " <>
+   intercalateSnippet ", " ((pgFmtSelectItem qi <$> colSelects) ++ selects) <> " " <>
+-  fromFrag <> " " <>
++  "FROM " <> SQL.sql (BS.intercalate ", " (tabl : implJs)) <> " " <>
+   intercalateSnippet " " joins <> " " <>
+   (if null logicForest && null joinConditions_
+     then mempty
+@@ -49,26 +47,23 @@ readRequestToQuery (Node (Select colSelects mainQi tblAlias logicForest joinCond
+   orderF qi ordts <> " " <>
+   limitOffsetF range
+   where
+-    fromFrag = fromF rel mainQi tblAlias
+-    qi = getQualifiedIdentifier rel mainQi tblAlias
++    implJs = fromQi <$> implJoins
++    tabl = fromQi mainQi <> maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias
++    qi = maybe mainQi (QualifiedIdentifier mempty) tblAlias
+     (selects, joins) = foldr getSelectsJoins ([],[]) forest
+ 
+ getSelectsJoins :: ReadRequest -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+-getSelectsJoins (Node (_, (_, Nothing, _, _, _, _)) _) _ = ([], [])
+-getSelectsJoins rr@(Node (_, (name, Just rel, alias, _, joinType, _)) _) (selects,joins) =
++getSelectsJoins rr@(Node (_, (name, Just Relationship{relCardinality=card,relTable=QualifiedIdentifier{qiName=table}}, alias, _, joinType, _)) _) (selects,joins) =
+   let
+     subquery = readRequestToQuery rr
+     aliasOrName = fromMaybe name alias
+-    locTblName = qiName (relTable rel) <> "_" <> aliasOrName
++    locTblName = table <> "_" <> aliasOrName
+     localTableName = pgFmtIdent locTblName
+     internalTableName = pgFmtIdent $ "_" <> locTblName
+     correlatedSubquery sub al cond =
+       (if joinType == Just JTInner then "INNER" else "LEFT") <> " JOIN LATERAL ( " <> sub <> " ) AS " <> SQL.sql al <> " ON " <> cond
+-    (sel, joi) = case rel of
+-      Relationship{relCardinality=M2O _ _} ->
+-        ( SQL.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
+-        , correlatedSubquery subquery localTableName "TRUE")
+-      ComputedRelationship{relToOne=True} ->
++    (sel, joi) = case card of
++      M2O _ _ ->
+         ( SQL.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
+         , correlatedSubquery subquery localTableName "TRUE")
+       _ ->
+@@ -79,6 +74,7 @@ getSelectsJoins rr@(Node (_, (name, Just rel, alias, _, joinType, _)) _) (select
+           ) localTableName $ if joinType == Just JTInner then SQL.sql localTableName <> " IS NOT NULL" else "TRUE")
+   in
+   (sel:selects, joi:joins)
++getSelectsJoins (Node (_, (_, Nothing, _, _, _, _)) _) _ = ([], [])
+ 
+ mutateRequestToQuery :: MutateRequest -> SQL.Snippet
+ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
+@@ -222,19 +218,20 @@ requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall r
+ -- See https://github.com/PostgREST/postgrest/issues/2009#issuecomment-977473031
+ -- Only for the nodes that have an INNER JOIN linked to the root level.
+ readRequestToCountQuery :: ReadRequest -> SQL.Snippet
+-readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, where_=logicForest, joinConditions=joinConditions_}, (_, rel, _, _, _, _)) forest) =
+-  "SELECT 1 " <> fromFrag <>
++readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, implicitJoins=implJoins, where_=logicForest, joinConditions=joinConditions_}, _) forest) =
++  "SELECT 1 FROM " <> SQL.sql (BS.intercalate ", " (tabl : implJs)) <>
+   (if null logicForest && null joinConditions_ && null subQueries
+     then mempty
+     else " WHERE " ) <>
+   intercalateSnippet " AND " (
+-    map (pgFmtLogicTree qi) logicForest ++
++    map (pgFmtLogicTree treeQi) logicForest ++
+     map pgFmtJoinCondition joinConditions_ ++
+     subQueries
+   )
+   where
+-    qi = getQualifiedIdentifier rel mainQi tblAlias
+-    fromFrag = fromF rel mainQi tblAlias
++    treeQi = maybe mainQi (QualifiedIdentifier (qiSchema mainQi)) tblAlias
++    tabl = fromQi mainQi <> maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias
++    implJs = fromQi <$> implJoins
+     subQueries = foldr existsSubquery [] forest
+     existsSubquery :: ReadRequest -> [SQL.Snippet] -> [SQL.Snippet]
+     existsSubquery readReq@(Node (_, (_, _, _, _, joinType, _)) _) rest =
+@@ -244,20 +241,3 @@ readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, where_=lo
+ 
+ limitedQuery :: SQL.Snippet -> Maybe Integer -> SQL.Snippet
+ limitedQuery query maxRows = query <> SQL.sql (maybe mempty (\x -> " LIMIT " <> BS.pack (show x)) maxRows)
+-
+--- TODO refactor so this function is uneeded and ComputedRelationship QualifiedIdentifier comes from the ReadQuery type
+-getQualifiedIdentifier :: Maybe Relationship -> QualifiedIdentifier -> Maybe Alias -> QualifiedIdentifier
+-getQualifiedIdentifier rel mainQi tblAlias = case rel of
+-  Just ComputedRelationship{relFunction} -> QualifiedIdentifier mempty $ fromMaybe (qiName relFunction) tblAlias
+-  _                                      -> maybe mainQi (QualifiedIdentifier mempty) tblAlias
+-
+--- FROM clause plus implicit joins
+-fromF :: Maybe Relationship -> QualifiedIdentifier -> Maybe Alias -> SQL.Snippet
+-fromF rel mainQi tblAlias = SQL.sql $ "FROM " <>
+-  (case rel of
+-    Just ComputedRelationship{relFunction,relTable} -> fromQi relFunction <> "(" <> pgFmtIdent (qiName relTable) <> ")"
+-    _                                               -> fromQi mainQi) <>
+-  maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias <>
+-  (case rel of
+-    Just Relationship{relCardinality=M2M Junction{junTable=jt}} -> ", " <> fromQi jt
+-    _                                                           -> mempty)
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index a5ed7718..5df3cd38 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -87,7 +87,7 @@ initReadRequest rootQi rootAlias =
+     rootDepth = 0
+     rootSchema = qiSchema rootQi
+     rootName = qiName rootQi
+-    initial = Node (Select [] rootQi rootAlias [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
++    initial = Node (Select [] rootQi rootAlias [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
+     treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
+     treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node (q, i) rForest) =
+       let nxtDepth = succ depth in
+@@ -95,7 +95,7 @@ initReadRequest rootQi rootAlias =
+         [] -> Node (q {select=fld:select q}, i) rForest
+         _  -> Node (q, i) $
+               foldr (treeEntry nxtDepth)
+-              (Node (Select [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] allRange,
++              (Node (Select [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] [] allRange,
+                 (fn, Nothing, alias, hint, joinType, nxtDepth)) [])
+               fldForest:rForest
+ 
+@@ -109,19 +109,16 @@ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> reque
+ 
+ augmentRequestWithJoin :: Schema -> RelationshipsMap -> ReadRequest -> Either ApiRequestError ReadRequest
+ augmentRequestWithJoin schema allRels request =
+- addJoinConditions Nothing <$> addRels schema allRels Nothing request
++  addRels schema allRels Nothing request
++  >>= addJoinConditions Nothing
+ 
+ addRels :: Schema -> RelationshipsMap -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
+   case parentNode of
+     Just (Node (Select{from=parentNodeQi, fromAlias=aliasQi}, _) _) ->
+       let newFrom r = if qiName tbl == nodeName then relForeignTable r else tbl
+-          newReadNode = (\r ->
+-            if not $ relIsSelf r -- add alias if self rel TODO consolidate aliasing in another function
+-              then (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType, depth))
+-              else (query{from=newFrom r, fromAlias=Just (qiName (newFrom r) <> "_" <> show depth)}, (nodeName, Just r, alias, hint, joinType, depth))
+-            ) <$> rel
+-          origin = if depth == 1 -- Only on depth 1 we check if the root(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
++          newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType, depth))) <$> rel
++          origin = if depth == 1 -- Only on depth 1 we check if the parent(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
+             then fromMaybe (qiName parentNodeQi) aliasQi
+             else qiName parentNodeQi
+           rel = findRel schema allRels origin nodeName hint
+@@ -134,28 +131,6 @@ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, a
+     updateForest :: Maybe ReadRequest -> Either ApiRequestError [ReadRequest]
+     updateForest rq = addRels schema allRels rq `traverse` forest
+ 
+--- applies aliasing to join conditions TODO refactor, this should go into the querybuilder module
+-addJoinConditions :: Maybe Alias -> ReadRequest -> ReadRequest
+-addJoinConditions _ (Node node@(Select{fromAlias=tblAlias}, (_, Nothing, _, _, _, _)) forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions _ (Node node@(Select{fromAlias=tblAlias}, (_, Just ComputedRelationship{}, _, _, _, _)) forest) = Node node (addJoinConditions tblAlias <$> forest)
+-addJoinConditions previousAlias (Node (query@Select{fromAlias=tblAlias}, nodeProps@(_, Just (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} _ card _ _), _, _, _, _)) forest) =
+-  Node (query{joinConditions=joinConds}, nodeProps) (addJoinConditions tblAlias <$> forest)
+-  where
+-    joinConds =
+-      case card of
+-        M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
+-           (toJoinCondition Nothing Nothing ftN jtn <$> jcols2) ++ (toJoinCondition previousAlias tblAlias tN jtn <$> jcols1)
+-        O2M _ cols ->
+-          toJoinCondition previousAlias tblAlias tN ftN <$> cols
+-        M2O _ cols ->
+-          toJoinCondition previousAlias tblAlias tN ftN <$> cols
+-    toJoinCondition :: Maybe Alias -> Maybe Alias -> Text -> Text -> (FieldName, FieldName) -> JoinCondition
+-    toJoinCondition prAl newAl tb ftb (c, fc) =
+-      let qi1 = QualifiedIdentifier tSchema ftb
+-          qi2 = QualifiedIdentifier tSchema tb in
+-        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) newAl, fc)
+-                      (maybe qi2 (QualifiedIdentifier mempty) prAl, c)
+-
+ -- Finds a relationship between an origin and a target in the request:
+ -- /origin?select=target(*) If more than one relationship is found then the
+ -- request is ambiguous and we return an error.  In that case the request can
+@@ -189,9 +164,8 @@ findRel schema allRels origin target hint =
+     isO2M card = case card of
+       O2M _ _ -> True
+       _       -> False
+-    rels = filter (\case
+-      ComputedRelationship{relFunction} -> target == qiName relFunction
+-      Relationship{..} ->
++    rels = filter (
++      \Relationship{..} ->
+         -- In a self-relationship we have a single foreign key but two relationships with different cardinalities: M2O/O2M. For disambiguation, we use the convention of getting:
+         -- TODO: handle one-to-one and many-to-many self-relationships
+         if relIsSelf
+@@ -236,6 +210,46 @@ findRel schema allRels origin target hint =
+             )
+       ) $ fromMaybe mempty $ HM.lookup (QualifiedIdentifier schema origin, schema) allRels
+ 
++-- previousAlias is only used for the case of self joins
++addJoinConditions :: Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
++addJoinConditions previousAlias (Node node@(query@Select{from=tbl,fromAlias=tblAlias}, nodeProps@(_, rel, _, _, _, depth)) forest) =
++  case rel of
++    Just r@Relationship{relCardinality=M2M Junction{junTable}} ->
++      let rq = augmentQuery r in
++      Node (rq{implicitJoins=junTable:implicitJoins rq}, nodeProps) <$> updatedForest
++    Just r -> Node (augmentQuery r, nodeProps) <$> updatedForest
++    Nothing -> Node node <$> updatedForest
++  where
++    newAlias = if depth == 0
++      then tblAlias -- only use the alias on the root node(depth 0) for when the sourceCTEName alias is used for joining
++      else case relIsSelf <$> rel of -- no need to apply the self reference alias on depth 0 only on the next depths
++        Just True -> Just (qiName tbl <> "_" <> show depth)
++        _         -> Nothing
++    augmentQuery r =
++      foldr
++        (\jc rq@Select{joinConditions=jcs} -> rq{joinConditions=jc:jcs})
++        query{fromAlias=newAlias}
++        (getJoinConditions previousAlias newAlias r)
++    updatedForest = addJoinConditions newAlias `traverse` forest
++
++-- previousAlias and newAlias are used in the case of self joins
++getJoinConditions :: Maybe Alias -> Maybe Alias -> Relationship -> [JoinCondition]
++getJoinConditions previousAlias newAlias (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} _ card _ _) =
++  case card of
++    M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
++      (toJoinCondition previousAlias newAlias tN jtn <$> jcols1) ++ (toJoinCondition Nothing Nothing ftN jtn <$> jcols2)
++    O2M _ cols ->
++      toJoinCondition previousAlias newAlias tN ftN <$> cols
++    M2O _ cols ->
++      toJoinCondition previousAlias newAlias tN ftN <$> cols
++  where
++    toJoinCondition :: Maybe Alias -> Maybe Alias -> Text -> Text -> (FieldName, FieldName) -> JoinCondition
++    toJoinCondition prAl newAl tb ftb (c, fc) =
++      let qi1 = QualifiedIdentifier tSchema tb
++          qi2 = QualifiedIdentifier tSchema ftb in
++        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) prAl, c)
++                      (maybe qi2 (QualifiedIdentifier mempty) newAl, fc)
++
+ addFilters :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addFilters ApiRequest{..} rReq =
+   foldr addFilterToNode (Right rReq) flts
+@@ -367,10 +381,6 @@ returningCols rr@(Node _ forest) pkCols
+         Node (_, (_, Just Relationship{relCardinality=M2M Junction{junColumns1, junColumns2}}, _, _, _, _)) _ -> Just $ (fst <$> junColumns1) ++ (fst <$> junColumns2)
+         _                                                        -> Nothing
+       ) forest
+-    hasComputedRel = isJust $ find (\case
+-      Node (_, (_, Just ComputedRelationship{}, _, _, _, _)) _ -> True
+-      _ -> False
+-      ) forest
+     -- However if the "client_id" is present, e.g. mutateRequest to
+     -- /projects?select=client_id,name,clients(name) we would get `RETURNING
+     -- client_id, name, client_id` and then we would produce the "column
+@@ -378,10 +388,7 @@ returningCols rr@(Node _ forest) pkCols
+     -- deduplicate with Set: We are adding the primary key columns as well to
+     -- make sure, that a proper location header can always be built for
+     -- INSERT/POST
+-    returnings =
+-      if not hasComputedRel
+-        then S.toList . S.fromList $ fldNames ++ fkCols ++ pkCols
+-        else ["*"] -- on computed relationships we cannot know the required columns for an embedding to succeed, so we just return all
++    returnings = S.toList . S.fromList $ fldNames ++ fkCols ++ pkCols
+ 
+ -- Traditional filters(e.g. id=eq.1) are added as root nodes of the LogicTree
+ -- they are later concatenated with AND in the QueryBuilder
+diff --git a/src/PostgREST/Request/ReadQuery.hs b/src/PostgREST/Request/ReadQuery.hs
+index 11d1b352..8cdf3d4c 100644
+--- a/src/PostgREST/Request/ReadQuery.hs
++++ b/src/PostgREST/Request/ReadQuery.hs
+@@ -31,8 +31,10 @@ type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe Hint, Maybe JoinType)
+ data ReadQuery = Select
+   { select         :: [SelectItem]
+   , from           :: QualifiedIdentifier
+-  , fromAlias      :: Maybe Alias
+   -- ^ A table alias is used in case of self joins
++  , fromAlias      :: Maybe Alias
++  -- ^ Only used for Many to Many joins. Parent and Child joins use explicit joins.
++  , implicitJoins  :: [QualifiedIdentifier]
+   , where_         :: [LogicTree]
+   , joinConditions :: [JoinCondition]
+   , order          :: [OrderTerm]
+diff --git a/test/spec/Feature/Query/ComputedRelsSpec.hs b/test/spec/Feature/Query/ComputedRelsSpec.hs
+deleted file mode 100644
+index 2a205f5b..00000000
+--- a/test/spec/Feature/Query/ComputedRelsSpec.hs
++++ /dev/null
+@@ -1,101 +0,0 @@
+-module Feature.Query.ComputedRelsSpec where
+-
+-import Network.Wai (Application)
+-
+-import Network.HTTP.Types
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec = describe "computed relationships" $ do
+-  it "can define a many-to-one relationship and embed" $
+-    get "/videogames?select=name,designers:computed_designers(name)"
+-    `shouldRespondWith`
+-      [json|[
+-        {"name":"Civilization I","designers":{"name":"Sid Meier"}},
+-        {"name":"Civilization II","designers":{"name":"Sid Meier"}},
+-        {"name":"Final Fantasy I","designers":{"name":"Hironobu Sakaguchi"}},
+-        {"name":"Final Fantasy II","designers":{"name":"Hironobu Sakaguchi"}}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  it "can define a one-to-many relationship and embed" $
+-    get "/designers?select=name,videogames:computed_videogames(name)"
+-    `shouldRespondWith`
+-      [json|[
+-        {"name":"Sid Meier","videogames":[{"name":"Civilization I"}, {"name":"Civilization II"}]},
+-        {"name":"Hironobu Sakaguchi","videogames":[{"name":"Final Fantasy I"}, {"name":"Final Fantasy II"}]}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  it "works with !inner and count=exact" $ do
+-    request methodGet "/designers?select=name,videogames:computed_videogames!inner(name)&videogames.name=eq.Civilization%20I"
+-      [("Prefer", "count=exact")] ""
+-      `shouldRespondWith`
+-        [json|[{"name":"Sid Meier","videogames":[{"name":"Civilization I"}]}]|]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Range" <:> "0-0/1"]
+-        }
+-    request methodGet "/videogames?select=name,designer:computed_designers!inner(name)&designer.name=like.*Hironobu*"
+-      [("Prefer", "count=exact")] ""
+-      `shouldRespondWith`
+-        [json|[
+-          {"name":"Final Fantasy I","designer":{"name":"Hironobu Sakaguchi"}},
+-          {"name":"Final Fantasy II","designer":{"name":"Hironobu Sakaguchi"}}
+-        ]|]
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Range" <:> "0-1/2"]
+-        }
+-
+-  it "works with rpc" $ do
+-    get "/rpc/getallvideogames?select=name,designer:computed_designers(name)"
+-      `shouldRespondWith`
+-      [json|[
+-        {"name":"Civilization I","designer":{"name":"Sid Meier"}},
+-        {"name":"Civilization II","designer":{"name":"Sid Meier"}},
+-        {"name":"Final Fantasy I","designer":{"name":"Hironobu Sakaguchi"}},
+-        {"name":"Final Fantasy II","designer":{"name":"Hironobu Sakaguchi"}}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-    get "/rpc/getalldesigners?select=name,videogames:computed_videogames(name)"
+-      `shouldRespondWith`
+-      [json|[
+-        {"name":"Sid Meier","videogames":[{"name":"Civilization I"}, {"name":"Civilization II"}]},
+-        {"name":"Hironobu Sakaguchi","videogames":[{"name":"Final Fantasy I"}, {"name":"Final Fantasy II"}]}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  it "works with mutations" $ do
+-    request methodPost "/videogames?select=name,designer:computed_designers(name)"
+-      [("Prefer", "return=representation")]
+-      [json| {"id": 5, "name": "Chrono Trigger", "designer_id": 2} |]
+-      `shouldRespondWith`
+-        [json|[ {"name":"Chrono Trigger","designer":{"name":"Hironobu Sakaguchi"}} ]|]
+-        { matchStatus  = 201 }
+-    request methodPatch "/designers?select=name,videogames:computed_videogames(name)&id=eq.1"
+-      [("Prefer", "return=representation")]
+-      [json| {"name": "Sidney K. Meier"} |]
+-      `shouldRespondWith`
+-        [json|[ { "name": "Sidney K. Meier", "videogames": [{"name":"Civilization I"}, {"name":"Civilization II"}] } ]|]
+-        { matchStatus  = 200 }
+-    request methodDelete "/videogames?select=name,designer:computed_designers(name)&id=eq.3"
+-      [("Prefer", "return=representation")] ""
+-      `shouldRespondWith`
+-        [json|[ {"name":"Final Fantasy I","designer":{"name":"Hironobu Sakaguchi"}} ]|]
+-        { matchStatus  = 200 }
+-
+-  it "works with self joins" $
+-    get "/web_content?select=name,child_web_content(name),parent_web_content(name)&id=in.(0,1)"
+-    `shouldRespondWith`
+-      [json|[
+-        {"name":"tardis","child_web_content":[{"name":"fezz"}, {"name":"foo"}, {"name":"bar"}],"parent_web_content":{"name":"wat"}},
+-        {"name":"fezz","child_web_content":[{"name":"wut"}],"parent_web_content":{"name":"tardis"}}
+-      ]|] { matchHeaders = [matchContentTypeJson] }
+-
+-  it "can override detected relationships" $ do
+-    get "/videogames?select=*,designers!inner(*)"
+-      `shouldRespondWith`
+-      [json|[]|] { matchHeaders = [matchContentTypeJson] }
+-    get "/designers?select=*,videogames!inner(*)"
+-      `shouldRespondWith`
+-      [json|[]|] { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 1f647ede..2ab5b4b9 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -37,7 +37,6 @@ import qualified Feature.OpenApi.RootSpec
+ import qualified Feature.OpenApi.SecurityOpenApiSpec
+ import qualified Feature.OptionsSpec
+ import qualified Feature.Query.AndOrParamsSpec
+-import qualified Feature.Query.ComputedRelsSpec
+ import qualified Feature.Query.DeleteSpec
+ import qualified Feature.Query.EmbedDisambiguationSpec
+ import qualified Feature.Query.EmbedInnerJoinSpec
+@@ -148,7 +147,6 @@ main = do
+         , ("Feature.Query.SingularSpec"                  , Feature.Query.SingularSpec.spec)
+         , ("Feature.Query.UpdateSpec"                    , Feature.Query.UpdateSpec.spec)
+         , ("Feature.Query.UpsertSpec"                    , Feature.Query.UpsertSpec.spec actualPgVersion)
+-        , ("Feature.Query.ComputedRelsSpec"              , Feature.Query.ComputedRelsSpec.spec)
+         ]
+ 
+   hspec $ do
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index 0e31c0be..b8d121da 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -806,9 +806,3 @@ TRUNCATE TABLE unsafe_update_items CASCADE;
+ INSERT INTO unsafe_update_items(id, name, observation) VALUES (1, 'item-1', NULL), (2, 'item-2', NULL), (3, 'item-3', NULL);
+ TRUNCATE TABLE unsafe_delete_items CASCADE;
+ INSERT INTO unsafe_delete_items(id, name, observation) VALUES (1, 'item-1', NULL), (2, 'item-2', NULL), (3, 'item-3', NULL);
+-
+-TRUNCATE TABLE designers CASCADE;
+-INSERT INTO designers(id, name) VALUES (1, 'Sid Meier'), (2, 'Hironobu Sakaguchi');
+-
+-TRUNCATE TABLE videogames CASCADE;
+-INSERT INTO videogames(id, name, designer_id) VALUES (1, 'Civilization I', 1), (2, 'Civilization II', 1), (3, 'Final Fantasy I', 2), (4, 'Final Fantasy II', 2);
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index a2d079d4..5a3e9fed 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -197,8 +197,6 @@ GRANT ALL ON TABLE
+     , safe_delete_items
+     , unsafe_update_items
+     , unsafe_delete_items
+-    , videogames
+-    , designers
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 8910a944..a8a8bb36 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2707,49 +2707,3 @@ CREATE OR REPLACE FUNCTION test.load_safeupdate() RETURNS VOID AS $$
+ BEGIN
+   LOAD 'safeupdate';
+ END; $$ LANGUAGE plpgsql SECURITY DEFINER;
+-
+-CREATE TABLE designers (
+-  id int primary key
+-, name text
+-);
+-
+-CREATE TABLE videogames (
+-  id int primary key
+-, name text
+-, designer_id int references designers(id)
+-);
+-
+--- computed relationships
+-CREATE FUNCTION test.computed_designers(test.videogames) RETURNS SETOF test.designers AS $$
+-  SELECT * FROM test.designers WHERE id = $1.designer_id;
+-$$ LANGUAGE sql STABLE ROWS 1;
+-
+-CREATE FUNCTION test.computed_videogames(test.designers) RETURNS SETOF test.videogames AS $$
+-  SELECT * FROM test.videogames WHERE designer_id = $1.id;
+-$$ LANGUAGE sql STABLE;
+-
+-CREATE FUNCTION test.getallvideogames() RETURNS SETOF test.videogames AS $$
+-  SELECT * FROM test.videogames;
+-$$ LANGUAGE sql STABLE;
+-
+-CREATE FUNCTION test.getalldesigners() RETURNS SETOF test.designers AS $$
+-  SELECT * FROM test.designers;
+-$$ LANGUAGE sql STABLE;
+-
+--- self join for computed relationships
+-CREATE FUNCTION test.child_web_content(test.web_content) RETURNS SETOF test.web_content AS $$
+-  SELECT * FROM test.web_content WHERE $1.id = p_web_id;
+-$$ LANGUAGE sql STABLE;
+-
+-CREATE FUNCTION test.parent_web_content(test.web_content) RETURNS SETOF test.web_content AS $$
+-  SELECT * FROM test.web_content WHERE $1.p_web_id = id;
+-$$ LANGUAGE sql STABLE ROWS 1;
+-
+--- overriding computed rels that empty the results
+-CREATE FUNCTION test.designers(test.videogames) RETURNS SETOF test.designers AS $$
+-  SELECT * FROM test.designers WHERE FALSE;
+-$$ LANGUAGE sql STABLE ROWS 1;
+-
+-CREATE FUNCTION test.videogames(test.designers) RETURNS SETOF test.videogames AS $$
+-  SELECT * FROM test.videogames WHERE FALSE;
+-$$ LANGUAGE sql STABLE;

@@ -1,0 +1,182 @@
+diff --git a/Changes b/Changes
+index 5e0d5fdd57..a7ec9137e9 100644
+--- a/Changes
++++ b/Changes
+@@ -88,12 +88,6 @@ Working version
+ 
+ ### Standard library:
+ 
+-- #14363: Preserve the backtrace at exceptional domain termination. Domain.join
+-  on an exceptionally terminated domain re-raises the exception with the
+-  backtrace.
+-  (KC Sivaramakrishnan, report by Nathan Taylor, review by Gabriel Scherer,
+-  David Allsopp)
+-
+ - #13372: New Format and Printf printf-like functions that accept a
+    heterogeneous list as arguments.
+   (Leonardo Santos, review by Florian Angeletti and Gabriel Scherer)
+diff --git a/runtime/caml/backtrace.h b/runtime/caml/backtrace.h
+index 7f8b3fae47..40bbb637d6 100644
+--- a/runtime/caml/backtrace.h
++++ b/runtime/caml/backtrace.h
+@@ -150,8 +150,6 @@ CAMLextern void caml_print_exception_backtrace(void);
+ void caml_init_backtrace(void);
+ CAMLextern void caml_init_debug_info(void);
+ 
+-value caml_get_exception_raw_backtrace(value unit);
+-
+ #endif /* CAML_INTERNALS */
+ 
+ #endif /* CAML_BACKTRACE_H */
+diff --git a/runtime/domain.c b/runtime/domain.c
+index 5a8b6ea43a..8aef0dcc15 100644
+--- a/runtime/domain.c
++++ b/runtime/domain.c
+@@ -1294,24 +1294,14 @@ CAMLexport _Atomic caml_timing_hook caml_domain_terminated_hook =
+ static value make_finished(caml_result result)
+ {
+   CAMLparam0();
+-  CAMLlocal2(res, bt);
+-  if (caml_result_is_exception(result)) {
+-    res = result.data; /* Ensure that [result.data] is rooted before
+-                          subsequent allocations */
+-    /* res = exn */
+-    bt = caml_get_exception_raw_backtrace(Val_unit);
+-    res = caml_alloc_2(0, res, bt);
+-    /* res = (exn, bt) */
+-    res = caml_alloc_1(1 /* Error */, res);
+-    /* res = Error (exn, bt) */
+-    res = caml_alloc_1(0 /* Finished */, res);
+-    /* res = Finished(Error(exn, bt)) */
+-  } else {
+-    res = caml_alloc_1(0 /* Ok */,result.data);
+-    /* res = Ok v */
+-    res = caml_alloc_1(0, res);
+-    /* res = Finished(Ok v) */
+-  }
++  CAMLlocal1(res);
++  res = caml_alloc_1(
++    (caml_result_is_exception(result) ?
++     1 /* Error */ :
++     0 /* Ok */),
++    result.data);
++  /* [Finished res] */
++  res = caml_alloc_1(0, res);
+   CAMLreturn(res);
+ }
+ 
+diff --git a/stdlib/.depend b/stdlib/.depend
+index d6c5987c0a..1420b0094c 100644
+--- a/stdlib/.depend
++++ b/stdlib/.depend
+@@ -216,7 +216,6 @@ stdlib__Digest.cmi : digest.mli
+ stdlib__Domain.cmo : domain.ml \
+     stdlib__Sys.cmi \
+     stdlib.cmi \
+-    stdlib__Printexc.cmi \
+     stdlib__Obj.cmi \
+     stdlib__Mutex.cmi \
+     stdlib__List.cmi \
+@@ -227,7 +226,6 @@ stdlib__Domain.cmo : domain.ml \
+ stdlib__Domain.cmx : domain.ml \
+     stdlib__Sys.cmx \
+     stdlib.cmx \
+-    stdlib__Printexc.cmx \
+     stdlib__Obj.cmx \
+     stdlib__Mutex.cmx \
+     stdlib__List.cmx \
+diff --git a/stdlib/StdlibModules b/stdlib/StdlibModules
+index 3bbe1f1568..14a61afe4e 100644
+--- a/stdlib/StdlibModules
++++ b/stdlib/StdlibModules
+@@ -73,11 +73,11 @@ STDLIB_MODULE_BASENAMES = \
+   mutex \
+   condition \
+   semaphore \
++  domain \
+   camlinternalFormat \
+   printf \
+   arg \
+   printexc \
+-  domain \
+   fun \
+   gc \
+   in_channel \
+diff --git a/stdlib/domain.ml b/stdlib/domain.ml
+index 157335c1c8..2e9605cee9 100644
+--- a/stdlib/domain.ml
++++ b/stdlib/domain.ml
+@@ -25,8 +25,7 @@ module Raw = struct
+ 
+   type 'a state =
+     | Running
+-    | Finished of ('a, exn * Printexc.raw_backtrace) result
+-    [@warning "-unused-constructor"]
++    | Finished of ('a, exn) result [@warning "-unused-constructor"]
+ 
+   type 'a term_sync = {
+     (* protected by [mut] *)
+@@ -300,7 +299,7 @@ let join { term_sync ; _ } =
+   in
+   match Mutex.protect term_sync.mut loop with
+   | Ok x -> x
+-  | Error (ex, bt) -> Printexc.raise_with_backtrace ex bt
++  | Error ex -> raise ex
+ 
+ let count = Raw.get_domain_count
+ let recommended_domain_count = Raw.get_recommended_domain_count
+diff --git a/testsuite/tests/backtrace/backtrace_domain_join.ml b/testsuite/tests/backtrace/backtrace_domain_join.ml
+deleted file mode 100644
+index 55e40d6a1a..0000000000
+--- a/testsuite/tests/backtrace/backtrace_domain_join.ml
++++ /dev/null
+@@ -1,28 +0,0 @@
+-(* TEST_BELOW
+-(* Blank lines added here to preserve locations. *)
+-
+-*)
+-
+-(* A test for backtraces on [Domain.join] *)
+-
+-let rec bar n =
+-  if n = 0 then failwith "bar raised"
+-  else foo (n-1) + 1
+-
+-and foo n =
+-  if n = 0 then failwith "foo raised"
+-  else bar (n-1) + 1
+-
+-let f () = foo 10
+-
+-let _ =
+-  match Domain.spawn f |> Domain.join with
+-  | v -> ()
+-  | exception e ->
+-      let bt = Printexc.get_raw_backtrace () in
+-      Printexc.print_raw_backtrace stdout bt
+-
+-(* TEST
+- flags = "-g";
+- ocamlrunparam += ",b=1";
+-*)
+diff --git a/testsuite/tests/backtrace/backtrace_domain_join.reference b/testsuite/tests/backtrace/backtrace_domain_join.reference
+deleted file mode 100644
+index e82d673a4b..0000000000
+--- a/testsuite/tests/backtrace/backtrace_domain_join.reference
++++ /dev/null
+@@ -1,15 +0,0 @@
+-Raised at Stdlib.failwith in file "stdlib.ml", line 29, characters 17-33
+-Called from Backtrace_domain_join.bar in file "backtrace_domain_join.ml", line 10, characters 7-16
+-Called from Backtrace_domain_join.foo in file "backtrace_domain_join.ml", line 14, characters 7-16
+-Called from Backtrace_domain_join.bar in file "backtrace_domain_join.ml", line 10, characters 7-16
+-Called from Backtrace_domain_join.foo in file "backtrace_domain_join.ml", line 14, characters 7-16
+-Called from Backtrace_domain_join.bar in file "backtrace_domain_join.ml", line 10, characters 7-16
+-Called from Backtrace_domain_join.foo in file "backtrace_domain_join.ml", line 14, characters 7-16
+-Called from Backtrace_domain_join.bar in file "backtrace_domain_join.ml", line 10, characters 7-16
+-Called from Backtrace_domain_join.foo in file "backtrace_domain_join.ml", line 14, characters 7-16
+-Called from Backtrace_domain_join.bar in file "backtrace_domain_join.ml", line 10, characters 7-16
+-Called from Backtrace_domain_join.foo in file "backtrace_domain_join.ml", line 14, characters 7-16
+-Called from Stdlib__Domain.spawn.body in file "domain.ml", line 270, characters 16-20
+-Re-raised at Stdlib__Domain.spawn.body in file "domain.ml", line 286, characters 8-17
+-Re-raised at Stdlib__Domain.join in file "domain.ml", line 303, characters 22-57
+-Called from Backtrace_domain_join in file "backtrace_domain_join.ml", line 19, characters 8-37

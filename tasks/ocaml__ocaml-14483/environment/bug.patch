@@ -1,0 +1,284 @@
+diff --git a/.depend b/.depend
+index e33bc26082..633e89ac1b 100644
+--- a/.depend
++++ b/.depend
+@@ -7094,7 +7094,6 @@ driver/compmisc.cmo : \
+     utils/load_path.cmi \
+     typing/ident.cmi \
+     typing/env.cmi \
+-    typing/ctype.cmi \
+     utils/config.cmi \
+     driver/compenv.cmi \
+     utils/clflags.cmi \
+@@ -7108,7 +7107,6 @@ driver/compmisc.cmx : \
+     utils/load_path.cmx \
+     typing/ident.cmx \
+     typing/env.cmx \
+-    typing/ctype.cmx \
+     utils/config.cmx \
+     driver/compenv.cmx \
+     utils/clflags.cmx \
+diff --git a/Changes b/Changes
+index 11d617a246..31e2e7eb1f 100644
+--- a/Changes
++++ b/Changes
+@@ -271,14 +271,6 @@ Working version
+   (Jacques Garrigue and Takafumi Saikawa, reported by Olivier Nicole,
+    review by Gabriel Scherer)
+ 
+-- #14483: Reset type ID and level counters between compilations to restore
+-  reproducibility of debug information between `ocamlc -c foo.mli foo.ml` versus
+-  `ocamlc -c foo.mli; ocamlc -c foo.ml`. Also hashcons the identifiers used for
+-  persistent structures across resets of the type checker. In particular, that
+-  means the initialisation of globals in Matching do not become observable in
+-  the marshalled output.
+-  (David Allsopp, review by Gabriel Scherer)
+-
+ ### Other libraries:
+ 
+ - #13700, #14454: Use POSIX thread-safe getgrnam_r, getgrgid_r, getpwnam_r,
+diff --git a/driver/compmisc.ml b/driver/compmisc.ml
+index 9027b5ea98..f2179c6ba2 100644
+--- a/driver/compmisc.ml
++++ b/driver/compmisc.ml
+@@ -69,8 +69,6 @@ let init_path ?(standard_library=Config.standard_library)
+ let initial_env () =
+   Ident.reinit();
+   Types.Uid.reinit();
+-  Types.reset();
+-  Ctype.reset();
+   let initially_opened_module =
+     if !Clflags.nopervasives then
+       None
+diff --git a/testsuite/tests/tool-ocamlc-determinism/determinism.ml b/testsuite/tests/tool-ocamlc-determinism/determinism.ml
+deleted file mode 100644
+index 085cf1e8f8..0000000000
+--- a/testsuite/tests/tool-ocamlc-determinism/determinism.ml
++++ /dev/null
+@@ -1,102 +0,0 @@
+-(* TEST
+- include ocamlcommon;
+- include ocamlbytecomp;
+- readonly_files = "test_module.ml test_module.mli trigger_lazy.ml";
+- setup-ocamlc.byte-build-env;
+-
+- (* First compilation: .mli and .ml separately *)
+- flags = "-g";
+- all_modules = "test_module.mli";
+- compile_only = "true";
+- ocamlc.byte;
+- all_modules = "test_module.ml";
+- ocamlc.byte;
+- src = "test_module.cmo";
+- dst = "test_module_solo.cmo";
+- copy;
+-
+-
+- (* Second compilation: all files together *)
+- all_modules = "trigger_lazy.ml test_module.mli test_module.ml";
+- ocamlc.byte;
+- src = "test_module.cmo";
+- dst = "test_module_with_mli.cmo";
+- copy;
+-
+- (* Now run the comparison test *)
+- {
+-   compile_only = "false";
+-   all_modules = "determinism.ml";
+-   program = "${test_build_directory}/determinism.exe";
+-   ocamlc.byte;
+-   run;
+-   check-program-output;
+- }
+-*)
+-
+-(* Test that .cmo files are identical except for debug info
+-   when compiled separately vs together with .mli *)
+-
+-let load_cmo_and_debug filename =
+-  let ic = open_in_bin filename in
+-  (* Skip magic number *)
+-  let _ = really_input_string ic (String.length Config.cmo_magic_number) in
+-  (* Read compilation unit *)
+-  let compunit_pos = input_binary_int ic in
+-  seek_in ic compunit_pos;
+-  let cu : Cmo_format.compilation_unit = input_value ic in
+-
+-  (* Load debug data if present *)
+-  let debug_data =
+-    if cu.cu_debug > 0 then begin
+-      seek_in ic cu.cu_debug;
+-      let events : Instruct.debug_event list = input_value ic in
+-      let dirs : string list = input_value ic in
+-      Some (events, dirs)
+-    end else
+-      None
+-  in
+-  close_in ic;
+-  (cu, debug_data)
+-
+-let () =
+-  let (cu1, debug1) = load_cmo_and_debug "test_module_solo.cmo" in
+-  let (cu2, debug2) = load_cmo_and_debug "test_module_with_mli.cmo" in
+-
+-  (* Check that all non-debug-content fields are identical *)
+-  if cu1.cu_name <> cu2.cu_name
+-     || cu1.cu_imports <> cu2.cu_imports
+-     || cu1.cu_required_compunits <> cu2.cu_required_compunits
+-     || cu1.cu_primitives <> cu2.cu_primitives
+-     || cu1.cu_force_link <> cu2.cu_force_link
+-     || cu1.cu_debug <> cu2.cu_debug  (* offset should be the same *)
+-  then
+-    failwith "Non-debug fields differ!";
+-
+-  (* Check if the files are byte-for-byte identical *)
+-  let load_file filename =
+-    let ic = open_in_bin filename in
+-    let size = in_channel_length ic in
+-    let bytes = Bytes.create size in
+-    really_input ic bytes 0 size;
+-    close_in ic;
+-    bytes
+-  in
+-  let bytes1 = load_file "test_module_solo.cmo" in
+-  let bytes2 = load_file "test_module_with_mli.cmo" in
+-  if bytes1 = bytes2 then
+-    print_endline "CMO files are identical"
+-  else
+-    print_endline "CMO files differ";
+-
+-  if cu1.cu_debug > 0 && cu2.cu_debug > 0 then begin
+-    let debug_section1 = Bytes.sub bytes1 cu1.cu_debug cu1.cu_debugsize in
+-    let debug_section2 = Bytes.sub bytes2 cu2.cu_debug cu2.cu_debugsize in
+-    if debug_section1 = debug_section2 then
+-      print_endline "Debug events are identical"
+-    else
+-      print_endline "Debug events differ"
+-  end else if cu1.cu_debug = 0 && cu2.cu_debug = 0 then
+-    print_endline "No debug data in either file"
+-  else
+-    print_endline "Debug data presence mismatch"
+diff --git a/testsuite/tests/tool-ocamlc-determinism/determinism.reference b/testsuite/tests/tool-ocamlc-determinism/determinism.reference
+deleted file mode 100644
+index 972bcf7fe9..0000000000
+--- a/testsuite/tests/tool-ocamlc-determinism/determinism.reference
++++ /dev/null
+@@ -1,2 +0,0 @@
+-CMO files are identical
+-Debug events are identical
+diff --git a/testsuite/tests/tool-ocamlc-determinism/test_module.ml b/testsuite/tests/tool-ocamlc-determinism/test_module.ml
+deleted file mode 100644
+index ac21967765..0000000000
+--- a/testsuite/tests/tool-ocamlc-determinism/test_module.ml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-type t = int
+-let greeting = "Hello"
+-
+-type 'a u = 'a CamlinternalLazy.t
+-exception Undefined = CamlinternalLazy.Undefined
+-external force : 'a u -> 'a = "%lazy_force"
+-
+-let map f x =
+-  lazy (f (force x))
+diff --git a/testsuite/tests/tool-ocamlc-determinism/test_module.mli b/testsuite/tests/tool-ocamlc-determinism/test_module.mli
+deleted file mode 100644
+index 314bb89457..0000000000
+--- a/testsuite/tests/tool-ocamlc-determinism/test_module.mli
++++ /dev/null
+@@ -1,2 +0,0 @@
+-type t
+-val greeting : string
+diff --git a/testsuite/tests/tool-ocamlc-determinism/trigger_lazy.ml b/testsuite/tests/tool-ocamlc-determinism/trigger_lazy.ml
+deleted file mode 100644
+index 80a2dadd1c..0000000000
+--- a/testsuite/tests/tool-ocamlc-determinism/trigger_lazy.ml
++++ /dev/null
+@@ -1,2 +0,0 @@
+-let force_lazy = function
+-  | lazy x -> x
+diff --git a/typing/ctype.ml b/typing/ctype.ml
+index 44ef818ca4..d2811263b2 100644
+--- a/typing/ctype.ml
++++ b/typing/ctype.ml
+@@ -318,13 +318,6 @@ let increase_global_level () =
+ let restore_global_level gl =
+   global_level := gl
+ 
+-(* Reset all level counters - used between compilation units *)
+-let reset () =
+-  current_level := 0;
+-  nongen_level := 0;
+-  global_level := 0;
+-  saved_levels := []
+-
+ (**** Some type creators ****)
+ 
+ (* Re-export generic type creators *)
+diff --git a/typing/ctype.mli b/typing/ctype.mli
+index f5d9508ebf..d6112cd0ae 100644
+--- a/typing/ctype.mli
++++ b/typing/ctype.mli
+@@ -95,9 +95,6 @@ val create_scope: unit -> int
+            the scope continues until the end of the compilation unit
+            or toplevel session. *)
+ 
+-val reset: unit -> unit
+-        (* Reset all level counters - used between compilation units *)
+-
+ val newty: type_desc -> type_expr
+ val new_scoped_ty: int -> type_desc -> type_expr
+ val newvar: ?name:string -> unit -> type_expr
+diff --git a/typing/env.ml b/typing/env.ml
+index 285b8388b7..fd26bbb800 100644
+--- a/typing/env.ml
++++ b/typing/env.ml
+@@ -904,24 +904,11 @@ let components_of_module ~alerts ~uid env ps path addr mty shape =
+     }
+   }
+ 
+-(* Maintain the same physical name for .cmi names even across type-checker
+-   resets. In particular, this means that lazy thunks (e.g. in Matching) do not
+-   need to be reset as persistent names in identifiers in those lambda blocks
+-   will be physically identical across type-checker resets.
+-   See also tests in testsuite/tests/tool-ocamlc-determinism *)
+-let hashcons_name =
+-  let names = String.Tbl.create 1023 in
+-  fun name ->
+-    try String.Tbl.find names name
+-    with Not_found ->
+-      String.Tbl.add names name name;
+-      name
+-
+ let sign_of_cmi ~freshen { Persistent_env.Persistent_signature.cmi; _ } =
+   let name = cmi.cmi_name in
+   let sign = cmi.cmi_sign in
+   let flags = cmi.cmi_flags in
+-  let id = Ident.create_persistent (hashcons_name name) in
++  let id = Ident.create_persistent name in
+   let path = Pident id in
+   let alerts =
+     List.fold_left (fun acc -> function Alerts s -> s | _ -> acc)
+diff --git a/typing/types.ml b/typing/types.ml
+index b3ea522a1b..ed2063f0d8 100644
+--- a/typing/types.ml
++++ b/typing/types.ml
+@@ -754,8 +754,6 @@ let match_row_field ~present ~absent ~either (f : row_field) =
+ 
+ let new_id = Local_store.s_ref (-1)
+ 
+-let reset () = new_id := -1
+-
+ let create_expr = Transient_expr.create
+ 
+ let proto_newty3 ~level ~scope desc  =
+diff --git a/typing/types.mli b/typing/types.mli
+index 00503796e2..9b9e7d945a 100644
+--- a/typing/types.mli
++++ b/typing/types.mli
+@@ -769,5 +769,3 @@ val set_univar: type_expr option ref -> type_expr -> unit
+ val link_kind: inside:field_kind -> field_kind -> unit
+ val link_commu: inside:commutable -> commutable -> unit
+ val set_commu_ok: commutable -> unit
+-
+-val reset : unit -> unit

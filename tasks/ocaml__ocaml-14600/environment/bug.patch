@@ -1,0 +1,271 @@
+diff --git a/Changes b/Changes
+index 637c790b56..bd6f8384aa 100644
+--- a/Changes
++++ b/Changes
+@@ -80,10 +80,6 @@ Working version
+ - #14142: print GADT equations in error messages when they introduce a type
+   (Stefan Muenzel, review by Florian Angeletti)
+ 
+-- #14359, #14600: when reporting unbound type variables in a type declaration,
+-  avoid a possible confusion between type parameters and unbound variables.
+-  (Florian Angeletti, report by Florian Weimer, review by Gabriel Scherer)
+-
+ ### Internal/compiler-libs changes:
+ 
+ ### Build system:
+diff --git a/testsuite/tests/typing-misc/unbound_type_variables.ml b/testsuite/tests/typing-misc/unbound_type_variables.ml
+index ccf8f5f9b1..a19cb24d77 100644
+--- a/testsuite/tests/typing-misc/unbound_type_variables.ml
++++ b/testsuite/tests/typing-misc/unbound_type_variables.ml
+@@ -59,80 +59,3 @@ Line 2, characters 32-34:
+                                     ^^
+ Error: The type variable "'a" is unbound in this type declaration.
+ |}]
+-
+-type 'a t = [> `A]
+-[%%expect {|
+-Line 1, characters 0-18:
+-1 | type 'a t = [> `A]
+-    ^^^^^^^^^^^^^^^^^^
+-Error: A type variable is unbound in this type declaration.
+-       In type "[> `A ] as 'b" the variable "'b" is unbound
+-|}]
+-
+-type ('a,'b,'c,'d,'e,'f) t =
+-  | A of 'x
+-  | B of 'y
+-constraint 'x = 'c * _
+-constraint 'y = 'd * _
+-[%%expect {|
+-Lines 1-5, characters 0-22:
+-1 | type ('a,'b,'c,'d,'e,'f) t =
+-2 |   | A of 'x
+-3 |   | B of 'y
+-4 | constraint 'x = 'c * _
+-5 | constraint 'y = 'd * _
+-Error: A type variable is unbound in this type declaration.
+-       In case "A of ('c * 'g)" the variable "'g" is unbound
+-|}]
+-
+-
+-type ('a,'b,'c,'d,'e,'f) t = { a: 'x; b: 'y }
+-constraint 'x = 'c * _
+-constraint 'y = 'd * _
+-[%%expect {|
+-Lines 1-3, characters 0-22:
+-1 | type ('a,'b,'c,'d,'e,'f) t = { a: 'x; b: 'y }
+-2 | constraint 'x = 'c * _
+-3 | constraint 'y = 'd * _
+-Error: A type variable is unbound in this type declaration.
+-       In field "a: 'c * 'g" the variable "'g" is unbound
+-|}]
+-
+-type ('a,'b,'c,'d,'e,'f) t =
+-  | A of { r:'x; s:'y }
+-  | B of { t: 'z; w:'w}
+-constraint 'x = 'c * _
+-constraint 'y = 'd * _
+-constraint 'z = 'f * _
+-constraint 'w = _
+-[%%expect {|
+-Lines 1-7, characters 0-17:
+-1 | type ('a,'b,'c,'d,'e,'f) t =
+-2 |   | A of { r:'x; s:'y }
+-3 |   | B of { t: 'z; w:'w}
+-4 | constraint 'x = 'c * _
+-5 | constraint 'y = 'd * _
+-6 | constraint 'z = 'f * _
+-7 | constraint 'w = _
+-Error: A type variable is unbound in this type declaration.
+-       In case "A of { r : 'c * 'g; s : 'd * 'h; }" the variable "'g" is unbound
+-|}]
+-
+-class ['a,'b,'c,'d,'e,'f] c = object
+-constraint 'x = 'a * _ * 'c
+-constraint 'y = 'd * _
+-  method m: 'x * 'y = assert false
+-end
+-
+-[%%expect{|
+-Lines 1-5, characters 0-3:
+-1 | class ['a,'b,'c,'d,'e,'f] c = object
+-2 | constraint 'x = 'a * _ * 'c
+-3 | constraint 'y = 'd * _
+-4 |   method m: 'x * 'y = assert false
+-5 | end
+-Error: Some type variables are unbound in this type:
+-         class ['a, 'b, 'c, 'd, 'e, 'f] c :
+-           object method m : ('a * 'g * 'c) * ('d * 'h) end
+-       The method "m" has type "('a * 'g * 'c) * ('d * 'h)" where "'g" is unbound
+-|}]
+diff --git a/typing/typedecl.ml b/typing/typedecl.ml
+index f5faf61cdd..63eee2ad69 100644
+--- a/typing/typedecl.ml
++++ b/typing/typedecl.ml
+@@ -54,11 +54,7 @@ type error =
+     }
+   | Null_arity_external
+   | Missing_native_external
+-  | Unbound_type_var of {
+-      var: type_expr;
+-      params: type_expr list;
+-      decl: type_declaration;
+-    }
++  | Unbound_type_var of type_expr * type_declaration
+   | Cannot_extend_private_type of Path.t
+   | Not_extensible_type of Path.t
+   | Extension_mismatch of Path.t * Env.t * Includecore.type_mismatch
+@@ -349,13 +345,12 @@ let shape_map_cstrs =
+       @@ Shape.str ~uid:cd_uid cstr_shape_map)
+     (Shape.Map.empty)
+ 
+-let param_types params = List.map (fun (cty,_vi) -> cty.ctyp_type) params
+ 
+ let transl_declaration env sdecl (id, uid) =
+   (* Bind type parameters *)
+   TyVarEnv.reset();
+   let tparams = make_params env sdecl.ptype_params in
+-  let params = param_types tparams in
++  let params = List.map (fun (cty, _) -> cty.ctyp_type) tparams in
+   let constraints = List.map
+     (fun (sty, sty', loc) ->
+       transl_simple_type env ~closed:false sty,
+@@ -1237,11 +1232,9 @@ let transl_type_decl env rec_flag sdecl_list =
+   (* Check that all type variables are closed *)
+   List.iter2
+     (fun sdecl (tdecl, _shape) ->
+-       let decl = tdecl.typ_type in
++      let decl = tdecl.typ_type in
+        match Ctype.closed_type_decl decl with
+-         Some var ->
+-           let params = param_types tdecl.typ_params in
+-           raise(Error(sdecl.ptype_loc, Unbound_type_var{ var; params; decl}))
++         Some ty -> raise(Error(sdecl.ptype_loc, Unbound_type_var(ty,decl)))
+        | None   -> ())
+     sdecl_list tdecls;
+   (* Check that constraints are enforced *)
+@@ -1748,7 +1741,7 @@ let transl_with_constraint id ?fixed_row_path ~sig_env ~sig_decl ~outer_env
+   let env = outer_env in
+   let loc = sdecl.ptype_loc in
+   let tparams = make_params env sdecl.ptype_params in
+-  let params = param_types tparams in
++  let params = List.map (fun (cty, _) -> cty.ctyp_type) tparams in
+   let arity = List.length params in
+   let constraints =
+     List.map (fun (ty, ty', loc) ->
+@@ -1825,8 +1818,7 @@ let transl_with_constraint id ?fixed_row_path ~sig_env ~sig_decl ~outer_env
+   Option.iter (fun p -> set_private_row env sdecl.ptype_loc p new_sig_decl)
+     fixed_row_path;
+   begin match Ctype.closed_type_decl new_sig_decl with None -> ()
+-  | Some var ->
+-      raise(Error(loc, Unbound_type_var{ var; params; decl=new_sig_decl}))
++  | Some ty -> raise(Error(loc, Unbound_type_var(ty, new_sig_decl)))
+   end;
+   let new_sig_decl = name_recursion sdecl id new_sig_decl in
+   let new_type_variance =
+@@ -1961,36 +1953,36 @@ open Format_doc
+ module Style = Misc.Style
+ module Printtyp = Printtyp.Doc
+ 
+-let explain_unbound_gen ppf ~params tv tl typ kwd pr =
++let explain_unbound_gen ppf tv tl typ kwd pr =
+   try
+     let ti = List.find (fun ti -> Ctype.deep_occur tv (typ ti)) tl in
+     let ty0 = (* Hack to force aliasing when needed *)
+       Btype.newgenty (Tobject(tv, ref None)) in
+-    Out_type.prepare_for_printing (params @ [typ ti; ty0]);
++    Out_type.prepare_for_printing [typ ti; ty0];
+     fprintf ppf
+       ".@ @[<hov2>In %s@ %a@;<1 -2>the variable %a is unbound@]"
+       kwd (Style.as_inline_code pr) ti
+       (Style.as_inline_code Out_type.prepared_type_expr) tv
+   with Not_found -> ()
+ 
+-let explain_unbound ppf ~params tv tl typ kwd lab =
+-  explain_unbound_gen ppf ~params tv tl typ kwd
++let explain_unbound ppf tv tl typ kwd lab =
++  explain_unbound_gen ppf tv tl typ kwd
+     (fun ppf ti ->
+        fprintf ppf "%s%a" (lab ti) Out_type.prepared_type_expr (typ ti)
+     )
+ 
+-let explain_unbound_single ppf ~params tv ty =
++let explain_unbound_single ppf tv ty =
+   let trivial ty =
+-    explain_unbound ppf ~params tv [ty] (fun t -> t) "type" (fun _ -> "") in
++    explain_unbound ppf tv [ty] (fun t -> t) "type" (fun _ -> "") in
+   match get_desc ty with
+     Tobject(fi,_) ->
+       let (tl, rv) = Ctype.flatten_fields fi in
+       if eq_type rv tv then trivial ty else
+-      explain_unbound ppf ~params tv tl (fun (_,_,t) -> t)
++      explain_unbound ppf tv tl (fun (_,_,t) -> t)
+         "method" (fun (lab,_,_) -> lab ^ ": ")
+   | Tvariant row ->
+       if eq_type (row_more row) tv then trivial ty else
+-      explain_unbound ppf ~params tv (row_fields row)
++      explain_unbound ppf tv (row_fields row)
+         (fun (_l,f) -> match row_field_repr f with
+           Rpresent (Some t) -> t
+         | Reither (_,[t],_) -> t
+@@ -2054,10 +2046,10 @@ let quoted_out_type ppf ty = Style.as_inline_code !Oprint.out_type ppf ty
+ let quoted_type ppf ty = Style.as_inline_code Printtyp.type_expr ppf ty
+ let quoted_constr = Style.as_inline_code Pprintast.Doc.constr
+ 
+-let explain_unbounded params ty decl ppf =
++let explain_unbounded ty decl ppf =
+   match decl.type_kind, decl.type_manifest with
+   | Type_variant (tl, _rep), _ ->
+-      explain_unbound_gen ppf ~params ty tl (fun c ->
++      explain_unbound_gen ppf ty tl (fun c ->
+           let tl = tys_of_constr_args c.Types.cd_args in
+           Btype.newgenty (Ttuple (List.map (fun t -> None, t) tl))
+         )
+@@ -2066,10 +2058,10 @@ let explain_unbounded params ty decl ppf =
+             "%a of %a" Printtyp.ident c.Types.cd_id
+             Printtyp.constructor_arguments c.Types.cd_args)
+   | Type_record (tl, _), _ ->
+-      explain_unbound ppf ~params ty tl (fun l -> l.Types.ld_type)
++      explain_unbound ppf ty tl (fun l -> l.Types.ld_type)
+         "field" (fun l -> Ident.name l.Types.ld_id ^ ": ")
+   | Type_abstract _, Some ty' ->
+-      explain_unbound_single ppf ~params ty ty'
++      explain_unbound_single ppf ty ty'
+   | _ -> ()
+ 
+ let variance (p,n,i) =
+@@ -2224,14 +2216,14 @@ let report_error ~loc = function
+         "An external function with more than 5 arguments \
+          requires a second stub function@
+          for native-code compilation"
+-  | Unbound_type_var { var; params; decl } ->
++  | Unbound_type_var (ty, decl) ->
+       Location.errorf ~loc
+         "A type variable is unbound in this type declaration%t"
+-        (explain_unbounded params var decl)
++        (explain_unbounded ty decl)
+   | Unbound_type_var_ext (ty, ext) ->
+       let explain ppf =
+         let args = tys_of_constr_args ext.ext_args in
+-        explain_unbound ppf ~params:[] ty args (fun c -> c) "type" (fun _ -> "")
++        explain_unbound ppf ty args (fun c -> c) "type" (fun _ -> "")
+       in
+       Location.errorf ~loc
+         "A type variable is unbound in this extension constructor%t"
+diff --git a/typing/typedecl.mli b/typing/typedecl.mli
+index c1d20c4bf9..f57ca97a92 100644
+--- a/typing/typedecl.mli
++++ b/typing/typedecl.mli
+@@ -99,11 +99,7 @@ type error =
+     }
+   | Null_arity_external
+   | Missing_native_external
+-  | Unbound_type_var of {
+-      var: type_expr;
+-      params: type_expr list;
+-      decl: type_declaration;
+-    }
++  | Unbound_type_var of type_expr * type_declaration
+   | Cannot_extend_private_type of Path.t
+   | Not_extensible_type of Path.t
+   | Extension_mismatch of Path.t * Env.t * Includecore.type_mismatch

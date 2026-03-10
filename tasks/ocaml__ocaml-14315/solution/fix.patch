@@ -1,0 +1,285 @@
+diff --git a/Changes b/Changes
+index 5bca065d73..d0e19411fd 100644
+--- a/Changes
++++ b/Changes
+@@ -366,6 +366,9 @@ Working version
+   e.g. `< foo : int; .. as $0>` when $0 is introduced by a GADT constructor
+   (Stefan Muenzel, review by Jacques Garrigue and Florian Angeletti)
+ 
++- #14190: `ocaml -e` now also processes `-init` (previously it was ignored).
++  (Emile Trotignon, review by David Allsopp and @ygrek)
++
+ - #14225: do not raise unused-constructor warning on private
+   constructor in type implementations, for example
+   `type safe = private Safe`, which are typically used to
+@@ -388,13 +391,15 @@ Working version
+   hard-coded path.
+   (David Allsopp, review by Damien Doligez and Samuel Hym)
+ 
+-- #14190: `ocaml -e` now also processes `-init` (previously it was ignored).
+-  (Emile Trotignon, review by David Allsopp and @ygrek)
++- #14315: enable -i-variance also for classes and extension constructors,
++  and add description of -i-variance in manpages
++  (Takafumi Saikawa, review by Florian Angeletti and Jacques Garrigue)
+ 
+--  #14373: remove the OCAML_BINANNOT_WITHENV environment variable, and
++- #14373: remove the OCAML_BINANNOT_WITHENV environment variable, and
+    always strip typing environment in cmt files
+    (Florian Angeletti, review by David Allsopp)
+ 
++
+ ### Internal/compiler-libs changes:
+ 
+ - #13839, #14008: Reimplement `let open`, `let module` and `let exception` in
+diff --git a/man/ocaml.1 b/man/ocaml.1
+index a120f0b4a4..1cf836e1df 100644
+--- a/man/ocaml.1
++++ b/man/ocaml.1
+@@ -69,6 +69,11 @@ Show absolute filenames in error messages.
+ .B \-no-absname
+ Do not try to show absolute filenames in error messages.
+ .TP
++.B \-i-variance
++Cause the compiler to print the computed variance of type parameters for
++every type declaration.  Without this option, variance is printed only for
++private types or types without a manifest (e.g., abstract types).
++.TP
+ .BI \-I " directory"
+ Add the given directory to the list of directories searched for
+ source and compiled files. By default, the current directory is
+diff --git a/man/ocamlc.1 b/man/ocamlc.1
+index 8e2dbdb8b0..49fb359f6c 100644
+--- a/man/ocamlc.1
++++ b/man/ocamlc.1
+@@ -414,6 +414,11 @@ can help in writing an explicit interface (.mli file) for a file: just
+ redirect the standard output of the compiler to a .mli file, and edit
+ that file to remove all declarations of unexported names.
+ .TP
++.B \-i-variance
++Cause the compiler to print the computed variance of type parameters for
++every type declaration.  Without this option, variance is printed only for
++private types or types without a manifest (e.g., abstract types).
++.TP
+ .BI \-cmi-file " filename"
+ Type-check the source implementation to be compiled against the
+ specified interface file (bypasses the normal lookup for .mli and .cmi files).
+diff --git a/man/ocamlopt.1 b/man/ocamlopt.1
+index 5d1254478a..961bff9c6d 100644
+--- a/man/ocamlopt.1
++++ b/man/ocamlopt.1
+@@ -307,6 +307,11 @@ can help in writing an explicit interface (.mli file) for a file:
+ just redirect the standard output of the compiler to a .mli file,
+ and edit that file to remove all declarations of unexported names.
+ .TP
++.B \-i-variance
++Cause the compiler to print the computed variance of type parameters for
++every type declaration.  Without this option, variance is printed only for
++private types or types without a manifest (e.g., abstract types).
++.TP
+ .BI \-cmi\-file " filename"
+ Type-check the source implementation to be compiled against the
+ specified interface file (bypasses the normal lookup for .mli and .cmi files).
+diff --git a/typing/oprint.ml b/typing/oprint.ml
+index 5f91fa29bf..f00de8fafb 100644
+--- a/typing/oprint.ml
++++ b/typing/oprint.ml
+@@ -808,12 +808,12 @@ and print_out_extension_constructor ppf ext =
+         [] -> fprintf ppf "%a" print_lident ext.oext_type_name
+       | [ty_param] ->
+         fprintf ppf "@[%a@ %a@]"
+-          (print_type_parameter ~non_gen:false)
++          type_parameter
+           ty_param
+           print_lident ext.oext_type_name
+       | _ ->
+         fprintf ppf "@[(@[%a)@]@ %a@]"
+-          (print_list print_type_parameter (fun ppf -> fprintf ppf ",@ "))
++          (print_list type_parameter (fun ppf -> fprintf ppf ",@ "))
+           ext.oext_type_params
+           print_lident ext.oext_type_name
+   in
+@@ -829,11 +829,11 @@ and print_out_type_extension ppf te =
+       [] -> fprintf ppf "%a" print_lident te.otyext_name
+     | [param] ->
+       fprintf ppf "@[%a@ %a@]"
+-        (print_type_parameter ~non_gen:false) param
++        type_parameter param
+         print_lident te.otyext_name
+     | _ ->
+         fprintf ppf "@[(@[%a)@]@ %a@]"
+-          (print_list print_type_parameter (fun ppf -> fprintf ppf ",@ "))
++          (print_list type_parameter (fun ppf -> fprintf ppf ",@ "))
+           te.otyext_params
+           print_lident te.otyext_name
+   in
+diff --git a/typing/out_type.ml b/typing/out_type.ml
+index a2627785b3..d8882ef4a4 100644
+--- a/typing/out_type.ml
++++ b/typing/out_type.ml
+@@ -1288,6 +1288,24 @@ let filter_params tyl =
+       [] tyl
+   in List.rev params
+ 
++(* When printing the variance of a type parameter,
++   we need to translate the computed variance ([Variance.t])
++   back into the corresponding syntactic node ([Asttypes.variance]).
++   [Typedecl_variance.transl_variance] is half inverse to this operation. *)
++let syntactic_variance
++    ?(with_variance=(!Clflags.print_variance))
++    ?(with_injectivity=(!Clflags.print_variance)) vi =
++  let open Variance in let open Asttypes in
++  let v = if not with_variance then NoVariance else
++  match mem May_pos vi, mem May_neg vi with
++  | false, false -> Bivariant
++  | true, false -> Covariant
++  | false, true -> Contravariant
++  | true, true -> NoVariance in
++  let i = if not with_injectivity then NoInjectivity else
++  if mem Inj vi then Injective else NoInjectivity in
++  (v, i)
++
+ let prepare_type_constructor_arguments = function
+   | Cstr_tuple l -> List.iter prepare_type l
+   | Cstr_record l -> List.iter (fun l -> prepare_type l.ld_type) l
+@@ -1410,23 +1428,18 @@ let tree_of_type_decl id decl =
+       List.map2
+         (fun ty v ->
+           let is_var = is_Tvar ty in
+-          if !Clflags.print_variance || abstr || not is_var then
+-            let inj =
+-              !Clflags.print_variance && Variance.mem Inj v ||
+-              type_kind_is_abstract decl && Variance.mem Inj v &&
+-              match decl.type_manifest with
+-              | None -> true
+-              | Some ty -> (* only abstract or private row types *)
+-                  decl.type_private = Private &&
+-                  Btype.is_constr_row ~allow_ident:true (Btype.row_of_type ty)
+-            and (co, cn) = Variance.get_upper v in
+-            (match co, cn with
+-            | false, false -> Bivariant
+-            | true, false -> Covariant
+-            | false, true -> Contravariant
+-            | true, true -> NoVariance),
+-            (if inj then Injective else NoInjectivity)
+-          else (NoVariance, NoInjectivity))
++          let with_variance = !Clflags.print_variance || abstr || not is_var in
++          let with_injectivity =
++            !Clflags.print_variance ||
++            (abstr || not is_var) &&
++            type_kind_is_abstract decl &&
++            match decl.type_manifest with
++            | None -> true
++            | Some ty -> (* only abstract or private row types *)
++                decl.type_private = Private &&
++                Btype.is_constr_row ~allow_ident:true (Btype.row_of_type ty)
++          in
++          syntactic_variance ~with_variance ~with_injectivity v)
+         decl.type_params decl.type_variance
+     in
+     (Ident.name id,
+@@ -1535,15 +1548,25 @@ let extension_constructor_args_and_ret_type_subtree ext_args ext_ret_type =
+   let args = tree_of_constructor_arguments ext_args in
+   (args, ret)
+ 
+-let prepared_tree_of_extension_constructor
+-   id ext es
+-  =
++let prepared_tree_of_extension_constructor id ext es =
+   let ty_name = Path.name ext.ext_type_path in
+   let ty_params = filter_params ext.ext_type_params in
+-  let type_param =
++  let ty_variances =
++    try
++      let variances =
++        (Env.find_type ext.ext_type_path !printing_env).type_variance in
++      List.map syntactic_variance variances
++    with Not_found ->
++      List.map (fun _ -> NoVariance, NoInjectivity) ty_params
++  in
++  let type_param ot_variance =
+     function
+-    | Otyp_var (_, id) -> id
+-    | _ -> "?"
++    | Otyp_var (_ot_non_gen, ot_name) ->
++        {ot_non_gen=false; ot_name; ot_variance}
++        (* NB(#14315): simply using the given ot_non_gen here
++           does not break the testsuite *)
++    | _ ->
++        {ot_non_gen=false; ot_name="?"; ot_variance=NoVariance,NoInjectivity}
+   in
+   let param_scope f =
+     match ext.ext_ret_type with
+@@ -1558,7 +1581,8 @@ let prepared_tree_of_extension_constructor
+     param_scope
+       (fun () ->
+          List.iter (Aliases.add_printed ~non_gen:false) ty_params;
+-         List.map (fun ty -> type_param (tree_of_typexp Type ty)) ty_params
++         List.map2 (fun v ty -> type_param v (tree_of_typexp Type ty))
++          ty_variances ty_params
+       )
+   in
+   let name = Ident.name id in
+@@ -1714,23 +1738,12 @@ let rec tree_of_class_type mode params =
+ 
+ 
+ let tree_of_class_param param variance =
+-  let ot_variance =
+-    if is_Tvar param then Asttypes.(NoVariance, NoInjectivity) else variance in
++  let ot_variance = syntactic_variance variance
++      ~with_variance:(!Clflags.print_variance || not (is_Tvar param)) in
+   match tree_of_typexp Type_scheme param with
+     Otyp_var (ot_non_gen, ot_name) -> {ot_non_gen; ot_name; ot_variance}
+   | _ -> {ot_non_gen=false; ot_name="?"; ot_variance}
+ 
+-let class_variance =
+-  let open Variance in let open Asttypes in
+-  List.map (fun v ->
+-    let inj = !Clflags.print_variance && Variance.mem Inj v in
+-    (match mem May_pos v, mem May_neg v with
+-    | false, false -> Bivariant
+-    | true, false -> Covariant
+-    | false, true -> Contravariant
+-    | true, true -> NoVariance),
+-    (if inj then Injective else NoInjectivity))
+-
+ let tree_of_class_declaration id cl rs =
+   let params = filter_params cl.cty_params in
+ 
+@@ -1747,7 +1760,7 @@ let tree_of_class_declaration id cl rs =
+   let vir_flag = cl.cty_new = None in
+   Osig_class
+     (vir_flag, Ident.name id,
+-     List.map2 tree_of_class_param params (class_variance cl.cty_variance),
++     List.map2 tree_of_class_param params cl.cty_variance,
+      tree_of_class_type Type_scheme params cl.cty_type,
+      tree_of_rec rs)
+ 
+@@ -1774,7 +1787,7 @@ let tree_of_cltype_declaration id cl rs =
+   in
+   Osig_class_type
+     (has_virtual_vars || has_virtual_meths, Ident.name id,
+-     List.map2 tree_of_class_param params (class_variance cl.clty_variance),
++     List.map2 tree_of_class_param params cl.clty_variance,
+      tree_of_class_type Type_scheme params cl.clty_type,
+      tree_of_rec rs)
+ 
+diff --git a/typing/outcometree.mli b/typing/outcometree.mli
+index d1b088582f..7c446bed0b 100644
+--- a/typing/outcometree.mli
++++ b/typing/outcometree.mli
+@@ -150,13 +150,13 @@ and out_type_decl =
+ and out_extension_constructor =
+   { oext_name: string;
+     oext_type_name: string;
+-    oext_type_params: string list;
++    oext_type_params: out_type_param list;
+     oext_args: out_type list;
+     oext_ret_type: out_type option;
+     oext_private: Asttypes.private_flag }
+ and out_type_extension =
+   { otyext_name: string;
+-    otyext_params: string list;
++    otyext_params: out_type_param list;
+     otyext_constructors: out_constructor list;
+     otyext_private: Asttypes.private_flag }
+ and out_val_decl =

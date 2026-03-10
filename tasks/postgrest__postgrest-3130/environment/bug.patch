@@ -1,0 +1,148 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 138f054f..e9a9237f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,14 +5,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Added
+-
+  - #2887, Add Preference `max-affected` to limit affected resources - @taimoorzaeem
+ 
+-### Fixed
+-
+-  - #3124, Fix table's media type handlers not working for all schemas - @steve-chavez
+-
+ ## [12.0.1] - 2023-12-12
+ 
+ ### Fixed
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 65d0416d..12b9a136 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -1167,7 +1167,7 @@ mediaHandlers pgVer =
+         join pg_type      arg_name     on arg_name.oid = proc.proargtypes[0]
+         join pg_namespace arg_schema   on arg_schema.oid = arg_name.typnamespace
+       where
+-        proc_schema.nspname = ANY($1) and
++        proc_schema.nspname = ANY('{test}') and
+         proc.pronargs = 1 and
+         arg_name.oid in (select reltype from all_relations)
+       union
+@@ -1182,8 +1182,7 @@ mediaHandlers pgVer =
+         join pg_namespace pro_sch on pro_sch.oid = proc.pronamespace
+         join media_types mtype on proc.prorettype = mtype.oid
+         join pg_namespace typ_sch     on typ_sch.oid = mtype.typnamespace
+-      where
+-        pro_sch.nspname = ANY($1) and NOT proretset
++      where NOT proretset
+       |] <> (if pgVer >= pgVersion110 then " AND prokind = 'f'" else " AND NOT (proisagg OR proiswindow)")
+ 
+ decodeMediaHandlers :: HD.Result MediaHandlerMap
+diff --git a/test/memory/memory-tests.sh b/test/memory/memory-tests.sh
+index 20967082..9d91518e 100755
+--- a/test/memory/memory-tests.sh
++++ b/test/memory/memory-tests.sh
+@@ -102,7 +102,7 @@ postJsonArrayTest(){
+ 
+ echo "Running memory usage tests.."
+ 
+-jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "27M"
++jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "26M"
+ jsonKeyTest "1M" "POST" "/leak?columns=blob" "16M"
+ jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "16M"
+ 
+diff --git a/test/spec/Feature/Query/MultipleSchemaSpec.hs b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+index 7b25e2ff..deaa5954 100644
+--- a/test/spec/Feature/Query/MultipleSchemaSpec.hs
++++ b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+@@ -150,20 +150,6 @@ spec =
+             matchStatus = 406
+           }
+ 
+-      it "succeeds in calling handler with a domain on another schema" $
+-        request methodGet "/another_table" [("Accept-Profile", "v2"), (hAccept, "text/plain")] ""
+-          `shouldRespondWith` "plain"
+-          { matchStatus = 200
+-          , matchHeaders = ["Content-Type" <:> "text/plain; charset=utf-8", "Content-Profile" <:> "v2"]
+-          }
+-
+-      it "succeeds in calling handler with a domain on an exposed schema" $
+-        request methodGet "/another_table" [("Accept-Profile", "v2"), (hAccept, "text/special")] ""
+-          `shouldRespondWith` "special"
+-          { matchStatus = 200
+-          , matchHeaders = ["Content-Type" <:> "text/special", "Content-Profile" <:> "v2"]
+-          }
+-
+     context "calling procs on different schemas" $ do
+       it "succeeds in calling the default schema proc" $
+         request methodGet "/rpc/get_parents_below?id=6" [] ""
+@@ -208,20 +194,6 @@ spec =
+           , matchHeaders = [matchContentTypeJson, "Content-Profile" <:> "v2"]
+           }
+ 
+-      it "succeeds in calling handler with a domain on another schema" $
+-        request methodGet "/rpc/get_plain_text" [("Accept-Profile", "v2"), (hAccept, "text/plain")] ""
+-          `shouldRespondWith` "plain"
+-          { matchStatus = 200
+-          , matchHeaders = ["Content-Type" <:> "text/plain; charset=utf-8", "Content-Profile" <:> "v2"]
+-          }
+-
+-      it "succeeds in calling handler with a domain on an exposed schema" $
+-        request methodGet "/rpc/get_special_text" [("Accept-Profile", "v2"), (hAccept, "text/special")] ""
+-          `shouldRespondWith` "special"
+-          { matchStatus = 200
+-          , matchHeaders = ["Content-Type" <:> "text/special", "Content-Profile" <:> "v2"]
+-          }
+-
+     context "Modifying tables on different schemas" $ do
+       it "succeeds in patching on the v1 schema and returning its parent" $
+         request methodPatch "/children?select=name,parent(name)&id=eq.1" [("Content-Profile", "v1"), ("Prefer", "return=representation")]
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 8d268dcc..539e8e2a 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2169,42 +2169,6 @@ returns setof v2.parents as $$
+   select * from v2.parents where id < $1;
+ $$ language sql;
+ 
+-create function v2.get_plain_text()
+-returns test."text/plain" as $$
+-  select 'plain'::test."text/plain";
+-$$ language sql;
+-
+-create domain v2."text/special" as text;
+-
+-create function v2.get_special_text()
+-returns v2."text/special" as $$
+-  select 'special'::v2."text/special";
+-$$ language sql;
+-
+-create or replace function v2.special_trans (state v2."text/special", next v2.another_table)
+-returns v2."text/special" as $$
+-  select 'special'::v2."text/special";
+-$$ language sql;
+-
+-drop aggregate if exists v2.special_agg(v2.another_table);
+-create aggregate v2.special_agg (v2.another_table) (
+-  initcond = ''
+-, stype = v2."text/special"
+-, sfunc = v2.special_trans
+-);
+-
+-create or replace function v2.plain_trans (state test."text/plain", next v2.another_table)
+-returns test."text/plain" as $$
+-  select 'plain'::test."text/plain";
+-$$ language sql;
+-
+-drop aggregate if exists v2.plain_agg(v2.another_table);
+-create aggregate v2.plain_agg (v2.another_table) (
+-  initcond = ''
+-, stype = test."text/plain"
+-, sfunc = v2.plain_trans
+-);
+-
+ create table private.screens (
+   id serial primary key,
+   name text not null default 'new screen'

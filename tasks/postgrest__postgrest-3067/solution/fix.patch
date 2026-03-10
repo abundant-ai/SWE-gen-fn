@@ -1,0 +1,212 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1e0da168..839f36fd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #915, Add support for aggregate functions - @timabdulla
+     + The aggregate functions SUM(), MAX(), MIN(), AVG(), and COUNT() are now supported.
+     + It's disabled by default, you can enable it with `db-aggregates-enabled`.
++ - #3057, Log all internal database errors to stderr - @laurenceisla
+ 
+ ### Fixed
+ 
+@@ -34,6 +35,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Shows `set_config('pgrst.setting_name', $1)` instead of `setconfig($1, $2)`
+    + Does not apply to role settings and `app.settings.*`
+  - #2420, Fix bogus message when listening on port 0 - @develop7
++ - #3067, Fix Acquision Timeout errors logging to stderr when `log-level=crit` - @laurenceisla
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index f7f8648e..55230712 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -38,7 +38,7 @@ admin appState appConfig req respond  = do
+   isConnectionUp      <-
+     if configDbChannelEnabled appConfig
+       then AppState.getIsListenerOn appState
+-      else isRight <$> AppState.usePool appState (SQL.sql "SELECT 1")
++      else isRight <$> AppState.usePool appState appConfig (SQL.sql "SELECT 1")
+ 
+   case Wai.pathInfo req of
+     ["ready"] ->
+@@ -62,4 +62,3 @@ reachMainApp appSock = do
+     addrFamily (SockAddrInet _ _) = AF_INET
+     addrFamily (SockAddrInet6 {}) = AF_INET6
+     addrFamily (SockAddrUnix _)   = AF_UNIX
+-
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 9d01be85..399d12ae 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -157,11 +157,11 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+ 
+   handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtAndParseTiming
+ 
+-runDbHandler :: AppState.AppState -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+-runDbHandler appState isoLvl mode authenticated prepared handler = do
++runDbHandler :: AppState.AppState -> AppConfig -> SQL.IsolationLevel -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
++runDbHandler appState config isoLvl mode authenticated prepared handler = do
+   dbResp <- lift $ do
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
+-    AppState.usePool appState . transaction isoLvl mode $ runExceptT handler
++    AppState.usePool appState config . transaction isoLvl mode $ runExceptT handler
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+@@ -245,7 +245,7 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     roleSettings = fromMaybe mempty (HM.lookup authRole $ configRoleSettings conf)
+     roleIsoLvl = HM.findWithDefault SQL.ReadCommitted authRole $ configRoleIsoLvl conf
+     runQuery isoLvl timeout mode query =
+-      runDbHandler appState isoLvl mode authenticated prepared $ do
++      runDbHandler appState conf isoLvl mode authenticated prepared $ do
+         Query.setPgLocals conf authClaims authRole (HM.toList roleSettings) apiReq timeout
+         Query.runPreReq conf
+         query
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 8fff8edc..7a8dd052 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -42,6 +42,7 @@ import qualified Hasql.Notifications        as SQL
+ import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Session              as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
++import qualified Network.HTTP.Types.Status  as HTTP
+ import qualified Network.Socket             as NS
+ import qualified PostgREST.Error            as Error
+ import           PostgREST.Version          (prettyVersion)
+@@ -58,6 +59,7 @@ import Data.Time          (ZonedTime, defaultTimeLocale, formatTime,
+ import Data.Time.Clock    (UTCTime, getCurrentTime)
+ 
+ import PostgREST.Config                  (AppConfig (..),
++                                          LogLevel (..),
+                                           addFallbackAppName,
+                                           readAppConfig)
+ import PostgREST.Config.Database         (queryDbSettings,
+@@ -204,12 +206,18 @@ initPool AppConfig{..} =
+     (toUtf8 $ addFallbackAppName prettyVersion configDbUri)
+ 
+ -- | Run an action with a database connection.
+-usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+-usePool AppState{..} x = do
++usePool :: AppState -> AppConfig -> SQL.Session a -> IO (Either SQL.UsageError a)
++usePool appState@AppState{..} AppConfig{configLogLevel} x = do
+   res <- SQL.use statePool x
+-  whenLeft res (\case
+-    SQL.AcquisitionTimeoutUsageError -> debounceLogAcquisitionTimeout -- this can happen rapidly for many requests, so we debounce
+-    _                                -> pure ())
++
++  when (configLogLevel > LogCrit) $ do
++    whenLeft res (\case
++      SQL.AcquisitionTimeoutUsageError -> debounceLogAcquisitionTimeout -- this can happen rapidly for many requests, so we debounce
++      error
++        -- TODO We're using the 500 HTTP status for getting all internal db errors but there's no response here. We need a new intermediate type to not rely on the HTTP status.
++        | Error.status (Error.PgError False error) >= HTTP.status500 -> logPgrstError appState error
++        | otherwise -> pure ())
++
+   return res
+ 
+ -- | Flush the connection pool so that any future use of the pool will
+@@ -301,7 +309,7 @@ loadSchemaCache appState = do
+   conf@AppConfig{..} <- getConfig appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    usePool appState . transaction SQL.ReadCommitted SQL.Read $
++    usePool appState conf . transaction SQL.ReadCommitted SQL.Read $
+       querySchemaCache conf
+   case result of
+     Left e -> do
+@@ -344,10 +352,10 @@ internalConnectionWorker :: AppState -> IO ()
+ internalConnectionWorker appState = work
+   where
+     work = do
+-      AppConfig{..} <- getConfig appState
++      config@AppConfig{..} <- getConfig appState
+       logWithZTime appState $ "Starting PostgREST " <> T.decodeUtf8 prettyVersion <> "..."
+       logWithZTime appState "Attempting to connect to the database..."
+-      connected <- establishConnection appState
++      connected <- establishConnection appState config
+       case connected of
+         FatalConnectionError reason ->
+           -- Fatal error when connecting
+@@ -387,8 +395,8 @@ internalConnectionWorker appState = work
+ --
+ -- The connection tries are capped, but if the connection times out no error is
+ -- thrown, just 'False' is returned.
+-establishConnection :: AppState -> IO ConnectionStatus
+-establishConnection appState =
++establishConnection :: AppState -> AppConfig -> IO ConnectionStatus
++establishConnection appState config =
+   retrying retrySettings shouldRetry $
+     const $ flushPool appState >> getConnectionStatus
+   where
+@@ -398,7 +406,7 @@ establishConnection appState =
+ 
+     getConnectionStatus :: IO ConnectionStatus
+     getConnectionStatus = do
+-      pgVersion <- usePool appState $ queryPgVersion False -- No need to prepare the query here, as the connection might not be established
++      pgVersion <- usePool appState config $ queryPgVersion False -- No need to prepare the query here, as the connection might not be established
+       case pgVersion of
+         Left e -> do
+           logPgrstError appState e
+@@ -431,11 +439,11 @@ establishConnection appState =
+ -- | Re-reads the config plus config options from the db
+ reReadConfig :: Bool -> AppState -> IO ()
+ reReadConfig startingUp appState = do
+-  AppConfig{..} <- getConfig appState
++  config@AppConfig{..} <- getConfig appState
+   pgVer <- getPgVersion appState
+   dbSettings <-
+     if configDbConfig then do
+-      qDbSettings <- usePool appState $ queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements
++      qDbSettings <- usePool appState config $ queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements
+       case qDbSettings of
+         Left e -> do
+           logWithZTime appState
+@@ -453,7 +461,7 @@ reReadConfig startingUp appState = do
+       pure mempty
+   (roleSettings, roleIsolationLvl) <-
+     if configDbConfig then do
+-      rSettings <- usePool appState $ queryRoleSettings pgVer configDbPreparedStatements
++      rSettings <- usePool appState config $ queryRoleSettings pgVer configDbPreparedStatements
+       case rSettings of
+         Left e -> do
+           logWithZTime appState "An error ocurred when trying to query the role settings"
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index bd00006c..363f1cb0 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -53,7 +53,7 @@ dumpSchema appState = do
+   conf@AppConfig{..} <- AppState.getConfig appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    AppState.usePool appState $
++    AppState.usePool appState conf $
+       transaction SQL.ReadCommitted SQL.Read $
+         querySchemaCache conf
+   case result of
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 8b441161..6d4de526 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -115,6 +115,7 @@ data AppConfig = AppConfig
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo
++  deriving (Eq, Ord)
+ 
+ dumpLogLevel :: LogLevel -> Text
+ dumpLogLevel = \case
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 90c3ea0a..61e53ef8 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -11,6 +11,7 @@ module PostgREST.Error
+   , PgError(..)
+   , Error(..)
+   , errorPayload
++  , status
+   ) where
+ 
+ import qualified Data.Aeson                as JSON

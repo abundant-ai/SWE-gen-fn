@@ -1,0 +1,222 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6959080..b0928b38 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file. From versio
+ - Fix not returning `Content-Length` on empty HTTP `201` responses by @laurenceisla in #4518
+ - Fix inaccurate Server-Timing header durations by @steve-chavez in #4522
+ - Fix inaccurate "Schema cache queried" logs by @steve-chavez in #4522
++- Fix performance and high memory usage of relation hint calculation by @mkleczek in #4462 #4463
+ 
+ ## [14.1] - 2025-11-05
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 39217610..7d6a01d0 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -3,6 +3,7 @@ Module      : PostgREST.Error
+ Description : PostgREST error HTTP responses
+ -}
+ {-# OPTIONS_GHC -fno-warn-orphans #-}
++{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ 
+ module PostgREST.Error
+@@ -41,6 +42,7 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.MediaType (MediaType (..))
+ import qualified PostgREST.MediaType as MediaType
+ 
++import PostgREST.SchemaCache              (SchemaCache (SchemaCache, dbTablesFuzzyIndex))
+ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..),
+                                            Schema)
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+@@ -49,10 +51,8 @@ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            RelationshipsMap)
+ import PostgREST.SchemaCache.Routine      (Routine (..),
+                                            RoutineParam (..))
+-import PostgREST.SchemaCache.Table        (Table (..))
+ import Protolude
+ 
+-
+ class (ErrorBody a, JSON.ToJSON a) => PgrstError a where
+   status   :: a -> HTTP.Status
+   headers  :: a -> [Header]
+@@ -250,7 +250,7 @@ data SchemaCacheError
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] MediaType Bool [QualifiedIdentifier] [Routine]
+   | ColumnNotFound Text Text
+-  | TableNotFound Text Text [Table]
++  | TableNotFound Text Text SchemaCache
+   deriving Show
+ 
+ instance PgrstError SchemaCacheError where
+@@ -313,7 +313,7 @@ instance ErrorBody SchemaCacheError where
+       where
+         onlySingleParams = isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream]
+   hint (AmbiguousRpc _)      = Just "Try renaming the parameters or the function itself in the database so function overloading can be resolved"
+-  hint (TableNotFound schemaName relName tbls) = JSON.String <$> tableNotFoundHint schemaName relName tbls
++  hint (TableNotFound schemaName relName schemaCache) = JSON.String <$> tableNotFoundHint schemaName relName schemaCache
+ 
+   hint _ = Nothing
+ 
+@@ -428,13 +428,11 @@ noRpcHint schema procName params allProcs overloadedProcs =
+ 
+ -- |
+ -- Do a fuzzy search in all tables in the same schema and return closest result
+-tableNotFoundHint :: Text -> Text -> [Table] -> Maybe Text
+-tableNotFoundHint schema tblName tblList
++tableNotFoundHint :: Text -> Text -> SchemaCache -> Maybe Text
++tableNotFoundHint schema tblName SchemaCache{dbTablesFuzzyIndex}
+   = fmap (\tbl -> "Perhaps you meant the table '" <> schema <> "." <> tbl <> "'") perhapsTable
+     where
+-      perhapsTable = Fuzzy.getOne fuzzyTableSet tblName
+-      fuzzyTableSet = Fuzzy.fromList [ tableName tbl | tbl <- tblList, tableSchema tbl == schema]
+-
++      perhapsTable = (`Fuzzy.getOne` tblName) =<< HM.lookup schema dbTablesFuzzyIndex
+ 
+ compressedRel :: Relationship -> JSON.Value
+ -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 73836b26..a1d92ae3 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -172,7 +172,7 @@ dbActionPlan dbAct conf apiReq sCache = case dbAct of
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Bool -> Either Error CrudPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} headersOnly = do
+-  qi <- findTable identifier (dbTables sCache)
++  qi <- findTable identifier sCache
+   rPlan <- readPlan qi conf sCache apiRequest
+   (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+@@ -180,7 +180,7 @@ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Prefe
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error CrudPlan
+ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+-  qi <- findTable identifier (dbTables sCache)
++  qi <- findTable identifier sCache
+   rPlan <- readPlan qi conf sCache apiRequest
+   mPlan <- mutatePlan mutation qi apiRequest sCache rPlan
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+@@ -812,10 +812,10 @@ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
+ -- | Lookup table in the schema cache before creating read plan
+-findTable :: QualifiedIdentifier -> TablesMap -> Either Error QualifiedIdentifier
+-findTable qi@QualifiedIdentifier{..} tableMap =
+-  case HM.lookup qi tableMap of
+-    Nothing -> Left $ SchemaCacheErr $ TableNotFound qiSchema qiName (HM.elems tableMap)
++findTable :: QualifiedIdentifier -> SchemaCache -> Either Error QualifiedIdentifier
++findTable qi@QualifiedIdentifier{..} sc@SchemaCache{dbTables} =
++  case HM.lookup qi dbTables of
++    Nothing -> Left $ SchemaCacheErr $ TableNotFound qiSchema qiName sc
+     Just _ -> Right qi
+ 
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either Error ReadPlanTree
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 49eaa863..8498e792 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -213,10 +213,10 @@ actionResponse (MaybeDbResult InspectPlan{ipHdrsOnly=headersOnly} body) _ versio
+   in
+   Right $ PgrstResponse HTTP.status200 (MediaType.toContentType MTOpenAPI : cLHeader ++ maybeToList (profileHeader schema negotiatedByProfile)) rsBody
+ 
+-actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ SchemaCache{dbTables} _ _ =
++actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ sc@SchemaCache{dbTables} _ _ =
+   case HM.lookup qi dbTables of
+     Just tbl -> respondInfo $ allowH tbl
+-    Nothing  -> Left $ Error.SchemaCacheErr $ Error.TableNotFound qiSchema qiName (HM.elems dbTables)
++    Nothing  -> Left $ Error.SchemaCacheErr $ Error.TableNotFound qiSchema qiName sc
+   where
+     allowH table =
+       let hasPK = not . null $ tablePKCols table in
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 528d7905..f69ec882 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -20,6 +20,7 @@ These queries are executed once at startup or when PostgREST is reloaded.
+ 
+ module PostgREST.SchemaCache
+   ( SchemaCache(..)
++  , TablesFuzzyIndex
+   , querySchemaCache
+   , showSummary
+   , decodeFuncs
+@@ -66,21 +67,28 @@ import PostgREST.SchemaCache.Table           (Column (..), ColumnMap,
+ 
+ import qualified PostgREST.MediaType as MediaType
+ 
+-import Control.Arrow    ((&&&))
+-import Protolude
+-import System.IO.Unsafe (unsafePerformIO)
++import           Control.Arrow    ((&&&))
++import qualified Data.FuzzySet    as Fuzzy
++import           Protolude
++import           System.IO.Unsafe (unsafePerformIO)
++
++type TablesFuzzyIndex = HM.HashMap Schema Fuzzy.FuzzySet
+ 
+ data SchemaCache = SchemaCache
+-  { dbTables          :: TablesMap
+-  , dbRelationships   :: RelationshipsMap
+-  , dbRoutines        :: RoutineMap
+-  , dbRepresentations :: RepresentationsMap
+-  , dbMediaHandlers   :: MediaHandlerMap
+-  , dbTimezones       :: TimezoneNames
+-  }
++  { dbTables           :: TablesMap
++  , dbRelationships    :: RelationshipsMap
++  , dbRoutines         :: RoutineMap
++  , dbRepresentations  :: RepresentationsMap
++  , dbMediaHandlers    :: MediaHandlerMap
++  , dbTimezones        :: TimezoneNames
++  -- Memoized fuzzy index of table names per schema to support approximate matching
++  -- Since index construction can be expensive, we build it once and store in the SchemaCache
++  -- Haskell lazy evaluation ensures it's only built on first use and memoized afterwards
++  , dbTablesFuzzyIndex :: TablesFuzzyIndex
++  } deriving (Show)
+ 
+ instance JSON.ToJSON SchemaCache where
+-  toJSON (SchemaCache tabs rels routs reps hdlers tzs) = JSON.object [
++  toJSON (SchemaCache tabs rels routs reps hdlers tzs _) = JSON.object [
+       "dbTables"          .= JSON.toJSON tabs
+     , "dbRelationships"   .= JSON.toJSON rels
+     , "dbRoutines"        .= JSON.toJSON routs
+@@ -90,7 +98,7 @@ instance JSON.ToJSON SchemaCache where
+     ]
+ 
+ showSummary :: SchemaCache -> Text
+-showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs) =
++showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs _) =
+   T.intercalate ", "
+   [ show (HM.size tbls)       <> " Relations"
+   , show (HM.size rels)       <> " Relationships"
+@@ -138,6 +146,8 @@ data KeyDep
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
++maxDbTablesForFuzzySearch :: Int
++maxDbTablesForFuzzySearch = 500
+ 
+ querySchemaCache :: AppConfig -> SQL.Transaction SchemaCache
+ querySchemaCache conf@AppConfig{..} = do
+@@ -166,6 +176,11 @@ querySchemaCache conf@AppConfig{..} = do
+     , dbRepresentations = reps
+     , dbMediaHandlers = HM.union mHdlers initialMediaHandlers -- the custom handlers will override the initial ones
+     , dbTimezones = tzones
++
++    , dbTablesFuzzyIndex =
++        -- Only build fuzzy index for schemas with a reasonable number of tables
++        -- Fuzzy.FuzzySet is memory heavy we just don't use it for large schemas
++        Fuzzy.fromList <$> HM.filter ((< maxDbTablesForFuzzySearch) . length) (HM.fromListWith (<>) ((qiSchema &&& pure . qiName) <$> HM.keys tabsWViewsPks))
+     }
+   where
+     schemas = toList configDbSchemas
+@@ -203,6 +218,7 @@ removeInternal schemas dbStruct =
+     , dbRepresentations = dbRepresentations dbStruct -- no need to filter, not directly exposed through the API
+     , dbMediaHandlers   = dbMediaHandlers dbStruct
+     , dbTimezones       = dbTimezones dbStruct
++    , dbTablesFuzzyIndex = dbTablesFuzzyIndex dbStruct
+     }
+   where
+     hasInternalJunction ComputedRelationship{} = False

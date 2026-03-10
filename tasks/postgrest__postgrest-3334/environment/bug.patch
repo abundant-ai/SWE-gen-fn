@@ -1,0 +1,150 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 55f30899..51de9304 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,7 +23,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3160, Fix using select= query parameter for custom media type handlers - @wolfgangwalther
+  - #3237, Dump media handlers and timezones with --dump-schema - @wolfgangwalther
+  - #3323, #3324, Don't hide error on LISTEN channel failure - @steve-chavez
+- - #3330, Incorrect admin server `/ready` response on slow schema cache loads - @steve-chavez
+ 
+ ### Deprecated
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 70df961f..1429816e 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -38,7 +38,7 @@ runAdmin conf@AppConfig{configAdminServerPort} appState settings observer =
+ admin :: AppState.AppState -> AppConfig -> (Observation -> IO ()) -> Wai.Application
+ admin appState appConfig observer req respond  = do
+   isMainAppReachable  <- isRight <$> reachMainApp (AppState.getSocketREST appState)
+-  isSchemaCacheLoaded <- AppState.getSchemaCacheLoaded appState
++  isSchemaCacheLoaded <- isJust <$> AppState.getSchemaCache appState
+   isConnectionUp      <-
+     if configDbChannelEnabled appConfig
+       then AppState.getIsListenerOn appState
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index e05e777f..4fd6d3a7 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -16,7 +16,6 @@ module PostgREST.AppState
+   , getJwtCache
+   , getSocketREST
+   , getSocketAdmin
+-  , getSchemaCacheLoaded
+   , init
+   , initSockets
+   , initWithPool
+@@ -86,8 +85,6 @@ data AppState = AppState
+   , statePgVersion                :: IORef PgVersion
+   -- | No schema cache at the start. Will be filled in by the connectionWorker
+   , stateSchemaCache              :: IORef (Maybe SchemaCache)
+-  -- | If schema cache is loaded
+-  , stateSchemaCacheLoaded        :: IORef Bool
+   -- | starts the connection worker with a debounce
+   , debouncedConnectionWorker     :: IO ()
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+@@ -126,7 +123,6 @@ initWithPool (sock, adminSock) pool conf observer = do
+   appState <- AppState pool
+     <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
+     <*> newIORef Nothing
+-    <*> newIORef False
+     <*> pure (pure ())
+     <*> newEmptyMVar
+     <*> newIORef False
+@@ -287,12 +283,6 @@ getIsListenerOn = readIORef . stateIsListenerOn
+ putIsListenerOn :: AppState -> Bool -> IO ()
+ putIsListenerOn = atomicWriteIORef . stateIsListenerOn
+ 
+-getSchemaCacheLoaded :: AppState -> IO Bool
+-getSchemaCacheLoaded = readIORef . stateSchemaCacheLoaded
+-
+-putSchemaCacheLoaded :: AppState -> Bool -> IO ()
+-putSchemaCacheLoaded = atomicWriteIORef . stateSchemaCacheLoaded
+-
+ -- | Schema cache status
+ data SCacheStatus
+   = SCLoaded
+@@ -315,7 +305,6 @@ loadSchemaCache appState observer = do
+         Nothing -> do
+           putSchemaCache appState Nothing
+           observer $ SchemaCacheNormalErrorObs e
+-          putSchemaCacheLoaded appState False
+           return SCOnRetry
+ 
+     Right sCache -> do
+@@ -323,7 +312,6 @@ loadSchemaCache appState observer = do
+       observer $ SchemaCacheQueriedObs resultTime
+       (t, _) <- timeItT $ observer $ SchemaCacheSummaryObs sCache
+       observer $ SchemaCacheLoadedObs t
+-      putSchemaCacheLoaded appState True
+       return SCLoaded
+ 
+ -- | Current database connection status data ConnectionStatus
+diff --git a/test/io/postgrest.py b/test/io/postgrest.py
+index 6fd46613..307c58eb 100644
+--- a/test/io/postgrest.py
++++ b/test/io/postgrest.py
+@@ -78,7 +78,6 @@ def run(
+     port=None,
+     host=None,
+     wait_for_readiness=True,
+-    wait_max_seconds=1,
+     no_pool_connection_available=False,
+     no_startup_stdout=True,
+ ):
+@@ -119,7 +118,7 @@ def run(
+             process.stdin.close()
+ 
+             if wait_for_readiness:
+-                wait_until_ready(adminurl + "/ready", wait_max_seconds)
++                wait_until_ready(adminurl + "/ready")
+ 
+             if no_startup_stdout:
+                 process.stdout.read()
+@@ -177,11 +176,12 @@ def wait_until_exit(postgrest):
+         raise PostgrestTimedOut()
+ 
+ 
+-def wait_until_ready(url, max_seconds):
++def wait_until_ready(url):
+     "Wait for the given HTTP endpoint to return a status of 200."
+     session = requests_unixsocket.Session()
+ 
+-    for _ in range(max_seconds * 10):
++    response = None
++    for _ in range(10):
+         try:
+             response = session.get(url, timeout=1)
+             if response.status_code == 200:
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index 403232bd..86bfab25 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -7,26 +7,6 @@ from util import *
+ from postgrest import *
+ 
+ 
+-def test_first_request_succeeds(defaultenv):
+-    "the first request suceeds fast since the admin server readiness was checked before"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_SCHEMAS": "apflora",
+-        "PGRST_DB_POOL": "2",
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-        "PGRST_SERVER_TIMING_ENABLED": "true",
+-    }
+-
+-    with run(env=env, wait_max_seconds=20) as postgrest:
+-        response = postgrest.session.get("/tpopmassn?select=*,tpop(*)")
+-        assert response.status_code == 200
+-
+-        server_timings = parse_server_timings_header(response.headers["Server-Timing"])
+-        plan_dur = server_timings["plan"]
+-        assert plan_dur < 2.0
+-
+-
+ def test_requests_wait_for_schema_cache_to_be_loaded(defaultenv):
+     "requests that use the schema cache (e.g. resource embedding) wait for schema cache to be loaded"
+ 

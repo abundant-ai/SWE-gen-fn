@@ -1,0 +1,289 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8dab2899..506403aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,7 +20,6 @@ All notable changes to this project will be documented in this file. From versio
+ - Fix not returning `Content-Length` on empty HTTP `201` responses by @laurenceisla in #4518
+ - Fix inaccurate Server-Timing header durations by @steve-chavez in #4522
+ - Fix inaccurate "Schema cache queried" logs by @steve-chavez in #4522
+-- Fix performance and high memory usage of relation hint calculation by @mkleczek in #4462 #4463
+ 
+ ## [14.1] - 2025-11-05
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 7d6a01d0..39217610 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -3,7 +3,6 @@ Module      : PostgREST.Error
+ Description : PostgREST error HTTP responses
+ -}
+ {-# OPTIONS_GHC -fno-warn-orphans #-}
+-{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ 
+ module PostgREST.Error
+@@ -42,7 +41,6 @@ import Network.HTTP.Types.Header (Header)
+ import           PostgREST.MediaType (MediaType (..))
+ import qualified PostgREST.MediaType as MediaType
+ 
+-import PostgREST.SchemaCache              (SchemaCache (SchemaCache, dbTablesFuzzyIndex))
+ import PostgREST.SchemaCache.Identifiers  (QualifiedIdentifier (..),
+                                            Schema)
+ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+@@ -51,8 +49,10 @@ import PostgREST.SchemaCache.Relationship (Cardinality (..),
+                                            RelationshipsMap)
+ import PostgREST.SchemaCache.Routine      (Routine (..),
+                                            RoutineParam (..))
++import PostgREST.SchemaCache.Table        (Table (..))
+ import Protolude
+ 
++
+ class (ErrorBody a, JSON.ToJSON a) => PgrstError a where
+   status   :: a -> HTTP.Status
+   headers  :: a -> [Header]
+@@ -250,7 +250,7 @@ data SchemaCacheError
+   | NoRelBetween Text Text (Maybe Text) Text RelationshipsMap
+   | NoRpc Text Text [Text] MediaType Bool [QualifiedIdentifier] [Routine]
+   | ColumnNotFound Text Text
+-  | TableNotFound Text Text SchemaCache
++  | TableNotFound Text Text [Table]
+   deriving Show
+ 
+ instance PgrstError SchemaCacheError where
+@@ -313,7 +313,7 @@ instance ErrorBody SchemaCacheError where
+       where
+         onlySingleParams = isInvPost && contentType `elem` [MTTextPlain, MTTextXML, MTOctetStream]
+   hint (AmbiguousRpc _)      = Just "Try renaming the parameters or the function itself in the database so function overloading can be resolved"
+-  hint (TableNotFound schemaName relName schemaCache) = JSON.String <$> tableNotFoundHint schemaName relName schemaCache
++  hint (TableNotFound schemaName relName tbls) = JSON.String <$> tableNotFoundHint schemaName relName tbls
+ 
+   hint _ = Nothing
+ 
+@@ -428,11 +428,13 @@ noRpcHint schema procName params allProcs overloadedProcs =
+ 
+ -- |
+ -- Do a fuzzy search in all tables in the same schema and return closest result
+-tableNotFoundHint :: Text -> Text -> SchemaCache -> Maybe Text
+-tableNotFoundHint schema tblName SchemaCache{dbTablesFuzzyIndex}
++tableNotFoundHint :: Text -> Text -> [Table] -> Maybe Text
++tableNotFoundHint schema tblName tblList
+   = fmap (\tbl -> "Perhaps you meant the table '" <> schema <> "." <> tbl <> "'") perhapsTable
+     where
+-      perhapsTable = (`Fuzzy.getOne` tblName) =<< HM.lookup schema dbTablesFuzzyIndex
++      perhapsTable = Fuzzy.getOne fuzzyTableSet tblName
++      fuzzyTableSet = Fuzzy.fromList [ tableName tbl | tbl <- tblList, tableSchema tbl == schema]
++
+ 
+ compressedRel :: Relationship -> JSON.Value
+ -- An ambiguousness error cannot happen for computed relationships TODO refactor so this mempty is not needed
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index f070b1e3..e5e58899 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -170,7 +170,7 @@ dbActionPlan dbAct conf apiReq sCache = case dbAct of
+ 
+ wrappedReadPlan :: QualifiedIdentifier -> AppConfig -> SchemaCache -> ApiRequest -> Bool -> Either Error CrudPlan
+ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Preferences{..},..} headersOnly = do
+-  qi <- findTable identifier sCache
++  qi <- findTable identifier (dbTables sCache)
+   rPlan <- readPlan qi conf sCache apiRequest
+   (handler, mediaType)  <- mapLeft ApiRequestError $ negotiateContent conf apiRequest qi iAcceptMediaType (dbMediaHandlers sCache) (hasDefaultSelect rPlan)
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+@@ -178,7 +178,7 @@ wrappedReadPlan  identifier conf sCache apiRequest@ApiRequest{iPreferences=Prefe
+ 
+ mutateReadPlan :: Mutation -> ApiRequest -> QualifiedIdentifier -> AppConfig -> SchemaCache -> Either Error CrudPlan
+ mutateReadPlan  mutation apiRequest@ApiRequest{iPreferences=Preferences{..},..} identifier conf sCache = do
+-  qi <- findTable identifier sCache
++  qi <- findTable identifier (dbTables sCache)
+   rPlan <- readPlan qi conf sCache apiRequest
+   mPlan <- mutatePlan mutation qi apiRequest sCache rPlan
+   if not (null invalidPrefs) && preferHandling == Just Strict then Left $ ApiRequestError $ InvalidPreferences invalidPrefs else Right ()
+@@ -810,10 +810,10 @@ validateAggFunctions aggFunctionsAllowed (Node rp@ReadPlan {select} forest)
+   | otherwise = Node rp <$> traverse (validateAggFunctions aggFunctionsAllowed) forest
+ 
+ -- | Lookup table in the schema cache before creating read plan
+-findTable :: QualifiedIdentifier -> SchemaCache -> Either Error QualifiedIdentifier
+-findTable qi@QualifiedIdentifier{..} sc@SchemaCache{dbTables} =
+-  case HM.lookup qi dbTables of
+-    Nothing -> Left $ SchemaCacheErr $ TableNotFound qiSchema qiName sc
++findTable :: QualifiedIdentifier -> TablesMap -> Either Error QualifiedIdentifier
++findTable qi@QualifiedIdentifier{..} tableMap =
++  case HM.lookup qi tableMap of
++    Nothing -> Left $ SchemaCacheErr $ TableNotFound qiSchema qiName (HM.elems tableMap)
+     Just _ -> Right qi
+ 
+ addFilters :: ResolverContext -> ApiRequest -> ReadPlanTree -> Either Error ReadPlanTree
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 8498e792..49eaa863 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -213,10 +213,10 @@ actionResponse (MaybeDbResult InspectPlan{ipHdrsOnly=headersOnly} body) _ versio
+   in
+   Right $ PgrstResponse HTTP.status200 (MediaType.toContentType MTOpenAPI : cLHeader ++ maybeToList (profileHeader schema negotiatedByProfile)) rsBody
+ 
+-actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ sc@SchemaCache{dbTables} _ _ =
++actionResponse (NoDbResult (RelInfoPlan qi@QualifiedIdentifier{..})) _ _ _ SchemaCache{dbTables} _ _ =
+   case HM.lookup qi dbTables of
+     Just tbl -> respondInfo $ allowH tbl
+-    Nothing  -> Left $ Error.SchemaCacheErr $ Error.TableNotFound qiSchema qiName sc
++    Nothing  -> Left $ Error.SchemaCacheErr $ Error.TableNotFound qiSchema qiName (HM.elems dbTables)
+   where
+     allowH table =
+       let hasPK = not . null $ tablePKCols table in
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index f69ec882..528d7905 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -20,7 +20,6 @@ These queries are executed once at startup or when PostgREST is reloaded.
+ 
+ module PostgREST.SchemaCache
+   ( SchemaCache(..)
+-  , TablesFuzzyIndex
+   , querySchemaCache
+   , showSummary
+   , decodeFuncs
+@@ -67,28 +66,21 @@ import PostgREST.SchemaCache.Table           (Column (..), ColumnMap,
+ 
+ import qualified PostgREST.MediaType as MediaType
+ 
+-import           Control.Arrow    ((&&&))
+-import qualified Data.FuzzySet    as Fuzzy
+-import           Protolude
+-import           System.IO.Unsafe (unsafePerformIO)
+-
+-type TablesFuzzyIndex = HM.HashMap Schema Fuzzy.FuzzySet
++import Control.Arrow    ((&&&))
++import Protolude
++import System.IO.Unsafe (unsafePerformIO)
+ 
+ data SchemaCache = SchemaCache
+-  { dbTables           :: TablesMap
+-  , dbRelationships    :: RelationshipsMap
+-  , dbRoutines         :: RoutineMap
+-  , dbRepresentations  :: RepresentationsMap
+-  , dbMediaHandlers    :: MediaHandlerMap
+-  , dbTimezones        :: TimezoneNames
+-  -- Memoized fuzzy index of table names per schema to support approximate matching
+-  -- Since index construction can be expensive, we build it once and store in the SchemaCache
+-  -- Haskell lazy evaluation ensures it's only built on first use and memoized afterwards
+-  , dbTablesFuzzyIndex :: TablesFuzzyIndex
+-  } deriving (Show)
++  { dbTables          :: TablesMap
++  , dbRelationships   :: RelationshipsMap
++  , dbRoutines        :: RoutineMap
++  , dbRepresentations :: RepresentationsMap
++  , dbMediaHandlers   :: MediaHandlerMap
++  , dbTimezones       :: TimezoneNames
++  }
+ 
+ instance JSON.ToJSON SchemaCache where
+-  toJSON (SchemaCache tabs rels routs reps hdlers tzs _) = JSON.object [
++  toJSON (SchemaCache tabs rels routs reps hdlers tzs) = JSON.object [
+       "dbTables"          .= JSON.toJSON tabs
+     , "dbRelationships"   .= JSON.toJSON rels
+     , "dbRoutines"        .= JSON.toJSON routs
+@@ -98,7 +90,7 @@ instance JSON.ToJSON SchemaCache where
+     ]
+ 
+ showSummary :: SchemaCache -> Text
+-showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs _) =
++showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs) =
+   T.intercalate ", "
+   [ show (HM.size tbls)       <> " Relations"
+   , show (HM.size rels)       <> " Relationships"
+@@ -146,8 +138,6 @@ data KeyDep
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
+-maxDbTablesForFuzzySearch :: Int
+-maxDbTablesForFuzzySearch = 500
+ 
+ querySchemaCache :: AppConfig -> SQL.Transaction SchemaCache
+ querySchemaCache conf@AppConfig{..} = do
+@@ -176,11 +166,6 @@ querySchemaCache conf@AppConfig{..} = do
+     , dbRepresentations = reps
+     , dbMediaHandlers = HM.union mHdlers initialMediaHandlers -- the custom handlers will override the initial ones
+     , dbTimezones = tzones
+-
+-    , dbTablesFuzzyIndex =
+-        -- Only build fuzzy index for schemas with a reasonable number of tables
+-        -- Fuzzy.FuzzySet is memory heavy we just don't use it for large schemas
+-        Fuzzy.fromList <$> HM.filter ((< maxDbTablesForFuzzySearch) . length) (HM.fromListWith (<>) ((qiSchema &&& pure . qiName) <$> HM.keys tabsWViewsPks))
+     }
+   where
+     schemas = toList configDbSchemas
+@@ -218,7 +203,6 @@ removeInternal schemas dbStruct =
+     , dbRepresentations = dbRepresentations dbStruct -- no need to filter, not directly exposed through the API
+     , dbMediaHandlers   = dbMediaHandlers dbStruct
+     , dbTimezones       = dbTimezones dbStruct
+-    , dbTablesFuzzyIndex = dbTablesFuzzyIndex dbStruct
+     }
+   where
+     hasInternalJunction ComputedRelationship{} = False
+diff --git a/test/io/fixtures/big_schema.sql b/test/io/fixtures/big_schema.sql
+index 6984164a..34027c7d 100644
+--- a/test/io/fixtures/big_schema.sql
++++ b/test/io/fixtures/big_schema.sql
+@@ -11375,34 +11375,12 @@ ALTER TABLE ONLY apflora.zielber
+ 
+ ALTER TABLE apflora."user" ENABLE ROW LEVEL SECURITY;
+ 
+-
+-CREATE SCHEMA fuzzysearch;
+-
+--- Create many tables to test fuzzy string search
+--- computing hints for non existing tables
+-DO
+-$$
+-DECLARE
+-  r record;
+-BEGIN
+-  FOR r IN
+-    SELECT
+-      format('CREATE TABLE fuzzysearch.unknown_table_%s ()', n) AS ct
+-    FROM
+-      generate_series(1, 499) n
+-    LOOP
+-      EXECUTE r.ct;
+-    END LOOP;
+-END
+-$$;
+-
+ DROP ROLE IF EXISTS postgrest_test_anonymous;
+ CREATE ROLE postgrest_test_anonymous;
+ 
+ GRANT postgrest_test_anonymous TO :PGUSER;
+ 
+ GRANT USAGE ON SCHEMA apflora TO postgrest_test_anonymous;
+-GRANT USAGE ON SCHEMA fuzzysearch TO postgrest_test_anonymous;
+ 
+ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA apflora
+ TO postgrest_test_anonymous;
+diff --git a/test/io/test_big_schema.py b/test/io/test_big_schema.py
+index 2cfbb939..ae8e8a99 100644
+--- a/test/io/test_big_schema.py
++++ b/test/io/test_big_schema.py
+@@ -70,23 +70,3 @@ def test_should_not_fail_with_stack_overflow(defaultenv):
+         assert response.status_code == 404
+         data = response.json()
+         assert data["code"] == "PGRST205"
+-
+-
+-def test_second_request_for_non_existent_table_should_be_quick(defaultenv):
+-    "requesting a non-existent relationship should be quick after the fuzzy search index is loaded (2nd request)"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_SCHEMAS": "fuzzysearch",
+-        "PGRST_DB_POOL": "2",
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",
+-    }
+-
+-    with run(env=env, wait_max_seconds=30) as postgrest:
+-        response = postgrest.session.get("/unknown-table")
+-        assert response.status_code == 404
+-        data = response.json()
+-        assert data["code"] == "PGRST205"
+-        first_duration = response.elapsed.total_seconds()
+-        response = postgrest.session.get("/unknown-table")
+-        assert response.elapsed.total_seconds() < first_duration / 10

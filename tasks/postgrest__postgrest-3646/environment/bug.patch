@@ -1,0 +1,127 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 62d02004..7d841b9d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,13 +5,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ## Unreleased
+ 
+-### Fixed
+-
+- - #3093, Nested empty embeds no longer show empty values and are correctly omitted - @laurenceisla
+- - #3644, Make --dump-schema work with in-database pgrst.db_schemas setting - @wolfgangwalther
+- - #3644, Show number of timezones in schema cache load report - @wolfgangwalther
+- - #3644, List correct enum options in OpenApi output when multiple types with same name are present - @wolfgangwalther
+-
+ ## [12.2.1] - 2024-06-27
+ 
+ ### Fixed
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index c09e3b5f..c4f18d54 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -44,9 +44,7 @@ main CLI{cliCommand, cliPath} = do
+       CmdDumpConfig -> do
+         when configDbConfig $ AppState.reReadConfig True appState
+         putStr . Config.toText =<< AppState.getConfig appState
+-      CmdDumpSchema -> do
+-        when configDbConfig $ AppState.reReadConfig True appState
+-        putStrLn =<< dumpSchema appState
++      CmdDumpSchema -> putStrLn =<< dumpSchema appState
+       CmdRun -> App.run appState)
+ 
+ -- | Dump SchemaCache schema to JSON
+diff --git a/src/PostgREST/Plan.hs b/src/PostgREST/Plan.hs
+index 4acedf42..db52d363 100644
+--- a/src/PostgREST/Plan.hs
++++ b/src/PostgREST/Plan.hs
+@@ -622,11 +622,7 @@ generateRelSelectField (Node ReadPlan{relToParent=Just rel, select, relName, rel
+   where
+     rsSelName = fromMaybe relName relAlias
+     rsEmbedMode = if relIsToOne rel then JsonObject else JsonArray
+-    rsEmptyEmbed = hasOnlyNullEmbed (null select) forest
+-    hasOnlyNullEmbed = foldr checkIfNullEmbed
+-    checkIfNullEmbed :: ReadPlanTree -> Bool -> Bool
+-    checkIfNullEmbed (Node ReadPlan{select=s} f) isNullEmbed =
+-      isNullEmbed && hasOnlyNullEmbed (null s) f
++    rsEmptyEmbed = null select && null forest
+ generateRelSelectField _ = Nothing
+ 
+ generateSpreadSelectFields :: ReadPlan -> [SpreadSelectField]
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index be34c29f..b6dca5ba 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -95,14 +95,13 @@ instance JSON.ToJSON SchemaCache where
+     ]
+ 
+ showSummary :: SchemaCache -> Text
+-showSummary (SchemaCache tbls rels routs reps mediaHdlrs tzs) =
++showSummary (SchemaCache tbls rels routs reps mediaHdlrs _) =
+   T.intercalate ", "
+   [ show (HM.size tbls)       <> " Relations"
+   , show (HM.size rels)       <> " Relationships"
+   , show (HM.size routs)      <> " Functions"
+   , show (HM.size reps)       <> " Domain Representations"
+   , show (HM.size mediaHdlrs) <> " Media Type Handlers"
+-  , show (S.size tzs)         <> " Timezones"
+   ]
+ 
+ -- | A view foreign key or primary key dependency detected on its source table
+@@ -647,7 +646,7 @@ tablesSqlQuery pgVer =
+               information_schema._pg_truetypid(a.*, t.*),
+               information_schema._pg_truetypmod(a.*, t.*)
+           )::integer AS character_maximum_length,
+-          COALESCE(bt.oid, t.oid) AS base_type,
++          COALESCE(bt.typname, t.typname)::name AS udt_name,
+           a.attnum::integer AS position
+       FROM pg_attribute a
+           LEFT JOIN pg_description AS d
+@@ -691,13 +690,14 @@ tablesSqlQuery pgVer =
+     FROM columns info
+     LEFT OUTER JOIN (
+         SELECT
+-            e.enumtypid,
++            n.nspname AS s,
++            t.typname AS n,
+             array_agg(e.enumlabel ORDER BY e.enumsortorder) AS vals
+         FROM pg_type t
+         JOIN pg_enum e ON t.oid = e.enumtypid
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+-        GROUP BY enumtypid
+-    ) AS enum_info ON info.base_type = enum_info.enumtypid
++        GROUP BY s,n
++    ) AS enum_info ON info.udt_name = enum_info.n
+     WHERE info.table_schema NOT IN ('pg_catalog', 'information_schema')
+     GROUP BY info.table_schema, info.table_name
+   ),
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index f84da486..3b1da167 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1218,20 +1218,6 @@ spec actualPgVersion = do
+         [json|[{"id":1,"name":"Angela Martin"}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    it "works on nested relationships" $ do
+-      get "/users?select=*,users_tasks(tasks(projects()))" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Angela Martin"}, {"id":2,"name":"Michael Scott"}, {"id":3,"name":"Dwight Schrute"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/users?select=*,users_tasks!inner(tasks!inner(projects()))&users_tasks.tasks.id=eq.3" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Angela Martin"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/users?select=*,tasks(projects(clients()),users_tasks())" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Angela Martin"}, {"id":2,"name":"Michael Scott"}, {"id":3,"name":"Dwight Schrute"}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/users?select=*,tasks!inner(projects(clients()),users_tasks(),name)&tasks.id=eq.3" `shouldRespondWith`
+-        [json| [{"id":1,"name":"Angela Martin","tasks":[{"name": "Design w10"}]}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+   context "empty root select" $
+     it "gives all columns" $ do
+       get "/projects?select=" `shouldRespondWith`
+@@ -1427,3 +1413,4 @@ spec actualPgVersion = do
+       get "/infinite_recursion?select=*" `shouldRespondWith`
+         [json|{"code":"42P17","message":"infinite recursion detected in rules for relation \"infinite_recursion\"","details":null,"hint":null}|]
+         { matchStatus = 500 }
++

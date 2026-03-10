@@ -1,0 +1,627 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e767eef..4141eb97 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,7 +12,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
+  - #3560, Log resolved host in "Listening on ..." messages - @develop7
+  - #3727, Log maximum pool size - @steve-chavez
+- - #1536, Add string comparison feature for jwt-role-claim-key - @taimoorzaeem
+ 
+ ### Fixed
+ 
+diff --git a/docs/postgrest.dict b/docs/postgrest.dict
+index 78fefd3e..ded55e89 100644
+--- a/docs/postgrest.dict
++++ b/docs/postgrest.dict
+@@ -27,12 +27,10 @@ CSV
+ durations
+ DDL
+ DOM
+-DSL
+ DevOps
+ dockerize
+ enum
+ Enums
+-Entra
+ eq
+ ETH
+ Ethereum
+@@ -70,11 +68,9 @@ isdistinct
+ JS
+ js
+ JSON
+-JSPath
+ JWK
+ JWT
+ jwt
+-Keycloak
+ Kubernetes
+ localhost
+ login
+@@ -98,11 +94,10 @@ npm
+ nxl
+ nxr
+ OAuth
+-ORM
+ Observability
+-Okta
+ OpenAPI
+ openapi
++ORM
+ ov
+ parametrized
+ passphrase
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index cbfbd522..2610c20a 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -161,43 +161,6 @@ JWT Claims Validation
+ 
+ PostgREST honors the :code:`exp` claim for token expiration, rejecting expired tokens.
+ 
+-.. _jwt_role_claim_key_extract:
+-
+-JWT Role Claim Key Extraction
+-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-
+-A JSPath DSL that specifies the location of the :code:`role` key in the JWT claims. This can be used to consume a JWT provided by a third party service like Auth0, Okta, Microsoft Entra or Keycloak.
+-
+-The DSL follows the `JSONPath <https://goessner.net/articles/JsonPath/>`_ expression grammar with extended string comparison operators. Supported operators are:
+-
+-- ``==`` selects the first array element that exactly matches the right operand
+-- ``!=`` selects the first array element that does not match the right operand
+-- ``^==`` selects the first array element that starts with the right operand
+-- ``==^`` selects the first array element that ends with the right operand
+-- ``*==`` selects the first array element that contains the right operand
+-
+-Usage examples:
+-
+-  .. code:: bash
+-
+-    # {"postgrest":{"roles": ["other", "author"]}}
+-    # the DSL accepts characters that are alphanumerical or one of "_$@" as keys
+-    jwt-role-claim-key = ".postgrest.roles[1]"
+-
+-    # {"https://www.example.com/role": { "key": "author" }}
+-    # non-alphanumerical characters can go inside quotes(escaped in the config value)
+-    jwt-role-claim-key = ".\"https://www.example.com/role\".key"
+-
+-    # {"postgrest":{"roles": ["other", "author"]}}
+-    # `@` represents the current element in the array
+-    # all the these match the string "author"
+-    jwt-role-claim-key = ".postgrest.roles[?(@ == \"author\")]"
+-    jwt-role-claim-key = ".postgrest.roles[?(@ != \"other\")]"
+-    jwt-role-claim-key = ".postgrest.roles[?(@ ^== \"aut\")]"
+-    jwt-role-claim-key = ".postgrest.roles[?(@ ==^ \"hor\")]"
+-    jwt-role-claim-key = ".postgrest.roles[?(@ *== \"utho\")]"
+-
+-
+ JWT Security
+ ~~~~~~~~~~~~
+ 
+diff --git a/docs/references/configuration.rst b/docs/references/configuration.rst
+index 3d6c1d2b..4237d55b 100644
+--- a/docs/references/configuration.rst
++++ b/docs/references/configuration.rst
+@@ -620,7 +620,17 @@ jwt-role-claim-key
+ 
+   *For backwards compatibility, this config parameter is also available without prefix as "role-claim-key".*
+ 
+-  See :ref:`jwt_role_claim_key_extract` on how to specify key paths and usage examples.
++  A JSPath DSL that specifies the location of the :code:`role` key in the JWT claims. This can be used to consume a JWT provided by a third party service like Auth0, Okta or Keycloak. Usage examples:
++
++  .. code:: bash
++
++    # {"postgrest":{"roles": ["other", "author"]}}
++    # the DSL accepts characters that are alphanumerical or one of "_$@" as keys
++    jwt-role-claim-key = ".postgrest.roles[1]"
++
++    # {"https://www.example.com/role": { "key": "author }}
++    # non-alphanumerical characters can go inside quotes(escaped in the config value)
++    jwt-role-claim-key = ".\"https://www.example.com/role\".key"
+ 
+ .. _jwt-secret:
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index c8c3b720..46afa801 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -27,7 +27,6 @@ import qualified Data.ByteString                 as BS
+ import qualified Data.ByteString.Lazy.Char8      as LBS
+ import qualified Data.Cache                      as C
+ import qualified Data.Scientific                 as Sci
+-import qualified Data.Text                       as T
+ import qualified Data.Vault.Lazy                 as Vault
+ import qualified Data.Vector                     as V
+ import qualified Jose.Jwk                        as JWT
+@@ -47,8 +46,7 @@ import System.TimeIt           (timeItT)
+ 
+ import PostgREST.AppState (AppState, AuthResult (..), getConfig,
+                            getJwtCache, getTime)
+-import PostgREST.Config   (AppConfig (..), FilterExp (..), JSPath,
+-                           JSPathExp (..))
++import PostgREST.Config   (AppConfig (..), JSPath, JSPathExp (..))
+ import PostgREST.Error    (Error (..))
+ 
+ import Protolude
+@@ -123,20 +121,8 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+     walkJSPath x                      []                = x
+     walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (KM.lookup (K.fromText key) o) rest
+     walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
+-    walkJSPath (Just (JSON.Array ar)) [JSPFilter (EqualsCond txt)] = findFirstMatch (==) txt ar
+-    walkJSPath (Just (JSON.Array ar)) [JSPFilter (NotEqualsCond txt)] = findFirstMatch (/=) txt ar
+-    walkJSPath (Just (JSON.Array ar)) [JSPFilter (StartsWithCond txt)] = findFirstMatch T.isPrefixOf txt ar
+-    walkJSPath (Just (JSON.Array ar)) [JSPFilter (EndsWithCond txt)] = findFirstMatch T.isSuffixOf txt ar
+-    walkJSPath (Just (JSON.Array ar)) [JSPFilter (ContainsCond txt)] = findFirstMatch T.isInfixOf txt ar
+     walkJSPath _                      _                 = Nothing
+ 
+-    findFirstMatch matchWith pattern = foldr checkMatch Nothing
+-      where
+-        checkMatch (JSON.String txt) acc
+-            | pattern `matchWith` txt = Just $ JSON.String txt
+-            | otherwise = acc
+-        checkMatch _ acc = acc
+-
+     unquoted :: JSON.Value -> BS.ByteString
+     unquoted (JSON.String t) = encodeUtf8 t
+     unquoted v               = LBS.toStrict $ JSON.encode v
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 8f90f2b1..57276ef6 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -15,7 +15,6 @@ module PostgREST.Config
+   , Environment
+   , JSPath
+   , JSPathExp(..)
+-  , FilterExp(..)
+   , LogLevel(..)
+   , OpenAPIMode(..)
+   , Proxy(..)
+@@ -55,9 +54,8 @@ import System.Posix.Types      (FileMode)
+ 
+ import PostgREST.Config.Database         (RoleIsolationLvl,
+                                           RoleSettings)
+-import PostgREST.Config.JSPath           (FilterExp (..), JSPath,
+-                                          JSPathExp (..), dumpJSPath,
+-                                          pRoleClaimKey)
++import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
++                                          dumpJSPath, pRoleClaimKey)
+ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier, dumpQi,
+diff --git a/src/PostgREST/Config/JSPath.hs b/src/PostgREST/Config/JSPath.hs
+index a0b2dadc..97405654 100644
+--- a/src/PostgREST/Config/JSPath.hs
++++ b/src/PostgREST/Config/JSPath.hs
+@@ -1,8 +1,6 @@
+-{-# OPTIONS_GHC -Wno-unused-do-bind #-}
+ module PostgREST.Config.JSPath
+   ( JSPath
+   , JSPathExp(..)
+-  , FilterExp(..)
+   , dumpJSPath
+   , pRoleClaimKey
+   ) where
+@@ -16,37 +14,18 @@ import Text.Read                     (read)
+ import Protolude
+ 
+ 
+--- | full jspath, e.g. .property[0].attr.detail[?(@ == "role1")]
++-- | full jspath, e.g. .property[0].attr.detail
+ type JSPath = [JSPathExp]
+ 
+--- NOTE: We only accept one JSPFilter expr (at the end of input)
+--- | jspath expression
++-- | jspath expression, e.g. .property, .property[0] or ."property-dash"
+ data JSPathExp
+-  = JSPKey Text         -- .property or ."property-dash"
+-  | JSPIdx Int          -- [0]
+-  | JSPFilter FilterExp -- [?(@ == "match")]
+-
+-data FilterExp
+-  = EqualsCond Text
+-  | NotEqualsCond Text
+-  | StartsWithCond Text
+-  | EndsWithCond Text
+-  | ContainsCond Text
++  = JSPKey Text
++  | JSPIdx Int
+ 
+ dumpJSPath :: JSPathExp -> Text
+ -- TODO: this needs to be quoted properly for special chars
+ dumpJSPath (JSPKey k) = "." <> show k
+ dumpJSPath (JSPIdx i) = "[" <> show i <> "]"
+-dumpJSPath (JSPFilter cond) = "[?(@" <> expr <> ")]"
+-  where
+-    expr =
+-      case cond of
+-        EqualsCond text     -> " == " <> show text
+-        NotEqualsCond text  -> " != " <> show text
+-        StartsWithCond text -> " ^== " <> show text
+-        EndsWithCond text   -> " ==^ " <> show text
+-        ContainsCond text   -> " *== " <> show text
+-
+ 
+ -- Used for the config value "role-claim-key"
+ pRoleClaimKey :: Text -> Either Text JSPath
+@@ -54,47 +33,19 @@ pRoleClaimKey selStr =
+   mapLeft show $ P.parse pJSPath ("failed to parse role-claim-key value (" <> toS selStr <> ")") (toS selStr)
+ 
+ pJSPath :: P.Parser JSPath
+-pJSPath = P.many1 pJSPathExp <* P.eof
+-
+-pJSPathExp :: P.Parser JSPathExp
+-pJSPathExp = pJSPKey <|> pJSPFilter <|> pJSPIdx
+-
+-pJSPKey :: P.Parser JSPathExp
+-pJSPKey = do
+-  P.char '.'
+-  val <- toS <$> P.many1 (P.alphaNum <|> P.oneOf "_$@") <|> pQuotedValue
+-  return (JSPKey val) <?> "pJSPKey: JSPath attribute key"
+-
+-pJSPIdx :: P.Parser JSPathExp
+-pJSPIdx = do
+-  P.char '['
+-  num <- read <$> P.many1 P.digit
+-  P.char ']'
+-  return (JSPIdx num) <?> "pJSPIdx: JSPath array index"
++pJSPath = toJSPath <$> (period *> pPath `P.sepBy` period <* P.eof)
++  where
++    toJSPath :: [(Text, Maybe Int)] -> JSPath
++    toJSPath = concatMap (\(key, idx) -> JSPKey key : maybeToList (JSPIdx <$> idx))
++    period = P.char '.' <?> "period (.)"
++    pPath :: P.Parser (Text, Maybe Int)
++    pPath = (,) <$> pJSPKey <*> P.optionMaybe pJSPIdx
+ 
+-pJSPFilter :: P.Parser JSPathExp
+-pJSPFilter = do
+-  P.try $ P.string "[?("
+-  condition <- pFilterConditionParser
+-  P.char ')'
+-  P.char ']'
+-  P.eof -- this should be the last jspath expression
+-  return (JSPFilter condition) <?> "pJSPFilter: JSPath filter exp"
++pJSPKey :: P.Parser Text
++pJSPKey = toS <$> P.many1 (P.alphaNum <|> P.oneOf "_$@") <|> pQuotedValue <?> "attribute name [a..z0..9_$@])"
+ 
+-pFilterConditionParser :: P.Parser FilterExp
+-pFilterConditionParser = do
+-  P.char '@'
+-  P.spaces
+-  filt <- matchOperator
+-  P.spaces
+-  filt <$> pQuotedValue
+-    where
+-      matchOperator =
+-        P.try (P.string "==^" $> EndsWithCond)
+-        <|> P.try (P.string "==" $> EqualsCond)
+-        <|> P.try (P.string "!=" $> NotEqualsCond)
+-        <|> P.try (P.string "^==" $> StartsWithCond)
+-        <|> P.try (P.string "*==" $> ContainsCond)
++pJSPIdx :: P.Parser Int
++pJSPIdx = P.char '[' *> (read <$> P.many1 P.digit) <* P.char ']' <?> "array index [0..n]"
+ 
+ pQuotedValue :: P.Parser Text
+ pQuotedValue = toS <$> (P.char '"' *> P.many (P.noneOf "\"") <* P.char '"')
+diff --git a/test/io/configs/expected/jwt-role-claim-key1.config b/test/io/configs/expected/jwt-role-claim-key1.config
+deleted file mode 100644
+index 734650c2..00000000
+--- a/test/io/configs/expected/jwt-role-claim-key1.config
++++ /dev/null
+@@ -1,39 +0,0 @@
+-db-aggregates-enabled = false
+-db-anon-role = ""
+-db-channel = "pgrst"
+-db-channel-enabled = true
+-db-extra-search-path = "public"
+-db-hoisted-tx-settings = "statement_timeout,plan_filter.statement_cost_limit,default_transaction_isolation"
+-db-max-rows = ""
+-db-plan-enabled = false
+-db-pool = 10
+-db-pool-acquisition-timeout = 10
+-db-pool-max-lifetime = 1800
+-db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+-db-pre-request = ""
+-db-prepared-statements = true
+-db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
+-db-pre-config = ""
+-db-tx-end = "commit"
+-db-uri = "postgresql://"
+-jwt-aud = ""
+-jwt-role-claim-key = ".\"roles\"[?(@ == \"role1\")]"
+-jwt-secret = ""
+-jwt-secret-is-base64 = false
+-jwt-cache-max-lifetime = 0
+-log-level = "error"
+-openapi-mode = "follow-privileges"
+-openapi-security-active = false
+-openapi-server-proxy-uri = ""
+-server-cors-allowed-origins = ""
+-server-host = "!4"
+-server-port = 3000
+-server-trace-header = ""
+-server-timing-enabled = false
+-server-unix-socket = ""
+-server-unix-socket-mode = "660"
+-admin-server-host = "!4"
+-admin-server-port = ""
+diff --git a/test/io/configs/expected/jwt-role-claim-key2.config b/test/io/configs/expected/jwt-role-claim-key2.config
+deleted file mode 100644
+index 1caefcd1..00000000
+--- a/test/io/configs/expected/jwt-role-claim-key2.config
++++ /dev/null
+@@ -1,39 +0,0 @@
+-db-aggregates-enabled = false
+-db-anon-role = ""
+-db-channel = "pgrst"
+-db-channel-enabled = true
+-db-extra-search-path = "public"
+-db-hoisted-tx-settings = "statement_timeout,plan_filter.statement_cost_limit,default_transaction_isolation"
+-db-max-rows = ""
+-db-plan-enabled = false
+-db-pool = 10
+-db-pool-acquisition-timeout = 10
+-db-pool-max-lifetime = 1800
+-db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+-db-pre-request = ""
+-db-prepared-statements = true
+-db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
+-db-pre-config = ""
+-db-tx-end = "commit"
+-db-uri = "postgresql://"
+-jwt-aud = ""
+-jwt-role-claim-key = ".\"roles\"[?(@ != \"role1\")]"
+-jwt-secret = ""
+-jwt-secret-is-base64 = false
+-jwt-cache-max-lifetime = 0
+-log-level = "error"
+-openapi-mode = "follow-privileges"
+-openapi-security-active = false
+-openapi-server-proxy-uri = ""
+-server-cors-allowed-origins = ""
+-server-host = "!4"
+-server-port = 3000
+-server-trace-header = ""
+-server-timing-enabled = false
+-server-unix-socket = ""
+-server-unix-socket-mode = "660"
+-admin-server-host = "!4"
+-admin-server-port = ""
+diff --git a/test/io/configs/expected/jwt-role-claim-key3.config b/test/io/configs/expected/jwt-role-claim-key3.config
+deleted file mode 100644
+index 0b70baee..00000000
+--- a/test/io/configs/expected/jwt-role-claim-key3.config
++++ /dev/null
+@@ -1,39 +0,0 @@
+-db-aggregates-enabled = false
+-db-anon-role = ""
+-db-channel = "pgrst"
+-db-channel-enabled = true
+-db-extra-search-path = "public"
+-db-hoisted-tx-settings = "statement_timeout,plan_filter.statement_cost_limit,default_transaction_isolation"
+-db-max-rows = ""
+-db-plan-enabled = false
+-db-pool = 10
+-db-pool-acquisition-timeout = 10
+-db-pool-max-lifetime = 1800
+-db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+-db-pre-request = ""
+-db-prepared-statements = true
+-db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
+-db-pre-config = ""
+-db-tx-end = "commit"
+-db-uri = "postgresql://"
+-jwt-aud = ""
+-jwt-role-claim-key = ".\"roles\"[?(@ ^== \"role1\")]"
+-jwt-secret = ""
+-jwt-secret-is-base64 = false
+-jwt-cache-max-lifetime = 0
+-log-level = "error"
+-openapi-mode = "follow-privileges"
+-openapi-security-active = false
+-openapi-server-proxy-uri = ""
+-server-cors-allowed-origins = ""
+-server-host = "!4"
+-server-port = 3000
+-server-trace-header = ""
+-server-timing-enabled = false
+-server-unix-socket = ""
+-server-unix-socket-mode = "660"
+-admin-server-host = "!4"
+-admin-server-port = ""
+diff --git a/test/io/configs/expected/jwt-role-claim-key4.config b/test/io/configs/expected/jwt-role-claim-key4.config
+deleted file mode 100644
+index 8e07aab6..00000000
+--- a/test/io/configs/expected/jwt-role-claim-key4.config
++++ /dev/null
+@@ -1,39 +0,0 @@
+-db-aggregates-enabled = false
+-db-anon-role = ""
+-db-channel = "pgrst"
+-db-channel-enabled = true
+-db-extra-search-path = "public"
+-db-hoisted-tx-settings = "statement_timeout,plan_filter.statement_cost_limit,default_transaction_isolation"
+-db-max-rows = ""
+-db-plan-enabled = false
+-db-pool = 10
+-db-pool-acquisition-timeout = 10
+-db-pool-max-lifetime = 1800
+-db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+-db-pre-request = ""
+-db-prepared-statements = true
+-db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
+-db-pre-config = ""
+-db-tx-end = "commit"
+-db-uri = "postgresql://"
+-jwt-aud = ""
+-jwt-role-claim-key = ".\"roles\"[?(@ ==^ \"role1\")]"
+-jwt-secret = ""
+-jwt-secret-is-base64 = false
+-jwt-cache-max-lifetime = 0
+-log-level = "error"
+-openapi-mode = "follow-privileges"
+-openapi-security-active = false
+-openapi-server-proxy-uri = ""
+-server-cors-allowed-origins = ""
+-server-host = "!4"
+-server-port = 3000
+-server-trace-header = ""
+-server-timing-enabled = false
+-server-unix-socket = ""
+-server-unix-socket-mode = "660"
+-admin-server-host = "!4"
+-admin-server-port = ""
+diff --git a/test/io/configs/expected/jwt-role-claim-key5.config b/test/io/configs/expected/jwt-role-claim-key5.config
+deleted file mode 100644
+index 9681e8a8..00000000
+--- a/test/io/configs/expected/jwt-role-claim-key5.config
++++ /dev/null
+@@ -1,39 +0,0 @@
+-db-aggregates-enabled = false
+-db-anon-role = ""
+-db-channel = "pgrst"
+-db-channel-enabled = true
+-db-extra-search-path = "public"
+-db-hoisted-tx-settings = "statement_timeout,plan_filter.statement_cost_limit,default_transaction_isolation"
+-db-max-rows = ""
+-db-plan-enabled = false
+-db-pool = 10
+-db-pool-acquisition-timeout = 10
+-db-pool-max-lifetime = 1800
+-db-pool-max-idletime = 30
+-db-pool-automatic-recovery = true
+-db-pre-request = ""
+-db-prepared-statements = true
+-db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
+-db-pre-config = ""
+-db-tx-end = "commit"
+-db-uri = "postgresql://"
+-jwt-aud = ""
+-jwt-role-claim-key = ".\"roles\"[?(@ *== \"role1\")]"
+-jwt-secret = ""
+-jwt-secret-is-base64 = false
+-jwt-cache-max-lifetime = 0
+-log-level = "error"
+-openapi-mode = "follow-privileges"
+-openapi-security-active = false
+-openapi-server-proxy-uri = ""
+-server-cors-allowed-origins = ""
+-server-host = "!4"
+-server-port = 3000
+-server-trace-header = ""
+-server-timing-enabled = false
+-server-unix-socket = ""
+-server-unix-socket-mode = "660"
+-admin-server-host = "!4"
+-admin-server-port = ""
+diff --git a/test/io/configs/jwt-role-claim-key1.config b/test/io/configs/jwt-role-claim-key1.config
+deleted file mode 100644
+index bee3f814..00000000
+--- a/test/io/configs/jwt-role-claim-key1.config
++++ /dev/null
+@@ -1 +0,0 @@
+-jwt-role-claim-key = ".roles[?(@ == \"role1\")]"
+diff --git a/test/io/configs/jwt-role-claim-key2.config b/test/io/configs/jwt-role-claim-key2.config
+deleted file mode 100644
+index d92b49fe..00000000
+--- a/test/io/configs/jwt-role-claim-key2.config
++++ /dev/null
+@@ -1 +0,0 @@
+-jwt-role-claim-key = ".roles[?(@ != \"role1\")]"
+diff --git a/test/io/configs/jwt-role-claim-key3.config b/test/io/configs/jwt-role-claim-key3.config
+deleted file mode 100644
+index d55e8376..00000000
+--- a/test/io/configs/jwt-role-claim-key3.config
++++ /dev/null
+@@ -1 +0,0 @@
+-jwt-role-claim-key = ".roles[?(@ ^== \"role1\")]"
+diff --git a/test/io/configs/jwt-role-claim-key4.config b/test/io/configs/jwt-role-claim-key4.config
+deleted file mode 100644
+index 52c4ae3e..00000000
+--- a/test/io/configs/jwt-role-claim-key4.config
++++ /dev/null
+@@ -1 +0,0 @@
+-jwt-role-claim-key = ".roles[?(@ ==^ \"role1\")]"
+diff --git a/test/io/configs/jwt-role-claim-key5.config b/test/io/configs/jwt-role-claim-key5.config
+deleted file mode 100644
+index 16838837..00000000
+--- a/test/io/configs/jwt-role-claim-key5.config
++++ /dev/null
+@@ -1 +0,0 @@
+-jwt-role-claim-key = ".roles[?(@ *== \"role1\")]"
+diff --git a/test/io/fixtures.yaml b/test/io/fixtures.yaml
+index eb4e9489..5c738d7c 100644
+--- a/test/io/fixtures.yaml
++++ b/test/io/fixtures.yaml
+@@ -153,48 +153,6 @@ roleclaims:
+       role: postgrest_test_author
+       other: true
+     expected_status: 401
+-  # https://github.com/PostgREST/postgrest/pull/3813
+-  - key: '.realm_access.roles[?(@ == "postgrest_test_author")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - other
+-          - postgrest_test_author
+-    expected_status: 200
+-  - key: '.realm_access.roles[?(@ != "other")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - other
+-          - postgrest_test_author
+-    expected_status: 200
+-  - key: '.realm_access.roles[?(@ ^== "postgrest_te")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - other
+-          - postgrest_test_author
+-    expected_status: 200
+-  - key: '.realm_access.roles[?(@ ==^ "st_test_author")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - other
+-          - postgrest_test_author
+-    expected_status: 200
+-  - key: '.realm_access.roles[?(@ *== "_test_")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - other
+-          - postgrest_test_author
+-    expected_status: 200
+-  - key: '.realm_access.roles[?(@ == "string")]'
+-    data:
+-      realm_access:
+-        roles:
+-          - obj_key: obj_value
+-    expected_status: 401 # fails because it compares an object with a string
+ 
+ invalidroleclaimkeys:
+   - 'role.other'
+@@ -202,7 +160,6 @@ invalidroleclaimkeys:
+   - '.my_role;;domain'
+   - '.#$$%&$%/'
+   - '1234'
+-  - '.role[?(@ =)]'
+ 
+ invalidopenapimodes:
+   - 'follow-'

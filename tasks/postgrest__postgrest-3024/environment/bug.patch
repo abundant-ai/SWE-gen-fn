@@ -1,0 +1,571 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4f7223bc..d2999442 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,8 +15,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2983, Add more data to `Server-Timing` header - @develop7
+  - #2441, Add config `server-cors-allowed-origins` to specify CORS origins - @taimoorzaeem
+  - #2825, SQL handlers for custom media types - @steve-chavez
+-   + Solves #1548, #2699, #2763, #2170, #1462, #1102, #1374, #2901
+- - #2799, Add timezone in Prefer header - @taimoorzaeem
++  - Solves #1548, #2699, #2763, #2170, #1462, #1102, #1374, #2901
+ 
+ ### Fixed
+ 
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+index 29bbc990..0ddede6f 100644
+--- a/nix/tools/withTools.nix
++++ b/nix/tools/withTools.nix
+@@ -72,7 +72,7 @@ let
+         # We try to make the database cluster as independent as possible from the host
+         # by specifying the timezone, locale and encoding.
+         # initdb -U creates a superuser(man initdb)
+-        TZ=$PGTZ initdb --no-locale --encoding=UTF8 --nosync -U "${superuserRole}" --auth=trust \
++        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "${superuserRole}" --auth=trust \
+           >> "$setuplog"
+ 
+         log "Starting the database cluster..."
+diff --git a/src/PostgREST/ApiRequest.hs b/src/PostgREST/ApiRequest.hs
+index 896aabbe..826d4402 100644
+--- a/src/PostgREST/ApiRequest.hs
++++ b/src/PostgREST/ApiRequest.hs
+@@ -55,7 +55,6 @@ import PostgREST.RangeQuery              (NonnegRange, allRange,
+                                           convertToLimitZeroRange,
+                                           hasLimitZero,
+                                           rangeRequested)
+-import PostgREST.SchemaCache             (SchemaCache (..))
+ import PostgREST.SchemaCache.Identifiers (FieldName,
+                                           QualifiedIdentifier (..),
+                                           Schema)
+@@ -135,8 +134,8 @@ data ApiRequest = ApiRequest {
+   }
+ 
+ -- | Examines HTTP request and translates it into user intent.
+-userApiRequest :: AppConfig -> Request -> RequestBody -> SchemaCache -> Either ApiRequestError ApiRequest
+-userApiRequest conf req reqBody sCache = do
++userApiRequest :: AppConfig -> Request -> RequestBody -> Either ApiRequestError ApiRequest
++userApiRequest conf req reqBody = do
+   pInfo@PathInfo{..} <- getPathInfo conf $ pathInfo req
+   act <- getAction pInfo method
+   qPrms <- first QueryParamError $ QueryParams.parse (pathIsProc && act `elem` [ActionInvoke InvGet, ActionInvoke InvHead]) $ rawQueryString req
+@@ -151,7 +150,7 @@ userApiRequest conf req reqBody sCache = do
+   , iRange = ranges
+   , iTopLevelRange = topLevelRange
+   , iPayload = payload
+-  , iPreferences = Preferences.fromHeaders (configDbTxAllowOverride conf) (dbTimezones sCache) hdrs
++  , iPreferences = Preferences.fromHeaders (configDbTxAllowOverride conf) hdrs
+   , iQueryParams = qPrms
+   , iColumns = columns
+   , iHeaders = iHdrs
+diff --git a/src/PostgREST/ApiRequest/Preferences.hs b/src/PostgREST/ApiRequest/Preferences.hs
+index 53bf0d40..4e86610a 100644
+--- a/src/PostgREST/ApiRequest/Preferences.hs
++++ b/src/PostgREST/ApiRequest/Preferences.hs
+@@ -10,13 +10,12 @@
+ module PostgREST.ApiRequest.Preferences
+   ( Preferences(..)
+   , PreferCount(..)
+-  , PreferHandling(..)
+   , PreferMissing(..)
+   , PreferParameters(..)
+   , PreferRepresentation(..)
+   , PreferResolution(..)
+   , PreferTransaction(..)
+-  , PreferTimezone(..)
++  , PreferHandling(..)
+   , fromHeaders
+   , shouldCount
+   , prefAppliedHeader
+@@ -24,11 +23,8 @@ module PostgREST.ApiRequest.Preferences
+ 
+ import qualified Data.ByteString.Char8     as BS
+ import qualified Data.Map                  as Map
+-import qualified Data.Set                  as S
+ import qualified Network.HTTP.Types.Header as HTTP
+ 
+-import PostgREST.Config.Database (TimezoneNames)
+-
+ import Protolude
+ 
+ -- $setup
+@@ -41,7 +37,6 @@ import Protolude
+ -- >>> deriving instance Show PreferTransaction
+ -- >>> deriving instance Show PreferMissing
+ -- >>> deriving instance Show PreferHandling
+--- >>> deriving instance Show PreferTimezone
+ -- >>> deriving instance Show Preferences
+ 
+ -- | Preferences recognized by the application.
+@@ -54,17 +49,15 @@ data Preferences
+     , preferTransaction    :: Maybe PreferTransaction
+     , preferMissing        :: Maybe PreferMissing
+     , preferHandling       :: Maybe PreferHandling
+-    , preferTimezone       :: Maybe PreferTimezone
+     , invalidPrefs         :: [ByteString]
+     }
+ 
+ -- |
+ -- Parse HTTP headers based on RFC7240[1] to identify preferences.
+ --
+--- >>> let sc = S.fromList ["America/Los_Angeles"]
+---
+ -- One header with comma-separated values can be used to set multiple preferences:
+--- >>> pPrint $ fromHeaders True sc [("Prefer", "resolution=ignore-duplicates, count=exact, timezone=America/Los_Angeles")]
++--
++-- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates, count=exact")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+@@ -73,14 +66,12 @@ data Preferences
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Nothing
+ --     , preferHandling = Nothing
+---     , preferTimezone = Just
+---         ( PreferTimezone "America/Los_Angeles" )
+ --     , invalidPrefs = []
+ --     }
+ --
+ -- Multiple headers can also be used:
+ --
+--- >>> pPrint $ fromHeaders True sc [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null"), ("Prefer", "handling=lenient"), ("Prefer", "invalid")]
++-- >>> pPrint $ fromHeaders True [("Prefer", "resolution=ignore-duplicates"), ("Prefer", "count=exact"), ("Prefer", "missing=null"), ("Prefer", "handling=lenient"), ("Prefer", "invalid")]
+ -- Preferences
+ --     { preferResolution = Just IgnoreDuplicates
+ --     , preferRepresentation = Nothing
+@@ -89,19 +80,18 @@ data Preferences
+ --     , preferTransaction = Nothing
+ --     , preferMissing = Just ApplyNulls
+ --     , preferHandling = Just Lenient
+---     , preferTimezone = Nothing
+ --     , invalidPrefs = [ "invalid" ]
+ --     }
+ --
+ -- If a preference is set more than once, only the first is used:
+ --
+--- >>> preferTransaction $ fromHeaders True sc [("Prefer", "tx=commit, tx=rollback")]
++-- >>> preferTransaction $ fromHeaders True [("Prefer", "tx=commit, tx=rollback")]
+ -- Just Commit
+ --
+ -- This is also the case across multiple headers:
+ --
+ -- >>> :{
+---   preferResolution . fromHeaders True sc $
++--   preferResolution . fromHeaders True $
+ --     [ ("Prefer", "resolution=ignore-duplicates")
+ --     , ("Prefer", "resolution=merge-duplicates")
+ --     ]
+@@ -111,7 +101,7 @@ data Preferences
+ --
+ -- Preferences can be separated by arbitrary amounts of space, lower-case header is also recognized:
+ --
+--- >>> pPrint $ fromHeaders True sc [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default, handling=strict, anything")]
++-- >>> pPrint $ fromHeaders True [("prefer", "count=exact,    tx=commit   ,return=representation , missing=default, handling=strict, anything")]
+ -- Preferences
+ --     { preferResolution = Nothing
+ --     , preferRepresentation = Just Full
+@@ -120,22 +110,20 @@ data Preferences
+ --     , preferTransaction = Just Commit
+ --     , preferMissing = Just ApplyDefaults
+ --     , preferHandling = Just Strict
+---     , preferTimezone = Nothing
+ --     , invalidPrefs = [ "anything" ]
+ --     }
+ --
+-fromHeaders :: Bool -> TimezoneNames -> [HTTP.Header] -> Preferences
+-fromHeaders allowTxDbOverride acceptedTzNames headers =
++fromHeaders :: Bool -> [HTTP.Header] -> Preferences
++fromHeaders allowTxEndOverride headers =
+   Preferences
+     { preferResolution     = parsePrefs [MergeDuplicates, IgnoreDuplicates]
+     , preferRepresentation = parsePrefs [Full, None, HeadersOnly]
+     , preferParameters     = parsePrefs [SingleObject]
+     , preferCount          = parsePrefs [ExactCount, PlannedCount, EstimatedCount]
+-    , preferTransaction    = if allowTxDbOverride then parsePrefs [Commit, Rollback] else Nothing
++    , preferTransaction    = if allowTxEndOverride then parsePrefs [Commit, Rollback] else Nothing
+     , preferMissing        = parsePrefs [ApplyDefaults, ApplyNulls]
+     , preferHandling       = parsePrefs [Strict, Lenient]
+-    , preferTimezone       = if isTimezonePrefAccepted then PreferTimezone <$> timezonePref else Nothing
+-    , invalidPrefs         = filter checkPrefs prefs
++    , invalidPrefs         = filter (`notElem` acceptedPrefs) prefs
+     }
+   where
+     mapToHeadVal :: ToHeaderValue a => [a] -> [ByteString]
+@@ -151,11 +139,6 @@ fromHeaders allowTxDbOverride acceptedTzNames headers =
+     prefHeaders = filter ((==) HTTP.hPrefer . fst) headers
+     prefs = fmap BS.strip . concatMap (BS.split ',' . snd) $ prefHeaders
+ 
+-    timezonePref = listToMaybe $ mapMaybe (BS.stripPrefix "timezone=") prefs
+-    isTimezonePrefAccepted = (S.member <$> timezonePref <*> pure acceptedTzNames) == Just True
+-
+-    checkPrefs p = p `notElem` acceptedPrefs && not isTimezonePrefAccepted
+-
+     parsePrefs :: ToHeaderValue a => [a] -> Maybe a
+     parsePrefs vals =
+       head $ mapMaybe (flip Map.lookup $ prefMap vals) prefs
+@@ -164,7 +147,7 @@ fromHeaders allowTxDbOverride acceptedTzNames headers =
+     prefMap = Map.fromList . fmap (\pref -> (toHeaderValue pref, pref))
+ 
+ prefAppliedHeader :: Preferences -> Maybe HTTP.Header
+-prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing, preferHandling, preferTimezone } =
++prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferParameters, preferCount, preferTransaction, preferMissing, preferHandling } =
+   if null prefsVals
+     then Nothing
+     else Just (HTTP.hPreferenceApplied, combined)
+@@ -178,7 +161,6 @@ prefAppliedHeader Preferences {preferResolution, preferRepresentation, preferPar
+       , toHeaderValue <$> preferCount
+       , toHeaderValue <$> preferTransaction
+       , toHeaderValue <$> preferHandling
+-      , toHeaderValue <$> preferTimezone
+       ]
+ 
+ -- |
+@@ -271,10 +253,3 @@ data PreferHandling
+ instance ToHeaderValue PreferHandling where
+   toHeaderValue Strict  = "handling=strict"
+   toHeaderValue Lenient = "handling=lenient"
+-
+--- |
+--- Change timezone
+-newtype PreferTimezone = PreferTimezone ByteString
+-
+-instance ToHeaderValue PreferTimezone where
+-  toHeaderValue (PreferTimezone tz) = "timezone=" <> tz
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index c3442012..d886a81c 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -157,7 +157,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache pgVer authResult@
+ 
+   apiRequest <-
+     liftEither . mapLeft Error.ApiRequestError $
+-      ApiRequest.userApiRequest conf req body sCache
++      ApiRequest.userApiRequest conf req body
+ 
+   let jwtTiming = (SMJwt, if configDbPlanEnabled then Auth.getJwtDur req else Nothing)
+   handleRequest authResult conf appState (Just authRole /= configDbAnonRole) configDbPreparedStatements pgVer apiRequest sCache jwtTiming
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 29e87a4a..67dba009 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -3,11 +3,10 @@
+ module PostgREST.Config.Database
+   ( pgVersionStatement
+   , queryDbSettings
+-  , queryPgVersion
+   , queryRoleSettings
++  , queryPgVersion
+   , RoleSettings
+   , RoleIsolationLvl
+-  , TimezoneNames
+   , toIsolationLevel
+   ) where
+ 
+@@ -30,7 +29,6 @@ import Protolude
+ 
+ type RoleSettings     = (HM.HashMap ByteString (HM.HashMap ByteString ByteString))
+ type RoleIsolationLvl = HM.HashMap ByteString SQL.IsolationLevel
+-type TimezoneNames    = Set ByteString -- cache timezone names for prefer timezone=
+ 
+ toIsolationLevel :: (Eq a, IsString a) => a -> SQL.IsolationLevel
+ toIsolationLevel a = case a of
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 835559a5..16ed0c2a 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -33,7 +33,6 @@ import qualified PostgREST.SchemaCache        as SchemaCache
+ 
+ import PostgREST.ApiRequest              (ApiRequest (..))
+ import PostgREST.ApiRequest.Preferences  (PreferCount (..),
+-                                          PreferTimezone (..),
+                                           PreferTransaction (..),
+                                           Preferences (..),
+                                           shouldCount)
+@@ -236,22 +235,21 @@ optionalRollback AppConfig{..} ApiRequest{iPreferences=Preferences{..}} = do
+ -- | Runs local (transaction scoped) GUCs for every request.
+ setPgLocals :: AppConfig  -> KM.KeyMap JSON.Value -> BS.ByteString -> [(ByteString, ByteString)] ->
+                ApiRequest -> DbHandler ()
+-setPgLocals AppConfig{..} claims role roleSettings ApiRequest{..} = lift $
++setPgLocals AppConfig{..} claims role roleSettings req = lift $
+   SQL.statement mempty $ SQL.dynamicallyParameterized
+-    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ timezoneSql ++ appSettingsSql))
++    ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ roleSettingsSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql))
+     HD.noResult configDbPreparedStatements
+   where
+-    methodSql = setConfigWithConstantName ("request.method", iMethod)
+-    pathSql = setConfigWithConstantName ("request.path", iPath)
+-    headersSql = setConfigWithConstantNameJSON "request.headers" iHeaders
+-    cookiesSql = setConfigWithConstantNameJSON "request.cookies" iCookies
++    methodSql = setConfigWithConstantName ("request.method", iMethod req)
++    pathSql = setConfigWithConstantName ("request.path", iPath req)
++    headersSql = setConfigWithConstantNameJSON "request.headers" (iHeaders req)
++    cookiesSql = setConfigWithConstantNameJSON "request.cookies" (iCookies req)
+     claimsSql = [setConfigWithConstantName ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
+     roleSql = [setConfigWithConstantName ("role", role)]
+     roleSettingsSql = setConfigWithDynamicName <$> roleSettings
+     appSettingsSql = setConfigWithDynamicName <$> (join bimap toUtf8 <$> configAppSettings)
+-    timezoneSql = maybe mempty (\(PreferTimezone tz) -> [setConfigWithConstantName ("timezone", tz)]) $ preferTimezone iPreferences
+     searchPathSql =
+-      let schemas = escapeIdentList (iSchema : configDbExtraSearchPath) in
++      let schemas = escapeIdentList (iSchema req : configDbExtraSearchPath) in
+       setConfigWithConstantName ("search_path", schemas)
+ 
+ -- | Runs the pre-request function.
+diff --git a/src/PostgREST/Response.hs b/src/PostgREST/Response.hs
+index 52324a59..96faaf8f 100644
+--- a/src/PostgREST/Response.hs
++++ b/src/PostgREST/Response.hs
+@@ -74,7 +74,7 @@ readResponse WrappedReadPlan{wrMedia} headersOnly identifier ctxApiRequest@ApiRe
+     RSStandard{..} -> do
+       let
+         (status, contentRange) = RangeQuery.rangeStatusHeader iTopLevelRange rsQueryTotal rsTableTotal
+-        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing preferHandling preferTimezone []
++        prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing Nothing preferCount preferTransaction Nothing preferHandling []
+         headers =
+           [ contentRange
+           , ( "Content-Location"
+@@ -105,7 +105,7 @@ createResponse QualifiedIdentifier{..} MutateReadPlan{mrMutatePlan, mrMedia} ctx
+       pkCols = case mrMutatePlan of { Insert{insPkCols} -> insPkCols; _ -> mempty;}
+       prefHeader = prefAppliedHeader $
+         Preferences (if null pkCols && isNothing (qsOnConflict iQueryParams) then Nothing else preferResolution)
+-        preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling preferTimezone []
++        preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling []
+       headers =
+         catMaybes
+           [ if null rsLocation then
+@@ -146,7 +146,7 @@ updateResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+       contentRangeHeader =
+         Just . RangeQuery.contentRangeH 0 (rsQueryTotal - 1) $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling preferTimezone []
++      prefHeader = prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction preferMissing preferHandling []
+       headers = catMaybes [contentRangeHeader, prefHeader]
+ 
+     let (status, headers', body) =
+@@ -166,7 +166,7 @@ singleUpsertResponse :: MutateReadPlan -> ApiRequest -> ResultSet -> Either Erro
+ singleUpsertResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Preferences{..}} resultSet = case resultSet of
+   RSStandard {..} -> do
+     let
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling preferTimezone []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling []
+       cTHeader = contentTypeHeaders mrMedia ctxApiRequest
+ 
+     let isInsertIfGTZero i = if i > 0 then HTTP.status201 else HTTP.status200
+@@ -190,7 +190,7 @@ deleteResponse MutateReadPlan{mrMedia} ctxApiRequest@ApiRequest{iPreferences=Pre
+       contentRangeHeader =
+         RangeQuery.contentRangeH 1 0 $
+           if shouldCount preferCount then Just rsQueryTotal else Nothing
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling preferTimezone []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing preferRepresentation Nothing preferCount preferTransaction Nothing preferHandling []
+       headers = contentRangeHeader : prefHeader
+ 
+     let (status, headers', body) =
+@@ -243,7 +243,7 @@ invokeResponse CallReadPlan{crMedia} invMethod proc ctxApiRequest@ApiRequest{iPr
+         then Error.errorPayload $ Error.ApiRequestError $ ApiRequestTypes.InvalidRange
+           $ ApiRequestTypes.OutOfBounds (show $ RangeQuery.rangeOffset iTopLevelRange) (maybe "0" show rsTableTotal)
+         else LBS.fromStrict rsBody
+-      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing preferHandling preferTimezone []
++      prefHeader = maybeToList . prefAppliedHeader $ Preferences Nothing Nothing preferParameters preferCount preferTransaction Nothing preferHandling []
+       headers = contentRange : prefHeader
+ 
+     let (status', headers', body) =
+diff --git a/src/PostgREST/SchemaCache.hs b/src/PostgREST/SchemaCache.hs
+index 9f80e19b..a2e3e485 100644
+--- a/src/PostgREST/SchemaCache.hs
++++ b/src/PostgREST/SchemaCache.hs
+@@ -43,8 +43,7 @@ import Contravariant.Extras          (contrazip2)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+ import PostgREST.Config                      (AppConfig (..))
+-import PostgREST.Config.Database             (TimezoneNames,
+-                                              pgVersionStatement,
++import PostgREST.Config.Database             (pgVersionStatement,
+                                               toIsolationLevel)
+ import PostgREST.Config.PgVersion            (PgVersion, pgVersion100,
+                                               pgVersion110,
+@@ -81,17 +80,14 @@ data SchemaCache = SchemaCache
+   , dbRoutines        :: RoutineMap
+   , dbRepresentations :: RepresentationsMap
+   , dbMediaHandlers   :: MediaHandlerMap
+-  , dbTimezones       :: TimezoneNames
+   }
+-
+ instance JSON.ToJSON SchemaCache where
+-  toJSON (SchemaCache tabs rels routs reps _ _) = JSON.object [
++  toJSON (SchemaCache tabs rels routs reps _) = JSON.object [
+       "dbTables"          .= JSON.toJSON tabs
+     , "dbRelationships"   .= JSON.toJSON rels
+     , "dbRoutines"        .= JSON.toJSON routs
+     , "dbRepresentations" .= JSON.toJSON reps
+     , "dbMediaHandlers"   .= JSON.emptyArray
+-    , "dbTimezones"       .= JSON.emptyArray
+     ]
+ 
+ -- | A view foreign key or primary key dependency detected on its source table
+@@ -144,7 +140,6 @@ querySchemaCache AppConfig{..} = do
+   cRels   <- SQL.statement mempty $ allComputedRels prepared
+   reps    <- SQL.statement schemas $ dataRepresentations prepared
+   mHdlers <- SQL.statement schemas $ mediaHandlers pgVer prepared
+-  tzones  <- SQL.statement mempty $ timezones prepared
+   _       <-
+     let sleepCall = SQL.Statement "select pg_sleep($1)" (param HE.int4) HD.noResult prepared in
+     whenJust configInternalSCSleep (`SQL.statement` sleepCall) -- only used for testing
+@@ -158,7 +153,6 @@ querySchemaCache AppConfig{..} = do
+     , dbRoutines = funcs
+     , dbRepresentations = reps
+     , dbMediaHandlers = HM.union mHdlers initialMediaHandlers -- the custom handlers will override the initial ones
+-    , dbTimezones = tzones
+     }
+   where
+     schemas = toList configDbSchemas
+@@ -194,7 +188,6 @@ removeInternal schemas dbStruct =
+     , dbRoutines        = dbRoutines dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+     , dbRepresentations = dbRepresentations dbStruct -- no need to filter, not directly exposed through the API
+     , dbMediaHandlers   = dbMediaHandlers dbStruct
+-    , dbTimezones       = dbTimezones dbStruct
+     }
+   where
+     hasInternalJunction ComputedRelationship{} = False
+@@ -1185,13 +1178,6 @@ decodeMediaHandlers =
+               <*> (QualifiedIdentifier <$> column HD.text <*> column HD.text)
+               <*> (MediaType.decodeMediaType . encodeUtf8 <$> column HD.text)
+ 
+-timezones :: Bool -> SQL.Statement () TimezoneNames
+-timezones = SQL.Statement sql HE.noParams decodeTimezones
+-  where
+-    sql = "SELECT name FROM pg_timezone_names"
+-    decodeTimezones :: HD.Result TimezoneNames
+-    decodeTimezones = S.fromList . map encodeUtf8 <$> HD.rowList (column HD.text)
+-
+ param :: HE.Value a -> HE.Params a
+ param = HE.param . HE.nonNullable
+ 
+diff --git a/test/io/postgrest.py b/test/io/postgrest.py
+index 307c58eb..a078940c 100644
+--- a/test/io/postgrest.py
++++ b/test/io/postgrest.py
+@@ -19,17 +19,17 @@ from config import *
+ 
+ def sleep_until_postgrest_scache_reload():
+     "Sleep until schema cache reload"
+-    time.sleep(0.3)
++    time.sleep(0.2)
+ 
+ 
+ def sleep_until_postgrest_config_reload():
+     "Sleep until config reload"
+-    time.sleep(0.2)
++    time.sleep(0.1)
+ 
+ 
+ def sleep_until_postgrest_full_reload():
+     "Sleep until schema cache plus config reload"
+-    time.sleep(0.3)
++    time.sleep(0.2)
+ 
+ 
+ class PostgrestTimedOut(Exception):
+diff --git a/test/memory/memory-tests.sh b/test/memory/memory-tests.sh
+index db2ae2d5..9ede579d 100755
+--- a/test/memory/memory-tests.sh
++++ b/test/memory/memory-tests.sh
+@@ -114,8 +114,8 @@ jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "172M"
+ jsonKeyTest "50M" "POST" "/leak?columns=blob" "172M"
+ jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "172M"
+ 
+-postJsonArrayTest "1000" "/perf_articles?columns=id,body" "15M"
+-postJsonArrayTest "10000" "/perf_articles?columns=id,body" "15M"
++postJsonArrayTest "1000" "/perf_articles?columns=id,body" "14M"
++postJsonArrayTest "10000" "/perf_articles?columns=id,body" "14M"
+ postJsonArrayTest "100000" "/perf_articles?columns=id,body" "24M"
+ 
+ trap - int term exit
+diff --git a/test/spec/Feature/Query/PreferencesSpec.hs b/test/spec/Feature/Query/PreferencesSpec.hs
+index a55bc3a9..ba437241 100644
+--- a/test/spec/Feature/Query/PreferencesSpec.hs
++++ b/test/spec/Feature/Query/PreferencesSpec.hs
+@@ -12,7 +12,7 @@ import SpecHelper
+ 
+ spec :: SpecWith ((), Application)
+ spec =
+-  describe "test prefer headers and preference-applied headers" $ do
++  describe "check prefer: handling=strict and handling=lenient" $ do
+ 
+     context "check behaviour of Prefer: handling=strict" $ do
+       it "throws error when handling=strict and invalid prefs are given" $
+@@ -71,51 +71,3 @@ spec =
+           { matchStatus  = 200
+           , matchHeaders = [matchContentTypeJson]
+            }
+-
+-    context "test Prefer: timezone=America/Los_Angeles" $ do
+-      it "should change timezone with handling=strict" $
+-        request methodGet "/timestamps"
+-          [("Prefer", "handling=strict, timezone=America/Los_Angeles")]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"t":"2023-10-18T05:37:59.611-07:00"}, {"t":"2023-10-18T07:37:59.611-07:00"}, {"t":"2023-10-18T09:37:59.611-07:00"}]|]
+-          { matchStatus = 200
+-          , matchHeaders = [matchContentTypeJson
+-                           , "Preference-Applied" <:> "handling=strict, timezone=America/Los_Angeles"]}
+-
+-      it "should change timezone without handling=strict" $
+-        request methodGet "/timestamps"
+-          [("Prefer", "timezone=America/Los_Angeles")]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"t":"2023-10-18T05:37:59.611-07:00"}, {"t":"2023-10-18T07:37:59.611-07:00"}, {"t":"2023-10-18T09:37:59.611-07:00"}]|]
+-          { matchStatus = 200
+-          , matchHeaders = [matchContentTypeJson
+-                           , "Preference-Applied" <:> "timezone=America/Los_Angeles"] }
+-
+-    context "test Prefer: timezone=Invalid/Timezone" $ do
+-      it "should throw error with handling=strict" $
+-        request methodGet "/timestamps"
+-          [("Prefer", "handling=strict, timezone=Invalid/Timezone")]
+-          ""
+-          `shouldRespondWith`
+-          [json|{"code":"PGRST122","details":"Invalid preferences: timezone=Invalid/Timezone","hint":null,"message":"Invalid preferences given with handling=strict"}|]
+-          { matchStatus = 400 }
+-
+-      it "should return with default timezone without handling or with handling=lenient" $ do
+-        request methodGet "/timestamps"
+-          [("Prefer", "timezone=Invalid/Timezone")]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"t":"2023-10-18T12:37:59.611+00:00"}, {"t":"2023-10-18T14:37:59.611+00:00"}, {"t":"2023-10-18T16:37:59.611+00:00"}]|]
+-          { matchStatus = 200
+-          , matchHeaders = [matchContentTypeJson]}
+-
+-        request methodGet "/timestamps"
+-          [("Prefer", "handling=lenient, timezone=Invalid/Timezone")]
+-          ""
+-          `shouldRespondWith`
+-          [json|[{"t":"2023-10-18T12:37:59.611+00:00"}, {"t":"2023-10-18T14:37:59.611+00:00"}, {"t":"2023-10-18T16:37:59.611+00:00"}]|]
+-          { matchStatus = 200
+-          , matchHeaders = [matchContentTypeJson
+-                           , "Preference-Applied" <:> "handling=lenient"]}
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index f5c4c71d..f9c2a0a2 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -861,8 +861,3 @@ INSERT INTO table_b(table_a_id, name) VALUES (1, 'Test 1'), (2, 'Test 2'), (null
+ 
+ TRUNCATE TABLE lines CASCADE;
+ insert into lines values (1, 'line-1', 'LINESTRING(1 1,5 5)'::extensions.geometry), (2, 'line-2', 'LINESTRING(2 2,6 6)'::extensions.geometry);
+-
+-TRUNCATE TABLE timestamps CASCADE;
+-INSERT INTO timestamps VALUES ('2023-10-18 12:37:59.611000+0000');
+-INSERT INTO timestamps VALUES ('2023-10-18 14:37:59.611000+0000');
+-INSERT INTO timestamps VALUES ('2023-10-18 16:37:59.611000+0000');
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 30036916..5a282337 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -3627,7 +3627,3 @@ create aggregate test.bom_csv_agg (test.lines) (
+ );
+ 
+ create table empty_string as select 1 as id, ''::text as string;
+-
+-create table timestamps (
+-  t timestamp with time zone
+-);

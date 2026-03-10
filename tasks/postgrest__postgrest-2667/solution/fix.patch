@@ -1,0 +1,282 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5f8bedbc..a26410c9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -27,6 +27,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2648, Fix inaccurate error codes with new ones - @laurenceisla
+    + `PGRST204`: Column is not found
+    + `PGRST003`: Timed out when acquiring connection to db
++ - #2667, Fix `db-pool-acquisition-timeout` not logging to stderr when the timeout is reached - @steve-chavez
+ 
+ ## [10.1.2] - 2023-02-01
+ 
+@@ -34,7 +35,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #2565, Fix bad M2M embedding on RPC - @steve-chavez
+  - #2575, Replace misleading error message when no function is found with a hint containing functions/parameters names suggestions - @laurenceisla
+- - #2582, Move explanation about "single parameters" from the `message` to the `details` in the error output - @laurenceisla 
++ - #2582, Move explanation about "single parameters" from the `message` to the `details` in the error output - @laurenceisla
+  - #2569, Replace misleading error message when no relationship is found with a hint containing parent/child names suggestions - @laurenceisla
+  - #1405, Add the required OpenAPI items object when the parameter is an array - @laurenceisla
+  - #2592, Add upsert headers for POST requests to the OpenAPI output - @laurenceisla
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index eb47231f..eb656c37 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -9,6 +9,7 @@ Some of its functionality includes:
+ - Producing HTTP Headers according to RFCs.
+ - Content Negotiation
+ -}
++{-# LANGUAGE LambdaCase      #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.App
+   ( SignalHandlerInstaller
+@@ -19,13 +20,14 @@ module PostgREST.App
+ 
+ 
+ import Control.Monad.Except     (liftEither)
+-import Data.Either.Combinators  (mapLeft)
++import Data.Either.Combinators  (mapLeft, whenLeft)
+ import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
+ import System.Posix.Types       (FileMode)
+ 
++import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.Wai                as Wai
+ import qualified Network.Wai.Handler.Warp   as Warp
+@@ -153,9 +155,13 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache jsonDbS pgVer aut
+ 
+ runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+ runDbHandler appState mode authenticated prepared handler = do
+-  dbResp <-
+-    let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-    lift . AppState.usePool appState . transaction SQL.ReadCommitted mode $ runExceptT handler
++  dbResp <- lift $ do
++    let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
++    res <- AppState.usePool appState . transaction SQL.ReadCommitted mode $ runExceptT handler
++    whenLeft res (\case
++      SQL.AcquisitionTimeoutUsageError -> AppState.debounceLogAcquisitionTimeout appState -- this can happen rapidly for many requests, so we debounce
++      _ -> pure ())
++    return res
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index a627b0b8..390c5815 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -16,6 +16,7 @@ module PostgREST.AppState
+   , init
+   , initWithPool
+   , logWithZTime
++  , logPgrstError
+   , putConfig
+   , putSchemaCache
+   , putIsListenerOn
+@@ -25,13 +26,18 @@ module PostgREST.AppState
+   , signalListener
+   , usePool
+   , waitListener
++  , debounceLogAcquisitionTimeout
+   ) where
+ 
+-import qualified Hasql.Pool    as SQL
+-import qualified Hasql.Session as SQL
++import qualified Data.ByteString.Lazy as LBS
++import qualified Data.Text.Encoding   as T
++import qualified Hasql.Pool           as SQL
++import qualified Hasql.Session        as SQL
++import qualified PostgREST.Error      as Error
+ 
+ import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                            updateAction)
++import Control.Debounce
+ import Data.IORef         (IORef, atomicWriteIORef, newIORef,
+                            readIORef)
+ import Data.Time          (ZonedTime, defaultTimeLocale, formatTime,
+@@ -47,29 +53,31 @@ import Protolude
+ 
+ data AppState = AppState
+   -- | Database connection pool
+-  { statePool         :: SQL.Pool
++  { statePool                     :: SQL.Pool
+   -- | Database server version, will be updated by the connectionWorker
+-  , statePgVersion    :: IORef PgVersion
++  , statePgVersion                :: IORef PgVersion
+   -- | No schema cache at the start. Will be filled in by the connectionWorker
+-  , stateSchemaCache  :: IORef (Maybe SchemaCache)
++  , stateSchemaCache              :: IORef (Maybe SchemaCache)
+   -- | Cached SchemaCache in json
+-  , stateJsonDbS      :: IORef ByteString
++  , stateJsonDbS                  :: IORef ByteString
+   -- | Binary semaphore to make sure just one connectionWorker can run at a time
+-  , stateWorkerSem    :: MVar ()
++  , stateWorkerSem                :: MVar ()
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+-  , stateListener     :: MVar ()
++  , stateListener                 :: MVar ()
+   -- | State of the LISTEN channel, used for the admin server checks
+-  , stateIsListenerOn :: IORef Bool
++  , stateIsListenerOn             :: IORef Bool
+   -- | Config that can change at runtime
+-  , stateConf         :: IORef AppConfig
++  , stateConf                     :: IORef AppConfig
+   -- | Time used for verifying JWT expiration
+-  , stateGetTime      :: IO UTCTime
++  , stateGetTime                  :: IO UTCTime
+   -- | Time with time zone used for worker logs
+-  , stateGetZTime     :: IO ZonedTime
++  , stateGetZTime                 :: IO ZonedTime
+   -- | Used for killing the main thread in case a subthread fails
+-  , stateMainThreadId :: ThreadId
++  , stateMainThreadId             :: ThreadId
+   -- | Keeps track of when the next retry for connecting to database is scheduled
+-  , stateRetryNextIn  :: IORef Int
++  , stateRetryNextIn              :: IORef Int
++  -- | Logs a pool error with a debounce
++  , debounceLogAcquisitionTimeout :: IO ()
+   }
+ 
+ init :: AppConfig -> IO AppState
+@@ -78,8 +86,8 @@ init conf = do
+   initWithPool pool conf
+ 
+ initWithPool :: SQL.Pool -> AppConfig -> IO AppState
+-initWithPool pool conf =
+-  AppState pool
++initWithPool pool conf = do
++  appState <- AppState pool
+     <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
+     <*> newIORef Nothing
+     <*> newIORef mempty
+@@ -91,6 +99,17 @@ initWithPool pool conf =
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getZonedTime }
+     <*> myThreadId
+     <*> newIORef 0
++    <*> pure (pure ())
++
++  deb <-
++    let oneSecond = 1000000 in
++    mkDebounce defaultDebounceSettings
++       { debounceAction = logPgrstError appState SQL.AcquisitionTimeoutUsageError
++       , debounceFreq = 5*oneSecond
++       , debounceEdge = leadingEdge -- logs at the start and the end
++       }
++
++  return appState { debounceLogAcquisitionTimeout = deb }
+ 
+ destroy :: AppState -> IO ()
+ destroy = destroyPool
+@@ -157,6 +176,9 @@ logWithZTime appState txt = do
+   zTime <- stateGetZTime appState
+   hPutStrLn stderr $ toS (formatTime defaultTimeLocale "%d/%b/%Y:%T %z: " zTime) <> txt
+ 
++logPgrstError :: AppState -> SQL.UsageError -> IO ()
++logPgrstError appState e = logWithZTime appState . T.decodeUtf8 . LBS.toStrict $ Error.errorPayload $ Error.PgError False e
++
+ getMainThreadId :: AppState -> ThreadId
+ getMainThreadId = stateMainThreadId
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index b5ce4b30..6682f898 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -446,13 +446,13 @@ pgErrorStatus authed (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError
+ 
+     _                       -> HTTP.status500
+ 
+-checkIsFatal :: PgError -> Maybe Text
+-checkIsFatal (PgError _ (SQL.ConnectionUsageError e))
++checkIsFatal :: SQL.UsageError -> Maybe Text
++checkIsFatal (SQL.ConnectionUsageError e)
+   | isAuthFailureMessage = Just $ toS failureMessage
+   | otherwise = Nothing
+   where isAuthFailureMessage = "FATAL:  password authentication failed" `isInfixOf` failureMessage
+         failureMessage = BS.unpack $ fromMaybe mempty e
+-checkIsFatal (PgError _ (SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError serverError))))
++checkIsFatal(SQL.SessionUsageError (SQL.QueryError _ _ (SQL.ResultError serverError)))
+   = case serverError of
+       -- Check for a syntax error (42601 is the pg code). This would mean the error is on our part somehow, so we treat it as fatal.
+       SQL.ServerError "42601" _ _ _ _
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 463b4c12..a8b76011 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -13,7 +13,6 @@ import qualified Data.Aeson                 as JSON
+ import qualified Data.ByteString            as BS
+ import qualified Data.ByteString.Lazy       as LBS
+ import qualified Data.Text                  as T
+-import qualified Data.Text.Encoding         as T
+ import qualified Hasql.Notifications        as SQL
+ import qualified Hasql.Session              as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+@@ -32,8 +31,7 @@ import PostgREST.AppState         (AppState)
+ import PostgREST.Config           (AppConfig (..), readAppConfig)
+ import PostgREST.Config.Database  (queryDbSettings, queryPgVersion)
+ import PostgREST.Config.PgVersion (PgVersion (..), minimumPgVersion)
+-import PostgREST.Error            (PgError (PgError), checkIsFatal,
+-                                   errorPayload)
++import PostgREST.Error            (checkIsFatal)
+ import PostgREST.SchemaCache      (querySchemaCache)
+ 
+ import qualified PostgREST.AppState as AppState
+@@ -131,9 +129,8 @@ establishConnection appState =
+       pgVersion <- AppState.usePool appState queryPgVersion
+       case pgVersion of
+         Left e -> do
+-          let err = PgError False e
+-          AppState.logWithZTime appState . T.decodeUtf8 . LBS.toStrict $ errorPayload err
+-          case checkIsFatal err of
++          AppState.logPgrstError appState e
++          case checkIsFatal e of
+             Just reason ->
+               return $ FatalConnectionError reason
+             Nothing ->
+@@ -168,19 +165,16 @@ loadSchemaCache appState = do
+       querySchemaCache (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
+   case result of
+     Left e -> do
+-      let
+-        err = PgError False e
+-        putErr = AppState.logWithZTime appState . T.decodeUtf8 . LBS.toStrict $ errorPayload err
+-      case checkIsFatal err of
++      case checkIsFatal e of
+         Just hint -> do
+           AppState.logWithZTime appState "A fatal error ocurred when loading the schema cache"
+-          putErr
++          AppState.logPgrstError appState e
+           AppState.logWithZTime appState hint
+           return SCFatalFail
+         Nothing -> do
+           AppState.putSchemaCache appState Nothing
+           AppState.logWithZTime appState "An error ocurred when loading the schema cache"
+-          putErr
++          AppState.logPgrstError appState e
+           return SCOnRetry
+ 
+     Right sCache -> do
+@@ -249,18 +243,15 @@ reReadConfig startingUp appState = do
+       qDbSettings <- AppState.usePool appState $ queryDbSettings configDbPreparedStatements
+       case qDbSettings of
+         Left e -> do
+-          let
+-            err = PgError False e
+-            putErr = AppState.logWithZTime appState . T.decodeUtf8 . LBS.toStrict $ errorPayload err
+           AppState.logWithZTime appState
+             "An error ocurred when trying to query database settings for the config parameters"
+-          case checkIsFatal err of
++          case checkIsFatal e of
+             Just hint -> do
+-              putErr
++              AppState.logPgrstError appState e
+               AppState.logWithZTime appState hint
+               killThread (AppState.getMainThreadId appState)
+             Nothing -> do
+-              putErr
++              AppState.logPgrstError appState e
+           pure []
+         Right x -> pure x
+     else
