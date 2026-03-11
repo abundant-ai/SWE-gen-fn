@@ -1,0 +1,944 @@
+diff --git a/babashka.nrepl b/babashka.nrepl
+index 8428f44e..436c8824 160000
+--- a/babashka.nrepl
++++ b/babashka.nrepl
+@@ -1 +1 @@
+-Subproject commit 8428f44e77b8977769fc15cd427a2fee3ff8981b
++Subproject commit 436c8824f52bf0b67751fa4c3245bf1c068fbc8a
+diff --git a/doc/adr/0004-jline-repl-completions/implementation-plan.md b/doc/adr/0004-jline-repl-completions/implementation-plan.md
+index 9c903c74..fee93273 100644
+--- a/doc/adr/0004-jline-repl-completions/implementation-plan.md
++++ b/doc/adr/0004-jline-repl-completions/implementation-plan.md
+@@ -1,11 +1,18 @@
+-# JLine REPL Completions
++# JLine Console REPL
+ 
+-## Proposal
++## Overview
+ 
+-Babashka now has a console REPL built with jline.
+-Relevant code is in `/src/babashka/impl/repl.clj`
++Babashka has a console REPL built with JLine.
++Relevant code is in `/src/babashka/impl/repl.clj`.
+ Tests are in `/test/babashka/impl/repl_test.clj`.
+ 
++Reusable logic factored out from the nREPL server lives in:
++- `babashka.nrepl/src/babashka/nrepl/impl/sci.clj` - Completions, lookup, namespace resolution
++
++## Completions
++
++### Proposal
++
+ Leiningen and rebel-readline, two other Clojure REPLs built with jline, provide completions. We want this too.
+ rebel-readline's code is in `~/dev/rebel-readline`. Lein's code is in `~/dev/leiningen`
+ 
+@@ -14,106 +21,214 @@ We should factor out this completion function so you only need a SCI context and
+ Then we can use this completion function for the console REPL as well.
+ For now it's ok that this completion logic stays in the nrepl submodule, although it's a bit weird to require an nrepl namespace for the console REPL, we'll think about that later.
+ 
+-## Implementation Plan
++### Implementation
++
++#### Files Modified
++
++1. **`babashka.nrepl/src/babashka/nrepl/impl/sci.clj`** - Shared SCI helpers (completions, lookup, namespace resolution)
++2. **`babashka.nrepl/src/babashka/nrepl/impl/server.clj`** - Updated to use sci helpers namespace
++3. **`src/babashka/impl/repl.clj`** - Added JLine Completer integration
+ 
+-### Files to Modify
++#### Key Decisions
++
++- Completion logic stays in the nrepl submodule - the console REPL requires this namespace
++- Error handling: completions never throw - silently return empty on errors
++- The `CompletingParsedLine` interface provides word context to the Completer
++- JLine classes (Completer, Candidate) are not added to classes.clj since they're only used internally, not exposed to script users
++
++### Testing
++
++#### Manual
++1. Build: `script/uberjar && script/compile`
++2. Start REPL: `./bb`
++3. Test completions:
++   - Type `ma<TAB>` - should show `map`, `mapv`, `mapcat`, etc.
++   - Type `str/<TAB>` - should show `str/join`, `str/split`, etc.
++   - Type `String/<TAB>` - should show static methods like `String/valueOf`
+ 
+-1. **`babashka.nrepl/src/babashka/nrepl/impl/completions.clj`** (NEW) - Factored-out completion logic
+-2. **`babashka.nrepl/src/babashka/nrepl/impl/server.clj`** - Update to use new completions namespace
+-3. **`src/babashka/impl/classes.clj`** - Add Completer and Candidate classes
+-4. **`src/babashka/impl/repl.clj`** - Add JLine Completer integration
++#### Automated
++- Unit tests for `word-at-cursor` and `complete-form?` in `test/babashka/impl/repl_test.clj`
+ 
+-### Step 1: Create completions.clj
++## Docstrings (doc-at-point)
+ 
+-Create new file `babashka.nrepl/src/babashka/nrepl/impl/completions.clj`:
++### Proposal
+ 
+-- Move helper functions from server.clj (lines 142-195):
+-  - `fully-qualified-syms`
+-  - `match`
+-  - `ns-imports->completions`
+-  - `import-symbols->completions`
++rebel-readline provides a doc-at-point widget that displays documentation for the symbol under the cursor when pressing Ctrl-X Ctrl-D. We want this in babashka's console REPL too.
+ 
+-- Create new `completions` function with signature:
+-  ```clojure
+-  (defn completions [ctx query]
+-    ;; Returns set of maps: {:candidate "name" :ns "ns" :type "type"}
+-    ...)
+-  ```
++Similar to completions, we already provide symbol lookup for the nREPL implementation (`:lookup`, `:info`, `:eldoc` ops in server.clj). We factor out the core metadata resolution into a reusable module.
+ 
+-- Extract core logic from server.clj `complete` function (lines 206-247) without the nREPL wrapping
++### Implementation
+ 
+-### Step 2: Update server.clj
++#### Files Modified
+ 
+-- Add require: `[babashka.nrepl.impl.completions :as completions]`
+-- Remove the moved helper functions
+-- Update `complete` function to call `completions/completions` and convert keyword keys to string keys for nREPL protocol
++1. **`babashka.nrepl/src/babashka/nrepl/impl/sci.clj`** - Lookup and `the-sci-ns` added to shared SCI helpers
++2. **`babashka.nrepl/src/babashka/nrepl/impl/server.clj`** - Updated to use `sci-helpers/lookup` and `sci-helpers/the-sci-ns`
++3. **`src/babashka/impl/repl.clj`** - Added doc-at-point widget with key binding
+ 
+-### Step 3: Add JLine classes
++#### Key Design
+ 
+-In `src/babashka/impl/classes.clj` at line 661 (before `;; end jline`):
++**lookup.clj** provides:
++- `(the-sci-ns ctx ns-sym)` - Resolves a SCI namespace
++- `(lookup ctx sym-str :ns-str ns-str)` - Resolves var metadata (`:name`, `:ns`, `:arglists`, `:doc`, `:val`, `:file`)
+ 
+-```clojure
+-org.jline.reader.Completer
+-org.jline.reader.Candidate
+-```
++**repl.clj** adds:
++- `format-doc` - Formats metadata map as Clojure `(doc ...)` style output
++- `doc-at-point-widget` - JLine Widget that gets word-at-cursor, looks up metadata, displays formatted doc
++- `register-widgets` - Registers the widget and binds Ctrl-X Ctrl-D (emacs keymap)
+ 
+-Michiel: this isn't necessary yet, this is only necessary when you want to expose these classes to script users.
+-So skip this step.
++**Display approach**: Uses `LineReaderImpl`'s `post` field (via reflection) to display documentation inline below the prompt, matching rebel-readline's behavior. Doc is colored: URL in faint blue, body in light yellow. Doc dismisses on the next keypress (self-insert, accept-line) but not on backspace.
+ 
+-### Step 4: Implement Completer in repl.clj
++#### Key Decisions
+ 
+-Add to imports:
+-```clojure
+-[org.jline.reader Completer Candidate]
+-```
++- Same factoring pattern as completions: extract core logic from nREPL server, reuse in console REPL
++- Widget, Reference, LineReaderImpl imported only in repl.clj (internal use, not in classes.clj)
++- Key binding matches rebel-readline: Ctrl-X Ctrl-D for doc-at-point
++- For `clojure.*` vars, the clojuredocs.org URL replaces the `-------------------------` separator
++- Colors match rebel-readline's dark theme: anchor (faint blue 39), doc text (yellow 222), separator (gray 243)
++- REPL init message updated to mention the Ctrl-X Ctrl-D shortcut
+ 
+-Add require:
+-```clojure
+-[babashka.nrepl.impl.completions :as completions]
+-```
++## Newline Insertion
+ 
+-Create completer function:
+-```clojure
+-(defn- clojure-completer [sci-ctx]
+-  (reify Completer
+-    (complete [_ _ parsed-line candidates]
+-      (let [word (.word parsed-line)]
+-        (when (and word (pos? (count word)))
+-          (try
+-            (doseq [{:keys [candidate ns type]} (completions/completions sci-ctx word)]
+-              (.add candidates
+-                    (Candidate. candidate candidate nil
+-                                (when (or ns type)
+-                                  (str (when type (str type " "))
+-                                       (when ns ns)))
+-                                nil nil false)))
+-            (catch Exception _ nil)))))))
+-```
++**Alt-Enter** inserts a literal newline into the buffer without evaluating. This is JLine's built-in `SELF_INSERT_UNMETA` widget (bound to `alt(ctrl('M'))` by default). Useful for editing multi-line expressions — e.g., positioning the cursor between `{}` and pressing Alt-Enter to insert a blank line.
+ 
+-Update `jline-parser` to handle `Parser$ParseContext/COMPLETE`:
+-- Return a `CompletingParsedLine` that provides word-at-cursor for completion queries
++Note: Shift-Enter is indistinguishable from Enter in most terminals (both send `0x0d`). Only Alt-Enter sends a distinct sequence (`ESC + CR`).
+ 
+-Update `jline-reader` to add completer:
+-```clojure
+-(.completer (clojure-completer sci-ctx))
++## Exit Behavior
++
++Following Node.js REPL conventions:
++
++- **Ctrl-D on empty line**: exits immediately (JLine only fires `EndOfFileException` when buffer is empty)
++- **Ctrl-D on non-empty line**: does nothing (JLine treats it as delete-char, which is a no-op at end of buffer)
++- **Ctrl-D at column 0 of continuation line**: does nothing (known difference from Node.js, which exits; would require a custom widget to override JLine's default delete-char binding)
++- **Ctrl-C on empty prompt**: first press shows warning, second consecutive press exits
++- **Ctrl-C with partial input**: clears input, continues
++- **`:repl/exit` or `:repl/quit`**: exits
++
++### Testing
++
++#### Manual
++1. Build: `script/uberjar && script/compile`
++2. Start REPL: `./bb`
++3. Test docstrings:
++   - Type `map` then press Ctrl-X Ctrl-D - should show map's documentation above the prompt
++   - Type `str/join` then press Ctrl-X Ctrl-D - should show clojure.string/join docs
++   - Cursor on non-symbol (e.g. after `(`) - should do nothing
++
++#### Automated
++- Unit tests for `format-doc` in `test/babashka/impl/repl_test.clj`
++
++## Eldoc (automatic argument help)
++
++### Proposal
++
++Eldoc automatically shows function signatures as you type. When the cursor is inside a function call like `(map |...)`, the arglists are displayed below the prompt via JLine's `post` field. Updates on every keystroke.
++
++### Implementation
++
++#### Enclosing function detection: `enclosing-fn`
++
++Uses a regex approach to find the innermost unclosed `(`:
++1. Take text before cursor
++2. Repeatedly strip balanced paren pairs with `\([^()]*\)` regex
++3. Last remaining `(` is the innermost unclosed one
++4. Extract the function name after it, only if cursor is past the name
++
++#### Display
++
++One-line format matching rebel-readline's eldoc style:
+ ```
++clojure.core/map: ([f] [f coll] [f c1 c2] [f c1 c2 c3] [f c1 c2 c3 & colls])
++```
++
++Colors (rebel-readline dark theme): namespace faint blue 123, var name faint yellow 178, separator/arglists gray 243.
+ 
+-## Testing
++#### Trigger mechanism
+ 
+-### Manual Testing
++Wraps JLine's `self-insert` and `backward-delete-char` widgets. After each keystroke:
++- If enclosing function found with arglists → set `post` to eldoc supplier
++- Otherwise → set `post` to null
++
++Lookup results are cached by function name to avoid repeated SCI evaluation.
++
++#### Key Decisions
++
++- Regex-based paren matching is ~8 lines and handles nesting correctly via iterative stripping. Known limitation: parens inside string literals can confuse matching (rare in REPL usage).
++- Widget wrapping (not a persistent supplier) avoids blank-line issue when JLine's `post.get()` returns null/empty (JLine prepends `"\n"` before post content).
++- Only `self-insert` and `backward-delete-char` are wrapped; other editing operations leave the last eldoc in place.
++
++### Testing
++
++#### Manual
+ 1. Build: `script/uberjar && script/compile`
+ 2. Start REPL: `./bb`
+-3. Test completions:
+-   - Type `ma<TAB>` - should show `map`, `mapv`, `mapcat`, etc.
+-   - Type `str/<TAB>` - should show `str/join`, `str/split`, etc.
+-   - Type `String/<TAB>` - should show static methods like `String/valueOf`
++3. Type `(map ` → should show arglists below prompt
++4. Type `(str/join ` → should show join's arglists
++5. Backspace past fn name → eldoc clears
++
++#### Automated
++- Unit tests for `enclosing-fn` in `test/babashka/impl/repl_test.clj`
++
++## Inline Autosuggestion (ghost text)
++
++### Proposal
++
++Node.js-style ghost text: as you type, show the common completion prefix beyond what's typed as faint/grey text inline after the cursor. Press TAB to accept.
++
++### Implementation
++
++#### Tail tip computation: `compute-tail-tip`
++
++Public, pure function. Given the typed word and list of candidate strings:
++1. Filter candidates to those starting with the typed word (avoids pollution from fully-qualified names like `java.lang.String` when typing `Stri`)
++2. Compute `common-prefix` of filtered candidates
++3. Return the suffix beyond the typed word, or `""` if no extension
++
++#### Display mechanism
++
++Uses JLine's `SuggestionType/TAIL_TIP` mode with `LineReaderImpl.setTailTip(String)`. The tail tip renders as faint text inline after the cursor.
++
++#### Trigger
++
++Same widget wrappers as eldoc — `self-insert` and `backward-delete-char` call `update-tail-tip` after each keystroke. `EXPAND_OR_COMPLETE` (TAB) clears the tail tip *before* the widget runs (pre-clear) to prevent stale ghost text from appearing during JLine's internal `redisplay()`, then recomputes after.
++
++#### Ctrl+C clearing
++
++The `UserInterruptException` handler in `jline-read` clears the tail tip so ghost text doesn't leak into the next prompt.
++
++#### Key Decisions
++
++- `SuggestionType/TAIL_TIP` (not `COMPLETER`) — `COMPLETER` mode was too aggressive, showing the full completion list inline
++- TAB is bound to `EXPAND_OR_COMPLETE` in JLine's emacs keymap (not `COMPLETE_WORD` or `MENU_COMPLETE`)
++- Pre-clear is required for the completion widget because JLine calls `redisplay()` internally before our after-hook runs
++- Filtering candidates by `str/starts-with?` is essential — without it, fully-qualified class names (e.g. `java.lang.String`) break the common prefix for short-name completions (e.g. `Stri` → `String`)
++
++### Testing
++
++#### Manual
++1. Build: `script/uberjar && script/compile`
++2. Start REPL: `./bb`
++3. Type `get-i` → ghost text `n` appears (for `get-in`)
++4. Type `Stri` → ghost text `ng` appears (for `String`)
++5. Press TAB → completes, ghost text clears cleanly
++6. Press Ctrl+C → ghost text clears
++
++#### Automated
++- Unit tests for `common-prefix` and `compute-tail-tip` in `test/babashka/impl/repl_test.clj`
++
++## Startup Banner
++
++Two plain text lines printed to stderr:
++```
++Babashka v1.12.215-SNAPSHOT
++Type :repl/help for help
++```
++
++## Known Limitations
+ 
+-### Automated Testing
+-- Add unit tests for `completions/completions` in `babashka.nrepl/test/babashka/nrepl/impl/completions_test.clj`
+-- Add integration test in `test/babashka/impl/repl_test.clj` verifying completer creation
++- **Ghost text only at end of buffer**: JLine's `TAIL_TIP` rendering requires `buf.length() == buf.cursor()` (LineReaderImpl.java:4217). When editing in the middle of a multi-line expression (e.g., cursor on line 2 of `{\n(frequ\n}`), the cursor is not at the end of the buffer and ghost text is not rendered. Fixing this would require patching JLine or implementing custom ghost text rendering.
++- **No Shift-Enter support**: Most terminals send the same byte (`0x0d`) for both Enter and Shift-Enter, making them indistinguishable. The [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) solves this by sending distinct CSI u escape sequences for modified keys (e.g. `\033[13;2u` for Shift-Enter), but JLine doesn't support it yet ([jline/jline3#1217](https://github.com/jline/jline3/issues/1217)). Enabling the protocol without JLine support breaks arrow keys and other keys. **Alt-Enter** works as an alternative for inserting newlines on macOS/Linux (JLine's built-in `SELF_INSERT_UNMETA`), but on Windows Terminal Alt-Enter is bound to fullscreen toggle.
+ 
+-## Notes
++## TODO
+ 
+-- The completion logic stays in the nrepl submodule per the proposal - the console REPL requires this namespace
+-- Error handling: completions should never throw - silently return empty on errors
+-- The `CompletingParsedLine` interface is needed to provide word context to the Completer
++- Expose the JLine interop used by the console REPL (Completer, Candidate, Widget, Parser, ParsedLine, CompletingParsedLine, EOFError, Reference, LineReaderImpl, AttributedStringBuilder, AttributedStyle, KeyMap, etc.) in `classes.clj` so bb scripts can build custom JLine-based tooling themselves.
++- Investigate loading rebel-readline from source with bb. Many JLine classes rebel-readline needs (Highlighter, Completer, Candidate, Parser, DefaultParser, Widget, LineReader$Option, DumbTerminal, Attributes$LocalFlag, etc.) are on the classpath but not in bb's class map. Adding these to `classes.clj` could make it possible to run rebel-readline as a bb script/library.
+diff --git a/doc/news/release-1.12.215.md b/doc/news/release-1.12.215.md
+new file mode 100644
+index 00000000..bb2fd181
+--- /dev/null
++++ b/doc/news/release-1.12.215.md
+@@ -0,0 +1,216 @@
++# Babashka 1.12.215
++
++[Babashka](https://babashka.org) is a fast-starting native Clojure scripting
++runtime. It uses [SCI](https://github.com/babashka/sci) to interpret Clojure and
++compiles to a native binary via GraalVM, giving you Clojure's power with
++near-instant startup. It's commonly used for shell scripting, build tooling, and
++small CLI applications.
++
++## Highlights
++
++### JLine3 and TUI support
++
++Babashka now bundles [JLine3](https://github.com/jline/jline3), a Java library
++for building interactive terminal applications. The following JLine3 classes are
++exposed for direct use in scripts:
++
++- `org.jline.terminal.Terminal`, `TerminalBuilder` for creating and configuring
++  terminals
++- `org.jline.reader.LineReader`, `LineReaderBuilder` for reading input with line
++  editing, history, and tab completion
++- `org.jline.utils.AttributedString`, `AttributedStringBuilder`,
++  `AttributedStyle` for styled terminal output
++- `org.jline.keymap.KeyMap` for keyboard bindings
++- `org.jline.utils.InfoCmp$Capability` for querying terminal capabilities
++
++Babashka bundles two JLine terminal providers: FFM (Foreign Function & Memory
++API) and exec. The FFM provider works everywhere except in statically compiled
++Linux binaries, where the exec provider serves as a performant alternative.
++Thanks to this choice, TUI applications built with babashka work on all
++platforms, including Windows PowerShell and cmd.exe.
++
++Here's a simple interactive prompt that reads lines from the user until EOF
++(Ctrl+D):
++
++```clojure
++(import '[org.jline.terminal TerminalBuilder]
++        '[org.jline.reader LineReaderBuilder])
++
++(let [terminal (-> (TerminalBuilder/builder) (.build))
++      reader   (-> (LineReaderBuilder/builder)
++                   (.terminal terminal)
++                   (.build))]
++  (try
++    (loop []
++      (when-let [line (.readLine reader "prompt> ")]
++        (println "You typed:" line)
++        (recur)))
++    (catch org.jline.reader.EndOfFileException _
++      (println "Goodbye!"))
++    (finally
++      (.close terminal))))
++```
++
++### babashka.terminal namespace
++
++A new `babashka.terminal` namespace exposes a `tty?` function to detect whether
++stdin, stdout, or stderr is connected to a terminal:
++
++```clojure
++(require '[babashka.terminal :refer [tty?]])
++
++(when (tty? :stdout)
++  (println "Interactive terminal detected, enabling colors"))
++```
++
++This accepts `:stdin`, `:stdout`, or `:stderr` as argument. It uses JLine3's
++terminal provider under the hood.
++
++This is useful for scripts that want to behave differently when piped vs.
++run interactively, for example enabling colored output or progress bars only
++in a terminal.
++
++### charm.clj compatibility
++
++[charm.clj](https://github.com/TimoKramer/charm.clj) is a new Clojure library
++for building terminal user interfaces using the Elm architecture
++(Model-Update-View). It provides components like spinners, text inputs, lists,
++paginators, and progress bars, with support for ANSI/256/true color styling and
++keyboard/mouse input handling.
++
++charm.clj is now compatible with babashka, enabled by the combination of JLine3
++support and other interpreter improvements in this release. This means you can
++build rich TUI applications that start instantly as native binaries.
++
++Here's a complete counter example you can save as a single file and run with `bb`:
++
++```clojure
++#!/usr/bin/env bb
++
++(babashka.deps/add-deps
++ '{:deps {io.github.TimoKramer/charm.clj {:local/root "/Users/borkdude/dev/charm.clj"}}})
++
++(require '[charm.core :as charm])
++
++(def title-style
++  (charm/style :fg charm/magenta :bold true))
++
++(def count-style
++  (charm/style :fg charm/cyan
++               :padding [0 1]
++               :border charm/rounded-border))
++
++(defn update-fn [state msg]
++  (cond
++    (or (charm/key-match? msg "q")
++        (charm/key-match? msg "ctrl+c"))
++    [state charm/quit-cmd]
++
++    (or (charm/key-match? msg "k")
++        (charm/key-match? msg :up))
++    [(update state :count inc) nil]
++
++    (or (charm/key-match? msg "j")
++        (charm/key-match? msg :down))
++    [(update state :count dec) nil]
++
++    :else
++    [state nil]))
++
++(defn view [state]
++  (str (charm/render title-style "Counter App") "\n\n"
++       (charm/render count-style (str (:count state))) "\n\n"
++       "j/k or arrows to change\n"
++       "q to quit"))
++
++(charm/run {:init {:count 0}
++            :update update-fn
++            :view view
++            :alt-screen true})
++```
++
++### Deftype with map interfaces
++
++Babashka's interpreter, SCI, supports `deftype` for implementing protocols. But
++until now, `deftype` couldn't implement JVM interfaces like `IPersistentMap`,
++`ILookup`, or `Associative`. This meant libraries that define custom map-like
++types, a very common Clojure pattern, couldn't work in babashka.
++
++Starting with this release, `deftype` supports map interfaces. You can now write
++types that behave as full persistent maps:
++
++```clojure
++(deftype MyCache [cache]
++  clojure.lang.ILookup
++  (valAt [_ k] (get cache k))
++  (valAt [_ k nf] (get cache k nf))
++  clojure.lang.IPersistentMap
++  (assoc [_ k v] (MyCache. (assoc cache k v)))
++  (without [_ k] (MyCache. (dissoc cache k)))
++  clojure.lang.Associative
++  (containsKey [_ k] (contains? cache k))
++  (entryAt [_ k] (when (contains? cache k)
++                    (clojure.lang.MapEntry. k (get cache k))))
++  clojure.lang.IPersistentCollection
++  (count [_] (count cache))
++  (empty [_] (MyCache. {}))
++  (cons [_ o] (MyCache. (conj cache o)))
++  (equiv [_ other] (= cache other))
++  clojure.lang.Seqable
++  (seq [_] (seq cache))
++  java.lang.Iterable
++  (iterator [_] (.iterator ^java.lang.Iterable cache)))
++```
++
++Under the hood, babashka uses a pre-built Java class (`SciMap`) that extends
++`APersistentMap` and delegates all method calls to the functions you define.
++Since SCI interprets code rather than generating bytecode, it can't create new
++JVM classes at runtime, so this approach gives you all the map behavior while
++staying within SCI's interpreter model.
++
++The key requirement is that your `deftype` must declare `IPersistentMap`. This
++signals that you want a full map type. Other map-related interfaces like
++`ILookup`, `Associative`, `Counted`, `Seqable`, and `Iterable` are accepted
++freely since the underlying class already implements them.
++
++#### Libraries enabled
++
++This feature unlocks several libraries that were previously incompatible:
++
++- [core.cache](https://github.com/clojure/core.cache): all cache types
++  (BasicCache, FIFOCache, LRUCache, TTLCache, LUCache) work unmodified. The
++  `defcache` macro expands to a `deftype` with all seven core map interfaces.
++- [linked](https://github.com/frankiesardo/linked): insertion-ordered maps and
++  sets. `LinkedMap` declares 13 interfaces including `Reversible` for reverse
++  insertion-order traversal.
++
++### Console REPL improvements
++
++The `bb repl` experience has been significantly improved with JLine3 integration.
++You no longer need `rlwrap` to get a comfortable console REPL:
++
++- **Multi-line editing**: the REPL detects incomplete forms and continues reading
++  on the next line with a `#_=> ` continuation prompt
++- **Tab completion**: Clojure-aware completions powered by SCI
++- **Persistent history**: command history saved across sessions in
++  `~/.bb_repl_history`
++- **Ctrl+C handling**: first press on an empty prompt warns, second press exits
++
++### Other improvements
++
++- Support multiple `catch` clauses in combination with `^:sci/error`, improving
++  compatibility with libraries like
++  [slingshot](https://github.com/scgilardi/slingshot) that use multiple catch
++  patterns
++- Fix `satisfies?` on protocols with `proxy`
++- Support `reify` with `java.time.temporal.TemporalQuery`
++- Add `java.lang.ref.SoftReference`
++- Add `java.nio.file.attribute.UserPrincipal` and `GroupPrincipal`
++- Add `java.nio.file.FileSystemNotFoundException`
++- Bumped `deps.clj`, `fs`, `transit-clj`, and `Selmer`
++
++## Thanks
++
++Thanks to all the contributors and users who reported issues and tested
++pre-release builds.
++
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index d1a49b13..b2449d8c 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -213,7 +213,10 @@
+     {:allPublicConstructors true
+      :methods [{:name "create"}]}
+     clojure.lang.TaggedLiteral
+-    {:methods [{:name "create"}]}})
++    {:methods [{:name "create"}]}
++    org.jline.reader.impl.LineReaderImpl
++    {:fields [{:name "post"}]
++     :methods [{:name "readLine"}]}})
+ 
+ (def custom-map
+   (cond->
+diff --git a/src/babashka/impl/repl.clj b/src/babashka/impl/repl.clj
+index fcfd7204..2563c5d9 100644
+--- a/src/babashka/impl/repl.clj
++++ b/src/babashka/impl/repl.clj
+@@ -5,7 +5,7 @@
+    [babashka.impl.clojure.core :as core-extras]
+    [babashka.impl.clojure.main :as m]
+    [babashka.impl.common :as common]
+-   [babashka.nrepl.impl.completions :as completions]
++   [babashka.nrepl.impl.sci :as sci-helpers]
+    [babashka.terminal :as terminal]
+    [clojure.java.io :as io]
+    [clojure.string :as str]
+@@ -16,10 +16,13 @@
+    [sci.impl.parser :as parser]
+    [sci.impl.utils :as utils])
+   (:import
+-   [org.jline.reader LineReaderBuilder EndOfFileException UserInterruptException
++   [org.jline.keymap KeyMap]
++   [org.jline.reader LineReader LineReader$SuggestionType LineReaderBuilder EndOfFileException UserInterruptException
+     Parser Parser$ParseContext ParsedLine CompletingParsedLine EOFError
+-    Completer Candidate]
+-   [org.jline.terminal TerminalBuilder]))
++    Completer Candidate Widget Reference]
++   [org.jline.terminal TerminalBuilder]
++   [org.jline.reader.impl LineReaderImpl]
++   [org.jline.utils AttributedString AttributedStringBuilder AttributedStyle]))
+ 
+ (set! *warn-on-reflection* true)
+ 
+@@ -55,15 +58,35 @@
+     (when-not (= \newline c)
+       (r/unread s c))))
+ 
++(defn- bb-version []
++  (str/trim (slurp (io/resource "BABASHKA_VERSION" common/jvm-loader))))
++
++(defn- print-repl-help []
++  (sci/with-bindings {sci/out @sci/err}
++    (sio/println "    Docs: (doc function-name-here)
++          (find-doc \"part-of-name-here\")
++          Ctrl+X Ctrl+D (at cursor)
++  Source: (source function-name-here)
++ Javadoc: (javadoc java-object-or-class-here)
++    Exit: Ctrl+D or :repl/exit or :repl/quit
++ Results: Stored in vars *1, *2, *3, an exception in *e")))
++
++(defn- print-banner []
++  (.println System/err (str "Babashka v" (bb-version) "\nType :repl/help for help")))
++
+ (defn repl-read [sci-ctx in-stream _request-prompt request-exit]
+   (if (nil? (r/peek-char in-stream))
+     request-exit
+     (let [v (parser/parse-next sci-ctx in-stream)]
+       (skip-if-eol in-stream)
+-      (if (or (identical? :repl/quit v)
+-              (identical? :repl/exit v))
++      (cond
++        (or (identical? :repl/quit v)
++            (identical? :repl/exit v))
+         request-exit
+-        v))))
++        (identical? :repl/help v)
++        (do (print-repl-help)
++            (recur sci-ctx in-stream _request-prompt request-exit))
++        :else v))))
+ 
+ (defn repl
+   "REPL with predefined hooks for attachable socket server."
+@@ -78,16 +101,7 @@
+        (m/repl
+         :init (or init
+                   (fn []
+-                    (sci/with-bindings {sci/out @sci/err}
+-                      (sio/println "Babashka"
+-                                   (str "v" (str/trim (slurp (io/resource "BABASHKA_VERSION" common/jvm-loader)))))
+-                      (sio/print "    Docs: (doc function-name-here)
+-          (find-doc \"part-of-name-here\")
+-  Source: (source function-name-here)
+- Javadoc: (javadoc java-object-or-class-here)
+-    Exit: Control+D or :repl/exit or :repl/quit
+- Results: Stored in vars *1, *2, *3, an exception in *e")
+-                      (sio/println))
++                    (print-banner)
+                     (eval-form sci-ctx `(apply require (quote ~m/repl-requires)))))
+         :read (or read
+                   (fn [request-prompt request-exit]
+@@ -138,6 +152,18 @@
+         (when (and word (pos? (count word)))
+           [word start])))))
+ 
++(defn enclosing-fn
++  "Returns the function name for the innermost unclosed ( before cursor, or nil.
++   Only returns a name when cursor is past the function name."
++  [^String line ^long cursor]
++  (let [s (subs line 0 (min cursor (.length line)))
++        stripped (loop [s s]
++                  (let [s' (str/replace s #"\([^()]*\)" "")]
++                    (if (= s s') s (recur s'))))
++        last-open (str/last-index-of stripped "(")]
++    (when last-open
++      (second (re-find #"^\s*(\S+)\s" (subs stripped (inc ^int last-open)))))))
++
+ (defn- completing-parsed-line
+   "Creates a CompletingParsedLine with word information for completions."
+   ^CompletingParsedLine [^String line ^long cursor word ^long word-start]
+@@ -160,7 +186,7 @@
+     (complete [_ _ parsed-line candidates]
+       (let [word (.word ^ParsedLine parsed-line)]
+         (when (and word (pos? (count word)))
+-          (let [{:keys [completions]} (completions/completions sci-ctx word)]
++          (let [{:keys [completions]} (sci-helpers/completions sci-ctx word)]
+             (doseq [{:keys [candidate ns type]} completions]
+               (.add ^java.util.List candidates
+                     (Candidate.
+@@ -180,6 +206,203 @@
+                      nil                ; key
+                      false)))))))))    ; complete - add space after?
+ 
++(defn- clojuredocs-url
++  "Returns a clojuredocs.org URL for clojure.* vars, nil otherwise."
++  [ns name]
++  (when (and ns name (str/starts-with? (str ns) "clojure."))
++    (str "https://clojuredocs.org/" ns "/" (str/replace (str name) #"\?$" "_q"))))
++
++(defn- format-doc-body
++  "Formats the doc body (everything after the header line)."
++  [{:keys [ns name arglists doc macro]}]
++  (str (when ns (str ns "/"))
++       name
++       (when macro "\nMacro")
++       "\n"
++       (when arglists (str (pr-str arglists) "\n"))
++       (when doc (str "  " doc "\n"))))
++
++(defn format-doc
++  "Formats a metadata map as a doc string, like Clojure's (doc ...) output."
++  [{:keys [ns name] :as m}]
++  (str (if-let [url (clojuredocs-url ns name)]
++         (str url "\n")
++         "-------------------------\n")
++       (format-doc-body m)))
++
++(def ^:private post-field
++  (delay
++    (doto (.getDeclaredField LineReaderImpl "post")
++      (.setAccessible true))))
++
++(def ^:private anchor-style
++  (delay (-> AttributedStyle/DEFAULT (.faint) (.foreground 39))))
++
++(def ^:private doc-style
++  (delay (.foreground AttributedStyle/DEFAULT 222)))
++
++(def ^:private separator-style
++  (delay (.foreground AttributedStyle/DEFAULT 243)))
++
++(defn- format-doc-attributed
++  "Builds a colored AttributedString for the doc display."
++  ^AttributedString [{:keys [ns name] :as m}]
++  (let [^AttributedStringBuilder asb (AttributedStringBuilder.)
++        url (clojuredocs-url ns name)]
++    (if url
++      (.styled asb ^AttributedStyle @anchor-style (str url "\n"))
++      (.styled asb ^AttributedStyle @separator-style "-------------------------\n"))
++    (.styled asb ^AttributedStyle @doc-style ^String (format-doc-body m))
++    (.toAttributedString asb)))
++
++(def ^:private eldoc-ns-style
++  (delay (-> AttributedStyle/DEFAULT (.faint) (.foreground 123))))
++
++(def ^:private eldoc-name-style
++  (delay (-> AttributedStyle/DEFAULT (.faint) (.foreground 178))))
++
++(defn- format-eldoc-attributed
++  "Builds a one-line colored AttributedString for eldoc display."
++  ^AttributedString [{:keys [ns name arglists]}]
++  (let [^AttributedStringBuilder asb (AttributedStringBuilder.)]
++    (when ns
++      (.styled asb ^AttributedStyle @eldoc-ns-style ^String (str ns))
++      (.styled asb ^AttributedStyle @separator-style "/"))
++    (.styled asb ^AttributedStyle @eldoc-name-style ^String (str name))
++    (when arglists
++      (.styled asb ^AttributedStyle @separator-style ": ")
++      (.styled asb ^AttributedStyle @separator-style ^String (pr-str arglists)))
++    (.toAttributedString asb)))
++
++(defn- set-post [^LineReaderImpl line-reader ^AttributedString as]
++  (.set ^java.lang.reflect.Field @post-field line-reader
++        (when as
++          (reify java.util.function.Supplier
++            (get [_] as)))))
++
++(defn common-prefix
++  "Returns the longest common prefix of a collection of strings."
++  ^String [strs]
++  (let [first-str (first strs)]
++    (if (or (nil? first-str) (= 1 (count strs)))
++      (or first-str "")
++      (let [len (count first-str)]
++        (loop [i 0]
++          (if (and (< i len)
++                   (every? #(and (< i (count %))
++                                 (= (.charAt ^String first-str i)
++                                    (.charAt ^String % i)))
++                           (rest strs)))
++            (recur (inc i))
++            (subs first-str 0 i)))))))
++
++(defn compute-tail-tip
++  "Computes the ghost text for autosuggestion given a word and completion candidates.
++   Returns the suffix beyond what's typed, or empty string."
++  ^String [^String word candidates]
++  (let [matching (->> candidates (filterv #(str/starts-with? % word)))
++        prefix (common-prefix matching)]
++    (if (> (count prefix) (count word))
++      (subs prefix (count word))
++      "")))
++
++(defn- update-tail-tip
++  "Sets the tail tip to the common completion prefix beyond what's typed.
++   Only computes when cursor is at end of buffer (where JLine renders it)."
++  [sci-ctx ^LineReaderImpl line-reader]
++  (try
++    (let [buf (.getBuffer line-reader)
++          cursor (.cursor buf)]
++      (if (< cursor (.length buf))
++        (.setTailTip line-reader "")
++        (let [line (str buf)]
++          (if-let [[word _] (word-at-cursor line cursor)]
++            (let [{:keys [completions]} (sci-helpers/completions sci-ctx word)
++                  candidates (mapv :candidate completions)
++                  tip (compute-tail-tip word candidates)]
++              (.setTailTip line-reader tip))
++            (.setTailTip line-reader "")))))
++    (catch Exception _ nil)))
++
++(defn- update-eldoc
++  "Computes eldoc for the current buffer and sets/clears the post field."
++  [sci-ctx ^LineReaderImpl line-reader cache]
++  (try
++    (let [buf (.getBuffer line-reader)
++          line (str buf)
++          cursor (.cursor buf)
++          fn-name (enclosing-fn line cursor)
++          [cached-name cached-result] @cache
++          m (if (= fn-name cached-name)
++              cached-result
++              (let [result (when fn-name (sci-helpers/lookup sci-ctx fn-name))]
++                (reset! cache [fn-name result])
++                result))]
++      (set-post line-reader (when (:arglists m) (format-eldoc-attributed m))))
++    (catch Exception _ nil)))
++
++(defn- wrap-widget
++  "Wraps a named widget with before/after hooks."
++  [^LineReaderImpl line-reader ^String widget-name before after]
++  (let [^Widget original (.get (.getWidgets line-reader) widget-name)]
++    (.put (.getWidgets line-reader) widget-name
++          (reify Widget
++            (apply [_]
++              (when before (before))
++              (let [result (.apply original)]
++                (when after (after))
++                result))))))
++
++(defn- doc-at-point-widget
++  "Creates a JLine Widget that displays documentation for the symbol at cursor.
++   Shows doc below the prompt, waits for any keypress, clears doc and replays the key."
++  [sci-ctx ^LineReaderImpl line-reader]
++  (reify Widget
++    (apply [_]
++      (let [buf (.getBuffer line-reader)
++            line (str buf)
++            cursor (.cursor buf)]
++        (when-let [[word _] (word-at-cursor line cursor)]
++          (when-let [m (sci-helpers/lookup sci-ctx word)]
++            (set-post line-reader (format-doc-attributed m))
++            (.redisplay line-reader)
++            (.readBinding line-reader (.getKeys line-reader) nil)
++            (set-post line-reader nil)
++            (when-let [s (.getLastBinding line-reader)]
++              (.runMacro line-reader s)))))
++      true)))
++
++(defn- register-widgets
++  "Registers custom widgets and key bindings on the LineReader."
++  [^LineReader line-reader sci-ctx]
++  (.put (.getWidgets line-reader) "clojure-doc-at-point"
++        (doc-at-point-widget sci-ctx ^LineReaderImpl line-reader))
++  (let [^KeyMap km (.get (.getKeyMaps line-reader) LineReader/EMACS)]
++    (.bind km (Reference. "clojure-doc-at-point")
++           (str (KeyMap/ctrl \X) (KeyMap/ctrl \D))))
++  ;; Enter in the middle of buffer inserts newline, at the end evaluates
++  (let [^Widget accept-line (.get (.getWidgets line-reader) LineReader/ACCEPT_LINE)]
++    (.put (.getWidgets line-reader) LineReader/ACCEPT_LINE
++          (reify Widget
++            (apply [_]
++              (let [buf (.getBuffer ^LineReaderImpl line-reader)]
++                (if (< (.cursor buf) (.length buf))
++                  (do (.write buf (int \newline)) true)
++                  (.apply accept-line)))))))
++  (let [cache (atom [nil nil])
++        after (fn []
++                (update-eldoc sci-ctx ^LineReaderImpl line-reader cache)
++                (update-tail-tip sci-ctx ^LineReaderImpl line-reader))
++        clear-tip #(.setTailTip ^LineReaderImpl line-reader "")]
++    (wrap-widget ^LineReaderImpl line-reader LineReader/SELF_INSERT nil after)
++    (wrap-widget ^LineReaderImpl line-reader LineReader/BACKWARD_DELETE_CHAR nil after)
++    (wrap-widget ^LineReaderImpl line-reader LineReader/EXPAND_OR_COMPLETE clear-tip after)
++    ;; Clear stale ghost text on cursor movement
++    (doseq [w [LineReader/FORWARD_CHAR LineReader/BACKWARD_CHAR
++               LineReader/UP_LINE_OR_HISTORY LineReader/DOWN_LINE_OR_HISTORY
++               LineReader/BEGINNING_OF_LINE LineReader/END_OF_LINE]]
++      (wrap-widget ^LineReaderImpl line-reader w nil clear-tip))))
++
+ (defn- try-parse-next
+   "Try to parse the next form from reader. Returns :ok, :incomplete, or :error."
+   [sci-ctx reader]
+@@ -235,14 +458,17 @@
+   (let [terminal (-> (TerminalBuilder/builder)
+                      (.system true)
+                      (.build))
+-        history-file (fs/path (fs/home) ".bb_repl_history")]
+-    (-> (LineReaderBuilder/builder)
+-        (.terminal terminal)
+-        (.parser (jline-parser sci-ctx))
+-        (.completer (clojure-completer sci-ctx))
+-        (.variable org.jline.reader.LineReader/HISTORY_FILE history-file)
+-        (.variable org.jline.reader.LineReader/SECONDARY_PROMPT_PATTERN "%P #_=> ")
+-        (.build))))
++        history-file (fs/path (fs/home) ".bb_repl_history")
++        reader (-> (LineReaderBuilder/builder)
++                   (.terminal terminal)
++                   (.parser (jline-parser sci-ctx))
++                   (.completer (clojure-completer sci-ctx))
++                   (.variable org.jline.reader.LineReader/HISTORY_FILE history-file)
++                   (.variable org.jline.reader.LineReader/SECONDARY_PROMPT_PATTERN "%P #_=> ")
++                   (.build))]
++    (.setAutosuggestion reader LineReader$SuggestionType/TAIL_TIP)
++    (register-widgets reader sci-ctx)
++    reader))
+ 
+ (defn- read-remaining
+   "Read remaining characters from a reader into a string."
+@@ -276,8 +502,7 @@
+ (defn- jline-read
+   "Read function for m/repl that uses JLine for input.
+    JLine handles multi-line editing via the Clojure parser.
+-   Implements Node-style Ctrl+C behavior: first Ctrl+C on empty prompt shows warning,
+-   second Ctrl+C exits."
++   First Ctrl+C or Ctrl+D on empty prompt shows warning, second exits."
+   [sci-ctx ^org.jline.reader.LineReader line-reader input-buffer ctrl-c-pending _request-prompt request-exit]
+   (try
+     (when-let [[_ form remaining]
+@@ -296,15 +521,22 @@
+       (reset! input-buffer remaining)
+       (reset! ctrl-c-pending false)
+       ;; Return form from buffer
+-      (if (or (identical? :repl/quit form)
+-              (identical? :repl/exit form))
++      (cond
++        (or (identical? :repl/quit form)
++            (identical? :repl/exit form))
+         request-exit
+-        form))
++        (identical? :repl/help form)
++        (do (print-repl-help) interrupted)
++        :else form))
+     (catch EndOfFileException _
++      ;; Ctrl+D on empty line: exit immediately. JLine only throws
++      ;; EndOfFileException when the buffer is empty, so no further check needed.
+       request-exit)
+     (catch UserInterruptException e
+       (let [partial-line (.getPartialLine e)]
+         (reset! input-buffer "")
++        (when (instance? LineReaderImpl line-reader)
++          (.setTailTip ^LineReaderImpl line-reader ""))
+         (cond
+           ;; Second consecutive Ctrl+C on empty prompt - exit
+           (and (= "" partial-line) @ctrl-c-pending)

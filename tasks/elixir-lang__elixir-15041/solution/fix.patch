@@ -1,0 +1,227 @@
+diff --git a/lib/elixir/lib/module/types/apply.ex b/lib/elixir/lib/module/types/apply.ex
+index 61e851144..e5a853e04 100644
+--- a/lib/elixir/lib/module/types/apply.ex
++++ b/lib/elixir/lib/module/types/apply.ex
+@@ -477,6 +477,7 @@ defp do_remote(mod, fun, args, expected, expr, stack, context, _of_fun) do
+     remote_domain(mod, fun, args, expected, elem(expr, 1), stack, context)
+   end
+ 
++  @number union(integer(), float())
+   @empty_list empty_list()
+   @non_empty_list non_empty_list(term())
+   @empty_map empty_map()
+@@ -522,21 +523,65 @@ defp custom_compare(
+ 
+         {actual, context} = of_fun.(arg, expected, expr, stack, context)
+         result = if compatible?(actual, expected), do: return, else: boolean()
++
++        # We can skip return compare because literal is always an integer,
++        # so it cannot be a disjoint comparison
+         {result, context}
+     end
+   end
+ 
+-  defp custom_compare(name, left, right, _expected, expr, stack, context, of_fun) do
+-    compare(name, left, right, false, expr, stack, context, of_fun)
++  defp custom_compare(name, arg, literal, expected, expr, stack, context, of_fun) do
++    case booleaness(expected) do
++      booleaness when booleaness in [:maybe_both, :none] ->
++        compare(name, arg, literal, false, expr, stack, context, of_fun)
++
++      booleaness ->
++        {literal_type, context} = of_fun.(literal, term(), expr, stack, context)
++
++        {polarity, return} =
++          case booleaness do
++            :maybe_true -> {name in [:==, :"=:="], @atom_true}
++            :maybe_false -> {name in [:"/=", :"=/="], @atom_false}
++          end
++
++        # If it is a singleton, we can always be precise
++        if singleton?(literal_type) do
++          expected = if polarity, do: literal_type, else: negation(literal_type)
++          {arg_type, context} = of_fun.(arg, expected, expr, stack, context)
++          result = if compatible?(arg_type, expected), do: return, else: boolean()
++
++          # Because reverse polarity means we will infer negated types
++          # (which are naturally disjoint), we skip checks in such cases
++          skip_check? = not polarity
++          return_compare(name, arg_type, literal_type, result, skip_check?, expr, stack, context)
++        else
++          expected =
++            cond do
++              # We are checking for `not x == 1` or similar, we can't say anything about x
++              polarity == false -> term()
++              # We are checking for `x == 1`, make sure x is integer or float
++              number_type?(literal_type) and name in [:==, :"/="] -> union(literal_type, @number)
++              # Otherwise we have the literal type as is
++              true -> literal_type
++            end
++
++          {arg_type, context} = of_fun.(arg, expected, expr, stack, context)
++          return_compare(name, arg_type, literal_type, boolean(), false, expr, stack, context)
++        end
++    end
+   end
+ 
+-  defp compare(name, left, right, literal?, expr, stack, context, of_fun) do
++  defp compare(name, left, right, both_literal?, expr, stack, context, of_fun) do
+     {left_type, context} = of_fun.(left, term(), expr, stack, context)
+     {right_type, context} = of_fun.(right, term(), expr, stack, context)
+-    result = return(boolean(), [left_type, right_type], stack)
++    return_compare(name, left_type, right_type, boolean(), both_literal?, expr, stack, context)
++  end
++
++  defp return_compare(name, left_type, right_type, result, skip_check?, expr, stack, context) do
++    result = return(result, [left_type, right_type], stack)
+ 
+     cond do
+-      literal? or not is_warning(stack) ->
++      skip_check? or not is_warning(stack) ->
+         {result, context}
+ 
+       name in [:==, :"/="] and number_type?(left_type) and number_type?(right_type) ->
+diff --git a/lib/elixir/lib/module/types/descr.ex b/lib/elixir/lib/module/types/descr.ex
+index a594fd515..34a16d58d 100644
+--- a/lib/elixir/lib/module/types/descr.ex
++++ b/lib/elixir/lib/module/types/descr.ex
+@@ -270,7 +270,7 @@ def domain_to_args(descr) do
+   end
+ 
+   defp unwrap_domain_tuple(%{tuple: bdd} = descr, transform) when map_size(descr) == 1 do
+-    tuple_normalize(bdd) |> Enum.map(transform)
++    tuple_bdd_to_dnf(bdd) |> Enum.map(transform)
+   end
+ 
+   defp unwrap_domain_tuple(descr, _transform) when descr == %{}, do: []
+@@ -604,6 +604,56 @@ defp empty_key?(:list, value), do: list_empty?(value)
+   defp empty_key?(:tuple, value), do: tuple_empty?(value)
+   defp empty_key?(_, _value), do: false
+ 
++  @doc """
++  Returns if the type is a singleton.
++  """
++  def singleton?(:term), do: false
++  def singleton?(descr), do: static_singleton?(Map.get(descr, :dynamic, descr))
++
++  defp static_singleton?(:term), do: false
++  defp static_singleton?(%{optional: _}), do: false
++  defp static_singleton?(%{list: _}), do: false
++  defp static_singleton?(%{fun: _}), do: false
++  defp static_singleton?(descr), do: each_singleton?(descr, [:atom, :bitmap, :map, :tuple], false)
++
++  defp each_singleton?(descr, [key | keys], acc) do
++    case descr do
++      %{^key => value} ->
++        case each_singleton?(key, value) do
++          true when acc == true -> false
++          true -> each_singleton?(descr, keys, true)
++          false -> false
++          :empty -> each_singleton?(descr, keys, acc)
++        end
++
++      %{} ->
++        each_singleton?(descr, keys, acc)
++    end
++  end
++
++  defp each_singleton?(_descr, [], acc), do: acc
++
++  # Implement for each type
++  defp each_singleton?(:bitmap, bitmap), do: bitmap == @bit_empty_list
++
++  defp each_singleton?(:atom, atoms), do: match?({:union, set} when map_size(set) == 1, atoms)
++
++  defp each_singleton?(:tuple, bdd) do
++    case tuple_bdd_to_dnf(bdd) do
++      [] -> :empty
++      [{:closed, entries}] -> Enum.all?(entries, &static_singleton?/1)
++      _ -> false
++    end
++  end
++
++  defp each_singleton?(:map, bdd) do
++    case map_bdd_to_dnf(bdd) do
++      [] -> :empty
++      [{:closed, fields, _negs}] -> Enum.all?(fields, fn {_, v} -> static_singleton?(v) end)
++      _ -> false
++    end
++  end
++
+   @doc """
+   Converts a descr to its quoted representation.
+ 
+@@ -3850,15 +3900,6 @@ defp map_split_negative_domain(negs, domain_key) do
+     end)
+   end
+ 
+-  # Use heuristics to normalize a map bdd for pretty printing.
+-  defp map_normalize(bdd) do
+-    map_bdd_to_dnf(bdd)
+-    |> Enum.map(fn {tag, fields, negs} ->
+-      map_eliminate_while_negs_decrease(tag, fields, negs)
+-    end)
+-    |> map_fusion()
+-  end
+-
+   # Continue to eliminate negations while length of list of negs decreases
+   defp map_eliminate_while_negs_decrease(tag, fields, []), do: {tag, fields, []}
+ 
+@@ -3950,7 +3991,12 @@ defp map_all_but_one(tag1, fields1, tag2, fields2) do
+   end
+ 
+   defp map_to_quoted(bdd, opts) do
+-    map_normalize(bdd)
++    bdd
++    |> map_bdd_to_dnf()
++    |> Enum.map(fn {tag, fields, negs} ->
++      map_eliminate_while_negs_decrease(tag, fields, negs)
++    end)
++    |> map_fusion()
+     |> Enum.map(&map_each_to_quoted(&1, opts))
+   end
+ 
+@@ -4472,14 +4518,14 @@ defp tuple_union_next_strategy(_index, v1, v2, :right_subtype_of_left) do
+   end
+ 
+   defp tuple_to_quoted(bdd, opts) do
+-    tuple_normalize(bdd)
++    tuple_bdd_to_dnf(bdd)
+     |> tuple_fusion()
+     |> Enum.map(&tuple_literal_to_quoted(&1, opts))
+   end
+ 
+   # Transforms a bdd into a union of tuples with no negations.
+   # Note: it is important to compose the results with tuple_dnf_union/2 to avoid duplicates
+-  defp tuple_normalize(bdd) do
++  defp tuple_bdd_to_dnf(bdd) do
+     bdd_to_dnf(bdd)
+     |> Enum.reduce([], fn {positive_tuples, negative_tuples}, acc ->
+       case non_empty_tuple_literals_intersection(positive_tuples) do
+@@ -4639,7 +4685,7 @@ defp tuple_fetch_static(descr, index) when is_integer(index) do
+   end
+ 
+   defp tuple_get(bdd, index) do
+-    tuple_normalize(bdd)
++    tuple_bdd_to_dnf(bdd)
+     |> Enum.reduce(none(), fn
+       {tag, elements}, acc -> Enum.at(elements, index, tuple_tag_to_type(tag)) |> union(acc)
+     end)
+@@ -4670,7 +4716,7 @@ def tuple_values(descr) do
+   end
+ 
+   defp process_tuples_values(bdd) do
+-    tuple_normalize(bdd)
++    tuple_bdd_to_dnf(bdd)
+     |> Enum.reduce(none(), fn {tag, elements}, acc ->
+       cond do
+         Enum.any?(elements, &empty?/1) -> none()
+@@ -4808,7 +4854,7 @@ defp tuple_of_size_at_least(n) when is_integer(n) and n >= 0 do
+   defp tuple_of_size_at_least_static?(descr, index) do
+     case descr do
+       %{tuple: bdd} ->
+-        tuple_normalize(bdd)
++        tuple_bdd_to_dnf(bdd)
+         |> Enum.all?(fn {_, elements} -> length(elements) >= index end)
+ 
+       %{} ->

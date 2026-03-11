@@ -1,0 +1,155 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 22f63ad9..693d554b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -71,7 +71,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + For migrating, clients must be updated to the embedding form of `/view?select=*,other_view!column(*)`.
+  - #1959, A full table PATCH(without filters) is now restricted, it requires a `limit` parameter - @steve-chavez
+    + A `PATCH /tbl` will now result in 0 rows updated, unless `PATCH /tbl?limit=10&order=<pkcol>` is done
+- - #2312, Using `Prefer: return=representation` no longer returns a `Location` header - @laurenceisla
+ 
+ ## [9.0.1] - 2022-06-03
+ 
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 455fe303..e188b0f8 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -63,7 +63,7 @@ createWriteStatement selectQuery mutateQuery wantSingle isInsert asCsv asGeoJson
+     "FROM (" <> selectF <> ") _postgrest_t"
+ 
+   locF =
+-    if isInsert && rep == HeadersOnly
++    if isInsert && rep /= None
+       then BS.unwords [
+         "CASE WHEN pg_catalog.count(_postgrest_t) = 1",
+           "THEN coalesce(" <> locationF pKeys <> ", " <> noLocationF <> ")",
+diff --git a/src/PostgREST/Request/Preferences.hs b/src/PostgREST/Request/Preferences.hs
+index 048a2d9e..6c809a17 100644
+--- a/src/PostgREST/Request/Preferences.hs
++++ b/src/PostgREST/Request/Preferences.hs
+@@ -155,7 +155,7 @@ instance ToAppliedHeader PreferResolution
+ --
+ -- From https://tools.ietf.org/html/rfc7240#section-4.2
+ data PreferRepresentation
+-  = Full        -- ^ Return the body.
++  = Full        -- ^ Return the body plus the Location header(in case of POST).
+   | HeadersOnly -- ^ Return the Location header(in case of POST). This needs a SELECT privilege on the pk.
+   | None        -- ^ Return nothing from the mutated data.
+   deriving Eq
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 970cea89..18ff3495 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -96,7 +96,7 @@ spec actualPgVersion = do
+           [json|{"id":6,"name":"New Project","client_id":2}|] `shouldRespondWith` [json|[{"id":6,"name":"New Project","clients":{"id":2,"name":"Apple"}}]|]
+           { matchStatus  = 201
+           , matchHeaders = [ matchContentTypeJson
+-                           , matchHeaderAbsent hLocation
++                           , "Location" <:> "/projects?id=eq.6"
+                            , "Content-Range" <:> "*/1" ]
+           }
+ 
+@@ -107,7 +107,7 @@ spec actualPgVersion = do
+           [json|[{"pId":"7","pName":"New Project","cId":"2"}]|]
+           { matchStatus  = 201
+           , matchHeaders = [ matchContentTypeJson
+-                           , matchHeaderAbsent hLocation
++                           , "Location" <:> "/projects?id=eq.7"
+                            , "Content-Range" <:> "*/*" ]
+           }
+ 
+@@ -117,7 +117,7 @@ spec actualPgVersion = do
+           [json|[{"name":"New Project","client_id":2}]|]
+           { matchStatus  = 201
+           , matchHeaders = [ matchContentTypeJson
+-                           , matchHeaderAbsent hLocation
++                           , "Location" <:> "/projects?id=eq.10"
+                            , "Content-Range" <:> "*/*" ]
+           }
+ 
+@@ -254,7 +254,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             [json|[ { "k1":12, "k2":"Rock & R+ll", "extra": null } ]|]
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hLocation ]
++            , matchHeaders = [ "Location" <:> "/compound_pk?k1=eq.12&k2=eq.Rock%20%26%20R%2Bll" ]
+             }
+ 
+     context "with bulk insert" $
+@@ -436,37 +436,6 @@ spec actualPgVersion = do
+           , matchHeaders = []
+           }
+ 
+-    context "with unicode values" $ do
+-      it "succeeds and returns full representation" $
+-        request methodPost "/simple_pk2?select=extra,k"
+-            [("Prefer", "return=representation")]
+-            [json| { "k":"圍棋", "extra":"￥" } |]
+-        `shouldRespondWith`
+-          [json|[ { "k":"圍棋", "extra":"￥" } ]|]
+-          { matchStatus = 201 }
+-
+-      it "succeeds and returns usable location header" $ do
+-        p <- request methodPost "/simple_pk2?select=extra,k"
+-            [("Prefer", "tx=commit"), ("Prefer", "return=headers-only")]
+-            [json| { "k":"圍棋", "extra":"￥" } |]
+-        pure p `shouldRespondWith`
+-          ""
+-          { matchStatus = 201 }
+-
+-        Just location <- pure $ lookup hLocation $ simpleHeaders p
+-        get location
+-          `shouldRespondWith`
+-            [json|[ { "k":"圍棋", "extra":"￥" } ]|]
+-
+-        request methodDelete location
+-            [("Prefer", "tx=commit")]
+-            ""
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
+-
+   describe "CSV insert" $ do
+     context "disparate csv types" $
+       it "succeeds with multipart response" $ do
+@@ -520,6 +489,29 @@ spec actualPgVersion = do
+         , matchHeaders = [matchContentTypeJson]
+         }
+ 
++    context "with unicode values" $
++      it "succeeds and returns usable location header" $ do
++        p <- request methodPost "/simple_pk2?select=extra,k"
++            [("Prefer", "tx=commit"), ("Prefer", "return=representation")]
++            [json| { "k":"圍棋", "extra":"￥" } |]
++        pure p `shouldRespondWith`
++          [json|[ { "k":"圍棋", "extra":"￥" } ]|]
++          { matchStatus = 201 }
++
++        Just location <- pure $ lookup hLocation $ simpleHeaders p
++        get location
++          `shouldRespondWith`
++            [json|[ { "k":"圍棋", "extra":"￥" } ]|]
++
++        request methodDelete location
++            [("Prefer", "tx=commit")]
++            ""
++          `shouldRespondWith`
++            ""
++            { matchStatus = 204
++            , matchHeaders = [matchHeaderAbsent hContentType]
++            }
++
+   describe "Row level permission" $
+     it "set user_id when inserting rows" $ do
+       request methodPost "/authors_only"
+@@ -545,7 +537,7 @@ spec actualPgVersion = do
+         `shouldRespondWith`
+         [json|[{"id":6,"name":"wot","parent_content":{"name":"wut"}}]|]
+         { matchStatus  = 201
+-        , matchHeaders = [ matchContentTypeJson , matchHeaderAbsent hLocation ]
++        , matchHeaders = [ matchContentTypeJson , "Location" <:> "/web_content?id=eq.6" ]
+         }
+ 
+   context "table with limited privileges" $ do

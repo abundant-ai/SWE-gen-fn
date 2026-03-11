@@ -1,0 +1,114 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ad2bbfbc..524f870c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,14 +3,6 @@
+ All notable changes to this project will be documented in this file.
+ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+-## Unreleased
+-
+-## [11.2.2] - 2023-10-25
+-
+-### Fixed
+-
+- - #2824, Fix regression by reverting fix that returned 206 when first position = length in a `Range` header - @laurenceisla, @strengthless
+-
+ ## [11.2.1] - 2023-10-03
+ 
+ ### Fixed
+diff --git a/postgrest.cabal b/postgrest.cabal
+index f41a2a44..9c81d075 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -1,5 +1,5 @@
+ name:               postgrest
+-version:            11.2.2
++version:            11.2.1
+ synopsis:           REST API for any Postgres database
+ description:        Reads the schema of a PostgreSQL database and creates RESTful routes
+                     for tables, views, and functions, supporting all HTTP methods that security
+diff --git a/src/PostgREST/RangeQuery.hs b/src/PostgREST/RangeQuery.hs
+index a27a1af5..c042a373 100644
+--- a/src/PostgREST/RangeQuery.hs
++++ b/src/PostgREST/RangeQuery.hs
+@@ -104,9 +104,9 @@ rangeStatusHeader topLevelRange queryTotal tableTotal =
+     rangeStatus :: Integer -> Integer -> Maybe Integer -> Status
+     rangeStatus _ _ Nothing = status200
+     rangeStatus lower upper (Just total)
+-      | lower > total               = status416 -- 416 Range Not Satisfiable
+-      | (1 + upper - lower) < total = status206 -- 206 Partial Content
+-      | otherwise                   = status200 -- 200 OK
++      | lower >= total && lower /= upper = status416 -- 416 Range Not Satisfiable
++      | (1 + upper - lower) < total      = status206 -- 206 Partial Content
++      | otherwise                        = status200 -- 200 OK
+ 
+ contentRangeH :: (Integral a, Show a) => a -> a -> Maybe a -> Header
+ contentRangeH lower upper total =
+diff --git a/test/spec/Feature/Query/RangeSpec.hs b/test/spec/Feature/Query/RangeSpec.hs
+index 5eb2e177..8a983fbc 100644
+--- a/test/spec/Feature/Query/RangeSpec.hs
++++ b/test/spec/Feature/Query/RangeSpec.hs
+@@ -145,14 +145,6 @@ spec = do
+         it "returns whole range with status 200" $
+           get "/items" `shouldRespondWith` 200
+ 
+-      context "count with an empty body" $ do
+-        it "returns empty body with Content-Range */0" $
+-          request methodGet "/items?id=eq.0"
+-            [("Prefer", "count=exact")] ""
+-            `shouldRespondWith`
+-              [json|[]|]
+-              { matchHeaders = ["Content-Range" <:> "*/0"] }
+-
+       context "when I don't want the count" $ do
+         it "returns range Content-Range with /*" $
+           request methodGet "/menagerie"
+@@ -219,24 +211,11 @@ spec = do
+                              , "Content-Range" <:> "2-4/*" ]
+             }
+ 
+-      context "succeeds if offset equals 0 as a no-op" $ do
+-        it  "no items" $ do
+-          get "/items?offset=0&id=eq.0"
+-            `shouldRespondWith`
+-              [json|[]|]
+-              { matchHeaders = ["Content-Range" <:> "*/*"] }
+-
+-          request methodGet "/items?offset=0&id=eq.0"
+-            [("Prefer", "count=exact")] ""
+-            `shouldRespondWith`
+-              [json|[]|]
+-              { matchHeaders = ["Content-Range" <:> "*/0"] }
+-
+-        it  "one or more items" $
+-          get "/items?select=id&offset=0&order=id"
+-            `shouldRespondWith`
+-              [json|[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}]|]
+-              { matchHeaders = ["Content-Range" <:> "0-14/*"] }
++      it "succeeds if offset equals 0 as a no-op" $
++        get "/items?select=id&offset=0&order=id"
++          `shouldRespondWith`
++            [json|[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}]|]
++            { matchHeaders = ["Content-Range" <:> "0-14/*"] }
+ 
+       it "succeeds if offset is negative as a no-op" $
+         get "/items?select=id&offset=-4&order=id"
+@@ -474,3 +453,17 @@ spec = do
+             { matchStatus  = 416
+             , matchHeaders = ["Content-Range" <:> "*/15"]
+             }
++
++        it "refuses a range with first position the same as number of items" $
++          request methodGet "/rpc/getitemrange?min=1&max=2"
++                  (rangeHdrsWithCount $ ByteRangeFromTo 1 2) mempty
++            `shouldRespondWith`
++              [json| {
++                "message":"Requested range not satisfiable",
++                "code":"PGRST103",
++                "details":"An offset of 1 was requested, but there are only 1 rows.",
++                "hint":null
++              }|]
++            { matchStatus  = 416
++            , matchHeaders = ["Content-Range" <:> "*/1"]
++            }

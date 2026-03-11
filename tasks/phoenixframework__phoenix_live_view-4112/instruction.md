@@ -1,0 +1,11 @@
+`live_file_input` currently renders with `data-phx-update="ignore"` to preserve the user’s file selection across LiveView patches. However, this causes LiveView’s DOM patching to ignore updates to the `<input type="file">` element’s normal (non-`data-*`) attributes after the element is first rendered. As a result, changing assigns that are reflected as attributes on `live_file_input` (such as `disabled`, `class`, and `style`) does not update the DOM, leaving the file input stuck with its initial attributes.
+
+Reproduction example: render a form with `<.live_file_input upload={@uploads.avatar} disabled={@disabled?} class={@custom_class} />`, where `@disabled?` and `@custom_class` are assigns that can be toggled via events. On initial render the input may be disabled and have an initial CSS class. After toggling the assigns (e.g., clicking a button that flips `@disabled?` or swaps `@custom_class` between two values), the `<input type="file">` element should reflect the updated attributes in the browser, but currently it does not because of the ignore behavior.
+
+The expected behavior is:
+
+- When the server updates assigns that change non-`data-*` attributes passed to `live_file_input` (e.g., `disabled`, `class`), the corresponding attributes on the existing `<input type="file">` element must update in the DOM on the next patch.
+- At the same time, the file input must continue to preserve the selected files across such attribute-only updates. In other words, if a user selects a file and then an attribute like `class` is changed by a LiveView update, the selected file should remain present and the upload entry should remain visible.
+- The only attribute that must not be synced via patches is the input’s `value` (LiveView should not attempt to set/overwrite the file input value programmatically).
+
+Fix the behavior so `live_file_input` can “sync non-data attributes except value”: attribute changes like `disabled` and `class` must apply dynamically, while preserving the chosen files and still avoiding any attempt to set the file input’s `value` from the server.

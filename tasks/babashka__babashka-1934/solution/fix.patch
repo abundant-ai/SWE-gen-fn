@@ -1,0 +1,252 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 39c762e0..21d926ab 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ A preview of the next release can be installed from
+ 
+ ## Unreleased
+ 
++- Add `java.lang.reflect.Constructor`, `java.lang.reflect.Executable`, `java.util.stream.Collectors`, `java.lang.StackOverflowError`, `clojure.lang.IType`, `java.util.Comparator` (reify)
+ - Add JLine classes for rebel-readline compatibility: `Highlighter`, `LineReader$Option`, `Attributes$InputFlag`, `Attributes$LocalFlag`
+ - Hide redundant `(keyword)` description in REPL completions
+ - SCI: add `proxy-super`, `proxy-call-with-super`, `update-proxy` and `proxy-mappings`
+diff --git a/deps.edn b/deps.edn
+index 2e2e7b1a..add1b368 100644
+--- a/deps.edn
++++ b/deps.edn
+@@ -20,7 +20,7 @@
+          "impl-java/src"],
+  :deps {org.clojure/clojure {:mvn/version "1.12.3"},
+         org.babashka/sci {:local/root "sci"}
+-        org.babashka/babashka.impl.java {:mvn/version "0.1.16"}
++        org.babashka/babashka.impl.java {:mvn/version "0.1.17"}
+         org.babashka/sci.impl.types {:mvn/version "0.0.3"}
+         babashka/babashka.curl {:local/root "babashka.curl"}
+         babashka/fs {:local/root "fs"}
+diff --git a/doc/adr/0007-native-image-size-analysis/compare-reports.bb b/doc/adr/0007-native-image-size-analysis/compare-reports.bb
+new file mode 100644
+index 00000000..c21ebeaf
+--- /dev/null
++++ b/doc/adr/0007-native-image-size-analysis/compare-reports.bb
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bb
++
++;; Usage:
++;;   Compare two reports:
++;;     bb compare-reports.bb report-before.json report-after.json
++;;
++;;   Count public methods on classes (to find likely culprits):
++;;     bb compare-reports.bb --methods java.util.stream.Collectors java.lang.reflect.Constructor
++
++(require '[cheshire.core :as json]
++         '[clojure.java.io :as io]
++         '[babashka.process :as p]
++         '[clojure.string :as str])
++
++(defn read-report [path]
++  (json/parse-string (slurp path) true))
++
++(defn get-in* [m ks]
++  (get-in m ks 0))
++
++(defn compare-reports [before-path after-path]
++  (let [before (read-report before-path)
++        after (read-report after-path)]
++    (doseq [[label ks]
++            [["total_bytes"        [:image_details :total_bytes]]
++             ["code_area"          [:image_details :code_area :bytes]]
++             ["image_heap"         [:image_details :image_heap :bytes]]
++             ["heap objects"       [:image_details :image_heap :objects :count]]
++             ["compilation_units"  [:image_details :code_area :compilation_units]]
++             ["types total"        [:analysis_results :types :total]]
++             ["types reachable"    [:analysis_results :types :reachable]]
++             ["types reflection"   [:analysis_results :types :reflection]]
++             ["methods total"      [:analysis_results :methods :total]]
++             ["methods reachable"  [:analysis_results :methods :reachable]]
++             ["methods reflection" [:analysis_results :methods :reflection]]
++             ["fields total"       [:analysis_results :fields :total]]
++             ["fields reachable"   [:analysis_results :fields :reachable]]
++             ["fields reflection"  [:analysis_results :fields :reflection]]]]
++      (let [b (get-in* before ks)
++            a (get-in* after ks)
++            d (- a b)]
++        (printf "%-22s %,12d  %,12d  %+,10d\n" label b a d)))))
++
++(defn count-methods
++  "Count public methods/fields per class using javap.
++  Classes in :all get full reflection — the more methods, the bigger the impact."
++  [class-names]
++  (printf "%-50s %8s %8s %8s\n" "class" "methods" "fields" "ctors")
++  (println (apply str (repeat 76 "-")))
++  (doseq [cn class-names]
++    (let [out (:out (p/shell {:out :string :err :string} "javap" "-public" cn))
++          lines (str/split-lines out)
++          methods (count (filter #(and (str/includes? % "(") (not (str/includes? % cn))) lines))
++          fields (count (filter #(and (not (str/includes? % "("))
++                                      (str/includes? % "public")
++                                      (not (str/includes? % "class "))) lines))
++          ctors (count (filter #(str/includes? % (last (str/split cn #"\."))) (filter #(str/includes? % "(") lines)))]
++      (printf "%-50s %8d %8d %8d\n" cn methods fields (max 0 (dec ctors))))))
++
++(let [args *command-line-args*]
++  (if (= "--methods" (first args))
++    (count-methods (rest args))
++    (compare-reports (first args) (second args))))
+diff --git a/doc/adr/0007-native-image-size-analysis/decision.md b/doc/adr/0007-native-image-size-analysis/decision.md
+new file mode 100644
+index 00000000..bdabc5c1
+--- /dev/null
++++ b/doc/adr/0007-native-image-size-analysis/decision.md
+@@ -0,0 +1,70 @@
++# ADR 0007: Native Image Size Analysis
++
++## How to measure native image size impact of changes
++
++### 1. Enable JSON report in `script/compile`
++
++Uncomment (or add) the `-H:BuildOutputJSONFile` flag:
++
++```bash
++"-H:BuildOutputJSONFile=report.json"
++```
++
++### 2. Build baseline on master
++
++```bash
++git stash  # if needed
++git checkout master
++# edit script/compile: "-H:BuildOutputJSONFile=report-before.json"
++script/uberjar && script/compile
++mv report-before.json tmp/
++```
++
++### 3. Build with changes
++
++```bash
++git checkout <your-branch>
++# edit script/compile: "-H:BuildOutputJSONFile=report-after.json"
++script/uberjar && script/compile
++mv report-after.json tmp/
++```
++
++### 4. Compare reports
++
++```bash
++bb doc/adr/0007-native-image-size-analysis/compare-reports.bb tmp/report-before.json tmp/report-after.json
++```
++
++The JSON contains:
++
++- `image_details.total_bytes` — total binary size
++- `image_details.code_area.bytes` — compiled native code
++- `image_details.image_heap.bytes` — heap snapshot
++- `image_details.image_heap.objects.count` — heap object count
++- `analysis_results.types` — total, reachable, reflection
++- `analysis_results.methods` — total, reachable, reflection
++- `analysis_results.fields` — total, reachable, reflection
++
++Key metrics to watch: `total_bytes`, `code_area.bytes`, `methods.reachable`, `methods.reflection`.
++
++### 5. Don't forget to revert `script/compile`
++
++Remove or re-comment the `-H:BuildOutputJSONFile` flag before committing.
++
++## Lessons learned
++
++### Bare `:all` class entries are expensive
++
++Classes listed under `:all` in `classes.clj` get `allPublicMethods`, `allPublicConstructors`, etc. in reflection config. This makes all their methods reachable, pulling in transitive types.
++
++Example: `java.util.stream.Collectors` under `:all` added 44 methods, 86 types, and ~49KB to the binary. Restricting to `{:methods [{:name "toList"}]}` reduced the impact to +32 bytes.
++
++### Explicit `:methods` entries are nearly free
++
++Adding a class with specific methods listed barely affects image size. The reflection metadata is registered but only listed methods become reachable.
++
++### Where the size goes
++
++- Code area: compiled native code for reachable methods (~175 bytes/method average)
++- Image heap: object snapshots (often unchanged for small additions)
++- Reflection metadata itself is cheap; reachability of methods is what costs
+diff --git a/impl-java/build.clj b/impl-java/build.clj
+index b0c2ed86..7d4a4ae9 100644
+--- a/impl-java/build.clj
++++ b/impl-java/build.clj
+@@ -3,7 +3,7 @@
+             [clojure.tools.build.api :as b]))
+ 
+ (def lib 'org.babashka/babashka.impl.java)
+-(def version "0.1.16")
++(def version "0.1.17")
+ (def class-dir "target/classes")
+ (def basis (b/create-basis {:project "deps.edn"}))
+ (def jar-file (format "target/%s-%s.jar" (name lib) version))
+diff --git a/impl-java/src/babashka/impl/reify2/interfaces.clj b/impl-java/src/babashka/impl/reify2/interfaces.clj
+index 9ce4aedf..cff223a5 100644
+--- a/impl-java/src/babashka/impl/reify2/interfaces.clj
++++ b/impl-java/src/babashka/impl/reify2/interfaces.clj
+@@ -30,6 +30,7 @@
+                  java.util.function.Predicate
+                  java.util.function.Supplier
+                  java.lang.Comparable
++                 java.util.Comparator
+                  javax.net.ssl.X509TrustManager
+                  clojure.lang.LispReader$Resolver
+                  sun.misc.SignalHandler
+diff --git a/project.clj b/project.clj
+index a0fc0493..664b6bfc 100644
+--- a/project.clj
++++ b/project.clj
+@@ -29,7 +29,7 @@
+                  [nrepl/bencode "1.2.0"]
+                  [borkdude/sci.impl.reflector "0.0.5"]
+                  [org.babashka/sci.impl.types "0.0.3"]
+-                 [org.babashka/babashka.impl.java "0.1.16"]
++                 [org.babashka/babashka.impl.java "0.1.17"]
+                  [org.clojure/core.async "1.8.741"]
+                  [org.clojure/test.check "1.1.1"]
+                  [com.github.clj-easy/graal-build-time "1.0.5"]
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index 50d669fb..37640d6a 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -122,6 +122,15 @@
+                {:name "setAccessible"}
+                {:name "get"}
+                {:name "set"}]}
++    java.lang.reflect.Constructor
++    {:methods [{:name "getName"}
++               {:name "getModifiers"}
++               {:name "getParameterTypes"}
++               {:name "getParameterCount"}]}
++    java.lang.reflect.Executable
++    {:methods [{:name "getParameterCount"}]}
++    java.util.stream.Collectors
++    {:methods [{:name "toList"}]}
+     java.lang.reflect.Array
+     {:methods [{:name "newInstance"}
+                {:name "set"}]}
+@@ -748,6 +757,7 @@
+                       clojure.lang.IPersistentStack
+                       clojure.lang.IPersistentList
+                       clojure.lang.IRecord
++                      clojure.lang.IType
+                       clojure.lang.IReduce
+                       clojure.lang.IReduceInit
+                       clojure.lang.IKVReduce
+@@ -793,6 +803,7 @@
+                       java.lang.ExceptionInInitializerError
+                       java.lang.LinkageError
+                       java.lang.ThreadDeath
++                      java.lang.StackOverflowError
+                       java.lang.VirtualMachineError
+                       java.lang.NoSuchFieldException
+                       java.sql.Timestamp
+@@ -1051,6 +1062,7 @@
+     ProcessBuilder java.lang.ProcessBuilder
+     SecurityException java.lang.SecurityException
+     Short java.lang.Short
++    StackOverflowError java.lang.StackOverflowError
+     StackTraceElement java.lang.StackTraceElement
+     String java.lang.String
+     StringBuilder java.lang.StringBuilder

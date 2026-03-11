@@ -1,0 +1,305 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6464a35..839f36fd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,15 +9,17 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #1614, Add `db-pool-automatic-recovery` configuration to disable connection retrying - @taimoorzaeem
+  - #2492, Allow full response control when raising exceptions - @taimoorzaeem, @laurenceisla
+- - #2771, #2983, #3062, #3055 Add `Server-Timing` response header - @taimoorzaeem, @develop7, @laurenceisla
++ - #2771, Add `Server-Timing` header with JWT duration - @taimoorzaeem
+  - #2698, Add config `jwt-cache-max-lifetime` and implement JWT caching - @taimoorzaeem
+  - #2943, Add `handling=strict/lenient` for Prefer header - @taimoorzaeem
++ - #2983, Add more data to `Server-Timing` header - @develop7
+  - #2441, Add config `server-cors-allowed-origins` to specify CORS origins - @taimoorzaeem
+  - #2825, SQL handlers for custom media types - @steve-chavez
+    + Solves #1548, #2699, #2763, #2170, #1462, #1102, #1374, #2901
+  - #2799, Add timezone in Prefer header - @taimoorzaeem
+  - #3001, Add `statement_timeout` set on functions - @taimoorzaeem
+  - #3045, Apply superuser settings on impersonated roles if they have PostgreSQL 15 `GRANT SET ON PARAMETER` privilege - @steve-chavez
++ - #3062, Add config for enabling the `Server-Timing` header - @develop7
+  - #915, Add support for aggregate functions - @timabdulla
+     + The aggregate functions SUM(), MAX(), MIN(), AVG(), and COUNT() are now supported.
+     + It's disabled by default, you can enable it with `db-aggregates-enabled`.
+diff --git a/src/PostgREST/ApiRequest/Types.hs b/src/PostgREST/ApiRequest/Types.hs
+index 44a9daa7..2fc73b04 100644
+--- a/src/PostgREST/ApiRequest/Types.hs
++++ b/src/PostgREST/ApiRequest/Types.hs
+@@ -71,6 +71,7 @@ data ApiRequestError
+   = AggregatesNotAllowed
+   | AmbiguousRelBetween Text Text [Relationship]
+   | AmbiguousRpc [Routine]
++  | BinaryFieldError MediaType
+   | MediaTypeError [ByteString]
+   | InvalidBody ByteString
+   | InvalidFilters
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 27fbe2db..399d12ae 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -175,66 +175,66 @@ handleRequest AuthResult{..} conf appState authenticated prepared pgVer apiReq@A
+     (ActionRead headersOnly, TargetIdent identifier) -> do
+       (planTime', wrPlan) <- withTiming $ liftEither $ Plan.wrappedReadPlan identifier conf sCache apiReq
+       (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.wrTxMode wrPlan) $ Query.readQuery wrPlan conf apiReq
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.readResponse wrPlan headersOnly identifier apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationCreate, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationCreate apiReq identifier conf sCache
+       (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.createQuery mrPlan apiReq conf
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.createResponse identifier mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.createResponse identifier mrPlan apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationUpdate, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationUpdate apiReq identifier conf sCache
+       (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.updateQuery mrPlan apiReq conf
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.updateResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.updateResponse mrPlan apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationSingleUpsert, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationSingleUpsert apiReq identifier conf sCache
+       (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.singleUpsertQuery mrPlan apiReq conf
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.singleUpsertResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.singleUpsertResponse mrPlan apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics pgrst
+ 
+     (ActionMutate MutationDelete, TargetIdent identifier) -> do
+       (planTime', mrPlan) <- withTiming $ liftEither $ Plan.mutateReadPlan MutationDelete apiReq identifier conf sCache
+       (txTime', resultSet) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.mrTxMode mrPlan) $ Query.deleteQuery mrPlan apiReq conf
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.deleteResponse mrPlan apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.deleteResponse mrPlan apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInvoke invMethod, TargetProc identifier _) -> do
+       (planTime', cPlan) <- withTiming $ liftEither $ Plan.callReadPlan identifier conf sCache apiReq invMethod
+       (txTime', resultSet) <- withTiming $ runQuery (fromMaybe roleIsoLvl $ pdIsoLvl (Plan.crProc cPlan)) (pdTimeout $ Plan.crProc cPlan) (Plan.crTxMode cPlan) $ Query.invokeQuery (Plan.crProc cPlan) cPlan apiReq conf pgVer
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.invokeResponse cPlan invMethod (Plan.crProc cPlan) apiReq resultSet
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) -> do
+       (planTime', iPlan) <- withTiming $ liftEither $ Plan.inspectPlan apiReq
+       (txTime', oaiResult) <- withTiming $ runQuery roleIsoLvl Nothing (Plan.ipTxmode iPlan) $ Query.openApiQuery sCache pgVer conf tSchema
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.openApiResponse (T.decodeUtf8 prettyVersion, docsVersion) headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.openApiResponse (T.decodeUtf8 prettyVersion, docsVersion) headersOnly oaiResult conf sCache iSchema iNegotiatedByProfile
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMTransaction, txTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetIdent identifier) -> do
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.infoIdentResponse identifier sCache
+-      let metrics = Map.fromList $ (SMResp, respTime'):jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.infoIdentResponse identifier sCache
++      let metrics = Map.fromList $ (SMRender, renderTime'):jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetProc identifier _) -> do
+       (planTime', cPlan) <- withTiming $ liftEither $ Plan.callReadPlan identifier conf sCache apiReq ApiRequest.InvHead
+-      (respTime', pgrst) <- withTiming $ liftEither $ Response.infoProcResponse (Plan.crProc cPlan)
+-      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMResp, respTime')] ++ jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither $ Response.infoProcResponse (Plan.crProc cPlan)
++      let metrics = Map.fromList $ [(SMPlan, planTime'), (SMRender, renderTime')] ++ jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     (ActionInfo, TargetDefaultSpec _) -> do
+-      (respTime', pgrst) <- withTiming $ liftEither Response.infoRootResponse
+-      let metrics = Map.fromList $ (SMResp, respTime'):jwtAndParseTime
++      (renderTime', pgrst) <- withTiming $ liftEither Response.infoRootResponse
++      let metrics = Map.fromList $ (SMRender, renderTime'):jwtAndParseTime
+       return $ pgrstResponse metrics  pgrst
+ 
+     _ ->
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 2d131ef1..61e53ef8 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -65,6 +65,7 @@ instance PgrstError ApiRequestError where
+   status AggregatesNotAllowed{}  = HTTP.status400
+   status AmbiguousRelBetween{}   = HTTP.status300
+   status AmbiguousRpc{}          = HTTP.status300
++  status BinaryFieldError{}      = HTTP.status406
+   status MediaTypeError{}        = HTTP.status415
+   status InvalidBody{}           = HTTP.status400
+   status InvalidFilters          = HTTP.status405
+@@ -154,6 +155,9 @@ instance JSON.ToJSON ApiRequestError where
+   toJSON GucStatusError = toJsonPgrstError
+     ApiRequestErrorCode12 "response.status guc must be a valid status code" Nothing Nothing
+ 
++  toJSON (BinaryFieldError ct) = toJsonPgrstError
++    ApiRequestErrorCode13 (T.decodeUtf8 (MediaType.toMime ct) <> " requested but more than one column was selected") Nothing Nothing
++
+   toJSON PutLimitNotAllowedError = toJsonPgrstError
+     ApiRequestErrorCode14 "limit/offset querystring parameters are not allowed for PUT" Nothing Nothing
+ 
+@@ -586,7 +590,7 @@ data ErrorCode
+   | ApiRequestErrorCode01
+   | ApiRequestErrorCode02
+   | ApiRequestErrorCode03
+-  -- | ApiRequestErrorCode04 -- no longer used (used to be mapped to ParseRequestError)
++  | ApiRequestErrorCode04 -- no longer used (used to be mapped to ParseRequestError)
+   | ApiRequestErrorCode05
+   | ApiRequestErrorCode06
+   | ApiRequestErrorCode07
+@@ -594,8 +598,8 @@ data ErrorCode
+   | ApiRequestErrorCode09
+   | ApiRequestErrorCode10
+   | ApiRequestErrorCode11
+-  -- | ApiRequestErrorCode13 -- no longer used (used to be mapped to BinaryFieldError)
+   | ApiRequestErrorCode12
++  | ApiRequestErrorCode13
+   | ApiRequestErrorCode14
+   | ApiRequestErrorCode15
+   | ApiRequestErrorCode16
+@@ -635,6 +639,7 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode01  -> "101"
+   ApiRequestErrorCode02  -> "102"
+   ApiRequestErrorCode03  -> "103"
++  ApiRequestErrorCode04  -> "104"
+   ApiRequestErrorCode05  -> "105"
+   ApiRequestErrorCode06  -> "106"
+   ApiRequestErrorCode07  -> "107"
+@@ -643,6 +648,7 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode10  -> "110"
+   ApiRequestErrorCode11  -> "111"
+   ApiRequestErrorCode12  -> "112"
++  ApiRequestErrorCode13  -> "113"
+   ApiRequestErrorCode14  -> "114"
+   ApiRequestErrorCode15  -> "115"
+   ApiRequestErrorCode16  -> "116"
+diff --git a/src/PostgREST/Response/Performance.hs b/src/PostgREST/Response/Performance.hs
+index 15bb324b..e5479d68 100644
+--- a/src/PostgREST/Response/Performance.hs
++++ b/src/PostgREST/Response/Performance.hs
+@@ -13,7 +13,7 @@ import           Protolude
+ data ServerMetric =
+     SMJwt
+   | SMParse
+-  | SMResp
++  | SMRender
+   | SMPlan
+   | SMTransaction
+   deriving (Show, Eq, Ord)
+@@ -21,7 +21,7 @@ type ServerTimingData = Map ServerMetric (Maybe Double)
+ 
+ -- | Render the Server-Timing header from a ServerTimingData
+ --
+--- >>> renderServerTimingHeader $ Map.fromList [(SMPlan, 0.1), (SMTransaction, 0.2), (SMResp, 0.3), (SMJwt, 0.4)]
++-- >>> renderServerTimingHeader $ Map.fromList [(SMPlan, 0.1), (SMTransaction, 0.2), (SMRender, 0.3), (SMJwt, 0.4)]
+ -- ("Server-Timing","jwt;dur=400000.0, render;dur=300000.0, plan;dur=100000.0, query;dur=200000.0")
+ renderServerTimingHeader :: ServerTimingData -> HTTP.Header
+ renderServerTimingHeader timingData =
+@@ -31,6 +31,6 @@ renderTiming (metric, time) = maybe "" (\x -> BS.concat [renderMetric metric, BS
+   where
+     renderMetric SMPlan        = "plan"
+     renderMetric SMTransaction = "transaction"
+-    renderMetric SMResp        = "response"
++    renderMetric SMRender      = "render"
+     renderMetric SMJwt         = "jwt"
+     renderMetric SMParse       = "parse"
+diff --git a/test/spec/Feature/Query/ServerTimingSpec.hs b/test/spec/Feature/Query/ServerTimingSpec.hs
+index 11cf2994..21a1b550 100644
+--- a/test/spec/Feature/Query/ServerTimingSpec.hs
++++ b/test/spec/Feature/Query/ServerTimingSpec.hs
+@@ -22,7 +22,7 @@ spec =
+           `shouldRespondWith`
+           [json|[{"id":6,"name":"Oscorp","referee":3,"auditor":4,"manager_id":6}]|]
+           { matchStatus  = 200
+-          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
++          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+           }
+ 
+       it "works with post request" $
+@@ -32,7 +32,7 @@ spec =
+           `shouldRespondWith`
+           [json|[{"id":7,"name":"John","referee":null,"auditor":null,"manager_id":6}]|]
+           { matchStatus  = 201
+-          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
++          , matchHeaders = matchContentTypeJson : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+           }
+ 
+       it "works with patch request" $
+@@ -41,7 +41,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
++            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+             }
+ 
+       it "works with put request" $
+@@ -51,7 +51,7 @@ spec =
+           `shouldRespondWith`
+             [json| [ { "name": "Python", "rank": 19 } ]|]
+             { matchStatus  = 200
+-            , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
++            , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+             }
+ 
+       it "works with delete request" $
+@@ -61,7 +61,7 @@ spec =
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
++            , matchHeaders = matchHeaderAbsent hContentType : map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+             }
+ 
+       it "works with rpc call" $
+@@ -71,41 +71,5 @@ spec =
+           `shouldRespondWith`
+           [json|{"x": 1, "y": 2}|]
+           { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
+-          }
+-
+-      it "works with root spec" $
+-        request methodHead "/"
+-          []
+-          ""
+-          `shouldRespondWith`
+-          ""
+-          { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "response"]
+-          }
+-
+-      it "works with OPTIONS method" $ do
+-        request methodOptions "/organizations"
+-          []
+-          ""
+-          `shouldRespondWith`
+-          ""
+-          { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "response"]
+-          }
+-        request methodOptions "/rpc/getallprojects"
+-          []
+-          ""
+-          `shouldRespondWith`
+-          ""
+-          { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "response"]
+-          }
+-        request methodOptions "/"
+-          []
+-          ""
+-          `shouldRespondWith`
+-          ""
+-          { matchStatus  = 200
+-          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "response"]
++          , matchHeaders = map matchServerTimingHasTiming ["jwt", "parse", "plan", "transaction", "render"]
+           }

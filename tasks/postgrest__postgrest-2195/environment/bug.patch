@@ -1,0 +1,989 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e3c71e57..b9b2d217 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,10 +18,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + #1689, Add the ability to run without `db-anon-role` disabling anonymous access. - @wolfgangwalther
+  - #1543, Allow access to fields of composite types in select=, order= and filters through JSON operators -> and ->>. - @wolfgangwalther
+  - #2075, Allow access to array items in ?select=, ?order= and filters through JSON operators -> and ->>. - @wolfgangwalther
+- - #2156, Allow applying `limit/offset` to UPDATE/DELETE to only affect a subset of rows - @steve-chavez
+-   + Uses the table primary key, so it needs a select privilege on the primary key columns
+-   + If no primary key is available, it will fallback to using the "ctid" system column(will also require a select privilege on it)
+-   + Doesn't work on views and it will throw an error if tried
+ 
+ ### Fixed
+ 
+@@ -41,17 +37,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2153, Fix --dump-schema running with a wrong PG version. - @wolfgangwalther
+  - #2042, Keep working when EMFILE(Too many open files) is reached. - @steve-chavez
+  - #2147, Ignore `Content-Type` headers for `GET` requests when calling RPCs. Previously, `GET` without parameters, but with `Content-Type: text/plain` or `Content-Type: application/octet-stream` would fail with `404 Not Found`, even if a function without arguments was available.
+- - #2155, Ignore `max-rows` on POST, PATCH, PUT and DELETE - @steve-chavez
+ 
+ ### Changed
+ 
+  - #2001, Return 204 No Content without Content-Type for RPCs returning VOID - @wolfgangwalther
+    + Previously, those RPCs would return "null" as a body with Content-Type: application/json.
+- - #2156, `limit/offset` now limits the affected rows on UPDATE/DELETE  - @steve-chavez
+-   + Previously, `limit/offset` only limited the returned rows but not the actual updated rows
+- - #2156, using PATCH/DELETE with `limit/offset` throws an error on views - @steve-chavez
+- - #2155, `max-rows` is no longer applied on POST/PATCH/PUT/DELETE returned rows - @steve-chavez
+-   + This was misleading because the affected rows were not really affected by `max-rows`, only the returned rows were limited
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+@@ -72,7 +62,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2031, Improve error message for ambiguous embedding and add a relevant hint that includes unambiguous embedding suggestions - @laurenceisla
+  - #1917, Add error codes with the `"PGRST"` prefix to the error response body to differentiate PostgREST errors from PostgreSQL errors - @laurenceisla
+  - #1917, Normalize the error response body by always having the `detail` and `hint` error fields with a `null` value if they are empty - @laurenceisla
+- - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla
++ - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla 
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 72e1bab4..2fc905e4 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -63,7 +63,6 @@ import PostgREST.Config                  (AppConfig (..),
+ import PostgREST.Config.PgVersion        (PgVersion (..))
+ import PostgREST.ContentType             (ContentType (..))
+ import PostgREST.DbStructure             (DbStructure (..),
+-                                          findIfView, findTable,
+                                           tablePKCols)
+ import PostgREST.DbStructure.Identifiers (FieldName,
+                                           QualifiedIdentifier (..),
+@@ -346,10 +345,7 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+       response HTTP.status201 headers mempty
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
+-  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
+-    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
+-
++handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   WriteQueryResult{..} <- writeQuery MutationUpdate identifier False mempty context
+ 
+   let
+@@ -395,10 +391,7 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+       response HTTP.status204 [] mempty
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleDelete identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
+-  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
+-    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
+-
++handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   WriteQueryResult{..} <- writeQuery MutationDelete identifier False mempty context
+ 
+   let
+@@ -417,7 +410,7 @@ handleDelete identifier context@(RequestContext _ ctxDbStructure ApiRequest{..}
+ 
+ handleInfo :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m Wai.Response
+ handleInfo identifier RequestContext{..} =
+-  case findTable (qiSchema identifier) (qiName identifier) $ dbTables ctxDbStructure of
++  case find tableMatches $ dbTables ctxDbStructure of
+     Just table ->
+       return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
+     Nothing ->
+@@ -433,6 +426,9 @@ handleInfo identifier RequestContext{..} =
+           ++ ["PATCH" | tableUpdatable table]
+           ++ ["DELETE" | tableDeletable table]
+       )
++    tableMatches table =
++      tableName table == qiName identifier
++      && tableSchema table == qiSchema identifier
+     hasPK =
+       not $ null $ tablePKCols ctxDbStructure (qiSchema identifier) (qiName identifier)
+ 
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 7bbc92b6..24754d8f 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -23,8 +23,6 @@ module PostgREST.DbStructure
+   , queryDbStructure
+   , accessibleTables
+   , accessibleProcs
+-  , findIfView
+-  , findTable
+   , schemaDescription
+   , tableCols
+   , tablePKCols
+@@ -78,13 +76,7 @@ tableCols dbs tSchema tName = filter (\Column{colTable=Table{tableSchema=s, tabl
+ 
+ -- TODO Table could hold references to all its PrimaryKeys
+ tablePKCols :: DbStructure -> Schema -> TableName -> [Text]
+-tablePKCols dbs tSchema tName = pkName <$> filter (\pk -> tSchema == (tableSchema . pkTable) pk && tName == (tableName . pkTable) pk) (dbPrimaryKeys dbs)
+-
+-findTable :: Schema -> TableName -> [Table] -> Maybe Table
+-findTable tSchema tName = find (\tbl -> tableSchema tbl == tSchema && tableName tbl == tName)
+-
+-findIfView :: QualifiedIdentifier -> [Table] -> Bool
+-findIfView identifier tbls = maybe False tableIsView (findTable (qiSchema identifier) (qiName identifier) tbls)
++tablePKCols dbs tSchema tName =  pkName <$> filter (\pk -> tSchema == (tableSchema . pkTable) pk && tName == (tableName . pkTable) pk) (dbPrimaryKeys dbs)
+ 
+ -- | The source table column a view column refers to
+ type SourceColumn = (Column, ViewColumn)
+@@ -142,7 +134,6 @@ decodeTables =
+                  <*> column HD.bool
+                  <*> column HD.bool
+                  <*> column HD.bool
+-                 <*> column HD.bool
+ 
+ decodeColumns :: [Table] -> HD.Result [Column]
+ decodeColumns tables =
+@@ -342,7 +333,6 @@ accessibleTables pgVer =
+       n.nspname as table_schema,
+       relname as table_name,
+       d.description as table_description,
+-      c.relkind IN ('v','m') as is_view,
+       (
+         c.relkind IN ('r','p')
+         OR (
+@@ -478,7 +468,6 @@ allTables pgVer =
+       n.nspname AS table_schema,
+       c.relname AS table_name,
+       d.description AS table_description,
+-      c.relkind IN ('v','m') as is_view,
+       (
+         c.relkind IN ('r','p')
+         OR (
+@@ -680,9 +669,10 @@ relFromRow :: [Table] -> [Column] -> (Text, Text, Text, [Text], Text, Text, [Tex
+ relFromRow allTabs allCols (rs, rt, cn, rcs, frs, frt, frcs) =
+   Relationship <$> table <*> cols <*> tableF <*> colsF <*> pure (M2O cn)
+   where
++    findTable s t = find (\tbl -> tableSchema tbl == s && tableName tbl == t) allTabs
+     findCol s t c = find (\col -> tableSchema (colTable col) == s && tableName (colTable col) == t && colName col == c) allCols
+-    table  = findTable rs rt allTabs
+-    tableF = findTable frs frt allTabs
++    table  = findTable rs rt
++    tableF = findTable frs frt
+     cols  = mapM (findCol rs rt) rcs
+     colsF = mapM (findCol frs frt) frcs
+ 
+diff --git a/src/PostgREST/DbStructure/Table.hs b/src/PostgREST/DbStructure/Table.hs
+index fa6c77c1..2dab546d 100644
+--- a/src/PostgREST/DbStructure/Table.hs
++++ b/src/PostgREST/DbStructure/Table.hs
+@@ -20,8 +20,6 @@ data Table = Table
+   { tableSchema      :: Schema
+   , tableName        :: TableName
+   , tableDescription :: Maybe Text
+-    -- TODO Find a better way to separate tables and views
+-  , tableIsView      :: Bool
+     -- The following fields identify what can be done on the table/view, they're not related to the privileges granted to it
+   , tableInsertable  :: Bool
+   , tableUpdatable   :: Bool
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 8c5a5632..60880c1e 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -314,7 +314,6 @@ data Error
+   | JwtTokenInvalid Text
+   | JwtTokenMissing
+   | JwtTokenRequired
+-  | NotImplemented Text
+   | NoSchemaCacheError
+   | NotFound
+   | PgErr PgError
+@@ -336,7 +335,6 @@ instance PgrstError Error where
+   status (PgErr err)             = status err
+   status PutMatchingPkError      = HTTP.status400
+   status PutRangeNotAllowedError = HTTP.status400
+-  status (NotImplemented _)      = HTTP.status501
+   status SingularityError{}      = HTTP.status406
+   status UnsupportedVerb{}       = HTTP.status405
+ 
+@@ -409,12 +407,6 @@ instance JSON.ToJSON Error where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (NotImplemented msg) = JSON.object [
+-    "code"    .= GeneralErrorCode07,
+-    "message" .= msg,
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+   toJSON NotFound = JSON.object []
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+@@ -468,7 +460,6 @@ data ErrorCode
+   | GeneralErrorCode04
+   | GeneralErrorCode05
+   | GeneralErrorCode06
+-  | GeneralErrorCode07
+ 
+ instance JSON.ToJSON ErrorCode where
+   toJSON e = JSON.toJSON (buildErrorCode e)
+@@ -513,4 +504,3 @@ buildErrorCode code = "PGRST" <> case code of
+   GeneralErrorCode04     -> "504"
+   GeneralErrorCode05     -> "505"
+   GeneralErrorCode06     -> "506"
+-  GeneralErrorCode07     -> "507"
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 2f1d2668..133e149c 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -29,7 +29,6 @@ import PostgREST.DbStructure.Table        (Table (..))
+ import PostgREST.Request.Preferences      (PreferResolution (..))
+ 
+ import PostgREST.Query.SqlFragment
+-import PostgREST.RangeQuery        (allRange)
+ import PostgREST.Request.Types
+ 
+ import Protolude
+@@ -106,63 +105,28 @@ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returning
+     ])
+   where
+     cols = BS.intercalate ", " $ pgFmtIdent <$> S.toList iCols
+-
+-mutateRequestToQuery (Update mainQi uCols body logicForest (range, rangeId) returnings)
+-  | S.null uCols =
++mutateRequestToQuery (Update mainQi uCols body logicForest returnings) =
++  if S.null uCols
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+     -- the select has to be based on "returnings" to make computed overloaded functions not throw
+-    SQL.sql $ "SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false"
+-
+-  | range == allRange =
+-    "WITH " <> normalizedBody body <> " " <>
+-    "UPDATE " <> mainTbl <> " SET " <> SQL.sql nonRangeCols <> " " <>
+-    "FROM (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " )) _ " <>
+-    whereLogic <> " " <>
+-    SQL.sql (returningF mainQi returnings)
+-
+-  | otherwise =
+-    "WITH " <> normalizedBody body <> ", " <>
+-    "pgrst_update_body AS (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " ) LIMIT 1), " <>
+-    "pgrst_affected_rows AS (" <>
+-      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
+-       whereLogic <> " " <>
+-      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
+-    ") " <>
+-    "UPDATE " <> mainTbl <> " SET " <> SQL.sql rangeCols <>
+-    "FROM pgrst_affected_rows " <>
+-    "WHERE " <> SQL.sql whereRangeIdF <> " " <>
+-    SQL.sql (returningF mainQi returnings)
+-
+-  where
+-    whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+-    mainTbl = SQL.sql (fromQi mainQi)
+-    emptyBodyReturnedColumns = if null returnings then "NULL" else BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+-    nonRangeCols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
+-    rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent col <> " = (SELECT " <> pgFmtIdent col <> " FROM pgrst_update_body) ") <$> S.toList uCols)
+-    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
+-
+-mutateRequestToQuery (Delete mainQi logicForest (range, rangeId) returnings)
+-  | range == allRange =
+-    "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+-    whereLogic <> " " <>
+-    SQL.sql (returningF mainQi returnings)
+-
+-  | otherwise =
+-    "WITH " <>
+-    "pgrst_affected_rows AS (" <>
+-      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> SQL.sql (fromQi mainQi) <>
+-       whereLogic <> " " <>
+-      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
+-    ") " <>
+-    "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+-    "USING pgrst_affected_rows " <>
+-    "WHERE " <> SQL.sql whereRangeIdF <> " " <>
+-    SQL.sql (returningF mainQi returnings)
+-
++    then SQL.sql ("SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false")
++    else
++      "WITH " <> normalizedBody body <> " " <>
++      "UPDATE " <> SQL.sql (fromQi mainQi) <> " SET " <> SQL.sql cols <> " " <>
++      "FROM (SELECT * FROM json_populate_recordset (null::" <> SQL.sql (fromQi mainQi) <> " , " <> SQL.sql selectBody <> " )) _ " <>
++      (if null logicForest then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)) <> " " <>
++      SQL.sql (returningF mainQi returnings)
+   where
+-    whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+-    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
++    cols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
++    emptyBodyReturnedColumns :: SqlFragment
++    emptyBodyReturnedColumns
++      | null returnings = "NULL"
++      | otherwise       = BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
++mutateRequestToQuery (Delete mainQi logicForest returnings) =
++  "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
++  (if null logicForest then mempty else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree mainQi) logicForest)) <> " " <>
++  SQL.sql (returningF mainQi returnings)
+ 
+ requestToCallProcQuery :: CallRequest -> SQL.Snippet
+ requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 0c275f9f..32eda78b 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -17,7 +17,6 @@ module PostgREST.Query.SqlFragment
+   , fromQi
+   , limitOffsetF
+   , locationF
+-  , mutRangeF
+   , normalizedBody
+   , pgFmtColumn
+   , pgFmtIdent
+@@ -335,12 +334,3 @@ unknownLiteral = unknownEncoder . encodeUtf8
+ intercalateSnippet :: ByteString -> [SQL.Snippet] -> SQL.Snippet
+ intercalateSnippet _ [] = mempty
+ intercalateSnippet frag snippets = foldr1 (\a b -> a <> SQL.sql frag <> b) snippets
+-
+--- the "ctid" system column is always available to tables
+-mutRangeF :: QualifiedIdentifier -> [FieldName] -> (SqlFragment, SqlFragment)
+-mutRangeF mainQi rangeId = (
+-    BS.intercalate " AND " $
+-          (\col -> pgFmtColumn mainQi col <> " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_affected_rows") col) <$>
+-          (if null rangeId then ["ctid"] else rangeId)
+-  , if null rangeId then pgFmtColumn mainQi "ctid" else BS.intercalate ", " (pgFmtColumn mainQi <$> rangeId)
+-  )
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 3c8da764..609192df 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -151,7 +151,7 @@ targetToJsonRpcParams target params =
+ -}
+ data ApiRequest = ApiRequest {
+     iAction               :: Action                           -- ^ Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
+-  , iRange                :: M.HashMap Text NonnegRange       -- ^ Requested range of rows within response
++  , iRange                :: M.HashMap Text NonnegRange -- ^ Requested range of rows within response
+   , iTopLevelRange        :: NonnegRange                      -- ^ Requested range of rows from the top level
+   , iTarget               :: Target                           -- ^ The target, be it calling a proc or accessing a table
+   , iPayload              :: Maybe Payload                    -- ^ Data sent by client and used for mutation actions
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 44de9e99..f9df1b84 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -63,7 +63,7 @@ import Protolude hiding (from)
+ readRequest :: Schema -> TableName -> Maybe Integer -> [Relationship] -> ApiRequest -> Either Error ReadRequest
+ readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+-  treeRestrictRange maxRows (iAction apiRequest) =<<
++  treeRestrictRange maxRows =<<
+   augmentRequestWithJoin schema rootRels =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+@@ -115,9 +115,8 @@ initReadRequest rootQi =
+               fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+-treeRestrictRange :: Maybe Integer -> Action -> ReadRequest -> Either ApiRequestError ReadRequest
+-treeRestrictRange _ (ActionMutate _) request = Right request
+-treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> request
++treeRestrictRange :: Maybe Integer -> ReadRequest -> Either ApiRequestError ReadRequest
++treeRestrictRange maxRows request = pure $ nodeRestrictRange maxRows <$> request
+   where
+     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
+     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+@@ -284,9 +283,7 @@ addOrders ApiRequest{..} rReq =
+ 
+ addRanges :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addRanges ApiRequest{..} rReq =
+-  case iAction of
+-    ActionMutate _ -> Right rReq
+-    _              -> foldr addRangeToNode (Right rReq) =<< ranges
++  foldr addRangeToNode (Right rReq) =<< ranges
+   where
+     ranges :: Either ApiRequestError [(EmbedPath, NonnegRange)]
+     ranges = first QueryParamError $ QueryParams.pRequestRange `traverse` M.toList iRange
+@@ -322,7 +319,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+   case mutation of
+     MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+-    MutationUpdate -> Right $ Update qi iColumns body combinedLogic (iTopLevelRange, pkCols) returnings
++    MutationUpdate -> Right $ Update qi iColumns body combinedLogic returnings
+     MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+@@ -333,7 +330,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+           then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
+         else
+           Left InvalidFilters
+-    MutationDelete -> Right $ Delete qi combinedLogic (iTopLevelRange, pkCols) returnings
++    MutationDelete -> Right $ Delete qi combinedLogic returnings
+   where
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 4506aab8..a4241711 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -135,13 +135,11 @@ data MutateQuery
+       , updCols   :: S.Set FieldName
+       , updBody   :: Maybe LBS.ByteString
+       , where_    :: [LogicTree]
+-      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+   | Delete
+       { in_       :: QualifiedIdentifier
+       , where_    :: [LogicTree]
+-      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+ 
+diff --git a/test/spec/Feature/OpenApi/RootSpec.hs b/test/spec/Feature/OpenApi/RootSpec.hs
+index 3baa3bc7..6d9bbe15 100644
+--- a/test/spec/Feature/OpenApi/RootSpec.hs
++++ b/test/spec/Feature/OpenApi/RootSpec.hs
+@@ -29,7 +29,6 @@ spec =
+         [json| {
+             "tableName": "orders_view", "tableSchema": "test",
+             "tableDeletable": true, "tableUpdatable": true,
+-            "tableIsView":true, "tableInsertable": true,
+-            "tableDescription": null
++            "tableInsertable": true, "tableDescription": null
+           } |]
+         { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index eb211fd4..9c31d7a8 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -3,7 +3,7 @@ module Feature.Query.DeleteSpec where
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+-import Test.Hspec          hiding (pendingWith)
++import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+@@ -115,173 +115,3 @@ spec =
+             { matchStatus = 204
+             , matchHeaders = [matchHeaderAbsent hContentType]
+             }
+-
+-    context "limited delete" $ do
+-      it "works with the limit and offset query params" $ do
+-        get "/limited_delete_items"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 2, "name": "item-2" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodDelete "/limited_delete_items?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Preference-Applied" <:> "tx=commit" ]
+-            }
+-
+-        get "/limited_delete_items?order=id"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodPost "/rpc/reset_limited_items"
+-          [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items"} |]
+-          `shouldRespondWith` ""
+-          { matchStatus  = 204 }
+-
+-      it "works with the limit query param plus a filter" $ do
+-        get "/limited_delete_items"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 2, "name": "item-2" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodDelete "/limited_delete_items?limit=1&id=gt.1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Preference-Applied" <:> "tx=commit" ]
+-            }
+-
+-        get "/limited_delete_items?order=id"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodPost "/rpc/reset_limited_items"
+-          [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items"} |]
+-          `shouldRespondWith` ""
+-          { matchStatus  = 204 }
+-
+-      it "works on a table with a composite pk" $ do
+-        get "/limited_delete_items_cpk"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 2, "name": "item-2" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodDelete "/limited_delete_items_cpk?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Preference-Applied" <:> "tx=commit" ]
+-            }
+-
+-        get "/limited_delete_items_cpk"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodPost "/rpc/reset_limited_items"
+-          [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items_cpk"} |]
+-          `shouldRespondWith` ""
+-          { matchStatus  = 204 }
+-
+-      it "doesn't work with views" $
+-        request methodDelete "/limited_delete_items_view?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            [json| {"hint":null,"details":null,"code":"PGRST507","message":"limit/offset is not implemented for views"} |]
+-            { matchStatus  = 501 }
+-
+-      it "works with views with an inferred pk" $ do
+-        pendingWith "not implemented yet"
+-        get "/limited_delete_items_view"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 2, "name": "item-2" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodDelete "/limited_delete_items_view?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Preference-Applied" <:> "tx=commit" ]
+-            }
+-
+-        get "/limited_delete_items_view"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodPost "/rpc/reset_limited_items"
+-          [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items_view"} |]
+-          `shouldRespondWith` ""
+-          { matchStatus  = 204 }
+-
+-      it "works on a table without a pk" $ do
+-        get "/limited_delete_items_no_pk"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 2, "name": "item-2" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodDelete "/limited_delete_items_no_pk?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Preference-Applied" <:> "tx=commit" ]
+-            }
+-
+-        get "/limited_delete_items_no_pk"
+-          `shouldRespondWith`
+-            [json|[
+-              { "id": 1, "name": "item-1" }
+-            , { "id": 3, "name": "item-3" }
+-            ]|]
+-
+-        request methodPost "/rpc/reset_limited_items"
+-          [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items_no_pk"} |]
+-          `shouldRespondWith` ""
+-          { matchStatus  = 204 }
+diff --git a/test/spec/Feature/Query/QueryLimitedSpec.hs b/test/spec/Feature/Query/QueryLimitedSpec.hs
+index addca790..eb89abad 100644
+--- a/test/spec/Feature/Query/QueryLimitedSpec.hs
++++ b/test/spec/Feature/Query/QueryLimitedSpec.hs
+@@ -77,40 +77,3 @@ spec =
+             , matchHeaders = [ matchContentTypeJson
+                              , "Content-Range" <:> "0-1/3" ]
+             }
+-
+-    context "max-rows=2 on mutations" $ do
+-      it "doesn't affect insertions" $
+-        request methodPost "/projects?select=id,name"
+-            [("Prefer", "return=representation")]
+-            [json| [
+-              { "id": 6, "name": "BeOS" },
+-              { "id": 7, "name": "PopOS" },
+-              { "id": 8, "name": "HaikuOS" } ]|]
+-          `shouldRespondWith`
+-            [json| [
+-              { "id": 6, "name": "BeOS" },
+-              { "id": 7, "name": "PopOS" },
+-              { "id": 8, "name": "HaikuOS" } ]|]
+-            { matchStatus  = 201 }
+-
+-      it "doesn't affect updates" $
+-        request methodPatch "/employees?select=first_name,last_name,occupation"
+-            [("Prefer", "return=representation")]
+-            [json| [{"occupation": "Barista"}] |]
+-          `shouldRespondWith`
+-            [json|[
+-                { "first_name": "Frances M.", "last_name": "Roe", "occupation": "Barista" },
+-                { "first_name": "Daniel B.", "last_name": "Lyon", "occupation": "Barista" },
+-                { "first_name": "Edwin S.", "last_name": "Smith", "occupation": "Barista" } ]|]
+-            { matchStatus  = 200 }
+-
+-      it "doesn't affect deletions" $
+-        request methodDelete "/employees?select=first_name,last_name"
+-            [("Prefer", "return=representation")]
+-            mempty
+-          `shouldRespondWith`
+-            [json| [
+-              { "first_name": "Frances M.", "last_name": "Roe" },
+-              { "first_name": "Daniel B.", "last_name": "Lyon" },
+-              { "first_name": "Edwin S.", "last_name": "Smith" } ]|]
+-            { matchStatus  = 200 }
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 7edc2543..842cbda1 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -386,211 +386,3 @@ spec = do
+           { matchStatus = 204
+           , matchHeaders = [matchHeaderAbsent hContentType]
+           }
+-
+-  context "limited update" $ do
+-    it "works with the limit query param" $ do
+-      get "/limited_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items?limit=2"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "updated-item" }
+-          , { "id": 2, "name": "updated-item" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "works with the limit query param plus a filter" $ do
+-      get "/limited_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items?limit=1&id=gt.2"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "updated-item" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "works with the limit and offset query params" $ do
+-      get "/limited_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items?limit=1&offset=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "updated-item" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "works on a table with a composite pk" $ do
+-      get "/limited_update_items_cpk"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items_cpk?limit=1&offset=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items_cpk?order=id,name"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "updated-item" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items_cpk"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "doesn't work with views" $
+-      request methodPatch "/limited_update_items_view?limit=1&offset=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          [json| {"hint":null,"details":null,"code":"PGRST507","message":"limit/offset is not implemented for views"} |]
+-          { matchStatus  = 501 }
+-
+-    it "works with views with an inferred pk" $ do
+-      pendingWith "not implemented yet"
+-      get "/limited_update_items_view"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items_view?limit=1&offset=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items_view?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "updated-item" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items_view"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "works on a table without a pk" $ do
+-      get "/limited_update_items_no_pk"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPatch "/limited_update_items_no_pk?limit=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/limited_update_items_no_pk?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "updated-item" }
+-          , { "id": 2, "name": "item-2" }
+-          , { "id": 3, "name": "item-3" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_limited_items"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items_no_pk"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index b5444c29..b6af7279 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -736,21 +736,3 @@ INSERT INTO test.fav_numbers VALUES (ROW(0.5, 0.5), 'A'),  (ROW(0.6, 0.6), 'B');
+ 
+ TRUNCATE TABLE test.arrays CASCADE;
+ INSERT INTO test.arrays VALUES (0, '{1,2,3}', '{{1,2,3},{4,5,6},{7,8,9}}'), (1, '{11,12,13}', '{{11,12,13},{14,15,16},{17,18,19}}');
+-
+-TRUNCATE TABLE test.limited_update_items CASCADE;
+-INSERT INTO test.limited_update_items VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-
+-TRUNCATE TABLE test.limited_update_items_cpk CASCADE;
+-INSERT INTO test.limited_update_items_cpk VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-
+-TRUNCATE TABLE test.limited_update_items_no_pk CASCADE;
+-INSERT INTO test.limited_update_items_no_pk VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-
+-TRUNCATE TABLE test.limited_delete_items CASCADE;
+-INSERT INTO test.limited_delete_items VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-
+-TRUNCATE TABLE test.limited_delete_items_cpk CASCADE;
+-INSERT INTO test.limited_delete_items_cpk VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-
+-TRUNCATE TABLE test.limited_delete_items_no_pk CASCADE;
+-INSERT INTO test.limited_delete_items_no_pk VALUES (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index b0926d99..3d4a3b58 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -163,14 +163,6 @@ GRANT ALL ON TABLE
+     , clientinfo
+     , contact
+     , chores
+-    , limited_update_items
+-    , limited_update_items_cpk
+-    , limited_update_items_no_pk
+-    , limited_update_items_view
+-    , limited_delete_items
+-    , limited_delete_items_cpk
+-    , limited_delete_items_no_pk
+-    , limited_delete_items_view
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 1e36ae1d..e2565855 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2463,53 +2463,3 @@ CREATE AGGREGATE test.unsupported_agg (*) (
+   SFUNC = public.dummy,
+   STYPE = int
+ );
+-
+-create view no_pk_view as
+-select * from no_pk;
+-
+-create table limited_update_items(
+-  id int primary key
+-, name text
+-);
+-
+-create table limited_update_items_cpk(
+-  id int
+-, name text
+-, primary key (id, name)
+-);
+-
+-create table limited_update_items_no_pk(
+-  id int
+-, name text
+-);
+-
+-create view limited_update_items_view as
+-select * from limited_update_items;
+-
+-create table limited_delete_items(
+-  id int primary key
+-, name text
+-);
+-
+-create table limited_delete_items_cpk(
+-  id int
+-, name text
+-, primary key (id, name)
+-);
+-
+-create table limited_delete_items_no_pk(
+-  id int
+-, name text
+-);
+-
+-create view limited_delete_items_view as
+-select * from limited_delete_items;
+-
+-create function reset_limited_items(tbl_name text default '') returns void as $_$ begin
+-  execute format(
+-  $$
+-    delete from %I;
+-    insert into %I values (1, 'item-1'), (2, 'item-2'), (3, 'item-3');
+-  $$::text,
+-  tbl_name, tbl_name);
+-end; $_$ language plpgsql volatile;

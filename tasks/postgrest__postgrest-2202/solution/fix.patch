@@ -1,0 +1,135 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0408a775..7eb3ea52 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1917, Normalize the error response body by always having the `detail` and `hint` error fields with a `null` value if they are empty - @laurenceisla
+  - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla
+  - #2236, Support POSIX regular expression operators for row filtering - @enote-kane
++ - #2202, Allow returning XML from RPCs - @fjf2002
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 8a82d4b5..dadc2add 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -466,6 +466,7 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+         (shouldCount iPreferCount)
+         (iAcceptContentType == CTSingularJSON)
+         (iAcceptContentType == CTTextCSV)
++        (iAcceptContentType == CTTextXML)
+         (iPreferParameters == Just MultipleObjects)
+         bField
+         (configDbPreparedStatements ctxConfig)
+@@ -623,7 +624,7 @@ binaryField RequestContext{..} readReq
+ 
+ rawContentTypes :: AppConfig -> [ContentType]
+ rawContentTypes AppConfig{..} =
+-  (ContentType.decodeContentType <$> configRawMediaTypes) `union` [CTOctetStream, CTTextPlain]
++  (ContentType.decodeContentType <$> configRawMediaTypes) `union` [CTOctetStream, CTTextPlain, CTTextXML]
+ 
+ profileHeader :: ApiRequest -> Maybe HTTP.Header
+ profileHeader ApiRequest{..} =
+diff --git a/src/PostgREST/ContentType.hs b/src/PostgREST/ContentType.hs
+index 7be307e3..40c4a138 100644
+--- a/src/PostgREST/ContentType.hs
++++ b/src/PostgREST/ContentType.hs
+@@ -20,6 +20,7 @@ data ContentType
+   | CTSingularJSON
+   | CTTextCSV
+   | CTTextPlain
++  | CTTextXML
+   | CTOpenAPI
+   | CTUrlEncoded
+   | CTOctetStream
+@@ -41,6 +42,7 @@ toMime :: ContentType -> ByteString
+ toMime CTApplicationJSON = "application/json"
+ toMime CTTextCSV         = "text/csv"
+ toMime CTTextPlain       = "text/plain"
++toMime CTTextXML         = "text/xml"
+ toMime CTOpenAPI         = "application/openapi+json"
+ toMime CTSingularJSON    = "application/vnd.pgrst.object+json"
+ toMime CTUrlEncoded      = "application/x-www-form-urlencoded"
+@@ -55,6 +57,7 @@ decodeContentType ct =
+     "application/json"                  -> CTApplicationJSON
+     "text/csv"                          -> CTTextCSV
+     "text/plain"                        -> CTTextPlain
++    "text/xml"                          -> CTTextXML
+     "application/openapi+json"          -> CTOpenAPI
+     "application/vnd.pgrst.object+json" -> CTSingularJSON
+     "application/vnd.pgrst.object"      -> CTSingularJSON
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 951a71ec..599a823d 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -271,7 +271,9 @@ pgErrorStatus authed (SQL.SessionError (SQL.QueryError _ _ (SQL.ResultError rErr
+         "P0001"   -> HTTP.status400 -- default code for "raise"
+         'P':'0':_ -> HTTP.status500 -- PL/pgSQL Error
+         'X':'X':_ -> HTTP.status500 -- internal Error
+-        "42883"   -> HTTP.status404 -- undefined function
++        "42883"-> if BS.isPrefixOf "function xmlagg(" m
++          then HTTP.status406
++          else HTTP.status404 -- undefined function
+         "42P01"   -> HTTP.status404 -- undefined table
+         "42501"   -> if authed then HTTP.status403 else HTTP.status401 -- insufficient privilege
+         'P':'T':n -> fromMaybe HTTP.status500 (HTTP.mkStatus <$> readMaybe n <*> pure m)
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 39ca830b..9ec9d95e 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -13,6 +13,7 @@ module PostgREST.Query.SqlFragment
+   , asCsvF
+   , asJsonF
+   , asJsonSingleF
++  , asXmlF
+   , countF
+   , fromQi
+   , limitOffsetF
+@@ -176,6 +177,9 @@ asJsonSingleF returnsScalar
+   | returnsScalar = "coalesce((json_agg(_postgrest_t.pgrst_scalar)->0)::text, 'null')"
+   | otherwise     = "coalesce((json_agg(_postgrest_t)->0)::text, 'null')"
+ 
++asXmlF :: FieldName -> SqlFragment
++asXmlF fieldName = "coalesce(xmlagg(_postgrest_t." <> pgFmtIdent fieldName <> "), '')"
++
+ asBinaryF :: FieldName -> SqlFragment
+ asBinaryF fieldName = "coalesce(string_agg(_postgrest_t." <> pgFmtIdent fieldName <> ", ''), '')"
+ 
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 679ff55e..430d7815 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -129,9 +129,9 @@ standardRow = (,,,,,) <$> nullableColumn HD.int8 <*> column HD.int8
+ type ProcResults = (Maybe Int64, Int64, ByteString, Either Error [GucHeader], Either Error (Maybe Status))
+ 
+ callProcStatement :: Bool -> Bool -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
+-                     Bool -> Bool -> Bool -> Maybe FieldName -> Bool ->
++                     Bool -> Bool -> Bool -> Bool -> Maybe FieldName -> Bool ->
+                      SQL.Statement () ProcResults
+-callProcStatement returnsScalar returnsSingle callProcQuery selectQuery countQuery countTotal asSingle asCsv multObjects binaryField =
++callProcStatement returnsScalar returnsSingle callProcQuery selectQuery countQuery countTotal asSingle asCsv asXml multObjects binaryField =
+   SQL.dynamicallyParameterized snippet decodeProc
+   where
+     snippet =
+@@ -151,6 +151,7 @@ callProcStatement returnsScalar returnsSingle callProcQuery selectQuery countQue
+     bodyF
+      | asSingle           = asJsonSingleF returnsScalar
+      | asCsv              = asCsvF
++     | isJust binaryField && asXml = asXmlF $ fromJust binaryField
+      | isJust binaryField = asBinaryF $ fromJust binaryField
+      | returnsSingle
+        && not multObjects = asJsonSingleF returnsScalar
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 3c8da764..e7a1d2b0 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -421,7 +421,7 @@ requestContentTypes conf action path =
+ 
+ rawContentTypes :: AppConfig -> [ContentType]
+ rawContentTypes AppConfig{..} =
+-  (ContentType.decodeContentType <$> configRawMediaTypes) `union` [CTOctetStream, CTTextPlain]
++  (ContentType.decodeContentType <$> configRawMediaTypes) `union` [CTOctetStream, CTTextPlain, CTTextXML]
+ 
+ {-|
+   Search a pg proc by matching name and arguments keys to parameters. Since a function can be overloaded,

@@ -1,0 +1,186 @@
+diff --git a/Changes b/Changes
+index 92d7fb6dd1..11972524b8 100644
+--- a/Changes
++++ b/Changes
+@@ -199,6 +199,10 @@ Working version
+   and socklen_param_type for socklen_t.
+   (Antonin Décimo, review by Nicolás Ojeda Bär, David Allsopp and Samuel Hym)
+ 
++- #14391: unload native dynlinked objects when an error occurs and it is safe to
++  do so. (Fixes #14323)
++  (Nicolás Ojeda Bär, review by Vincent Laviron)
++
+ ### Tools:
+ 
+ - #14055: Invert BUILD_PATH_PREFIX_MAP in directories loaded at startup
+diff --git a/otherlibs/dynlink/byte/dynlink.ml b/otherlibs/dynlink/byte/dynlink.ml
+index 714198bdea..209218c318 100644
+--- a/otherlibs/dynlink/byte/dynlink.ml
++++ b/otherlibs/dynlink/byte/dynlink.ml
+@@ -103,8 +103,6 @@ module Bytecode = struct
+       init
+       !default_crcs
+ 
+-  let run_shared_startup _ = ()
+-
+   let with_lock lock f =
+     Mutex.lock lock;
+     Fun.protect f
+diff --git a/otherlibs/dynlink/dynlink_common.ml b/otherlibs/dynlink/dynlink_common.ml
+index f05446a6ec..473c686331 100644
+--- a/otherlibs/dynlink/dynlink_common.ml
++++ b/otherlibs/dynlink/dynlink_common.ml
+@@ -346,8 +346,7 @@ module Make (P : Dynlink_platform_intf.S) = struct
+       with_lock (fun ({unsafe_allowed; _ } as global) ->
+           global.state <- check filename units global.state
+               ~unsafe_allowed
+-              ~priv;
+-          P.run_shared_startup handle;
++              ~priv
+         );
+       List.iter
+         (fun unit_header ->
+diff --git a/otherlibs/dynlink/dynlink_platform_intf.ml b/otherlibs/dynlink/dynlink_platform_intf.ml
+index 75cc813d97..b196256f3d 100644
+--- a/otherlibs/dynlink/dynlink_platform_intf.ml
++++ b/otherlibs/dynlink/dynlink_platform_intf.ml
+@@ -58,7 +58,6 @@ module type S = sig
+     -> priv:bool
+     -> handle * (Unit_header.t list)
+ 
+-  val run_shared_startup : handle -> unit
+   val run : Mutex.t -> handle -> unit_header:Unit_header.t -> priv:bool -> unit
+ 
+   val unsafe_get_global_value : bytecode_or_asm_symbol:string -> Obj.t option
+diff --git a/otherlibs/dynlink/native/dynlink.ml b/otherlibs/dynlink/native/dynlink.ml
+index 1b1bf4482c..0d3a2d7954 100644
+--- a/otherlibs/dynlink/native/dynlink.ml
++++ b/otherlibs/dynlink/native/dynlink.ml
+@@ -32,13 +32,22 @@ type global_map = {
+ }
+ 
+ module Native = struct
+-  type handle
+-
+-  external ndl_open : string -> bool -> handle * dynheader
++  type ndl_handle
++  type initialized =
++    | Initialized
++    | Not_yet_initialized of string list
++  type handle = {
++    ndl_handle : ndl_handle;
++    mutable initialized : initialized;
++  }
++
++  external ndl_open : string -> bool -> ndl_handle * dynheader
+     = "caml_natdynlink_open"
+-  external ndl_register : handle -> string array -> unit
++  external ndl_close : ndl_handle -> unit
++    = "caml_natdynlink_close"
++  external ndl_register : ndl_handle -> string array -> unit
+     = "caml_natdynlink_register"
+-  external ndl_run : handle -> string -> unit = "caml_natdynlink_run"
++  external ndl_run : ndl_handle -> string -> unit = "caml_natdynlink_run"
+   external ndl_getmap : unit -> global_map list = "caml_natdynlink_getmap"
+   external ndl_globals_inited : unit -> int = "caml_natdynlink_globals_inited"
+   external ndl_loadsym : string -> Obj.t = "caml_natdynlink_loadsym"
+@@ -78,11 +87,21 @@ module Native = struct
+       (ndl_getmap ())
+ 
+   let run_shared_startup handle =
+-    ndl_run handle "_shared_startup"
++    match handle.initialized with
++    | Initialized -> ()
++    | Not_yet_initialized syms ->
++        handle.initialized <- Initialized;
++        begin try
++          ndl_register handle.ndl_handle (Array.of_list syms);
++        with exn ->
++          raise (DT.Error (Cannot_open_dynamic_library exn))
++        end;
++        ndl_run handle.ndl_handle "_shared_startup"
+ 
+   let run _lock handle ~unit_header ~priv:_ =
++    run_shared_startup handle;
+     List.iter (fun cu ->
+-        try ndl_run handle cu
++        try ndl_run handle.ndl_handle cu
+         with exn ->
+           Printexc.raise_with_backtrace
+             (DT.Error (Library's_module_initializers_failed exn))
+@@ -90,28 +109,30 @@ module Native = struct
+       (Unit_header.defined_symbols unit_header)
+ 
+   let load ~filename ~priv =
+-    let handle, header =
++    let ndl_handle, header =
+       try ndl_open filename (not priv)
+       with exn -> raise (DT.Error (Cannot_open_dynamic_library exn))
+     in
+     if header.dynu_magic <> Config.cmxs_magic_number then begin
++      ndl_close ndl_handle;
+       raise (DT.Error (Not_a_bytecode_file filename))
+     end;
+     let syms =
+       "_shared_startup" ::
+       List.concat_map Unit_header.defined_symbols header.dynu_units
+     in
+-    try
+-      ndl_register handle (Array.of_list syms);
+-      handle, header.dynu_units
+-    with exn -> raise (DT.Error (Cannot_open_dynamic_library exn))
++    let handle = { ndl_handle; initialized = Not_yet_initialized syms } in
++    handle, header.dynu_units
+ 
+   let unsafe_get_global_value ~bytecode_or_asm_symbol =
+     match ndl_loadsym bytecode_or_asm_symbol with
+     | exception _ -> None
+     | obj -> Some obj
+ 
+-  let finish _handle = ()
++  let finish handle =
++    match handle.initialized with
++    | Initialized -> ()
++    | Not_yet_initialized _ -> ndl_close handle.ndl_handle
+ end
+ 
+ include DC.Make (Native)
+diff --git a/runtime/dynlink_nat.c b/runtime/dynlink_nat.c
+index 3daea52703..60b4e5338b 100644
+--- a/runtime/dynlink_nat.c
++++ b/runtime/dynlink_nat.c
+@@ -83,8 +83,6 @@ CAMLprim value caml_natdynlink_open(value filename, value global)
+   char_os *p;
+   int global_dup;
+ 
+-  /* TODO: dlclose in case of error... */
+-
+   p = caml_stat_strdup_to_os(String_val(filename));
+   global_dup = Int_val(global);
+   caml_enter_blocking_section();
+@@ -96,8 +94,10 @@ CAMLprim value caml_natdynlink_open(value filename, value global)
+     caml_failwith(caml_dlerror());
+ 
+   sym = caml_dlsym(dlhandle, "caml_plugin_header");
+-  if (NULL == sym)
++  if (NULL == sym) {
++    caml_dlclose(dlhandle);
+     caml_failwith("not an OCaml plugin");
++  }
+ 
+   handle = Val_handle(dlhandle);
+   header = caml_input_value_from_block(sym, INT_MAX);
+@@ -108,6 +108,13 @@ CAMLprim value caml_natdynlink_open(value filename, value global)
+   CAMLreturn(res);
+ }
+ 
++CAMLprim value caml_natdynlink_close(value handle)
++{
++  CAMLparam1(handle);
++  caml_dlclose(Handle_val(handle));
++  CAMLreturn(Val_unit);
++}
++
+ CAMLprim value caml_natdynlink_register(value handle_v, value symbols) {
+   CAMLparam2 (handle_v, symbols);
+   int nsymbols = Wosize_val(symbols);

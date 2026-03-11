@@ -1,0 +1,1125 @@
+diff --git a/assets/js/phoenix_live_view/live_socket.js b/assets/js/phoenix_live_view/live_socket.js
+index bba4fa49..2b01075e 100644
+--- a/assets/js/phoenix_live_view/live_socket.js
++++ b/assets/js/phoenix_live_view/live_socket.js
+@@ -221,11 +221,6 @@ export default class LiveSocket {
+     this.connect();
+   }
+ 
+-  /**
+-   * @param {HTMLElement} el
+-   * @param {import("./js_commands").EncodedJS} encodedJS
+-   * @param {string | null} [eventType]
+-   */
+   execJS(el, encodedJS, eventType = null) {
+     const e = new CustomEvent("phx:exec", { detail: { sourceElement: el } });
+     this.owner(el, (view) => JS.exec(e, eventType, encodedJS, view, el));
+diff --git a/assets/js/phoenix_live_view/view_hook.ts b/assets/js/phoenix_live_view/view_hook.ts
+index 1a3ce881..94cc2307 100644
+--- a/assets/js/phoenix_live_view/view_hook.ts
++++ b/assets/js/phoenix_live_view/view_hook.ts
+@@ -159,7 +159,7 @@ export interface HookInterface<E extends HTMLElement = HTMLElement> {
+ 
+ // based on https://github.com/DefinitelyTyped/DefinitelyTyped/blob/fac1aa75acdddbf4f1a95e98ee2297b54ce4b4c9/types/phoenix_live_view/hooks.d.ts#L26
+ // licensed under MIT
+-export interface Hook<T = object, E extends HTMLElement = HTMLElement> {
++export interface Hook<out T = object, E extends HTMLElement = HTMLElement> {
+   /**
+    * The mounted callback.
+    *
+@@ -240,15 +240,11 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+   implements HookInterface<E>
+ {
+   el: E;
++  liveSocket: LiveSocket;
+ 
+   private __listeners: Set<CallbackRef>;
+   private __isDisconnected: boolean;
+-  private __view!: () => View;
+-  private __liveSocket!: () => LiveSocket;
+-
+-  get liveSocket(): LiveSocket {
+-    return this.__liveSocket();
+-  }
++  private __view: () => View;
+ 
+   static makeID() {
+     return viewHookID++;
+@@ -330,18 +326,14 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+   __attachView(view: View | null) {
+     if (view) {
+       this.__view = () => view;
+-      this.__liveSocket = () => view.liveSocket;
++      this.liveSocket = view.liveSocket;
+     } else {
+       this.__view = () => {
+         throw new Error(
+           `hook not yet attached to a live view: ${this.el.outerHTML}`,
+         );
+       };
+-      this.__liveSocket = () => {
+-        throw new Error(
+-          `hook not yet attached to a live view: ${this.el.outerHTML}`,
+-        );
+-      };
++      this.liveSocket = null;
+     }
+   }
+ 
+@@ -394,13 +386,7 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+     };
+   }
+ 
+-  pushEvent(event: string, payload: any, onReply: OnReply): void;
+-  pushEvent(event: string, payload?: any): Promise<any>;
+-  pushEvent(
+-    event: string,
+-    payload?: any,
+-    onReply?: OnReply,
+-  ): Promise<any> | void {
++  pushEvent(event: string, payload?: any, onReply?: OnReply) {
+     const promise = this.__view().pushHookEvent(
+       this.el,
+       null,
+@@ -408,56 +394,35 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+       payload || {},
+     );
+     if (onReply === undefined) {
+-      return promise.then(({ reply }: { reply: any }) => reply);
++      return promise.then(({ reply }) => reply);
+     }
+-    promise
+-      .then(({ reply, ref }: { reply: any; ref: number }) =>
+-        onReply(reply, ref),
+-      )
+-      .catch(() => {});
++    promise.then(({ reply, ref }) => onReply(reply, ref)).catch(() => {});
++    return;
+   }
+ 
+-  pushEventTo(
+-    selectorOrTarget: PhxTarget,
+-    event: string,
+-    payload: object,
+-    onReply: OnReply,
+-  ): void;
+-  pushEventTo(
+-    selectorOrTarget: PhxTarget,
+-    event: string,
+-    payload?: object,
+-  ): Promise<PromiseSettledResult<{ reply: any; ref: number }>[]>;
+   pushEventTo(
+     selectorOrTarget: PhxTarget,
+     event: string,
+     payload?: object,
+     onReply?: OnReply,
+-  ): Promise<PromiseSettledResult<{ reply: any; ref: number }>[]> | void {
++  ) {
+     if (onReply === undefined) {
+       const targetPair: { view: View; targetCtx: any }[] = [];
+-      this.__view().withinTargets(
+-        selectorOrTarget,
+-        (view: View, targetCtx: any) => {
+-          targetPair.push({ view, targetCtx });
+-        },
+-      );
++      this.__view().withinTargets(selectorOrTarget, (view, targetCtx) => {
++        targetPair.push({ view, targetCtx });
++      });
+       const promises = targetPair.map(({ view, targetCtx }) => {
+         return view.pushHookEvent(this.el, targetCtx, event, payload || {});
+       });
+       return Promise.allSettled(promises);
+     }
+-    this.__view().withinTargets(
+-      selectorOrTarget,
+-      (view: View, targetCtx: any) => {
+-        view
+-          .pushHookEvent(this.el, targetCtx, event, payload || {})
+-          .then(({ reply, ref }: { reply: any; ref: number }) =>
+-            onReply(reply, ref),
+-          )
+-          .catch(() => {});
+-      },
+-    );
++    this.__view().withinTargets(selectorOrTarget, (view, targetCtx) => {
++      view
++        .pushHookEvent(this.el, targetCtx, event, payload || {})
++        .then(({ reply, ref }) => onReply(reply, ref))
++        .catch(() => {});
++    });
++    return;
+   }
+ 
+   handleEvent(event: string, callback: (payload: any) => any): CallbackRef {
+@@ -486,12 +451,9 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+   }
+ 
+   uploadTo(selectorOrTarget: PhxTarget, name: string, files: FileList): any {
+-    return this.__view().withinTargets(
+-      selectorOrTarget,
+-      (view: View, targetCtx: any) => {
+-        view.dispatchUploads(targetCtx, name, files);
+-      },
+-    );
++    return this.__view().withinTargets(selectorOrTarget, (view, targetCtx) => {
++      view.dispatchUploads(targetCtx, name, files);
++    });
+   }
+ 
+   /** @internal */
+@@ -502,6 +464,6 @@ export class ViewHook<E extends HTMLElement = HTMLElement>
+   }
+ }
+ 
+-export type HooksOptions = Record<string, typeof ViewHook | Hook<any, any>>;
++export type HooksOptions = Record<string, typeof ViewHook | Hook>;
+ 
+ export default ViewHook;
+diff --git a/assets/test/debounce_test.ts b/assets/test/debounce_test.ts
+index 429c3d00..c1265a26 100644
+--- a/assets/test/debounce_test.ts
++++ b/assets/test/debounce_test.ts
+@@ -62,7 +62,7 @@ describe("debounce", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=debounce-200]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -90,7 +90,7 @@ describe("debounce", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=debounce-200]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -122,7 +122,7 @@ describe("debounce", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=debounce-200]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -164,7 +164,7 @@ describe("debounce", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=debounce-200]",
+-    )!;
++    );
+     el.setAttribute("phx-debounce", "");
+ 
+     el.addEventListener("input", (e) => {
+@@ -201,7 +201,7 @@ describe("debounce", function () {
+     const parent = container();
+     const el: HTMLInputElement = parent.querySelector(
+       "input[name=debounce-200]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -215,7 +215,7 @@ describe("debounce", function () {
+         () => calls++,
+       );
+     });
+-    el.form!.addEventListener("submit", () => {
++    el.form.addEventListener("submit", () => {
+       el.value = "submitted";
+     });
+     simulateInput(el, "changed");
+@@ -236,7 +236,7 @@ describe("debounce", function () {
+ describe("throttle", function () {
+   test("triggers immediately, then on timeout", (done) => {
+     let calls = 0;
+-    const el: HTMLButtonElement = container().querySelector("#throttle-200")!;
++    const el: HTMLButtonElement = container().querySelector("#throttle-200");
+ 
+     el.addEventListener("click", (e) => {
+       DOM.debounce(
+@@ -274,7 +274,7 @@ describe("throttle", function () {
+ 
+   test("uses default when value is blank", (done) => {
+     let calls = 0;
+-    const el: HTMLButtonElement = container().querySelector("#throttle-200")!;
++    const el: HTMLButtonElement = container().querySelector("#throttle-200");
+     el.setAttribute("phx-throttle", "");
+ 
+     el.addEventListener("click", (e) => {
+@@ -315,7 +315,7 @@ describe("throttle", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=throttle-200]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -329,7 +329,7 @@ describe("throttle", function () {
+         () => calls++,
+       );
+     });
+-    el.form!.addEventListener("submit", () => {
++    el.form.addEventListener("submit", () => {
+       el.value = "submitted";
+     });
+     simulateInput(el, "changed");
+@@ -347,7 +347,7 @@ describe("throttle", function () {
+ 
+   test("triggers only once when there is only one event", (done) => {
+     let calls = 0;
+-    const el: HTMLButtonElement = container().querySelector("#throttle-200")!;
++    const el: HTMLButtonElement = container().querySelector("#throttle-200");
+ 
+     el.addEventListener("click", (e) => {
+       DOM.debounce(
+@@ -377,7 +377,7 @@ describe("throttle", function () {
+     let calls = 0;
+     const el: HTMLInputElement = container().querySelector(
+       "input[name=throttle-range-with-blur]",
+-    )!;
++    );
+ 
+     el.addEventListener("input", (e) => {
+       DOM.debounce(
+@@ -422,7 +422,7 @@ describe("throttle", function () {
+ describe("throttle keydown", function () {
+   test("when the same key is pressed triggers immediately, then on timeout", (done) => {
+     const keyPresses = {};
+-    const el: HTMLDivElement = container().querySelector("#throttle-keydown")!;
++    const el: HTMLDivElement = container().querySelector("#throttle-keydown");
+ 
+     el.addEventListener("keydown", (e) => {
+       DOM.debounce(
+@@ -457,7 +457,7 @@ describe("throttle keydown", function () {
+ 
+   test("when different key is pressed triggers immediately", (done) => {
+     const keyPresses = {};
+-    const el: HTMLDivElement = container().querySelector("#throttle-keydown")!;
++    const el: HTMLDivElement = container().querySelector("#throttle-keydown");
+ 
+     el.addEventListener("keydown", (e) => {
+       DOM.debounce(
+diff --git a/assets/test/event_test.ts b/assets/test/event_test.ts
+index 3723ef5c..46ff731f 100644
+--- a/assets/test/event_test.ts
++++ b/assets/test/event_test.ts
+@@ -3,7 +3,6 @@ import LiveSocket from "phoenix_live_view/live_socket";
+ import View from "phoenix_live_view/view";
+ 
+ import { version as liveview_version } from "../../package.json";
+-import { HooksOptions } from "phoenix_live_viewview_hook";
+ 
+ let containerId = 0;
+ 
+@@ -61,7 +60,7 @@ describe("events", () => {
+ 
+   test("events on join", () => {
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Map: {
+           mounted() {
+             this.handleEvent("points", (data) =>
+@@ -87,7 +86,7 @@ describe("events", () => {
+ 
+   test("events on update", () => {
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Game: {
+           mounted() {
+             this.handleEvent("scores", (data) =>
+@@ -115,9 +114,9 @@ describe("events", () => {
+   });
+ 
+   test("events handlers are cleaned up on destroy", () => {
+-    let destroyed: Array<string> = [];
++    let destroyed = [];
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Handler: {
+           mounted() {
+             this.handleEvent("my-event", (data) =>
+@@ -165,7 +164,7 @@ describe("events", () => {
+ 
+   test("removeHandleEvent", () => {
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Remove: {
+           mounted() {
+             let ref = this.handleEvent("remove", (data) => {
+@@ -203,7 +202,7 @@ describe("pushEvent replies", () => {
+   test("reply", (done) => {
+     let view;
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Gateway: {
+           mounted() {
+             stubNextChannelReply(view, { transactionID: "1001" });
+@@ -241,7 +240,7 @@ describe("pushEvent replies", () => {
+   test("promise", (done) => {
+     let view;
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Gateway: {
+           mounted() {
+             stubNextChannelReply(view, { transactionID: "1001" });
+@@ -277,7 +276,7 @@ describe("pushEvent replies", () => {
+   test("rejects with error", (done) => {
+     let view;
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Gateway: {
+           mounted() {
+             stubNextChannelReplyWithError(view, "error");
+@@ -306,7 +305,7 @@ describe("pushEvent replies", () => {
+   test("pushEventTo - promise with multiple targets", (done) => {
+     let view;
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Gateway: {
+           mounted() {
+             stubNextChannelReply(view, { transactionID: "1001" });
+@@ -351,7 +350,7 @@ describe("pushEvent replies", () => {
+     let view;
+     const spy = jest.fn();
+     let liveSocket = new LiveSocket("/live", Socket, {
+-      hooks: <HooksOptions>{
++      hooks: {
+         Gateway: {
+           mounted() {
+             stubNextChannelReply(view, { transactionID: "1001" });
+diff --git a/assets/test/hook_types_test.ts b/assets/test/hook_types_test.ts
+deleted file mode 100644
+index a41e03f5..00000000
+--- a/assets/test/hook_types_test.ts
++++ /dev/null
+@@ -1,129 +0,0 @@
+-/**
+- * Type tests for Hook and HooksOptions.
+- *
+- * These tests verify:
+- * 1. Typed hooks with custom state and element types can be assigned to HooksOptions
+- *    (requires Hook<any, any> in HooksOptions definition)
+- * 2. Hook<SpecificType> is assignable to Hook<object> due to covariant `out T` annotation
+- *    (see https://github.com/phoenixframework/phoenix_live_view/issues/3955)
+- *
+- * This file is checked by `npm run typecheck:tests`.
+- */
+-
+-import type { Hook, HooksOptions } from "phoenix_live_view/view_hook";
+-
+-// Hook with custom state
+-interface CounterState {
+-  count: number;
+-  increment(): void;
+-}
+-
+-const CounterHook: Hook<CounterState> = {
+-  count: 0,
+-  increment() {
+-    this.count++;
+-  },
+-  mounted() {
+-    this.el.addEventListener("click", () => this.increment());
+-  },
+-};
+-
+-// Hook targeting a specific element type
+-interface CanvasState {
+-  ctx: CanvasRenderingContext2D | null;
+-}
+-
+-const CanvasHook: Hook<CanvasState, HTMLCanvasElement> = {
+-  ctx: null,
+-  mounted() {
+-    // this.el should be typed as HTMLCanvasElement
+-    this.ctx = this.el.getContext("2d");
+-  },
+-};
+-
+-// Hook with both custom state and specific element type
+-interface VideoState {
+-  isPlaying: boolean;
+-  toggle(): void;
+-}
+-
+-const VideoHook: Hook<VideoState, HTMLVideoElement> = {
+-  isPlaying: false,
+-  toggle() {
+-    if (this.isPlaying) {
+-      this.el.pause();
+-    } else {
+-      this.el.play();
+-    }
+-    this.isPlaying = !this.isPlaying;
+-  },
+-  mounted() {
+-    this.el.addEventListener("click", () => this.toggle());
+-  },
+-};
+-
+-// All typed hooks should be assignable to HooksOptions
+-const hooks: HooksOptions = {
+-  Counter: CounterHook,
+-  Canvas: CanvasHook,
+-  Video: VideoHook,
+-};
+-
+-// =============================================================================
+-// Test for issue #3955: Hook<T> with required properties in HooksOptions
+-// https://github.com/phoenixframework/phoenix_live_view/issues/3955
+-//
+-// The fix using Hook<any, any> in HooksOptions allows typed hooks to be
+-// assigned regardless of their specific type parameters.
+-// =============================================================================
+-
+-interface LinksInTab {
+-  tabName: string; // required property
+-  links: string[];
+-}
+-
+-const LinksInTabHook: Hook<LinksInTab> = {
+-  tabName: "",
+-  links: [],
+-  mounted() {
+-    this.tabName = this.el.dataset.tab || "default";
+-    console.log(`Tab ${this.tabName} mounted with ${this.links.length} links`);
+-  },
+-};
+-
+-// This tests that Hook<LinksInTab> (with required properties) can be
+-// assigned to HooksOptions. This was the original issue #3955.
+-const hooksWithRequiredProps: HooksOptions = {
+-  LinksInTab: LinksInTabHook,
+-};
+-
+-export { hooks, hooksWithRequiredProps };
+-
+-// https://github.com/phoenixframework/phoenix_live_view/issues/3913
+-// Checks that custom methods and properties are allowed for a basic Hook.
+-const InfiniteScroll: Hook = {
+-  page() {
+-    return this.el.dataset.page;
+-  },
+-  mounted() {
+-    this.pending = this.page();
+-    window.addEventListener("scroll", () => {
+-      if (this.pending == this.page() && 80 > 90) {
+-        this.pending = this.page() + 1;
+-        this.pushEvent("load-more", {});
+-      }
+-    });
+-  },
+-  updated() {
+-    this.pending = this.page();
+-  },
+-};
+-
+-export { InfiniteScroll };
+-
+-// This file is primarily for compile-time type checking via `npm run typecheck:tests`.
+-// The dummy test below satisfies Jest's requirement for at least one test.
+-test("hook types compile correctly", () => {
+-  expect(hooks).toBeDefined();
+-  expect(hooksWithRequiredProps).toBeDefined();
+-});
+diff --git a/assets/test/integration/portal_test.ts b/assets/test/integration/portal_test.ts
+index 3a3719d9..6783add5 100644
+--- a/assets/test/integration/portal_test.ts
++++ b/assets/test/integration/portal_test.ts
+@@ -51,7 +51,7 @@ describe("Portal handling", () => {
+   test("basic portal teleporting", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // Create HTML with portal template
+     const html = `<div>${createHtmlWithPortal("portal1", "portal-target", "Hello from portal")}</div>`;
+@@ -72,7 +72,7 @@ describe("Portal handling", () => {
+   test("updating portal content", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // First patch to create portal
+     const html1 = `<div>${createHtmlWithPortal("portal1", "portal-target", "Initial content")}</div>`;
+@@ -90,7 +90,7 @@ describe("Portal handling", () => {
+   test("removing portal template removes teleported content", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // First patch to create portal
+     const html1 = `<div>${createHtmlWithPortal("portal1", "portal-target", "Portal content")}</div>`;
+@@ -113,7 +113,7 @@ describe("Portal handling", () => {
+   test("removing parent of portal template removes teleported content", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // First patch - create a parent container with portal inside
+     const html1 = `
+@@ -174,7 +174,7 @@ describe("Portal handling", () => {
+   test("cleans up teleported elements when view is destroyed", () => {
+     const { view, liveSocket } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // Create portal
+     const html = `<div>${createHtmlWithPortal("portal1", "portal-target", "Content")}</div>`;
+@@ -195,7 +195,7 @@ describe("Portal handling", () => {
+   test("handles multiple portals to the same target", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // Create HTML with two portal templates
+     const html = `
+@@ -222,7 +222,7 @@ describe("Portal handling", () => {
+   test("teleported elements are removed if source is removed", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // First patch to create portals
+     const html1 = `
+@@ -254,7 +254,7 @@ describe("Portal handling", () => {
+   test("teleported elements with PHX_SKIP are ignored", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget = document.getElementById("portal-target")!;
++    const portalTarget = document.getElementById("portal-target");
+ 
+     // Create template with skipped content
+     const html = `
+@@ -270,7 +270,7 @@ describe("Portal handling", () => {
+ 
+     // Verify the portal was not teleported because of PHX_SKIP
+     expect(
+-      portalTarget.querySelector("#portal-content-skipped")!.innerHTML,
++      portalTarget.querySelector("#portal-content-skipped").innerHTML,
+     ).toBe("Hello World!");
+ 
+     const html2 = `
+@@ -284,15 +284,15 @@ describe("Portal handling", () => {
+     performPatch(view, content, html2);
+     // PHX_SKIP nodes are skipped
+     expect(
+-      portalTarget.querySelector("#portal-content-skipped")!.innerHTML,
++      portalTarget.querySelector("#portal-content-skipped").innerHTML,
+     ).toBe("Hello World!");
+   });
+ 
+   test("changing target of a portal moves content to new target", () => {
+     const { view } = createViewWithPortal();
+     const content = document.getElementById("content");
+-    const portalTarget1 = document.getElementById("portal-target")!;
+-    const portalTarget2 = document.getElementById("portal-target-2")!;
++    const portalTarget1 = document.getElementById("portal-target");
++    const portalTarget2 = document.getElementById("portal-target-2");
+ 
+     // First patch to create portal with target1
+     const html1 = `<div>${createHtmlWithPortal("portal1", "portal-target", "Portal content")}</div>`;
+diff --git a/assets/test/js_test.ts b/assets/test/js_test.ts
+index 3039ef29..5830a7d4 100644
+--- a/assets/test/js_test.ts
++++ b/assets/test/js_test.ts
+@@ -222,7 +222,7 @@ describe("JS", () => {
+       <div id="click" phx-click='[["toggle", {"to": "#modal"}]]'></div>
+       `);
+       const modal = simulateVisibility(document.querySelector("#modal"));
+-      const click = document.querySelector("#click")!;
++      const click = document.querySelector("#click");
+       let showEndCalled = false;
+       let hideEndCalled = false;
+       let showStartCalled = false;
+@@ -256,7 +256,7 @@ describe("JS", () => {
+       <div id="click" phx-click='[["toggle", {"to": "#modal", "display": "inline-block"}]]'></div>
+       `);
+       const modal = simulateVisibility(document.querySelector("#modal"));
+-      const click = document.querySelector("#click")!;
++      const click = document.querySelector("#click");
+       let showEndCalled = false;
+       let hideEndCalled = false;
+       let showStartCalled = false;
+@@ -289,7 +289,7 @@ describe("JS", () => {
+       <div id="click" phx-click='[["toggle", {"to": "#modal", "ins": [["fade-in"],["fade-in-start"],["fade-in-end"]], "outs": [["fade-out"],["fade-out-start"],["fade-out-end"]]}]]'></div>
+       `);
+       const modal = simulateVisibility(document.querySelector("#modal"));
+-      const click = document.querySelector("#click")!;
++      const click = document.querySelector("#click");
+       let showEndCalled = false;
+       let hideEndCalled = false;
+       let showStartCalled = false;
+@@ -482,7 +482,7 @@ describe("JS", () => {
+       <div id="close" phx-click='[["dispatch", {"to": ".modal", "event": "close", "detail": {"id": 123}}]]'></div>
+       `);
+       let modal1Clicked = false;
+-      const modal1 = document.querySelector("#modal1")!;
++      const modal1 = document.querySelector("#modal1");
+       const modal2 = document.querySelector("#modal2")!;
+       const close = document.querySelector("#close")!;
+ 
+@@ -506,7 +506,7 @@ describe("JS", () => {
+       <div id="click" phx-click='[["dispatch", {"to": "#modal", "event": "custom", "blocking": true}]]'></div>
+       `);
+       let modal = simulateVisibility(document.querySelector("#modal"));
+-      let click = document.querySelector("#click")!;
++      let click = document.querySelector("#click");
+       let doneCalled = false;
+ 
+       modal.addEventListener("custom", (e) => {
+@@ -1008,7 +1008,7 @@ describe("JS", () => {
+       `);
+       const click = document.querySelector("#click")!;
+       view.pushEvent = (eventType, sourceEl, targetCtx, event, meta, opts) => {
+-        expect(opts!.page_loading).toBe(true);
++        expect(opts.page_loading).toBe(true);
+         done();
+       };
+       JS.exec(event, "click", click.getAttribute("phx-click"), view, click);
+diff --git a/assets/test/live_socket_test.ts b/assets/test/live_socket_test.ts
+index 94904c0a..db7fac94 100644
+--- a/assets/test/live_socket_test.ts
++++ b/assets/test/live_socket_test.ts
+@@ -94,12 +94,9 @@ describe("LiveSocket", () => {
+     liveSocket = new LiveSocket("/live", Socket);
+ 
+     liveSocket.connect();
+-    const channel = liveSocket.channel(
+-      "lv:def456",
+-      function (this: { getSession(): string }) {
+-        return { session: this.getSession() };
+-      },
+-    );
++    const channel = liveSocket.channel("lv:def456", function () {
++      return { session: this.getSession() };
++    });
+ 
+     expect(channel).toBeDefined();
+   });
+@@ -174,7 +171,7 @@ describe("LiveSocket", () => {
+   test("getActiveElement default before LiveSocket activeElement is set", async () => {
+     liveSocket = new LiveSocket("/live", Socket);
+ 
+-    const input = document.querySelector("input")!;
++    const input = document.querySelector("input");
+     input.focus();
+ 
+     expect(liveSocket.getActiveElement()).toEqual(input);
+@@ -183,7 +180,7 @@ describe("LiveSocket", () => {
+   test("blurActiveElement", async () => {
+     liveSocket = new LiveSocket("/live", Socket);
+ 
+-    const input = document.querySelector("input")!;
++    const input = document.querySelector("input");
+     input.focus();
+ 
+     expect(liveSocket.prevActive).toBeNull();
+@@ -197,7 +194,7 @@ describe("LiveSocket", () => {
+   test("restorePreviouslyActiveFocus", async () => {
+     liveSocket = new LiveSocket("/live", Socket);
+ 
+-    const input = document.querySelector("input")!;
++    const input = document.querySelector("input");
+     input.focus();
+ 
+     liveSocket.blurActiveElement();
+@@ -216,7 +213,7 @@ describe("LiveSocket", () => {
+ 
+     liveSocket.connect();
+ 
+-    const input = document.querySelector("input")!;
++    const input = document.querySelector("input");
+     input.focus();
+     liveSocket.blurActiveElement();
+     expect(liveSocket.prevActive).toEqual(input);
+diff --git a/assets/test/test_helpers.ts b/assets/test/test_helpers.ts
+index 3732a8ac..7ea24ba4 100644
+--- a/assets/test/test_helpers.ts
++++ b/assets/test/test_helpers.ts
+@@ -57,12 +57,10 @@ export const simulateVisibility = (el) => {
+   return el;
+ };
+ 
+-export const stubChannel = (view: View) => {
++export const stubChannel = (view) => {
+   const fakePush = {
+-    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+-    receives: [] as [string, Function][],
+-    // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+-    receive(kind: string, cb: Function) {
++    receives: [],
++    receive(kind, cb) {
+       this.receives.push([kind, cb]);
+       return this;
+     },
+diff --git a/assets/test/tsconfig.json b/assets/test/tsconfig.json
+index 85be778d..60e67ca8 100644
+--- a/assets/test/tsconfig.json
++++ b/assets/test/tsconfig.json
+@@ -6,8 +6,6 @@
+     "checkJs": false,
+     "resolveJsonModule": true,
+     "baseUrl": ".",
+-    "strict": true,
+-    "noImplicitAny": false,
+     "paths": {
+       "phoenix_live_view": ["../js/phoenix_live_view/index.ts"],
+       "phoenix_live_view*": ["../js/phoenix_live_view/*"]
+diff --git a/assets/test/view_test.ts b/assets/test/view_test.ts
+index 91292bf7..58607fed 100644
+--- a/assets/test/view_test.ts
++++ b/assets/test/view_test.ts
+@@ -3,7 +3,7 @@ import { createHook } from "phoenix_live_view/index";
+ import LiveSocket from "phoenix_live_view/live_socket";
+ import DOM from "phoenix_live_view/dom";
+ import View from "phoenix_live_view/view";
+-import ViewHook, { HooksOptions } from "phoenix_live_view/view_hook";
++import ViewHook from "phoenix_live_view/view_hook";
+ 
+ import { version as liveview_version } from "../../package.json";
+ 
+@@ -58,13 +58,13 @@ describe("View + DOM", function () {
+     view.update(updateDiff, []);
+ 
+     expect(view.el.firstChild.tagName).toBe("H2");
+-    expect(view.rendered!.get()).toEqual(updateDiff);
++    expect(view.rendered.get()).toEqual(updateDiff);
+   });
+ 
+   test("applyDiff with empty title uses default if present", async () => {
+     appendTitle({}, "Foo");
+ 
+-    const titleEl = document.querySelector("title")!;
++    const titleEl = document.querySelector("title");
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+     const updateDiff = {
+@@ -79,7 +79,7 @@ describe("View + DOM", function () {
+     );
+ 
+     expect(view.el.firstChild.tagName).toBe("H2");
+-    expect(view.rendered!.get()).toEqual(updateDiff);
++    expect(view.rendered.get()).toEqual(updateDiff);
+ 
+     await new Promise(requestAnimationFrame);
+     expect(document.title).toBe("Foo");
+@@ -94,7 +94,7 @@ describe("View + DOM", function () {
+   test("applyDiff with empty title does not use default for non-main views", async () => {
+     appendTitle({}, "Foo");
+ 
+-    const titleEl = document.querySelector("title")!;
++    const titleEl = document.querySelector("title");
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+     const updateDiff = {
+@@ -110,7 +110,7 @@ describe("View + DOM", function () {
+     );
+ 
+     expect(view.el.firstChild.tagName).toBe("H2");
+-    expect(view.rendered!.get()).toEqual(updateDiff);
++    expect(view.rendered.get()).toEqual(updateDiff);
+ 
+     await new Promise(requestAnimationFrame);
+     expect(document.title).toBe("Foo");
+@@ -260,7 +260,7 @@ describe("View + DOM", function () {
+ 
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+-    const input: HTMLInputElement = el.querySelector('input[type="checkbox"]')!;
++    const input: HTMLInputElement = el.querySelector('input[type="checkbox"]');
+     const view = simulateJoinedView(el, liveSocket);
+ 
+     input.checked = true;
+@@ -292,7 +292,7 @@ describe("View + DOM", function () {
+ 
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+-    const input: HTMLInputElement = el.querySelector('input[type="checkbox"]')!;
++    const input: HTMLInputElement = el.querySelector('input[type="checkbox"]');
+     const view = simulateJoinedView(el, liveSocket);
+ 
+     input.value = "1";
+@@ -325,7 +325,7 @@ describe("View + DOM", function () {
+ 
+     const liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+-    const input = el.querySelector("input")!;
++    const input = el.querySelector("input");
+     simulateUsedInput(input);
+     const view = simulateJoinedView(el, liveSocket);
+     const channelStub = {
+@@ -366,7 +366,7 @@ describe("View + DOM", function () {
+         <button phx-click="inc_temperature">Inc Temperature</button>
+       </form>
+     `);
+-    const input = el.querySelector("input")!;
++    const input = el.querySelector("input");
+     simulateUsedInput(input);
+     const view = simulateJoinedView(el, liveSocket);
+     const channelStub = {
+@@ -402,7 +402,7 @@ describe("View + DOM", function () {
+ 
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+-    const input = el.querySelector("input")!;
++    const input = el.querySelector("input");
+     input.removeAttribute("name");
+     simulateUsedInput(input);
+     const view = simulateJoinedView(el, liveSocket);
+@@ -576,7 +576,7 @@ describe("View + DOM", function () {
+     ) {
+       const liveSocket = new LiveSocket("/live", Socket);
+       const el = liveViewDOM();
+-      const form = el.querySelector("form")!;
++      const form = el.querySelector("form");
+       if (appendTo) {
+         appendTo.appendChild(btn);
+       } else {
+@@ -604,7 +604,7 @@ describe("View + DOM", function () {
+     test("disables elements after submission", function () {
+       const liveSocket = new LiveSocket("/live", Socket);
+       const el = liveViewDOM();
+-      const form = el.querySelector("form")!;
++      const form = el.querySelector("form");
+ 
+       const view = simulateJoinedView(el, liveSocket);
+       stubChannel(view);
+@@ -615,9 +615,9 @@ describe("View + DOM", function () {
+         expect(DOM.private(input, "phx-has-submitted")).toBeTruthy();
+       });
+       expect(form.classList.contains("phx-submit-loading")).toBeTruthy();
+-      expect(form.querySelector("button")!.dataset.phxDisabled).toBeTruthy();
+-      expect(form.querySelector("input")!.dataset.phxReadonly).toBeTruthy();
+-      expect(form.querySelector("textarea")!.dataset.phxReadonly).toBeTruthy();
++      expect(form.querySelector("button").dataset.phxDisabled).toBeTruthy();
++      expect(form.querySelector("input").dataset.phxReadonly).toBeTruthy();
++      expect(form.querySelector("textarea").dataset.phxReadonly).toBeTruthy();
+     });
+ 
+     test("disables elements outside form", function () {
+@@ -631,7 +631,7 @@ describe("View + DOM", function () {
+       <input type="checkbox" phx-click="toggle_me" form="my-form"/>
+       <button phx-click="inc_temperature" form="my-form">Inc Temperature</button>
+       `);
+-      const form = el.querySelector("form")!;
++      const form = el.querySelector("form");
+ 
+       const view = simulateJoinedView(el, liveSocket);
+       stubChannel(view);
+@@ -639,9 +639,9 @@ describe("View + DOM", function () {
+       view.submitForm(form, form, { target: form });
+       expect(DOM.private(form, "phx-has-submitted")).toBeTruthy();
+       expect(form.classList.contains("phx-submit-loading")).toBeTruthy();
+-      expect(el.querySelector("button")!.dataset.phxDisabled).toBeTruthy();
+-      expect(el.querySelector("input")!.dataset.phxReadonly).toBeTruthy();
+-      expect(el.querySelector("textarea")!.dataset.phxReadonly).toBeTruthy();
++      expect(el.querySelector("button").dataset.phxDisabled).toBeTruthy();
++      expect(el.querySelector("input").dataset.phxReadonly).toBeTruthy();
++      expect(el.querySelector("textarea").dataset.phxReadonly).toBeTruthy();
+     });
+ 
+     test("disables elements", function () {
+@@ -649,7 +649,7 @@ describe("View + DOM", function () {
+       const el = liveViewDOM(`
+       <button phx-click="inc" phx-disable-with>+</button>
+       `);
+-      const button = el.querySelector("button")!;
++      const button = el.querySelector("button");
+ 
+       const view = simulateJoinedView(el, liveSocket);
+       stubChannel(view);
+@@ -714,11 +714,11 @@ describe("View + DOM", function () {
+ 
+   describe("phx-update", function () {
+     const childIds = () =>
+-      Array.from(document.getElementById("list")!.children).map((child) =>
++      Array.from(document.getElementById("list").children).map((child) =>
+         parseInt(child.id),
+       );
+     const countChildNodes = () =>
+-      document.getElementById("list")!.childNodes.length;
++      document.getElementById("list").childNodes.length;
+ 
+     const createView = (updateType, initialEntries) => {
+       const liveSocket = new LiveSocket("/live", Socket);
+@@ -1178,7 +1178,7 @@ describe("View", function () {
+ 
+   test("showLoader and hideLoader", async () => {
+     liveSocket = new LiveSocket("/live", Socket);
+-    const el = document.querySelector("[data-phx-session]")!;
++    const el = document.querySelector("[data-phx-session]");
+ 
+     const view = simulateJoinedView(el, liveSocket);
+     view.showLoader();
+@@ -1195,10 +1195,10 @@ describe("View", function () {
+     jest.useFakeTimers();
+     liveSocket = new LiveSocket("/live", Socket);
+     const loader = document.createElement("span");
+-    const phxView = document.querySelector("[data-phx-session]")!;
+-    phxView.parentNode!.insertBefore(loader, phxView.nextSibling);
+-    const el = document.querySelector("[data-phx-session]")!;
+-    const status: HTMLElement = el.querySelector("#status")!;
++    const phxView = document.querySelector("[data-phx-session]");
++    phxView.parentNode.insertBefore(loader, phxView.nextSibling);
++    const el = document.querySelector("[data-phx-session]");
++    const status: HTMLElement = el.querySelector("#status");
+ 
+     const view = simulateJoinedView(el, liveSocket);
+ 
+@@ -1306,7 +1306,7 @@ describe("View Hooks", function () {
+       liveview_version,
+     });
+     window.requestAnimationFrame(() => {
+-      expect(document.getElementById("test")!.getAttribute("class")).toBe(
++      expect(document.getElementById("test").getAttribute("class")).toBe(
+         "new-class",
+       );
+       view.update(
+@@ -1320,10 +1320,10 @@ describe("View Hooks", function () {
+         [],
+       );
+       window.requestAnimationFrame(() => {
+-        expect(document.getElementById("test")!.getAttribute("class")).toBe(
++        expect(document.getElementById("test").getAttribute("class")).toBe(
+           "new-class",
+         );
+-        expect(document.getElementById("test2")!.getAttribute("class")).toBe(
++        expect(document.getElementById("test2").getAttribute("class")).toBe(
+           "new-class2",
+         );
+         done();
+@@ -1335,7 +1335,7 @@ describe("View Hooks", function () {
+     let upcaseWasDestroyed = false;
+     let upcaseBeforeUpdate = false;
+     let hookLiveSocket;
+-    const Hooks = <HooksOptions>{
++    const Hooks = {
+       Upcase: {
+         mounted() {
+           hookLiveSocket = this.liveSocket;
+@@ -1465,7 +1465,7 @@ describe("View Hooks", function () {
+     customElements.define(
+       "custom-el",
+       class extends HTMLElement {
+-        hook!: ViewHook;
++        hook: ViewHook;
+         connectedCallback() {
+           this.hook = createHook(this, {
+             mounted: () => {
+@@ -1473,8 +1473,7 @@ describe("View Hooks", function () {
+               done();
+             },
+           });
+-          // Before mounting, accessing liveSocket throws (hook not yet attached to a live view)
+-          expect(() => this.hook.liveSocket).toThrow();
++          expect(this.hook.liveSocket).toBe(null);
+         }
+       },
+     );
+@@ -1484,8 +1483,8 @@ describe("View Hooks", function () {
+   });
+ 
+   test("view destroyed", async () => {
+-    const values: Array<string> = [];
+-    const Hooks = <HooksOptions>{
++    const values = [];
++    const Hooks = {
+       Check: {
+         destroyed() {
+           values.push("destroyed");
+@@ -1512,9 +1511,9 @@ describe("View Hooks", function () {
+   });
+ 
+   test("view reconnected", async () => {
+-    const values: Array<string> = [];
++    const values = [];
+     const Hooks = {
+-      Check: <HooksOptions>{
++      Check: {
+         mounted() {
+           values.push("mounted");
+         },
+@@ -1617,16 +1616,16 @@ describe("View Hooks", function () {
+ 
+   test("can overwrite property", async () => {
+     let customHandleEventCalled = false;
+-    const Hooks = <HooksOptions>{
++    const Hooks = {
+       Upcase: {
+         mounted() {
+-          this.handleEvent = jest
+-            .fn()
+-            .mockImplementation(() => (customHandleEventCalled = true));
++          this.handleEvent = () => {
++            customHandleEventCalled = true;
++          };
+           this.el.innerHTML = this.el.innerHTML.toUpperCase();
+         },
+         updated() {
+-          this.handleEvent("foo", () => {});
++          this.handleEvent();
+         },
+       },
+     };
+@@ -1785,7 +1784,6 @@ describe("View + Component", function () {
+     );
+     const channelStub = {
+       validate: "",
+-      meta: null,
+       nextValidate(payload, meta) {
+         this.meta = meta;
+         this.validate = Object.entries(payload)
+@@ -2033,11 +2031,11 @@ describe("View + Component", function () {
+ 
+       view.undoRefs(1);
+ 
+-      expect(el.querySelector("#myhook")!.outerHTML).toBe(
++      expect(el.querySelector("#myhook").outerHTML).toBe(
+         '<span id="myhook" phx-hook="MyHook" data-phx-ref-src="container" data-phx-ref-lock="2" data-phx-ref-loading="1">Hello</span>',
+       );
+       view.undoRefs(2);
+-      expect(el.querySelector("#myhook")!.outerHTML).toBe(
++      expect(el.querySelector("#myhook").outerHTML).toBe(
+         '<span id="myhook" phx-hook="MyHook">world</span>',
+       );
+       expect(beforeUpdate).toBe(true);
+diff --git a/jest.config.js b/jest.config.js
+index 9be3c008..9e5c15a1 100644
+--- a/jest.config.js
++++ b/jest.config.js
+@@ -129,9 +129,9 @@ export default {
+   // rootDir: undefined,
+ 
+   // A list of paths to directories that Jest should use to search for files in
+-  roots: [
+-    "<rootDir>/assets/test"
+-  ],
++  // roots: [
++  //   "<rootDir>"
++  // ],
+ 
+   // Allows you to use a custom runner instead of Jest's default test runner
+   // runner: "jest-runner",

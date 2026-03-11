@@ -1,0 +1,7 @@
+PostgREST silently ignores restricted PostgreSQL system schemas when they are included in the `db-schemas` configuration, specifically `pg_catalog` and `information_schema`. This can lead to confusing behavior: a user may explicitly list one of these schemas in `db-schemas` expecting it to be exposed, but requests targeting those schemas fail (or behave as if the schema is unavailable) with no clear explanation.
+
+When PostgREST starts up, it should detect if `db-schemas` contains either `pg_catalog` or `information_schema` and emit an error-level log message indicating that these schemas are restricted and will not be exposed even if configured. The message should be produced during startup/config initialization (not only upon first request), and it should cover both schemas individually if both are present.
+
+Expected behavior: Starting PostgREST with `db-schemas` containing `pg_catalog` and/or `information_schema` results in normal startup, but an error is logged explaining that these schemas are not allowed and are ignored for API exposure.
+
+Actual behavior: PostgREST starts without any warning/error log about the restricted schemas, and users only discover the restriction indirectly when requests to objects in those schemas do not work.

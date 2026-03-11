@@ -1,0 +1,5131 @@
+diff --git a/lib/phoenix_component/macro_component.ex b/lib/phoenix_component/macro_component.ex
+index 5c93cb00..29aecd67 100644
+--- a/lib/phoenix_component/macro_component.ex
++++ b/lib/phoenix_component/macro_component.ex
+@@ -151,90 +151,123 @@ defmodule Phoenix.Component.MacroComponent do
+   end
+ 
+   @doc false
+-  def build_ast([{:tag, name, attrs, tag_meta} | rest], env) do
+-    if closing = tag_meta[:closing] do
+-      # we assert here because we don't expect any other values
+-      true = closing in [:self, :void]
++  def build_ast(node, env) when is_tuple(node) do
++    case node do
++      {:self_close, :tag, name, attrs, meta} ->
++        closing_meta = Map.take(meta, [:closing])
++        {:ok, {name, attrs_to_ast(attrs, env), [], closing_meta}}
++
++      {:block, :tag, name, attrs, children, _meta, _close_meta} ->
++        children_ast = build_ast(children, env)
++        {:ok, {name, attrs_to_ast(attrs, env), children_ast, %{}}}
+     end
+-
+-    meta = Map.take(tag_meta, [:closing])
+-    build_ast(rest, [], [{name, token_attrs_to_ast(attrs, env), meta}], env)
++  catch
++    {:ast_error, message, error_meta} ->
++      {:error, message, error_meta}
+   end
+ 
+-  # recursive case: build_ast(tokens, acc, stack)
++  def build_ast(children, env) when is_list(children) do
++    Enum.map(children, fn
++      {:text, text, _meta} ->
++        text
+ 
+-  # closing for final stack element -> done!
+-  defp build_ast([{:close, :tag, _, _} | rest], acc, [{tag_name, attrs, meta}], _env) do
+-    {:ok, {tag_name, attrs, Enum.reverse(acc), meta}, rest}
+-  end
++      {:self_close, :tag, name, attrs, meta} ->
++        closing_meta = Map.take(meta, [:closing])
++        {name, attrs_to_ast(attrs, env), [], closing_meta}
+ 
+-  # tag open (self closing or void)
+-  defp build_ast([{:tag, name, attrs, %{closing: type}} | rest], acc, stack, env)
+-       when type in [:self, :void] do
+-    acc = [{name, token_attrs_to_ast(attrs, env), [], %{closing: type}} | acc]
+-    build_ast(rest, acc, stack, env)
+-  end
++      {:block, :tag, name, attrs, nested_children, _meta, _close_meta} ->
++        {name, attrs_to_ast(attrs, env), build_ast(nested_children, env), %{}}
+ 
+-  # tag open
+-  defp build_ast([{:tag, name, attrs, _tag_meta} | rest], acc, stack, env) do
+-    build_ast(rest, [], [{name, token_attrs_to_ast(attrs, env), %{}, acc} | stack], env)
+-  end
++      {:self_close, type, _name, _attrs, meta}
++      when type in [:local_component, :remote_component] ->
++        throw({:ast_error, "function components cannot be nested inside a macro component", meta})
+ 
+-  # tag close
+-  defp build_ast(
+-         [{:close, :tag, name, _tag_meta} | tokens],
+-         acc,
+-         [{name, attrs, meta, prev_acc} | stack],
+-         env
+-       ) do
+-    build_ast(tokens, [{name, attrs, Enum.reverse(acc), meta} | prev_acc], stack, env)
+-  end
++      {:block, type, _name, _attrs, _children, meta, _close_meta}
++      when type in [:local_component, :remote_component] ->
++        throw({:ast_error, "function components cannot be nested inside a macro component", meta})
+ 
+-  # text
+-  defp build_ast([{:text, text, _meta} | rest], acc, stack, env) do
+-    build_ast(rest, [text | acc], stack, env)
+-  end
++      {:self_close, :slot, _name, _attrs, meta} ->
++        throw({:ast_error, "slots cannot be nested inside a macro component", meta})
+ 
+-  # unsupported token
+-  defp build_ast([{type, _name, _attrs, meta} | _tokens], _acc, _stack, _env)
+-       when type in [:local_component, :remote_component] do
+-    {:error, "function components cannot be nested inside a macro component", meta}
+-  end
++      {:block, :slot, _name, _attrs, _children, meta, _close_meta} ->
++        throw({:ast_error, "slots cannot be nested inside a macro component", meta})
+ 
+-  defp build_ast([{:expr, _, _} | _], _acc, _stack, _env) do
+-    # we raise here because we don't have a meta map (line + column) available
+-    raise ArgumentError, "EEx is not currently supported in macro components"
+-  end
++      {:body_expr, _expr, meta} ->
++        throw({:ast_error, "interpolation is not currently supported in macro components", meta})
+ 
+-  defp build_ast([{:body_expr, _, meta} | _], _acc, _stack, _env) do
+-    {:error, "interpolation is not currently supported in macro components", meta}
++      {:eex, _expr, meta} ->
++        throw({:ast_error, "EEx is not currently supported in macro components", meta})
++
++      {:eex_block, _expr, _blocks, meta} ->
++        throw({:ast_error, "EEx is not currently supported in macro components", meta})
++    end)
+   end
+ 
+-  defp token_attrs_to_ast(attrs, env) do
+-    Enum.map(attrs, fn {name, value, _meta} ->
++  defp attrs_to_ast(attrs, env) do
++    Enum.map(attrs, fn
+       # for now, we don't support root expressions (<div {@foo}>)
+-      if name == :root do
++      {:root, value, attr_meta} ->
+         format_attr = fn
+           {:string, binary, _meta} -> binary
+           {:expr, code, _meta} -> code
+           nil -> "nil"
+         end
+ 
+-        raise ArgumentError,
+-              "dynamic attributes are not supported in macro components, got: #{format_attr.(value)}"
+-      end
++        throw(
++          {:ast_error,
++           "dynamic attributes are not supported in macro components, got: #{format_attr.(value)}",
++           attr_meta}
++        )
+ 
+-      case value do
+-        {:string, binary, _meta} ->
+-          {name, binary}
++      {name, {:string, binary, _meta}, _attr_meta} ->
++        {name, binary}
+ 
+-        {:expr, code, meta} ->
+-          ast = Code.string_to_quoted!(code, line: meta.line, column: meta.column, file: env.file)
+-          {name, ast}
++      {name, {:expr, code, expr_meta}, _attr_meta} ->
++        ast =
++          Code.string_to_quoted!(code,
++            line: expr_meta.line,
++            column: expr_meta.column,
++            file: env.file
++          )
+ 
+-        nil ->
+-          {name, nil}
+-      end
++        {name, ast}
++
++      {name, nil, _attr_meta} ->
++        {name, nil}
++    end)
++  end
++
++  @doc false
++  # Convert macro AST back to tree nodes (parser format)
++  # We keep reuse the original line + column metadata from the original tag
++  def ast_to_tree({tag, attrs, [], %{closing: _closing} = meta}, original_meta) do
++    tree_attrs = attrs_to_tree(attrs, original_meta)
++    {:self_close, :tag, tag, tree_attrs, Map.merge(original_meta, meta)}
++  end
++
++  def ast_to_tree({tag, attrs, children, _meta}, original_meta) do
++    tree_attrs = attrs_to_tree(attrs, original_meta)
++    tree_children = Enum.map(children, &ast_to_tree(&1, original_meta))
++    {:block, :tag, tag, tree_attrs, tree_children, original_meta, %{}}
++  end
++
++  def ast_to_tree(text, _original_meta) when is_binary(text) do
++    {:text, text, %{}}
++  end
++
++  defp attrs_to_tree(attrs, meta) do
++    Enum.map(attrs, fn
++      {name, nil} ->
++        {name, nil, meta}
++
++      {name, value} when is_binary(value) ->
++        delimiter = attr_quotes(name, value)
++        {name, {:string, value, Map.put(meta, :delimiter, delimiter)}, meta}
++
++      {name, ast} ->
++        # Convert quoted AST back to string for the tree node format
++        code = Macro.to_string(ast)
++        {name, {:expr, code, meta}, meta}
+     end)
+   end
+ 
+@@ -307,14 +340,23 @@ defmodule Phoenix.Component.MacroComponent do
+     end)
+   end
+ 
+-  @doc false
+-  def encode_binary_attribute(key, value) when is_binary(key) and is_binary(value) do
++  defp encode_binary_attribute(key, value) when is_binary(key) and is_binary(value) do
++    case attr_quotes(key, value) do
++      ?" ->
++        ~s( #{key}="#{value}")
++
++      ?' ->
++        ~s( #{key}='#{value}')
++    end
++  end
++
++  defp attr_quotes(key, value) do
+     case {:binary.match(value, ~s["]), :binary.match(value, "'")} do
+       {:nomatch, _} ->
+-        ~s( #{key}="#{value}")
++        ?"
+ 
+       {_, :nomatch} ->
+-        ~s( #{key}='#{value}')
++        ?'
+ 
+       _ ->
+         raise ArgumentError, """
+diff --git a/lib/phoenix_live_view/html_algebra.ex b/lib/phoenix_live_view/html_algebra.ex
+index 9a2aca12..fed28b5b 100644
+--- a/lib/phoenix_live_view/html_algebra.ex
++++ b/lib/phoenix_live_view/html_algebra.ex
+@@ -173,11 +173,11 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+     end
+   end
+ 
+-  defp tag_block?({:tag_block, _, _, _, _}), do: true
++  defp tag_block?({:block, _, _, _, _, _, _}), do: true
+   defp tag_block?(_node), do: false
+ 
+-  defp tag?({:tag_block, _, _, _, _}), do: true
+-  defp tag?({:tag_self_close, _, _}), do: true
++  defp tag?({:block, _, _, _, _, _, _}), do: true
++  defp tag?({:self_close, _, _, _, _}), do: true
+   defp tag?(_node), do: false
+ 
+   defp text?({:text, _, _}), do: true
+@@ -195,7 +195,7 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+ 
+   defp text_ends_with_space?(_node), do: false
+ 
+-  defp block_preserve?({:tag_block, _, _, _, %{mode: :preserve}}), do: true
++  defp block_preserve?({:block, _, _, _, _, %{mode: :preserve}, _}), do: true
+   defp block_preserve?({:body_expr, _, _}), do: true
+   defp block_preserve?({:eex, _, _}), do: true
+   defp block_preserve?(_node), do: false
+@@ -208,7 +208,11 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+     {:block, group(nest(children, :reset))}
+   end
+ 
+-  defp to_algebra({:tag_block, name, attrs, block, meta}, context) when name in @languages do
++  defp to_algebra(
++         {:block, _type, _name, attrs, block, %{tag_name: name} = meta, _close_meta},
++         context
++       )
++       when name in @languages do
+     children = block_to_algebra(block, %{context | mode: :preserve})
+ 
+     # Convert the whole block to text as there are no
+@@ -253,7 +257,10 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+     {:block, group}
+   end
+ 
+-  defp to_algebra({:tag_block, name, attrs, block, meta}, %{mode: :preserve} = context) do
++  defp to_algebra(
++         {:block, _type, _name, attrs, block, %{tag_name: name} = meta, _close_meta},
++         %{mode: :preserve} = context
++       ) do
+     children = block_to_algebra(block, context)
+ 
+     children =
+@@ -270,11 +277,14 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+     {:inline, tag}
+   end
+ 
+-  defp to_algebra({:tag_block, _name, _attrs, _block, %{mode: :preserve}} = doc, context) do
++  defp to_algebra(
++         {:block, _type, _name, _attrs, _block, %{mode: :preserve}, _close_meta} = doc,
++         context
++       ) do
+     to_algebra(doc, %{context | mode: :preserve})
+   end
+ 
+-  defp to_algebra({:tag_block, name, attrs, block, _meta}, context) do
++  defp to_algebra({:block, _type, _name, attrs, block, %{tag_name: name}, _close_meta}, context) do
+     inline? = inline?(name, context)
+     {block, force_newline?} = trim_block_newlines(block, inline?)
+     inline? = inline? and not force_newline?
+@@ -304,7 +314,7 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+     end
+   end
+ 
+-  defp to_algebra({:tag_self_close, name, attrs}, context) do
++  defp to_algebra({:self_close, _type, _name, attrs, %{tag_name: name}}, context) do
+     doc =
+       concat([
+         "<#{name}",
+@@ -318,7 +328,7 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+   # Handle EEX blocks within preserve tags
+   defp to_algebra({:eex_block, expr, block, meta}, %{mode: :preserve} = context) do
+     doc =
+-      Enum.reduce(block, empty(), fn {block, expr}, doc ->
++      Enum.reduce(block, empty(), fn {block, expr, _clause_meta}, doc ->
+         children = block_to_algebra(block, context)
+         expr = "<% #{expr} %>"
+         concat([doc, children, expr])
+@@ -330,7 +340,7 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+   # Handle EEX blocks
+   defp to_algebra({:eex_block, expr, block, meta}, context) do
+     {doc, _stab} =
+-      Enum.reduce(block, {empty(), false}, fn {block, expr}, {doc, stab?} ->
++      Enum.reduce(block, {empty(), false}, fn {block, expr, _clause_meta}, {doc, stab?} ->
+         {block, _force_newline?} = trim_block_newlines(block, false)
+         {next_doc, stab?} = eex_block_to_algebra(expr, block, stab?, context)
+         {concat(doc, force_unfit(next_doc)), stab?}
+@@ -529,8 +539,8 @@ defmodule Phoenix.LiveView.HTMLAlgebra do
+ 
+   # Handle EEx clauses
+   #
+-  # {[], "something ->"}
+-  # {[{:tag_block, "p", [], [text: "do something"]}], "else"}
++  # {[], "something ->", %{...}}
++  # {[{:block, :tag, "p", [], [...], %{...}, %{...}}], "else", %{...}}
+   defp eex_block_to_algebra(expr, block, stab?, context) when is_list(block) do
+     indent = if stab?, do: 4, else: 2
+ 
+diff --git a/lib/phoenix_live_view/html_engine.ex b/lib/phoenix_live_view/html_engine.ex
+index f115e655..f00cbbcb 100644
+--- a/lib/phoenix_live_view/html_engine.ex
++++ b/lib/phoenix_live_view/html_engine.ex
+@@ -22,15 +22,16 @@ defmodule Phoenix.LiveView.HTMLEngine do
+     trim = Application.get_env(:phoenix, :trim_on_html_eex_engine, true)
+     source = File.read!(path)
+ 
+-    EEx.compile_string(source,
+-      engine: Phoenix.LiveView.TagEngine,
+-      line: 1,
++    options = [
++      engine: Phoenix.LiveView.Engine,
+       file: path,
+-      trim: trim,
++      line: 1,
+       caller: __CALLER__,
+-      source: source,
+-      tag_handler: __MODULE__
+-    )
++      tag_handler: __MODULE__,
++      trim: trim
++    ]
++
++    Phoenix.LiveView.TagEngine.compile(source, options)
+   end
+ 
+   @behaviour Phoenix.LiveView.TagEngine
+diff --git a/lib/phoenix_live_view/html_formatter.ex b/lib/phoenix_live_view/html_formatter.ex
+index 1ef10761..c7eb34d1 100644
+--- a/lib/phoenix_live_view/html_formatter.ex
++++ b/lib/phoenix_live_view/html_formatter.ex
+@@ -269,11 +269,8 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+   require Logger
+ 
+   alias Phoenix.LiveView.HTMLAlgebra
+-  alias Phoenix.LiveView.Tokenizer
+-  alias Phoenix.LiveView.Tokenizer.ParseError
+-
+-  defguard is_tag_open(tag_type)
+-           when tag_type in [:slot, :remote_component, :local_component, :tag]
++  alias Phoenix.LiveView.TagEngine.Parser
++  alias Phoenix.LiveView.TagEngine.Tokenizer.ParseError
+ 
+   # Default line length to be used in case nothing is specified in the `.formatter.exs` options.
+   @default_line_length 98
+@@ -307,11 +304,17 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+ 
+       formatted =
+         source
+-        |> tokenize()
+-        |> to_tree([], [], %{source: {source, newlines}})
++        |> Parser.parse(
++          tag_handler: Phoenix.LiveView.HTMLEngine,
++          file: "nofile",
++          skip_macro_components: true,
++          prune_text_after_slots: false,
++          process_buffer: &process_buffer/1
++        )
+         |> case do
+           {:ok, nodes} ->
+             nodes
++            |> transform_tree(source, newlines)
+             |> HTMLAlgebra.build(opts)
+             |> Inspect.Algebra.format(line_length)
+ 
+@@ -331,331 +334,182 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+     end
+   end
+ 
+-  # Tokenize contents using EEx.tokenize and Phoenix.Live.Tokenizer respectively.
+-  #
+-  # The following content:
+-  #
+-  # "<section>\n  <p><%= user.name ></p>\n  <%= if true do %> <p>this</p><% else %><p>that</p><% end %>\n</section>\n"
+-  #
+-  # Will be tokenized as:
+-  #
+-  # [
+-  #   {:tag, "section", [], %{column: 1, line: 1}},
+-  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
+-  #   {:tag, "p", [], %{column: 3, line: 2}},
+-  #   {:eex_tag_render, "<%= user.name ></p>\n  <%= if true do %>", %{block?: true, column: 6, line: 1}},
+-  #   {:text, " ", %{column_end: 2, line_end: 1}},
+-  #   {:tag, "p", [], %{column: 2, line: 1}},
+-  #   {:text, "this", %{column_end: 12, line_end: 1}},
+-  #   {::close, :tag, "p", %{column: 12, line: 1}},
+-  #   {:eex_tag, "<% else %>", %{block?: false, column: 35, line: 2}},
+-  #   {:tag, "p", [], %{column: 1, line: 1}},
+-  #   {:text, "that", %{column_end: 14, line_end: 1}},
+-  #   {::close, :tag, "p", %{column: 14, line: 1}},
+-  #   {:eex_tag, "<% end %>", %{block?: false, column: 62, line: 2}},
+-  #   {:text, "\n", %{column_end: 1, line_end: 2}},
+-  #   {::close, :tag, "section", %{column: 1, line: 2}}
+-  # ]
+-  #
+-  @eex_expr [:start_expr, :expr, :end_expr, :middle_expr]
+-
+-  defp tokenize(source) do
+-    {:ok, eex_nodes} = EEx.tokenize(source)
+-    {tokens, cont} = Enum.reduce(eex_nodes, {[], {:text, :enabled}}, &do_tokenize(&1, &2, source))
+-    Tokenizer.finalize(tokens, "nofile", cont, source)
++  # Buffer processing callback for Parser - handles preserve mode propagation and text metadata
++  defp process_buffer([{:text, text, meta} | rest]) do
++    rest = may_set_preserve_on_block(rest, text)
++
++    meta =
++      meta
++      |> Map.put_new(:newlines_before_text, count_newlines_before_text(text))
++      |> Map.put_new(:newlines_after_text, count_newlines_after_text(text))
++
++    [{:text, text, meta} | rest]
+   end
+ 
+-  defp do_tokenize({:text, text, meta}, {tokens, cont}, source) do
+-    text = List.to_string(text)
+-    meta = [line: meta.line, column: meta.column]
+-    state = Tokenizer.init(0, "nofile", source, Phoenix.LiveView.HTMLEngine)
+-    Tokenizer.tokenize(text, meta, tokens, cont, state)
++  defp process_buffer([{:body_expr, _, _} = node | rest]) do
++    [node | set_preserve_on_block(rest)]
+   end
+ 
+-  defp do_tokenize({:comment, text, meta}, {tokens, cont}, _contents) do
+-    {[{:eex_comment, List.to_string(text), meta} | tokens], cont}
++  defp process_buffer([{:eex, _, _} = node | rest]) do
++    [node | set_preserve_on_block(rest)]
+   end
+ 
+-  defp do_tokenize({type, opt, expr, %{column: column, line: line}}, {tokens, cont}, _contents)
+-       when type in @eex_expr do
+-    meta = %{opt: opt, line: line, column: column}
+-    {[{:eex, type, expr |> List.to_string() |> String.trim(), meta} | tokens], cont}
++  defp process_buffer(buffer), do: buffer
++
++  # In case the closing tag is immediately followed by non-whitespace text,
++  # we want to set mode as preserve.
++  defp may_set_preserve_on_block(
++         [{:block, type, name, attrs, block, meta, close_meta} | rest],
++         text
++       ) do
++    mode =
++      if String.trim_leading(text) != "" and :binary.first(text) not in ~c"\s\t\n\r" do
++        :preserve
++      else
++        Map.get(meta, :mode, :normal)
++      end
++
++    [{:block, type, name, attrs, block, Map.put(meta, :mode, mode), close_meta} | rest]
+   end
+ 
+-  defp do_tokenize(_node, acc, _contents) do
+-    acc
++  defp may_set_preserve_on_block(buffer, _text), do: buffer
++
++  # Set preserve on block when it is immediately followed by interpolation.
++  defp set_preserve_on_block([{:block, type, name, attrs, block, meta, close_meta} | rest]) do
++    [{:block, type, name, attrs, block, Map.put(meta, :mode, :preserve), close_meta} | rest]
+   end
+ 
+-  # Build an HTML Tree according to the tokens from the EEx and HTML tokenizers.
+-  #
+-  # This is a recursive algorithm that will build an HTML tree from a flat list of
+-  # tokens. For instance, given this input:
+-  #
+-  # [
+-  #   {:tag, "div", [], %{column: 1, line: 1}},
+-  #   {:tag, "h1", [], %{column: 6, line: 1}},
+-  #   {:text, "Hello", %{column_end: 15, line_end: 1}},
+-  #   {::close, :tag, "h1", %{column: 15, line: 1}},
+-  #   {::close, :tag, "div", %{column: 20, line: 1}},
+-  #   {:tag, "div", [], %{column: 1, line: 2}},
+-  #   {:tag, "h1", [], %{column: 6, line: 2}},
+-  #   {:text, "World", %{column_end: 15, line_end: 2}},
+-  #   {::close, :tag, "h1", %{column: 15, line: 2}},
+-  #   {::close, :tag, "div", %{column: 20, line: 2}}
+-  # ]
+-  #
+-  # The output will be:
+-  #
+-  # [
+-  #   {:tag_block, "div", [], [{:tag_block, "h1", [], [text: "Hello"]}]},
+-  #   {:tag_block, "div", [], [{:tag_block, "h1", [], [text: "World"]}]}
+-  # ]
+-  #
+-  # Note that a `tag_block` has been created so that its fourth argument is a list of
+-  # its nested content.
+-  #
+-  # ### How does this algorithm work?
+-  #
+-  # As this is a recursive algorithm, it starts with an empty buffer and an empty
+-  # stack. The buffer will be accumulated until it finds a `{:tag, ..., ...}`.
+-  #
+-  # As soon as the `tag_open` arrives, a new buffer will be started and we move
+-  # the previous buffer to the stack along with the `tag_open`:
+-  #
+-  #   ```
+-  #   defp build([{:tag, name, attrs, _meta} | tokens], buffer, stack) do
+-  #     build(tokens, [], [{name, attrs, buffer} | stack])
+-  #   end
+-  #   ```
+-  #
+-  # Then, we start to populate the buffer again until a `{::close, :tag, ...} arrives:
+-  #
+-  #   ```
+-  #   defp build([{::close, :tag, name, _meta} | tokens], buffer, [{name, attrs, upper_buffer} | stack]) do
+-  #     build(tokens, [{:tag_block, name, attrs, Enum.reverse(buffer)} | upper_buffer], stack)
+-  #   end
+-  #   ```
+-  #
+-  # In the snippet above, we build the `tag_block` with the accumulated buffer,
+-  # putting the buffer accumulated before the tag open (upper_buffer) on top.
+-  #
+-  # We apply the same logic for `eex` expressions but, instead of `tag_open` and
+-  # `tag_close`, eex expressions use `start_expr`, `middle_expr` and `end_expr`.
+-  # The only real difference is that also need to handle `middle_buffer`.
+-  #
+-  # So given this eex input:
+-  #
+-  # ```elixir
+-  # [
+-  #   {:eex, :start_expr, "if true do", %{column: 0, line: 0, opt: '='}},
+-  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
+-  #   {:eex, :expr, "\"Hello\"", %{column: 3, line: 1, opt: '='}},
+-  #   {:text, "\n", %{column_end: 1, line_end: 2}},
+-  #   {:eex, :middle_expr, "else", %{column: 1, line: 2, opt: []}},
+-  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
+-  #   {:eex, :expr, "\"World\"", %{column: 3, line: 3, opt: '='}},
+-  #   {:text, "\n", %{column_end: 1, line_end: 2}},
+-  #   {:eex, :end_expr, "end", %{column: 1, line: 4, opt: []}}
+-  # ]
+-  # ```
+-  #
+-  # The output will be:
+-  #
+-  # ```elixir
+-  # [
+-  #   {:eex_block, "if true do",
+-  #    [
+-  #      {[{:eex, "\"Hello\"", %{column: 3, line: 1, opt: '='}}], "else"},
+-  #      {[{:eex, "\"World\"", %{column: 3, line: 3, opt: '='}}], "end"}
+-  #    ]}
+-  # ]
+-  # ```
+-  defp to_tree([], buffer, [], _opts) do
+-    {:ok, Enum.reverse(buffer)}
++  defp set_preserve_on_block(buffer), do: buffer
++
++  defp count_newlines_before_text(binary),
++    do: count_newlines_until_text(binary, 0, 0, 1)
++
++  defp count_newlines_after_text(binary),
++    do: count_newlines_until_text(binary, 0, byte_size(binary) - 1, -1)
++
++  defp count_newlines_until_text(binary, counter, pos, inc) do
++    try do
++      :binary.at(binary, pos)
++    rescue
++      _ -> counter
++    else
++      char when char in [?\s, ?\t] -> count_newlines_until_text(binary, counter, pos + inc, inc)
++      ?\n -> count_newlines_until_text(binary, counter + 1, pos + inc, inc)
++      _ -> counter
++    end
+   end
+ 
+-  defp to_tree([], _buffer, [{name, _, %{line: line, column: column}, _} | _], _opts) do
+-    message = "end of template reached without closing tag for <#{name}>"
+-    {:error, line, column, message}
++  # Tree transformation - augments Parser output with formatter metadata
++  defp transform_tree(nodes, source, newlines) do
++    state = %{source: {source, newlines}}
++    augment_nodes(nodes, state)
+   end
+ 
+-  defp to_tree([{:text, text, %{context: [:comment_start]}} | tokens], buffer, stack, opts) do
+-    to_tree(tokens, [], [{:comment, text, buffer} | stack], opts)
++  # Augment nodes with formatter-specific metadata
++  defp augment_nodes(nodes, state) when is_list(nodes) do
++    nodes
++    |> reduce_html_comments([])
++    |> Enum.map(&augment_node(&1, state))
+   end
+ 
+-  defp to_tree(
+-         [{:text, text, %{context: [:comment_end | _rest]}} | tokens],
+-         buffer,
+-         [{:comment, start_text, upper_buffer} | stack],
+-         opts
++  # Group text nodes with :comment_start/:comment_end context into {:html_comment, block}
++  defp reduce_html_comments([], acc), do: Enum.reverse(acc)
++
++  # Single node that is both comment start and end
++  defp reduce_html_comments(
++         [{:text, text, %{context: [:comment_start, :comment_end]}} | rest],
++         acc
+        ) do
+     meta = %{
+       newlines_before_text: count_newlines_before_text(text),
+       newlines_after_text: count_newlines_after_text(text)
+     }
+ 
+-    buffer = Enum.reverse([{:text, String.trim_trailing(text), meta} | buffer])
+-    text = {:text, String.trim_leading(start_text), %{}}
+-    to_tree(tokens, [{:html_comment, [text | buffer]} | upper_buffer], stack, opts)
++    comment = {:html_comment, [{:text, String.trim(text), meta}]}
++    reduce_html_comments(rest, [comment | acc])
+   end
+ 
+-  defp to_tree(
+-         [{:text, text, %{context: [:comment_start, :comment_end]}} | tokens],
+-         buffer,
+-         stack,
+-         opts
++  # Comment start - begin accumulating comment content
++  defp reduce_html_comments(
++         [{:text, text, %{context: [:comment_start]}} | rest],
++         acc
+        ) do
+-    meta = %{
+-      newlines_before_text: count_newlines_before_text(text),
+-      newlines_after_text: count_newlines_after_text(text)
+-    }
+-
+-    to_tree(tokens, [{:html_comment, [{:text, String.trim(text), meta}]} | buffer], stack, opts)
++    collect_comment(rest, [{:text, String.trim_leading(text), %{}}], acc)
+   end
+ 
+-  defp to_tree([{:text, text, _meta} | tokens], buffer, stack, opts) do
+-    buffer = may_set_preserve_on_block(buffer, text)
++  # Regular node - pass through
++  defp reduce_html_comments([node | rest], acc) do
++    reduce_html_comments(rest, [node | acc])
++  end
+ 
++  # Collect comment content until we hit comment_end
++  defp collect_comment(
++         [{:text, text, %{context: [:comment_end | _rest]}} | rest],
++         comment_buffer,
++         acc
++       ) do
+     meta = %{
+       newlines_before_text: count_newlines_before_text(text),
+       newlines_after_text: count_newlines_after_text(text)
+     }
+ 
+-    to_tree(tokens, [{:text, text, meta} | buffer], stack, opts)
++    end_text = {:text, String.trim_trailing(text), meta}
++    block = Enum.reverse([end_text | comment_buffer])
++    comment = {:html_comment, block}
++    reduce_html_comments(rest, [comment | acc])
+   end
+ 
+-  defp to_tree([{:body_expr, value, meta} | tokens], buffer, stack, opts) do
+-    buffer = set_preserve_on_block(buffer)
+-    to_tree(tokens, [{:body_expr, value, meta} | buffer], stack, opts)
++  defp collect_comment([node | rest], comment_buffer, acc) do
++    collect_comment(rest, [node | comment_buffer], acc)
+   end
+ 
+-  defp to_tree([{type, _name, attrs, %{closing: _} = meta} | tokens], buffer, stack, opts)
+-       when is_tag_open(type) do
+-    to_tree(tokens, [{:tag_self_close, meta.tag_name, attrs} | buffer], stack, opts)
+-  end
++  # Handle block tags - add mode and recursively augment children
++  defp augment_node({:block, type, name, attrs, children, meta, close_meta}, state) do
++    tag_name = meta.tag_name
++    mode = determine_mode(tag_name, attrs, meta)
+ 
+-  defp to_tree([{type, _name, attrs, meta} | tokens], buffer, stack, opts)
+-       when is_tag_open(type) do
+-    to_tree(tokens, [], [{meta.tag_name, attrs, meta, buffer} | stack], opts)
+-  end
+-
+-  defp to_tree(
+-         [{:close, _type, _name, close_meta} | tokens],
+-         reversed_buffer,
+-         [{tag_name, attrs, open_meta, upper_buffer} | stack],
+-         opts
+-       ) do
+-    {mode, block} =
+-      if tag_name in ["pre", "textarea"] or contains_special_attrs?(attrs) do
++    {children, meta} =
++      if mode == :preserve do
+         content =
+-          content_from_source(opts.source, open_meta.inner_location, close_meta.inner_location)
++          content_from_source(state.source, meta.inner_location, close_meta.inner_location)
+ 
+-        {:preserve, [{:text, content, %{newlines_before_text: 0, newlines_after_text: 0}}]}
++        {[{:text, content, %{newlines_before_text: 0, newlines_after_text: 0}}],
++         Map.put(meta, :mode, :preserve)}
+       else
+-        {:normal, Enum.reverse(reversed_buffer)}
++        {augment_nodes(children, state), Map.put(meta, :mode, :normal)}
+       end
+ 
+-    tag_block = {:tag_block, tag_name, attrs, block, %{mode: mode}}
+-    to_tree(tokens, [tag_block | upper_buffer], stack, opts)
++    {:block, type, name, attrs, children, meta, close_meta}
+   end
+ 
+-  # handle eex
++  # Recursively augment eex_block children
++  defp augment_node({:eex_block, expr, blocks, meta}, state) do
++    blocks =
++      Enum.map(blocks, fn {children, clause, clause_meta} ->
++        {augment_nodes(children, state), clause, clause_meta}
++      end)
+ 
+-  defp to_tree([{:eex_comment, text, _meta} | tokens], buffer, stack, opts) do
+-    to_tree(tokens, [{:eex_comment, text} | buffer], stack, opts)
++    {:eex_block, expr, blocks, meta}
+   end
+ 
+-  defp to_tree([{:eex, :start_expr, expr, meta} | tokens], buffer, stack, opts) do
+-    to_tree(tokens, [], [{:eex_block, expr, meta, buffer} | stack], opts)
++  # html_comment - recursively augment block content
++  defp augment_node({:html_comment, block}, state) do
++    {:html_comment, augment_nodes(block, state)}
+   end
+ 
+-  defp to_tree(
+-         [{:eex, :middle_expr, middle_expr, _meta} | tokens],
+-         buffer,
+-         [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
+-         opts
+-       ) do
+-    middle_buffer = [{Enum.reverse(buffer), middle_expr} | middle_buffer]
+-    to_tree(tokens, [], [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack], opts)
+-  end
+-
+-  defp to_tree(
+-         [{:eex, :middle_expr, middle_expr, _meta} | tokens],
+-         buffer,
+-         [{:eex_block, expr, meta, upper_buffer} | stack],
+-         opts
+-       ) do
+-    middle_buffer = [{Enum.reverse(buffer), middle_expr}]
+-    to_tree(tokens, [], [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack], opts)
+-  end
+-
+-  defp to_tree(
+-         [{:eex, :end_expr, end_expr, _meta} | tokens],
+-         buffer,
+-         [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
+-         opts
+-       ) do
+-    block = Enum.reverse([{Enum.reverse(buffer), end_expr} | middle_buffer])
+-    to_tree(tokens, [{:eex_block, expr, block, meta} | upper_buffer], stack, opts)
+-  end
+-
+-  defp to_tree(
+-         [{:eex, :end_expr, end_expr, _meta} | tokens],
+-         buffer,
+-         [{:eex_block, expr, meta, upper_buffer} | stack],
+-         opts
+-       ) do
+-    block = [{Enum.reverse(buffer), end_expr}]
+-    to_tree(tokens, [{:eex_block, expr, block, meta} | upper_buffer], stack, opts)
+-  end
++  # Pass through other node types
++  defp augment_node(node, _state), do: node
+ 
+-  defp to_tree([{:eex, _type, expr, meta} | tokens], buffer, stack, opts) do
+-    buffer = set_preserve_on_block(buffer)
+-    to_tree(tokens, [{:eex, expr, meta} | buffer], stack, opts)
+-  end
+-
+-  # -- HELPERS
+-
+-  defp count_newlines_before_text(binary),
+-    do: count_newlines_until_text(binary, 0, 0, 1)
+-
+-  defp count_newlines_after_text(binary),
+-    do: count_newlines_until_text(binary, 0, byte_size(binary) - 1, -1)
+-
+-  defp count_newlines_until_text(binary, counter, pos, inc) do
+-    try do
+-      :binary.at(binary, pos)
+-    rescue
+-      _ -> counter
+-    else
+-      char when char in [?\s, ?\t] -> count_newlines_until_text(binary, counter, pos + inc, inc)
+-      ?\n -> count_newlines_until_text(binary, counter + 1, pos + inc, inc)
+-      _ -> counter
++  # Determine mode based on tag name, attributes, and existing meta
++  defp determine_mode(tag_name, attrs, meta) do
++    cond do
++      Map.get(meta, :mode) == :preserve -> :preserve
++      tag_name in ["pre", "textarea"] -> :preserve
++      contains_special_attrs?(attrs) -> :preserve
++      true -> :normal
+     end
+   end
+ 
+-  # In case the closing tag is immediatelly followed by non whitespace text,
+-  # we want to set mode as preserve.
+-  defp may_set_preserve_on_block([{:tag_block, name, attrs, block, meta} | list], text) do
+-    mode =
+-      if String.trim_leading(text) != "" and :binary.first(text) not in ~c"\s\t\n\r" do
+-        :preserve
+-      else
+-        meta.mode
+-      end
+-
+-    [{:tag_block, name, attrs, block, %{meta | mode: mode}} | list]
+-  end
+-
+-  defp may_set_preserve_on_block(buffer, _text), do: buffer
+-
+-  # Set preserve on block when it is immediately followed by interpolation.
+-  defp set_preserve_on_block([{:tag_block, name, attrs, block, meta} | list]) do
+-    [{:tag_block, name, attrs, block, %{meta | mode: :preserve}} | list]
+-  end
+-
+-  defp set_preserve_on_block(buffer), do: buffer
+-
+   defp contains_special_attrs?(attrs) do
+     Enum.any?(attrs, fn
+       {"contenteditable", {:string, "false", _meta}, _} -> false
+@@ -665,6 +519,7 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+     end)
+   end
+ 
++  # Extract content from source between two locations
+   defp content_from_source(
+          {source, newlines},
+          {line_start, column_start},
+diff --git a/lib/phoenix_live_view/tag_engine.ex b/lib/phoenix_live_view/tag_engine.ex
+index 8e4d48d4..ac20aca0 100644
+--- a/lib/phoenix_live_view/tag_engine.ex
++++ b/lib/phoenix_live_view/tag_engine.ex
+@@ -19,6 +19,8 @@ defmodule Phoenix.LiveView.TagEngine do
+   Where `:tag_handler` implements the behaviour defined by this module.
+   """
+ 
++  alias Phoenix.LiveView.TagEngine
++
+   @doc """
+   Compiles the given string into Elixir AST.
+ 
+@@ -36,16 +38,17 @@ defmodule Phoenix.LiveView.TagEngine do
+       Keyword.validate!(options, [
+         :caller,
+         :tag_handler,
++        :trim,
+         line: 1,
+         indentation: 0,
+-        file: "nofile"
++        file: "nofile",
++        engine: Phoenix.LiveView.Engine
+       ])
+-      |> Keyword.merge(
+-        engine: Phoenix.LiveView.TagEngine,
+-        source: source
+-      )
++      |> Keyword.merge(source: source, trim_eex: false)
+ 
+-    EEx.compile_string(source, options)
++    source
++    |> TagEngine.Parser.parse!(options)
++    |> TagEngine.Compiler.compile(options)
+   end
+ 
+   @doc """
+@@ -214,1495 +217,99 @@ defmodule Phoenix.LiveView.TagEngine do
+     end
+   end
+ 
+-  alias Phoenix.LiveView.Tokenizer
+-  alias Phoenix.LiveView.Tokenizer.ParseError
++  @doc false
++  def __unmatched_let__!(pattern, value) do
++    message = """
++    cannot match arguments sent from render_slot/2 against the pattern in :let.
++
++    Expected a value matching `#{pattern}`, got: #{inspect(value)}\
++    """
++
++    stacktrace =
++      self()
++      |> Process.info(:current_stacktrace)
++      |> elem(1)
++      |> Enum.drop(2)
++
++    reraise(message, stacktrace)
++  end
+ 
+   @behaviour EEx.Engine
+ 
+   @impl true
+   def init(opts) do
++    IO.warn("""
++    Using Phoenix.LiveView.TagEngine as an EEx.Engine is deprecated!
++
++    To compile HEEx, use Phoenix.LiveView.TagEngine.compile/2 instead.
++    """)
++
+     {subengine, opts} = Keyword.pop(opts, :subengine, Phoenix.LiveView.Engine)
+     tag_handler = Keyword.fetch!(opts, :tag_handler)
++    caller = Keyword.fetch!(opts, :caller)
+ 
+     %{
+-      cont: {:text, :enabled},
+-      tokens: [],
+       subengine: subengine,
+       substate: subengine.init(opts),
+       file: Keyword.get(opts, :file, "nofile"),
++      line: Keyword.get(opts, :line, caller.line),
+       indentation: Keyword.get(opts, :indentation, 0),
+-      caller: Keyword.fetch!(opts, :caller),
++      caller: caller,
+       source: Keyword.fetch!(opts, :source),
+       tag_handler: tag_handler
+     }
+   end
+ 
+-  ## These callbacks return AST
++  ## EEx.Engine callbacks
++  ## These delegate to the subengine to satisfy EEx's expectations,
++  ## but handle_body ignores everything and reparses with TagEngine.Parser + TagEngine.Compiler.
+ 
+   @impl true
+   def handle_body(state) do
+-    %{tokens: tokens, file: file, cont: cont, source: source, caller: caller} = state
+-    tokens = Tokenizer.finalize(tokens, file, cont, source)
+-
+-    token_state =
+-      state
+-      |> token_state(nil)
+-      |> continue(tokens)
+-      |> validate_unclosed_tags!("template")
+-
+-    opts = [root: token_state.root || false]
+-
+-    opts =
+-      if annotation = caller && has_tags?(tokens) && state.tag_handler.annotate_body(caller) do
+-        [meta: [template_annotation: annotation]] ++ opts
+-      else
+-        opts
+-      end
+-
+-    ast = invoke_subengine(token_state, :handle_body, [opts])
+-
+-    quote do
+-      require Phoenix.LiveView.TagEngine
+-      unquote(ast)
+-    end
+-  end
+-
+-  defp has_tags?([{:text, _, _} | tokens]), do: has_tags?(tokens)
+-  defp has_tags?([{:expr, _, _} | tokens]), do: has_tags?(tokens)
+-  defp has_tags?([{:body_expr, _, _} | tokens]), do: has_tags?(tokens)
++    trim = Application.get_env(:phoenix, :trim_on_html_eex_engine, true)
+ 
+-  # If we find a slot, discard everything in the slot and continue looking
+-  defp has_tags?([{:slot, _, _, _} | tokens]),
+-    do:
+-      tokens
+-      |> Enum.drop_while(&(not match?({:close, :slot, _, _}, &1)))
+-      |> Enum.drop(1)
+-      |> has_tags?()
+-
+-  # If we find a closing tag, we missed the opening one, so we are at the end
+-  defp has_tags?([{:close, _, _, _} | _]), do: false
+-  defp has_tags?([_ | _]), do: true
+-  defp has_tags?([]), do: false
+-
+-  defp validate_unclosed_tags!(%{tags: []} = state, _context) do
+-    state
+-  end
+-
+-  defp validate_unclosed_tags!(%{tags: [tag | _]} = state, context) do
+-    {_type, _name, _attrs, meta} = tag
+-    message = "end of #{context} reached without closing tag for <#{meta.tag_name}>"
+-    raise_syntax_error!(message, meta, state)
+-  end
+-
+-  @impl true
+-  def handle_end(state) do
+-    state
+-    |> token_state(false)
+-    |> continue(Enum.reverse(state.tokens))
+-    |> validate_unclosed_tags!("do-block")
+-    |> invoke_subengine(:handle_end, [])
+-  end
+-
+-  defp token_state(
+-         %{
+-           subengine: subengine,
+-           substate: substate,
+-           file: file,
+-           caller: caller,
+-           source: source,
+-           indentation: indentation,
+-           tag_handler: tag_handler
+-         },
+-         root
+-       ) do
+     %{
+-      subengine: subengine,
+-      substate: substate,
+       source: source,
+       file: file,
+-      stack: [],
+-      tags: [],
+-      slots: [],
++      line: line,
++      caller: caller,
++      tag_handler: tag_handler,
++      subengine: subengine,
++      indentation: indentation
++    } = state
++
++    options = [
++      engine: subengine,
++      file: file,
++      line: line,
+       caller: caller,
+-      root: root,
+       indentation: indentation,
+-      tag_handler: tag_handler
+-    }
+-  end
++      source: source,
++      tag_handler: tag_handler,
++      trim_tokens: true,
++      trim: trim
++    ]
+ 
+-  defp continue(token_state, tokens) do
+-    handle_token(tokens, token_state)
++    compile(source, options)
+   end
+ 
+-  ## These callbacks update the state
+-
+   @impl true
+-  def handle_begin(state) do
+-    update_subengine(%{state | tokens: []}, :handle_begin, [])
++  def handle_end(_state) do
++    nil
+   end
+ 
+   @impl true
+-  def handle_text(state, meta, text) do
+-    %{file: file, indentation: indentation, tokens: tokens, cont: cont, source: source} = state
+-    tokenizer_state = Tokenizer.init(indentation, file, source, state.tag_handler)
+-    {tokens, cont} = Tokenizer.tokenize(text, meta, tokens, cont, tokenizer_state)
+-
+-    %{
+-      state
+-      | tokens: tokens,
+-        cont: cont,
+-        source: state.source
+-    }
++  def handle_begin(_state) do
++    nil
+   end
+ 
+   @impl true
+-  def handle_expr(%{tokens: tokens} = state, marker, expr) do
+-    %{state | tokens: [{:expr, marker, expr} | tokens]}
+-  end
+-
+-  ## Helpers
+-
+-  defp push_substate_to_stack(%{substate: substate, stack: stack} = state) do
+-    %{state | stack: [{:substate, substate} | stack]}
+-  end
+-
+-  defp pop_substate_from_stack(%{stack: [{:substate, substate} | stack]} = state) do
+-    %{state | stack: stack, substate: substate}
+-  end
+-
+-  defp invoke_subengine(%{subengine: subengine, substate: substate}, fun, args) do
+-    apply(subengine, fun, [substate | args])
+-  end
+-
+-  defp update_subengine(state, fun, args) do
+-    %{state | substate: invoke_subengine(state, fun, args)}
+-  end
+-
+-  defp init_slots(state) do
+-    %{state | slots: [[] | state.slots]}
+-  end
+-
+-  defp add_inner_block({roots?, attrs, locs}, ast, tag_meta) do
+-    {roots?, [{:inner_block, ast} | attrs], [line_column(tag_meta) | locs]}
+-  end
+-
+-  defp add_slot(state, slot_name, slot_assigns, slot_info, tag_meta, special_attrs) do
+-    %{slots: [slots | other_slots]} = state
+-    slot = {slot_name, slot_assigns, special_attrs, {tag_meta, slot_info}}
+-    %{state | slots: [[slot | slots] | other_slots]}
+-  end
+-
+-  defp maybe_prune_text_after_macro_component("", tokens), do: prune_text(tokens)
+-  defp maybe_prune_text_after_macro_component(_ast, tokens), do: tokens
+-
+-  defp prune_text([{:text, text, meta} | tokens]),
+-    do: [{:text, String.trim_leading(text), meta} | tokens]
+-
+-  defp prune_text(tokens),
+-    do: tokens
+-
+-  defp validate_slot!(%{tags: [{type, _, _, _} | _]}, _name, _tag_meta)
+-       when type in [:remote_component, :local_component],
+-       do: :ok
+-
+-  defp validate_slot!(state, slot_name, meta) do
+-    message =
+-      "invalid slot entry <:#{slot_name}>. A slot entry must be a direct child of a component"
+-
+-    raise_syntax_error!(message, meta, state)
+-  end
+-
+-  defp pop_slots(%{slots: [slots | other_slots]} = state) do
+-    # Perform group_by by hand as we need to group two distinct maps.
+-    {acc_assigns, acc_info, specials} =
+-      Enum.reduce(slots, {%{}, %{}, %{}}, fn {key, assigns, special, info},
+-                                             {acc_assigns, acc_info, specials} ->
+-        special? = Map.has_key?(special, ":if") or Map.has_key?(special, ":for")
+-        specials = Map.update(specials, key, special?, &(&1 or special?))
+-
+-        case acc_assigns do
+-          %{^key => existing_assigns} ->
+-            acc_assigns = %{acc_assigns | key => [assigns | existing_assigns]}
+-            %{^key => existing_info} = acc_info
+-            acc_info = %{acc_info | key => [info | existing_info]}
+-            {acc_assigns, acc_info, specials}
+-
+-          %{} ->
+-            {Map.put(acc_assigns, key, [assigns]), Map.put(acc_info, key, [info]), specials}
+-        end
+-      end)
+-
+-    acc_assigns =
+-      Enum.into(acc_assigns, %{}, fn {key, assigns_ast} ->
+-        cond do
+-          # No special entry, return it as a list
+-          not Map.fetch!(specials, key) ->
+-            {key, assigns_ast}
+-
+-          # We have a special entry and multiple entries, we have to flatten
+-          match?([_, _ | _], assigns_ast) ->
+-            {key, quote(do: List.flatten(unquote(assigns_ast)))}
+-
+-          # A single special entry is guaranteed to return a list from the expression
+-          true ->
+-            {key, hd(assigns_ast)}
+-        end
+-      end)
+-
+-    {Map.to_list(acc_assigns), Map.to_list(acc_info), %{state | slots: other_slots}}
+-  end
+-
+-  defp push_tag(state, token) do
+-    %{state | tags: [token | state.tags]}
+-  end
+-
+-  # special clause for macro components
+-  defp pop_tag!(%{tags: [{:macro_tag, name} | tags]} = state, {:close, :macro_tag, name}) do
+-    %{state | tags: tags}
+-  end
+-
+-  defp pop_tag!(
+-         %{tags: [{type, tag_name, _attrs, _meta} = tag | tags]} = state,
+-         {:close, type, tag_name, _}
+-       ) do
+-    {tag, %{state | tags: tags}}
+-  end
+-
+-  defp pop_tag!(
+-         %{tags: [{type, tag_open_name, _attrs, tag_open_meta} | _]} = state,
+-         {:close, type, tag_close_name, tag_close_meta}
+-       ) do
+-    hint = closing_void_hint(tag_close_name, state)
+-
+-    message = """
+-    unmatched closing tag. Expected </#{tag_open_name}> for <#{tag_open_name}> \
+-    at line #{tag_open_meta.line}, got: </#{tag_close_name}>#{hint}\
+-    """
+-
+-    raise_syntax_error!(message, tag_close_meta, state)
+-  end
+-
+-  defp pop_tag!(state, {:close, _type, tag_name, tag_meta}) do
+-    hint = closing_void_hint(tag_name, state)
+-    message = "missing opening tag for </#{tag_name}>#{hint}"
+-    raise_syntax_error!(message, tag_meta, state)
+-  end
+-
+-  defp closing_void_hint(tag_name, state) do
+-    if state.tag_handler.void?(tag_name) do
+-      " (note <#{tag_name}> is a void tag and cannot have any content)"
+-    else
+-      ""
+-    end
+-  end
+-
+-  ## handle_token
+-
+-  # Expr
+-
+-  defp handle_token([{:expr, marker, expr} | tokens], state) do
+-    state
+-    |> set_root_on_not_tag()
+-    |> update_subengine(:handle_expr, [marker, expr])
+-    |> continue(tokens)
+-  end
+-
+-  defp handle_token([{:body_expr, value, %{line: line, column: column}} | tokens], state) do
+-    quoted = Code.string_to_quoted!(value, line: line, column: column, file: state.file)
+-
++  def handle_text(state, _meta, _text) do
+     state
+-    |> set_root_on_not_tag()
+-    |> update_subengine(:handle_expr, ["=", quoted])
+-    |> continue(tokens)
+-  end
+-
+-  # Text
+-
+-  defp handle_token([{:text, text, %{line_end: line, column_end: column}} | tokens], state) do
+-    if text == "" do
+-      continue(state, tokens)
+-    else
+-      state
+-      |> set_root_on_not_tag()
+-      |> update_subengine(:handle_text, [[line: line, column: column], text])
+-      |> continue(tokens)
+-    end
+-  end
+-
+-  # Remote function component (self close)
+-
+-  defp handle_token(
+-         [{:remote_component, name, attrs, %{closing: :self} = tag_meta} | tokens],
+-         state
+-       ) do
+-    attrs = postprocess_attrs(attrs, state)
+-    {mod_ast, mod_size, fun} = decompose_remote_component_tag!(name, tag_meta, state)
+-    %{line: line, column: column} = tag_meta
+-
+-    {assigns, attr_info} =
+-      build_self_close_component_assigns({"remote component", name}, attrs, tag_meta.line, state)
+-
+-    mod = expand_with_line(mod_ast, line, state.caller)
+-    store_component_call({mod, fun}, attr_info, [], line, state)
+-    meta = [line: line, column: column + mod_size]
+-    call = {{:., meta, [mod_ast, fun]}, meta, []}
+-
+-    ast =
+-      quote line: tag_meta.line do
+-        Phoenix.LiveView.TagEngine.component(
+-          &(unquote(call) / 1),
+-          unquote(assigns),
+-          {__MODULE__, __ENV__.function, __ENV__.file, unquote(tag_meta.line)}
+-        )
+-      end
+-
+-    case pop_special_attrs!(attrs, tag_meta, state) do
+-      {false, _tag_meta, _attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> maybe_anno_caller(meta, state.file, line)
+-        |> update_subengine(:handle_expr, ["=", ast])
+-        |> continue(tokens)
+-
+-      {true, new_meta, _new_attrs} ->
+-        state
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> set_root_on_not_tag()
+-        |> maybe_anno_caller(meta, state.file, line)
+-        |> update_subengine(:handle_expr, ["=", ast])
+-        |> handle_special_expr(new_meta)
+-        |> continue(tokens)
+-    end
+-  end
+-
+-  # Remote function component (with inner content)
+-
+-  defp handle_token([{:remote_component, name, attrs, tag_meta} | tokens], state) do
+-    mod_fun = decompose_remote_component_tag!(name, tag_meta, state)
+-    tag_meta = tag_meta |> Map.put(:mod_fun, mod_fun) |> Map.put(:has_tags?, has_tags?(tokens))
+-
+-    case pop_special_attrs!(attrs, tag_meta, state) do
+-      {false, tag_meta, attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> push_tag({:remote_component, name, attrs, tag_meta})
+-        |> init_slots()
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> continue(tokens)
+-
+-      {true, new_meta, new_attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> push_tag({:remote_component, name, new_attrs, new_meta})
+-        |> init_slots()
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> continue(tokens)
+-    end
+-  end
+-
+-  defp handle_token([{:close, :remote_component, _name, tag_close_meta} = token | tokens], state) do
+-    {{:remote_component, name, attrs, tag_meta}, state} = pop_tag!(state, token)
+-    %{mod_fun: {mod_ast, mod_size, fun}, line: line, column: column} = tag_meta
+-
+-    mod = expand_with_line(mod_ast, line, state.caller)
+-    attrs = postprocess_attrs(attrs, state)
+-    ref = {"remote component", name}
+-
+-    {assigns, attr_info, slot_info, state} =
+-      build_component_assigns(ref, attrs, line, tag_meta, tag_close_meta, state)
+-
+-    store_component_call({mod, fun}, attr_info, slot_info, line, state)
+-    meta = [line: line, column: column + mod_size]
+-    call = {{:., meta, [mod_ast, fun]}, meta, []}
+-
+-    ast =
+-      quote line: line do
+-        Phoenix.LiveView.TagEngine.component(
+-          &(unquote(call) / 1),
+-          unquote(assigns),
+-          {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
+-        )
+-      end
+-      |> tag_slots(slot_info)
+-
+-    state
+-    |> pop_substate_from_stack()
+-    |> maybe_anno_caller(meta, state.file, line)
+-    |> update_subengine(:handle_expr, ["=", ast])
+-    |> handle_special_expr(tag_meta)
+-    |> continue(tokens)
+-  end
+-
+-  # Slot (self close)
+-
+-  defp handle_token(
+-         [{:slot, slot_name, attrs, %{closing: :self} = tag_meta} | tokens],
+-         state
+-       ) do
+-    slot_name = String.to_atom(slot_name)
+-    validate_slot!(state, slot_name, tag_meta)
+-    attrs = postprocess_attrs(attrs, state)
+-    %{line: line} = tag_meta
+-    {special, roots, attrs, attr_info} = split_component_attrs({"slot", slot_name}, attrs, state)
+-    let = special[":let"]
+-
+-    with {_, let_meta} <- let do
+-      message = "cannot use :let on a slot without inner content"
+-      raise_syntax_error!(message, let_meta, state)
+-    end
+-
+-    attrs = [__slot__: slot_name, inner_block: nil] ++ attrs
+-    assigns = wrap_special_slot(special, merge_component_attrs(roots, attrs, line))
+-
+-    add_slot(state, slot_name, assigns, attr_info, tag_meta, special)
+-    |> continue(prune_text(tokens))
+-  end
+-
+-  # Slot (with inner content)
+-
+-  defp handle_token([{:slot, slot_name, attrs, tag_meta} | tokens], state) do
+-    validate_slot!(state, slot_name, tag_meta)
+-    tag_meta = Map.put(tag_meta, :has_tags?, has_tags?(tokens))
+-
+-    state
+-    |> push_tag({:slot, slot_name, attrs, tag_meta})
+-    |> push_substate_to_stack()
+-    |> update_subengine(:handle_begin, [])
+-    |> continue(tokens)
+-  end
+-
+-  defp handle_token([{:close, :slot, slot_name, tag_close_meta} = token | tokens], state) do
+-    slot_name = String.to_atom(slot_name)
+-    {{:slot, _name, attrs, %{line: line} = tag_meta}, state} = pop_tag!(state, token)
+-
+-    attrs = postprocess_attrs(attrs, state)
+-    {special, roots, attrs, attr_info} = split_component_attrs({"slot", slot_name}, attrs, state)
+-    clauses = build_component_clauses(special[":let"], slot_name, tag_meta, tag_close_meta, state)
+-
+-    ast =
+-      quote line: line do
+-        Phoenix.LiveView.TagEngine.inner_block(unquote(slot_name), do: unquote(clauses))
+-      end
+-
+-    attrs = [__slot__: slot_name, inner_block: ast] ++ attrs
+-    assigns = wrap_special_slot(special, merge_component_attrs(roots, attrs, line))
+-    inner = add_inner_block(attr_info, ast, tag_meta)
+-
+-    state
+-    |> add_slot(slot_name, assigns, inner, tag_meta, special)
+-    |> pop_substate_from_stack()
+-    |> continue(prune_text(tokens))
+-  end
+-
+-  # Local function component (self close)
+-
+-  defp handle_token(
+-         [{:local_component, name, attrs, %{closing: :self} = tag_meta} | tokens],
+-         state
+-       ) do
+-    fun = String.to_atom(name)
+-    %{line: line, column: column} = tag_meta
+-    attrs = postprocess_attrs(attrs, state)
+-
+-    {assigns, attr_info} =
+-      build_self_close_component_assigns({"local component", fun}, attrs, line, state)
+-
+-    mod = actual_component_module(state.caller, fun)
+-    store_component_call({mod, fun}, attr_info, [], line, state)
+-    meta = [line: line, column: column]
+-    call = {fun, meta, __MODULE__}
+-
+-    ast =
+-      quote line: line do
+-        Phoenix.LiveView.TagEngine.component(
+-          &(unquote(call) / 1),
+-          unquote(assigns),
+-          {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
+-        )
+-      end
+-
+-    case pop_special_attrs!(attrs, tag_meta, state) do
+-      {false, _tag_meta, _attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> maybe_anno_caller(meta, state.file, line)
+-        |> update_subengine(:handle_expr, ["=", ast])
+-        |> continue(tokens)
+-
+-      {true, new_meta, _new_attrs} ->
+-        state
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> set_root_on_not_tag()
+-        |> maybe_anno_caller(meta, state.file, line)
+-        |> update_subengine(:handle_expr, ["=", ast])
+-        |> handle_special_expr(new_meta)
+-        |> continue(tokens)
+-    end
+-  end
+-
+-  # Local function component (with inner content)
+-
+-  defp handle_token([{:local_component, name, attrs, tag_meta} | tokens], state) do
+-    tag_meta = Map.put(tag_meta, :has_tags?, has_tags?(tokens))
+-
+-    case pop_special_attrs!(attrs, tag_meta, state) do
+-      {false, tag_meta, attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> push_tag({:local_component, name, attrs, tag_meta})
+-        |> init_slots()
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> continue(tokens)
+-
+-      {true, new_meta, new_attrs} ->
+-        state
+-        |> set_root_on_not_tag()
+-        |> push_tag({:local_component, name, new_attrs, new_meta})
+-        |> init_slots()
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> continue(tokens)
+-    end
+-  end
+-
+-  defp handle_token([{:close, :local_component, _name, tag_close_meta} = token | tokens], state) do
+-    {{:local_component, name, attrs, tag_meta}, state} = pop_tag!(state, token)
+-    fun = String.to_atom(name)
+-    %{line: line, column: column} = tag_meta
+-    attrs = postprocess_attrs(attrs, state)
+-    mod = actual_component_module(state.caller, fun)
+-    ref = {"local component", fun}
+-
+-    {assigns, attr_info, slot_info, state} =
+-      build_component_assigns(ref, attrs, line, tag_meta, tag_close_meta, state)
+-
+-    store_component_call({mod, fun}, attr_info, slot_info, line, state)
+-    meta = [line: line, column: column]
+-    call = {fun, meta, __MODULE__}
+-
+-    ast =
+-      quote line: line do
+-        Phoenix.LiveView.TagEngine.component(
+-          &(unquote(call) / 1),
+-          unquote(assigns),
+-          {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
+-        )
+-      end
+-      |> tag_slots(slot_info)
+-
+-    state
+-    |> pop_substate_from_stack()
+-    |> maybe_anno_caller(meta, state.file, line)
+-    |> update_subengine(:handle_expr, ["=", ast])
+-    |> handle_special_expr(tag_meta)
+-    |> continue(tokens)
+-  end
+-
+-  # HTML element (self close)
+-
+-  defp handle_token([{:tag, name, attrs, %{closing: closing} = tag_meta} | tokens], state) do
+-    suffix = if closing == :void, do: ">", else: "></#{name}>"
+-    attrs = postprocess_attrs(attrs, state)
+-    validate_phx_attrs!(attrs, tag_meta, state)
+-    validate_tag_attrs!(attrs, tag_meta, state)
+-
+-    case pop_special_attrs!(attrs, tag_meta, state) do
+-      {false, tag_meta, attrs} ->
+-        state
+-        |> set_root_on_tag()
+-        |> handle_tag_and_attrs(name, attrs, suffix, to_location(tag_meta))
+-        |> continue(tokens)
+-
+-      {true, new_meta, new_attrs} ->
+-        state
+-        |> push_substate_to_stack()
+-        |> update_subengine(:handle_begin, [])
+-        |> set_root_on_not_tag()
+-        |> handle_tag_and_attrs(name, new_attrs, suffix, to_location(new_meta))
+-        |> handle_special_expr(new_meta)
+-        |> continue(tokens)
+-    end
+-  end
+-
+-  # HTML element
+-
+-  defp handle_token([{:tag, name, attrs, tag_meta} = token | tokens], state) do
+-    attrs = postprocess_attrs(attrs, state)
+-    validate_phx_attrs!(attrs, tag_meta, state)
+-    validate_tag_attrs!(attrs, tag_meta, state)
+-
+-    case List.keytake(attrs, ":type", 0) do
+-      {{":type", {:expr, code, _}, _meta}, attrs} ->
+-        # validate_phx_attrs! already ensured that if :type is present, it is an expression
+-        handle_macro_component([{:tag, name, attrs, tag_meta} | tokens], code, state)
+-
+-      nil ->
+-        case pop_special_attrs!(attrs, tag_meta, state) do
+-          {false, tag_meta, attrs} ->
+-            state
+-            |> set_root_on_tag()
+-            |> push_tag(token)
+-            |> handle_tag_and_attrs(name, attrs, ">", to_location(tag_meta))
+-            |> continue(tokens)
+-
+-          {true, new_meta, new_attrs} ->
+-            state
+-            |> push_substate_to_stack()
+-            |> update_subengine(:handle_begin, [])
+-            |> set_root_on_not_tag()
+-            |> push_tag({:tag, name, new_attrs, new_meta})
+-            |> handle_tag_and_attrs(name, new_attrs, ">", to_location(new_meta))
+-            |> continue(tokens)
+-        end
+-    end
+-  end
+-
+-  defp handle_token([{:close, :tag, name, tag_meta} = token | tokens], state) do
+-    {{:tag, _name, _attrs, tag_open_meta}, state} = pop_tag!(state, token)
+-
+-    state
+-    |> update_subengine(:handle_text, [to_location(tag_meta), "</#{name}>"])
+-    |> handle_special_expr(tag_open_meta)
+-    |> continue(tokens)
+-  end
+-
+-  defp handle_token([], state), do: state
+-
+-  defp handle_macro_component(
+-         [{:tag, _name, _attrs, tag_meta} | _] = tokens,
+-         module_string,
+-         state
+-       ) do
+-    # Macro components work by converting the HEEx tokens into an AST
+-    # (see Phoenix.Component.MacroComponent) and then calling the transform
+-    # function on the macro component module, which can return a transformed
+-    # AST.
+-    #
+-    # The AST is limited in functionality and we handle it separately in
+-    # the handle_ast function.
+-
+-    Macro.Env.required?(state.caller, Phoenix.Component) ||
+-      raise ArgumentError,
+-            "macro components are only supported in modules that `use Phoenix.Component`"
+-
+-    module = validate_module!(module_string, tag_meta, state)
+-
+-    try do
+-      {ast, rest} =
+-        case Phoenix.Component.MacroComponent.build_ast(tokens, state.caller) do
+-          {:ok, ast, rest} -> {ast, rest}
+-          {:error, message, meta} -> raise_syntax_error!(message, meta, state)
+-        end
+-
+-      {module.transform(ast, %{env: state.caller}), rest}
+-    rescue
+-      e in ArgumentError ->
+-        raise_syntax_error!(
+-          Exception.message(e),
+-          tag_meta,
+-          state
+-        )
+-    else
+-      {{:ok, new_ast}, rest} ->
+-        state
+-        |> handle_ast(new_ast, tag_meta)
+-        |> continue(maybe_prune_text_after_macro_component(new_ast, rest))
+-
+-      {{:ok, new_ast, data}, rest} ->
+-        Module.put_attribute(state.caller.module, :__macro_components__, {module, data})
+-
+-        state
+-        |> handle_ast(new_ast, tag_meta)
+-        |> continue(maybe_prune_text_after_macro_component(new_ast, rest))
+-
+-      {other, _rest} ->
+-        raise ArgumentError,
+-              "a macro component must return {:ok, ast} or {:ok, ast, data}, got: #{inspect(other)}"
+-    end
+-  end
+-
+-  # self closing / void tags cannot have children
+-  defp handle_ast(state, {tag, attrs, [], %{closing: closing}}, tag_open_meta) do
+-    suffix =
+-      case closing do
+-        :void -> ">"
+-        :self -> "/>"
+-      end
+-
+-    state
+-    |> set_root_on_tag()
+-    |> update_subengine(:handle_text, [[], "<#{tag}"])
+-    |> handle_ast_attrs(attrs, tag_open_meta)
+-    |> update_subengine(:handle_text, [[], suffix])
+-  end
+-
+-  defp handle_ast(state, {tag, attrs, children, _meta}, tag_open_meta) do
+-    state
+-    |> set_root_on_tag()
+-    |> push_tag({:macro_tag, tag})
+-    |> update_subengine(:handle_text, [[], "<#{tag}"])
+-    |> handle_ast_attrs(attrs, tag_open_meta)
+-    |> update_subengine(:handle_text, [[], ">"])
+-    |> handle_ast(children, tag_open_meta)
+-    |> update_subengine(:handle_text, [[], "</#{tag}>"])
+-    |> pop_tag!({:close, :macro_tag, tag})
+-  end
+-
+-  defp handle_ast(state, "", _tag_open_meta), do: state
+-
+-  defp handle_ast(state, text, _tag_open_meta) when is_binary(text) do
+-    state
+-    |> set_root_on_not_tag()
+-    |> update_subengine(:handle_text, [[], text])
+-  end
+-
+-  defp handle_ast(state, children, tag_open_meta) when is_list(children) do
+-    Enum.reduce(children, state, &handle_ast(&2, &1, tag_open_meta))
+-  end
+-
+-  defp handle_ast_attrs(state, attrs, tag_open_meta) do
+-    Enum.reduce(attrs, state, fn
+-      {name, value}, state when is_binary(value) ->
+-        attr = Phoenix.Component.MacroComponent.encode_binary_attribute(name, value)
+-        update_subengine(state, :handle_text, [[], attr])
+-
+-      {name, nil}, state ->
+-        update_subengine(state, :handle_text, [[], " #{name}"])
+-
+-      {name, ast}, state ->
+-        handle_tag_expr_attrs(state, tag_open_meta, [{name, ast}])
+-    end)
+-  end
+-
+-  defp validate_module!(module_string, tag_meta, state) do
+-    module =
+-      Code.string_to_quoted!(module_string,
+-        file: state.file,
+-        line: tag_meta.line,
+-        column: tag_meta.column
+-      )
+-      |> Macro.expand(state.caller)
+-
+-    if not is_atom(module) do
+-      raise_syntax_error!(
+-        "the given macro component #{inspect(module_string)} is not a valid module",
+-        tag_meta,
+-        state
+-      )
+-    end
+-
+-    _ = Code.ensure_compiled!(module)
+-
+-    if not function_exported?(module, :transform, 2) do
+-      raise_syntax_error!(
+-        "the given macro component #{inspect(module)} does not implement the `Phoenix.LiveView.MacroComponent` behaviour",
+-        tag_meta,
+-        state
+-      )
+-    end
+-
+-    module
+-  end
+-
+-  # Pop the given attr from attrs. Raises if the given attr is duplicated within
+-  # attrs.
+-  #
+-  # Examples:
+-  #
+-  #   attrs = [{":for", {...}}, {"class", {...}}]
+-  #   pop_special_attrs!(state, ":for", attrs, %{}, state)
+-  #   => {%{for: parsed_ast}}, {{":for", {...}}, [{"class", {...}]}}
+-  #
+-  #   attrs = [{"class", {...}}]
+-  #   pop_special_attrs!(state, ":for", attrs, %{}, state)
+-  #   => {%{}, []}
+-  defp pop_special_attrs!(attrs, tag_meta, state) do
+-    Enum.reduce([for: ":for", if: ":if", key: ":key"], {false, tag_meta, attrs}, fn
+-      {attr, string_attr}, {special_acc, meta_acc, attrs_acc} ->
+-        attrs_acc
+-        |> List.keytake(string_attr, 0)
+-        |> raise_if_duplicated_special_attr!(state)
+-        |> case do
+-          {{^string_attr, {:expr, _, _} = expr, meta}, attrs} ->
+-            parsed_expr = parse_expr!(expr, state.file)
+-            validate_quoted_special_attr!(string_attr, parsed_expr, meta, state)
+-            {true, Map.put(meta_acc, attr, parsed_expr), attrs}
+-
+-          {{^string_attr, _expr, meta}, _attrs} ->
+-            message = "#{string_attr} must be an expression between {...}"
+-            raise_syntax_error!(message, meta, state)
+-
+-          nil ->
+-            {special_acc, meta_acc, attrs_acc}
+-        end
+-    end)
+-  end
+-
+-  defp raise_if_duplicated_special_attr!({{attr, _expr, _meta}, attrs} = result, state) do
+-    case List.keytake(attrs, attr, 0) do
+-      {{attr, _expr, meta}, _attrs} ->
+-        message =
+-          "cannot define multiple #{inspect(attr)} attributes. Another #{inspect(attr)} has already been defined at line #{meta.line}"
+-
+-        raise_syntax_error!(message, meta, state)
+-
+-      nil ->
+-        result
+-    end
+   end
+ 
+-  defp raise_if_duplicated_special_attr!(nil, _state), do: nil
+-
+-  # Root tracking
+-  defp set_root_on_not_tag(%{root: root, tags: tags} = state) do
+-    if tags == [] and root != false do
+-      %{state | root: false}
+-    else
+-      state
+-    end
+-  end
+-
+-  defp set_root_on_tag(state) do
+-    case state do
+-      %{root: nil, tags: []} -> %{state | root: true}
+-      %{root: true, tags: []} -> %{state | root: false}
+-      %{root: bool} when is_boolean(bool) -> state
+-    end
+-  end
+-
+-  ## handle_tag_and_attrs
+-
+-  defp handle_tag_and_attrs(state, name, attrs, suffix, meta) do
+-    text =
+-      if Application.get_env(:phoenix_live_view, :debug_attributes, false) do
+-        "<#{name} data-phx-loc=\"#{meta[:line]}\""
+-      else
+-        "<#{name}"
+-      end
+-
++  @impl true
++  def handle_expr(state, _marker, _expr) do
+     state
+-    |> update_subengine(:handle_text, [meta, text])
+-    |> handle_tag_attrs(meta, attrs)
+-    |> update_subengine(:handle_text, [meta, suffix])
+-  end
+-
+-  defp handle_tag_attrs(state, meta, attrs) do
+-    Enum.reduce(attrs, state, fn
+-      {:root, {:expr, _, _} = expr, _attr_meta}, state ->
+-        ast = parse_expr!(expr, state.file)
+-
+-        # If we have a map of literal keys, we unpack it as a list
+-        # to simplify the downstream check.
+-        ast =
+-          with {:%{}, _meta, pairs} <- ast,
+-               true <- literal_keys?(pairs) do
+-            pairs
+-          else
+-            _ -> ast
+-          end
+-
+-        handle_tag_expr_attrs(state, meta, ast)
+-
+-      {name, {:expr, _, _} = expr, _attr_meta}, state ->
+-        handle_tag_expr_attrs(state, meta, [{name, parse_expr!(expr, state.file)}])
+-
+-      {name, {:string, value, %{delimiter: ?"}}, _attr_meta}, state ->
+-        update_subengine(state, :handle_text, [meta, ~s( #{name}="#{value}")])
+-
+-      {name, {:string, value, %{delimiter: ?'}}, _attr_meta}, state ->
+-        update_subengine(state, :handle_text, [meta, ~s( #{name}='#{value}')])
+-
+-      {name, nil, _attr_meta}, state ->
+-        update_subengine(state, :handle_text, [meta, " #{name}"])
+-    end)
+-  end
+-
+-  defp handle_tag_expr_attrs(state, meta, ast) do
+-    # It is safe to List.wrap/1 because if we receive nil,
+-    # it would become the interpolation of nil, which is an
+-    # empty string anyway.
+-    case state.tag_handler.handle_attributes(ast, meta) do
+-      {:attributes, attrs} ->
+-        Enum.reduce(attrs, state, fn
+-          {name, value}, state ->
+-            state = update_subengine(state, :handle_text, [meta, ~s( #{name}=")])
+-
+-            state =
+-              value
+-              |> List.wrap()
+-              |> Enum.reduce(state, fn
+-                binary, state when is_binary(binary) ->
+-                  update_subengine(state, :handle_text, [meta, binary])
+-
+-                expr, state ->
+-                  update_subengine(state, :handle_expr, ["=", expr])
+-              end)
+-
+-            update_subengine(state, :handle_text, [meta, ~s(")])
+-
+-          quoted, state ->
+-            update_subengine(state, :handle_expr, ["=", quoted])
+-        end)
+-
+-      {:quoted, quoted} ->
+-        update_subengine(state, :handle_expr, ["=", quoted])
+-    end
+-  end
+-
+-  defp parse_expr!({:expr, value, %{line: line, column: col}}, file) do
+-    Code.string_to_quoted!(value, line: line, column: col, file: file)
+-  end
+-
+-  defp literal_keys?([{key, _value} | rest]) when is_atom(key) or is_binary(key),
+-    do: literal_keys?(rest)
+-
+-  defp literal_keys?([]), do: true
+-  defp literal_keys?(_other), do: false
+-
+-  defp handle_special_expr(state, tag_meta) do
+-    ast =
+-      case tag_meta do
+-        %{for: _for_expr, if: if_expr} ->
+-          for_expr = maybe_keyed(tag_meta)
+-
+-          quote do
+-            for unquote(for_expr), unquote(if_expr),
+-              do: unquote(invoke_subengine(state, :handle_end, []))
+-          end
+-
+-        %{for: _for_expr} ->
+-          for_expr = maybe_keyed(tag_meta)
+-
+-          quote do
+-            for unquote(for_expr), do: unquote(invoke_subengine(state, :handle_end, []))
+-          end
+-
+-        %{if: if_expr} ->
+-          quote do
+-            if unquote(if_expr), do: unquote(invoke_subengine(state, :handle_end, []))
+-          end
+-
+-        %{key: _} ->
+-          raise_syntax_error!("cannot use :key without :for", tag_meta, state)
+-
+-        %{} ->
+-          nil
+-      end
+-
+-    if ast do
+-      state
+-      |> pop_substate_from_stack()
+-      |> update_subengine(:handle_expr, ["=", ast])
+-    else
+-      state
+-    end
+-  end
+-
+-  defp maybe_keyed(%{key: key_expr, for: for_expr}) do
+-    # we already validated that the for expression has the correct shape in
+-    # validate_quoted_special_attr
+-    {:<-, for_meta, [lhs, rhs]} = for_expr
+-    {:<-, [keyed_comprehension: true, key_expr: key_expr] ++ for_meta, [lhs, rhs]}
+-  end
+-
+-  defp maybe_keyed(%{for: for_expr}), do: for_expr
+-
+-  ## build_self_close_component_assigns/build_component_assigns
+-
+-  defp build_self_close_component_assigns(type_component, attrs, line, state) do
+-    {special, roots, attrs, attr_info} = split_component_attrs(type_component, attrs, state)
+-    raise_if_let!(special[":let"], state.file)
+-    {merge_component_attrs(roots, attrs, line), attr_info}
+-  end
+-
+-  defp build_component_assigns(type_component, attrs, line, tag_meta, tag_close_meta, state) do
+-    {special, roots, attrs, attr_info} = split_component_attrs(type_component, attrs, state)
+-
+-    clauses =
+-      build_component_clauses(special[":let"], :inner_block, tag_meta, tag_close_meta, state)
+-
+-    inner_block =
+-      quote line: line do
+-        Phoenix.LiveView.TagEngine.inner_block(:inner_block, do: unquote(clauses))
+-      end
+-
+-    inner_block_assigns =
+-      quote line: line do
+-        %{
+-          __slot__: :inner_block,
+-          inner_block: unquote(inner_block)
+-        }
+-      end
+-
+-    {slot_assigns, slot_info, state} = pop_slots(state)
+-
+-    slot_info = [
+-      {:inner_block, [{tag_meta, add_inner_block({false, [], []}, inner_block, tag_meta)}]}
+-      | slot_info
+-    ]
+-
+-    attrs = attrs ++ [{:inner_block, [inner_block_assigns]} | slot_assigns]
+-    {merge_component_attrs(roots, attrs, line), attr_info, slot_info, state}
+-  end
+-
+-  defp split_component_attrs(type_component, attrs, state) do
+-    {special, roots, attrs, locs} =
+-      attrs
+-      |> Enum.reverse()
+-      |> Enum.reduce(
+-        {%{}, [], [], []},
+-        &split_component_attr(&1, &2, state, type_component)
+-      )
+-
+-    {special, roots, attrs, {roots != [], attrs, locs}}
+-  end
+-
+-  defp split_component_attr(
+-         {:root, {:expr, value, %{line: line, column: col}}, _attr_meta},
+-         {special, r, a, locs},
+-         state,
+-         _type_component
+-       ) do
+-    quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
+-    quoted_value = quote line: line, do: Map.new(unquote(quoted_value))
+-    {special, [quoted_value | r], a, locs}
+-  end
+-
+-  @special_attrs ~w(:let :if :for :key)
+-  defp split_component_attr(
+-         {":key", _expr, attr_meta},
+-         _,
+-         state,
+-         {"slot", slot_name}
+-       ) do
+-    message = ":key is not supported on slots: #{slot_name}"
+-    raise_syntax_error!(message, attr_meta, state)
+-  end
+-
+-  defp split_component_attr(
+-         {attr, {:expr, value, %{line: line, column: col} = meta}, attr_meta},
+-         {special, r, a, locs},
+-         state,
+-         _type_component
+-       )
+-       when attr in @special_attrs do
+-    case special do
+-      %{^attr => {_, attr_meta}} ->
+-        message = """
+-        cannot define multiple #{attr} attributes. \
+-        Another #{attr} has already been defined at line #{meta.line}\
+-        """
+-
+-        raise_syntax_error!(message, attr_meta, state)
+-
+-      %{} ->
+-        quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
+-        validate_quoted_special_attr!(attr, quoted_value, attr_meta, state)
+-        {Map.put(special, attr, {quoted_value, attr_meta}), r, a, locs}
+-    end
+-  end
+-
+-  defp split_component_attr({attr, _, meta}, _state, state, {type, component_or_slot})
+-       when attr in @special_attrs do
+-    message = "#{attr} must be a pattern between {...} in #{type}: #{component_or_slot}"
+-    raise_syntax_error!(message, meta, state)
+-  end
+-
+-  defp split_component_attr({":" <> _ = name, _, meta}, _state, state, {type, component_or_slot}) do
+-    message = "unsupported attribute #{inspect(name)} in #{type}: #{component_or_slot}"
+-    raise_syntax_error!(message, meta, state)
+-  end
+-
+-  defp split_component_attr(
+-         {name, {:expr, value, %{line: line, column: col}}, attr_meta},
+-         {special, r, a, locs},
+-         state,
+-         _type_component
+-       ) do
+-    quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
+-    {special, r, [{String.to_atom(name), quoted_value} | a], [line_column(attr_meta) | locs]}
+-  end
+-
+-  defp split_component_attr(
+-         {name, {:string, value, _meta}, attr_meta},
+-         {special, r, a, locs},
+-         _state,
+-         _type_component
+-       ) do
+-    {special, r, [{String.to_atom(name), value} | a], [line_column(attr_meta) | locs]}
+-  end
+-
+-  defp split_component_attr(
+-         {name, nil, attr_meta},
+-         {special, r, a, locs},
+-         _state,
+-         _type_component
+-       ) do
+-    {special, r, [{String.to_atom(name), true} | a], [line_column(attr_meta) | locs]}
+-  end
+-
+-  defp line_column(%{line: line, column: column}), do: {line, column}
+-
+-  defp merge_component_attrs(roots, attrs, line) do
+-    entries =
+-      case {roots, attrs} do
+-        {[], []} -> [{:%{}, [], []}]
+-        {_, []} -> roots
+-        {_, _} -> roots ++ [{:%{}, [], attrs}]
+-      end
+-
+-    Enum.reduce(entries, fn expr, acc ->
+-      quote line: line, do: Map.merge(unquote(acc), unquote(expr))
+-    end)
+-  end
+-
+-  defp decompose_remote_component_tag!(tag_name, tag_meta, state) do
+-    case String.split(tag_name, ".") |> Enum.reverse() do
+-      [<<first, _::binary>> = fun_name | rest] when first in ?a..?z ->
+-        size = Enum.sum(Enum.map(rest, &byte_size/1)) + length(rest) + 1
+-        aliases = rest |> Enum.reverse() |> Enum.map(&String.to_atom/1)
+-        fun = String.to_atom(fun_name)
+-        %{line: line, column: column} = tag_meta
+-        {{:__aliases__, [line: line, column: column], aliases}, size, fun}
+-
+-      _ ->
+-        message = "invalid tag <#{tag_meta.tag_name}>"
+-        raise_syntax_error!(message, tag_meta, state)
+-    end
+-  end
+-
+-  @doc false
+-  def __unmatched_let__!(pattern, value) do
+-    message = """
+-    cannot match arguments sent from render_slot/2 against the pattern in :let.
+-
+-    Expected a value matching `#{pattern}`, got: #{inspect(value)}\
+-    """
+-
+-    stacktrace =
+-      self()
+-      |> Process.info(:current_stacktrace)
+-      |> elem(1)
+-      |> Enum.drop(2)
+-
+-    reraise(message, stacktrace)
+-  end
+-
+-  defp raise_if_let!(let, file) do
+-    with {_pattern, %{line: line}} <- let do
+-      message = "cannot use :let on a component without inner content"
+-      raise CompileError, line: line, file: file, description: message
+-    end
+-  end
+-
+-  defp build_component_clauses(let, name, tag_meta, tag_close_meta, %{caller: caller} = state) do
+-    opts =
+-      if annotation =
+-           caller && Map.get(tag_meta, :has_tags?, false) &&
+-             state.tag_handler.annotate_slot(name, tag_meta, tag_close_meta, caller) do
+-        [meta: [template_annotation: annotation]]
+-      else
+-        []
+-      end
+-
+-    ast = invoke_subengine(state, :handle_end, [opts])
+-
+-    case let do
+-      # If we have a var, we can skip the catch-all clause
+-      {{var, _, ctx} = pattern, %{line: line}} when is_atom(var) and is_atom(ctx) ->
+-        quote line: line do
+-          unquote(pattern) -> unquote(ast)
+-        end
+-
+-      {pattern, %{line: line}} ->
+-        quote line: line do
+-          unquote(pattern) -> unquote(ast)
+-        end ++
+-          quote generated: true do
+-            other ->
+-              Phoenix.LiveView.TagEngine.__unmatched_let__!(
+-                unquote(Macro.to_string(pattern)),
+-                other
+-              )
+-          end
+-
+-      _ ->
+-        quote do
+-          _ -> unquote(ast)
+-        end
+-    end
+-  end
+-
+-  defp store_component_call(component, attr_info, slot_info, line, %{caller: caller} = state) do
+-    module = caller.module
+-
+-    if module && Module.open?(module) do
+-      pruned_slots =
+-        for {slot_name, slot_values} <- slot_info, into: %{} do
+-          values =
+-            for {tag_meta, {root?, attrs, locs}} <- slot_values do
+-              %{line: tag_meta.line, root: root?, attrs: attrs_for_call(attrs, locs)}
+-            end
+-
+-          {slot_name, values}
+-        end
+-
+-      {root?, attrs, locs} = attr_info
+-      pruned_attrs = attrs_for_call(attrs, locs)
+-
+-      call = %{
+-        component: component,
+-        slots: pruned_slots,
+-        attrs: pruned_attrs,
+-        file: state.file,
+-        line: line,
+-        root: root?
+-      }
+-
+-      # This may still fail under a very specific scenario where
+-      # we are defining a template dynamically inside a function
+-      # (most likely a test) that starts running while the module
+-      # is still open.
+-      try do
+-        Module.put_attribute(module, :__components_calls__, call)
+-      rescue
+-        _ -> :ok
+-      end
+-    end
+-  end
+-
+-  defp attrs_for_call(attrs, locs) do
+-    for {{attr, value}, {line, column}} <- Enum.zip(attrs, locs),
+-        do: {attr, {line, column, attr_type(value)}},
+-        into: %{}
+-  end
+-
+-  defp attr_type({:<<>>, _, _} = value), do: {:string, value}
+-  defp attr_type(value) when is_list(value), do: {:list, value}
+-  defp attr_type(value = {:%{}, _, _}), do: {:map, value}
+-  defp attr_type(value) when is_binary(value), do: {:string, value}
+-  defp attr_type(value) when is_integer(value), do: {:integer, value}
+-  defp attr_type(value) when is_float(value), do: {:float, value}
+-  defp attr_type(value) when is_boolean(value), do: {:boolean, value}
+-  defp attr_type(value) when is_atom(value), do: {:atom, value}
+-  defp attr_type({:fn, _, [{:->, _, [args, _]}]}), do: {:fun, length(args)}
+-  defp attr_type({:&, _, [{:/, _, [_, arity]}]}), do: {:fun, arity}
+-
+-  # this could be a &myfun(&1, &2)
+-  defp attr_type({:&, _, args}) do
+-    {_ast, arity} =
+-      Macro.prewalk(args, 0, fn
+-        {:&, _, [n]} = ast, acc when is_integer(n) ->
+-          {ast, max(n, acc)}
+-
+-        ast, acc ->
+-          {ast, acc}
+-      end)
+-
+-    (arity > 0 && {:fun, arity}) || :any
+-  end
+-
+-  defp attr_type(_value), do: :any
+-
+-  ## Helpers
+-
+-  defp to_location(%{line: line, column: column}), do: [line: line, column: column]
+-
+-  defp actual_component_module(env, fun) do
+-    case Macro.Env.lookup_import(env, {fun, 1}) do
+-      [{_, module} | _] -> module
+-      _ -> env.module
+-    end
+-  end
+-
+-  # removes phx-no-format, etc. and maps phx-hook=".name" to the fully qualified name
+-  defp postprocess_attrs(attrs, state) do
+-    attrs_to_remove = ~w(phx-no-format phx-no-curly-interpolation)
+-
+-    for {key, value, meta} <- attrs,
+-        key not in attrs_to_remove do
+-      case {key, value, meta} do
+-        {"phx-hook", {:string, "." <> name, str_meta}, meta} ->
+-          {key, {:string, "#{inspect(state.caller.module)}.#{name}", str_meta}, meta}
+-
+-        _ ->
+-          {key, value, meta}
+-      end
+-    end
+-  end
+-
+-  defp validate_tag_attrs!(attrs, %{tag_name: "input"}, state) do
+-    # warn if using name="id" on an input
+-    case Enum.find(attrs, &match?({"name", {:string, "id", _}, _}, &1)) do
+-      {_name, _value, attr_meta} ->
+-        meta = [
+-          line: attr_meta.line,
+-          column: attr_meta.column,
+-          file: state.file,
+-          module: state.caller.module,
+-          function: state.caller.function
+-        ]
+-
+-        IO.warn(
+-          """
+-          Setting the "name" attribute to "id" on an input tag overrides the ID of the corresponding form element.
+-          This leads to unexpected behavior, especially when using LiveView, and is not recommended.
+-
+-          You should use a different value for the "name" attribute, e.g. "_id" and remap the value in the
+-          corresponding handle_event/3 callback or controller.
+-          """,
+-          meta
+-        )
+-
+-      _ ->
+-        :ok
+-    end
+-  end
+-
+-  defp validate_tag_attrs!(_attrs, _meta, _state), do: :ok
+-
+-  # Check if `phx-update`, `phx-hook` is present in attrs and raises in case
+-  # there is no ID attribute set.
+-  defp validate_phx_attrs!(attrs, meta, state) do
+-    validate_phx_attrs!(attrs, meta, state, nil, false)
+-  end
+-
+-  defp validate_phx_attrs!([], meta, state, attr, false)
+-       when attr in ["phx-update", "phx-hook"] do
+-    message = "attribute \"#{attr}\" requires the \"id\" attribute to be set"
+-
+-    raise_syntax_error!(message, meta, state)
+-  end
+-
+-  defp validate_phx_attrs!([], _meta, _state, _attr, _id?), do: :ok
+-
+-  # Handle <div phx-update="ignore" {@some_var}>Content</div> since here the ID
+-  # might be inserted dynamically so we can't raise at compile time.
+-  defp validate_phx_attrs!([{:root, _, _} | t], meta, state, attr, _id?),
+-    do: validate_phx_attrs!(t, meta, state, attr, true)
+-
+-  defp validate_phx_attrs!([{"id", _, _} | t], meta, state, attr, _id?),
+-    do: validate_phx_attrs!(t, meta, state, attr, true)
+-
+-  defp validate_phx_attrs!(
+-         [{"phx-update", {:string, value, _meta}, attr_meta} | t],
+-         meta,
+-         state,
+-         _attr,
+-         id?
+-       ) do
+-    cond do
+-      value in ~w(ignore stream replace) ->
+-        validate_phx_attrs!(t, meta, state, "phx-update", id?)
+-
+-      value in ~w(append prepend) ->
+-        line = meta[:line] || state.caller.line
+-
+-        IO.warn(
+-          "phx-update=\"#{value}\" is deprecated, please use streams instead",
+-          Macro.Env.stacktrace(%{state.caller | line: line})
+-        )
+-
+-        validate_phx_attrs!(t, meta, state, "phx-update", id?)
+-
+-      true ->
+-        message =
+-          "the value of the attribute \"phx-update\" must be: ignore, stream, append, prepend, or replace"
+-
+-        raise_syntax_error!(message, attr_meta, state)
+-    end
+-  end
+-
+-  defp validate_phx_attrs!([{"phx-update", _attrs, _} | t], meta, state, _attr, id?) do
+-    validate_phx_attrs!(t, meta, state, "phx-update", id?)
+-  end
+-
+-  defp validate_phx_attrs!([{"phx-hook", _, _} | t], meta, state, _attr, id?),
+-    do: validate_phx_attrs!(t, meta, state, "phx-hook", id?)
+-
+-  defp validate_phx_attrs!([{special, value, attr_meta} | t], meta, state, attr, id?)
+-       when special in ~w(:if :for :type) do
+-    case value do
+-      {:expr, _, _} ->
+-        validate_phx_attrs!(t, meta, state, attr, id?)
+-
+-      _ ->
+-        message = "#{special} must be an expression between {...}"
+-        raise_syntax_error!(message, attr_meta, state)
+-    end
+-  end
+-
+-  defp validate_phx_attrs!([{":" <> name, _, attr_meta} | _], _meta, state, _attr, _id?)
+-       when name not in ~w(if for key) do
+-    message = "unsupported attribute :#{name} in tags"
+-    raise_syntax_error!(message, attr_meta, state)
+-  end
+-
+-  defp validate_phx_attrs!([_h | t], meta, state, attr, id?),
+-    do: validate_phx_attrs!(t, meta, state, attr, id?)
+-
+-  defp validate_quoted_special_attr!(attr, quoted_value, attr_meta, state) do
+-    if attr == ":for" and not match?({:<-, _, [_, _]}, quoted_value) do
+-      message = ":for must be a generator expression (pattern <- enumerable) between {...}"
+-
+-      raise_syntax_error!(message, attr_meta, state)
+-    else
+-      :ok
+-    end
+-  end
+-
+-  defp tag_slots({call, meta, args}, slot_info) do
+-    {call, [slots: Keyword.keys(slot_info)] ++ meta, args}
+-  end
+-
+-  defp wrap_special_slot(special, ast) do
+-    case special do
+-      %{":for" => {for_expr, %{line: line}}, ":if" => {if_expr, %{line: _line}}} ->
+-        quote line: line do
+-          for unquote(for_expr), unquote(if_expr), do: unquote(ast)
+-        end
+-
+-      %{":for" => {for_expr, %{line: line}}} ->
+-        quote line: line do
+-          for unquote(for_expr), do: unquote(ast)
+-        end
+-
+-      %{":if" => {if_expr, %{line: line}}} ->
+-        quote line: line do
+-          if unquote(if_expr), do: [unquote(ast)], else: []
+-        end
+-
+-      %{} ->
+-        ast
+-    end
+-  end
+-
+-  defp expand_with_line(ast, line, env) do
+-    Macro.expand(ast, %{env | line: line})
+-  end
+-
+-  defp raise_syntax_error!(message, meta, state) do
+-    raise ParseError,
+-      line: meta.line,
+-      column: meta.column,
+-      file: state.file,
+-      description: message <> ParseError.code_snippet(state.source, meta, state.indentation)
+-  end
+-
+-  defp maybe_anno_caller(state, meta, file, line) do
+-    if anno = state.tag_handler.annotate_caller(file, line) do
+-      update_subengine(state, :handle_text, [meta, anno])
+-    else
+-      state
+-    end
+   end
+ end
+diff --git a/lib/phoenix_live_view/tag_engine/compiler.ex b/lib/phoenix_live_view/tag_engine/compiler.ex
+new file mode 100644
+index 00000000..ccf5067c
+--- /dev/null
++++ b/lib/phoenix_live_view/tag_engine/compiler.ex
+@@ -0,0 +1,1270 @@
++defmodule Phoenix.LiveView.TagEngine.Compiler do
++  @moduledoc false
++
++  alias Phoenix.LiveView.TagEngine.Tokenizer.ParseError
++
++  @doc """
++  Compiles the node tag tree into Elixir code.
++
++  Under the hood, this uses the `Phoenix.LiveView.Engine`
++  to convert template parts into static and dynamic parts
++  and perform change tracking. See the Engine documentation
++  for more details.
++
++  This function is responsible for converting the nodes into
++  text and expression parts and properly invoking the engine
++  with the correct code for features like components and slots.
++  """
++  def compile(nodes, opts) do
++    {engine, opts} = Keyword.pop(opts, :engine, Phoenix.LiveView.Engine)
++    tag_handler = Keyword.fetch!(opts, :tag_handler)
++
++    state = %{
++      engine: engine,
++      file: Keyword.get(opts, :file, "nofile"),
++      indentation: Keyword.get(opts, :indentation, 0),
++      caller: Keyword.fetch!(opts, :caller),
++      source: Keyword.fetch!(opts, :source),
++      tag_handler: tag_handler,
++      # slots is the only key that is updated when traversing nodes
++      slots: []
++    }
++
++    # Live components require a single, static root tag.
++    # This is because they are patched independently on the client
++    # and morphdom requires a single DOM node as an entrypoint for patching.
++    # It needs to be static, because if it is not, we cannot guarantee
++    # that it might render multiple tags at runtime.
++    #
++    # Because the parser already resolves macro components and trims
++    # leading and trailing whitespace, the root check can be a simple
++    # pattern match.
++    root =
++      case nodes do
++        # We do not allow any special attribute (:for, :if),
++        # because these violate the static requirement.
++        [{:block, :tag, _name, _attrs, _children, meta, _close_meta}]
++        when is_map_key(meta, :special) and meta.special == [] ->
++          true
++
++        [{:self_close, :tag, _name, _attrs, meta}]
++        when is_map_key(meta, :special) and meta.special == [] ->
++          true
++
++        _ ->
++          false
++      end
++
++    {state, substate} = handle_node(nodes, engine.init(caller: opts[:caller]), state)
++
++    caller = state.caller
++    body_opts = [root: root]
++
++    body_opts =
++      if annotation = caller && has_tags?(nodes) && tag_handler.annotate_body(caller) do
++        [meta: [template_annotation: annotation]] ++ body_opts
++      else
++        body_opts
++      end
++
++    ast = state.engine.handle_body(substate, body_opts)
++
++    quote do
++      require Phoenix.LiveView.TagEngine
++      unquote(ast)
++    end
++  end
++
++  defp handle_node(nodes, substate, state) when is_list(nodes) do
++    Enum.reduce(nodes, {state, substate}, fn node, {state, substate} ->
++      handle_node(node, substate, state)
++    end)
++  end
++
++  defp handle_node({:text, "", _meta}, substate, state) do
++    {state, substate}
++  end
++
++  defp handle_node({:text, text, _meta}, substate, state) do
++    substate = state.engine.handle_text(substate, [], text)
++    {state, substate}
++  end
++
++  ## Skip EEx comments (<%!-- ... --%>)
++  defp handle_node({:eex_comment, _text}, substate, state) do
++    {state, substate}
++  end
++
++  ## HEEx interpolation {...}
++  defp handle_node({:body_expr, expr, %{line: line, column: column}}, substate, state) do
++    ast = Code.string_to_quoted!(expr, line: line, column: column, file: state.file)
++    substate = state.engine.handle_expr(substate, "=", ast)
++    {state, substate}
++  end
++
++  ## EEx expression (<% ... %> or any modifier like <%= ... %>)
++  defp handle_node({:eex, expr, %{opt: opt, line: line, column: column}}, substate, state) do
++    ast = Code.string_to_quoted!(expr, line: line, column: column, file: state.file)
++    # opt is a charlist from the tokenizer, convert to string for the engine
++    marker = to_string(opt)
++    substate = state.engine.handle_expr(substate, marker, ast)
++    {state, substate}
++  end
++
++  ## eex_block (if/case/for/etc)
++  #
++  # Uses the same approach as EEx.Compiler: builds up the complete expression string
++  # with __EEX__(key) placeholders, parses it as Elixir code, then replaces the
++  # placeholders with the actual compiled content.
++  defp handle_node(
++         {:eex_block, expr, blocks, %{line: line, column: column, opt: opt}},
++         substate,
++         state
++       ) do
++    # EEx block structure: expr is "case @status do", blocks are [{children, clause_expr}, ...]
++    # For example: imagine this template
++    #
++    # ```heex
++    # <%= case @status do %>
++    #   <% :connecting -> %>
++    #     <.status status={@status} />
++    #   <% :loading -> %>
++    #     <.status status={@status} />
++    #   <% :connected -> %>
++    #     <.status status={@status} />
++    #   <% :loaded -> %>
++    #     <.live_component module={__MODULE__.Form} id="my-form" name={@name} email={@email} />
++    # <% end %>
++    # ```
++    #
++    # This ends up as an eex_block like this:
++    #
++    # [
++    #   {:eex_block, "case @status do",
++    #   [
++    #     {[{:text, "\n      ", %{}}], ":connecting ->"},
++    #     {[
++    #        {:text, "\n        ", %{}},
++    #        {:self_close, :local_component, "status", [...], %{}},
++    #        {:text, "\n      ", %{}}
++    #      ], ":loading ->"},
++    #     {children, ":connected ->"},
++    #     {children, ":loaded ->"},
++    #     {children, "end"}
++    #   ], %{line: 1, opt: ~c"=", column: 1}}
++    # ]
++    #
++    # So we start with the beginning, then we get pairs of children we need to handle,
++    # followed by the next clause / end.
++    #
++    # Each clause is its own EEx nesting, so we call handle_begin, process the children
++    # and get the compiled AST for the clause.
++    #
++    # Now, since we also need to compile the text parts, we also build a string with
++    # placeholders that ends up looking like this:
++    #
++    # case @status do
++    #  :connecting -> __EEX__(0);
++    #
++    #  :loading -> __EEX__(1);
++    #
++    #  :connected -> __EEX__(2);
++    #
++    #  :loaded -> __EEX__(3);
++    #
++    #  end
++    #
++    # Afterwards, the placeholders are replaced with the compiled content.
++    #
++    {quoted, combined_expr, _current_line} =
++      Enum.reduce(blocks, {[], expr, line}, fn
++        {children, clause_expr, clause_meta}, {quoted, acc_expr, prev_line} ->
++          # Calculate newlines needed to reach this clause's line
++          clause_line = clause_meta.line
++          newlines = String.duplicate("\n", clause_line - prev_line)
++
++          if all_spaces?(children) do
++            # This handles the case where the start expression is immediately followed
++            # by a middle expression, since we don't want to generate
++            # case @status do __EEX__(0); :connecting -> __EEX__(1) ...
++            # (we nened to skip adding the first placeholder)
++            # and instead generate
++            # case @status do :connecting -> __EEX__(0); ...
++            {quoted, acc_expr <> newlines <> " " <> clause_expr, clause_line}
++          else
++            inner_substate = state.engine.handle_begin(substate)
++            {_state, inner_substate} = handle_node(children, inner_substate, state)
++            clause_ast = state.engine.handle_end(inner_substate)
++
++            key = length(quoted)
++            placeholder = "__EEX__(#{key});"
++            quoted = [{key, clause_ast} | quoted]
++            acc_expr = acc_expr <> " " <> placeholder <> newlines <> " " <> clause_expr
++            {quoted, acc_expr, clause_line}
++          end
++      end)
++
++    # Calculate column offset: column points to '<', add length of '<%' + marker
++    # opt is a charlist like ~c"=" for <%= or ~c"" for <%
++    expr_column = column + 2 + length(opt)
++
++    # Parse the complete expression with placeholders
++    block_ast =
++      Code.string_to_quoted!(combined_expr,
++        line: line,
++        column: expr_column,
++        columns: true,
++        file: state.file
++      )
++
++    # Replace placeholders with actual content
++    final_ast = insert_quoted(block_ast, quoted)
++
++    # opt is a charlist from the tokenizer, convert to string for the engine
++    marker = to_string(opt)
++    substate = state.engine.handle_expr(substate, marker, final_ast)
++    {state, substate}
++  end
++
++  ## Self-closing tag (<div />)
++  defp handle_node({:self_close, :tag, name, attrs, meta}, substate, state) do
++    %{closing: closing} = meta
++    suffix = if closing == :void, do: ">", else: "></#{name}>"
++    attrs = postprocess_attrs(attrs, state)
++    validate_phx_attrs!(attrs, meta, state)
++    validate_tag_attrs!(attrs, meta, state)
++
++    with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
++      substate = handle_tag_and_attrs(name, attrs, suffix, to_location(meta), substate, state)
++      {state, substate}
++    end)
++  end
++
++  ## Self-closing slot (<:some_slot />)
++  defp handle_node({:self_close, :slot, slot_name, attrs, meta}, substate, state) do
++    slot_name = String.to_atom(slot_name)
++    attrs = postprocess_attrs(attrs, state)
++    %{line: line} = meta
++    {special, roots, attrs, attr_info} = split_component_attrs({"slot", slot_name}, attrs, state)
++    let = special[":let"]
++
++    with {_, let_meta} <- let do
++      message = "cannot use :let on a slot without inner content"
++      raise_syntax_error!(message, let_meta, state)
++    end
++
++    attrs = [__slot__: slot_name, inner_block: nil] ++ attrs
++    assigns = wrap_special_slot(special, merge_component_attrs(roots, attrs, line))
++
++    state = add_slot(state, slot_name, assigns, attr_info, meta, special)
++    {state, substate}
++  end
++
++  ## Self-closing local component (<.some_component />)
++  defp handle_node({:self_close, :local_component, name, attrs, meta}, substate, state) do
++    fun = String.to_atom(name)
++    %{line: line, column: column} = meta
++    attrs = postprocess_attrs(attrs, state)
++
++    {assigns, attr_info} =
++      build_self_close_component_assigns({"local component", fun}, attrs, line, state)
++
++    mod = actual_component_module(state.caller, fun)
++    store_component_call({mod, fun}, attr_info, [], line, state)
++    call_meta = [line: line, column: column]
++    call = {fun, call_meta, __MODULE__}
++
++    ast =
++      quote line: line do
++        Phoenix.LiveView.TagEngine.component(
++          &(unquote(call) / 1),
++          unquote(assigns),
++          {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
++        )
++      end
++
++    with_special_attrs(attrs, meta, substate, state, fn _new_attrs, _new_meta, substate, state ->
++      substate = maybe_anno_caller(substate, call_meta, state.file, line, state)
++      substate = state.engine.handle_expr(substate, "=", ast)
++      {state, substate}
++    end)
++  end
++
++  ## Self-closing remote component (<MyModule.some_component />)
++  defp handle_node({:self_close, :remote_component, name, attrs, meta}, substate, state) do
++    attrs = postprocess_attrs(attrs, state)
++    {mod_ast, mod_size, fun} = decompose_remote_component_tag!(name, meta, state)
++    %{line: line, column: column} = meta
++
++    {assigns, attr_info} =
++      build_self_close_component_assigns({"remote component", name}, attrs, meta.line, state)
++
++    mod = expand_with_line(mod_ast, line, state.caller)
++    store_component_call({mod, fun}, attr_info, [], line, state)
++    call_meta = [line: line, column: column + mod_size]
++    call = {{:., call_meta, [mod_ast, fun]}, call_meta, []}
++
++    ast =
++      quote line: meta.line do
++        Phoenix.LiveView.TagEngine.component(
++          &(unquote(call) / 1),
++          unquote(assigns),
++          {__MODULE__, __ENV__.function, __ENV__.file, unquote(meta.line)}
++        )
++      end
++
++    with_special_attrs(attrs, meta, substate, state, fn _new_attrs, _new_meta, substate, state ->
++      substate = maybe_anno_caller(substate, call_meta, state.file, line, state)
++      substate = state.engine.handle_expr(substate, "=", ast)
++      {state, substate}
++    end)
++  end
++
++  ## Regular HTML tag with content (<div>...</div>)
++  defp handle_node({:block, :tag, name, attrs, children, meta, close_meta}, substate, state) do
++    attrs = postprocess_attrs(attrs, state)
++    validate_phx_attrs!(attrs, meta, state)
++    validate_tag_attrs!(attrs, meta, state)
++
++    with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
++      substate = handle_tag_and_attrs(name, attrs, ">", to_location(meta), substate, state)
++      {_child_state, substate} = handle_node(children, substate, state)
++      substate = state.engine.handle_text(substate, [to_location(close_meta)], "</#{name}>")
++      {state, substate}
++    end)
++  end
++
++  ## Slot with content (<:slot>...</:slot>)
++  defp handle_node({:block, :slot, slot_name, attrs, children, meta, close_meta}, substate, state) do
++    slot_name = String.to_atom(slot_name)
++    attrs = postprocess_attrs(attrs, state)
++    %{line: line} = meta
++
++    {special, roots, attrs, attr_info} =
++      split_component_attrs({"slot", slot_name}, attrs, state)
++
++    # The parser verifies that slots are direct component children,
++    # so can ignore slots here, as they are always empty.
++    {clauses, _slots} =
++      build_component_clauses(
++        special[":let"],
++        slot_name,
++        children,
++        meta,
++        close_meta,
++        substate,
++        state
++      )
++
++    ast =
++      quote line: line do
++        Phoenix.LiveView.TagEngine.inner_block(unquote(slot_name), do: unquote(clauses))
++      end
++
++    attrs = [__slot__: slot_name, inner_block: ast] ++ attrs
++    assigns = wrap_special_slot(special, merge_component_attrs(roots, attrs, line))
++    inner = add_inner_block(attr_info, ast, meta)
++
++    state = add_slot(state, slot_name, assigns, inner, meta, special)
++    {state, substate}
++  end
++
++  ## Local component with content (<.some_component>...</.some_component>)
++  defp handle_node(
++         {:block, :local_component, name, attrs, children, meta, close_meta},
++         substate,
++         state
++       ) do
++    fun = String.to_atom(name)
++    %{line: line, column: column} = meta
++    attrs = postprocess_attrs(attrs, state)
++    mod = actual_component_module(state.caller, fun)
++    ref = {"local component", fun}
++
++    with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
++      {assigns, attr_info, slot_info} =
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++
++      store_component_call({mod, fun}, attr_info, slot_info, line, state)
++      call_meta = [line: line, column: column]
++      call = {fun, call_meta, __MODULE__}
++
++      ast =
++        quote line: line do
++          Phoenix.LiveView.TagEngine.component(
++            &(unquote(call) / 1),
++            unquote(assigns),
++            {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
++          )
++        end
++        |> tag_slots(slot_info)
++
++      substate = maybe_anno_caller(substate, call_meta, state.file, line, state)
++      substate = state.engine.handle_expr(substate, "=", ast)
++      {state, substate}
++    end)
++  end
++
++  ## Remote component with content (<MyModule.some_component>...</MyModule.some_component>)
++  defp handle_node(
++         {:block, :remote_component, name, attrs, children, meta, close_meta},
++         substate,
++         state
++       ) do
++    {mod_ast, mod_size, fun} = decompose_remote_component_tag!(name, meta, state)
++    %{line: line, column: column} = meta
++    attrs = postprocess_attrs(attrs, state)
++    mod = expand_with_line(mod_ast, line, state.caller)
++    ref = {"remote component", name}
++
++    with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
++      # Process children in a new nesting
++      {assigns, attr_info, slot_info} =
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++
++      store_component_call({mod, fun}, attr_info, slot_info, line, state)
++      call_meta = [line: line, column: column + mod_size]
++      call = {{:., call_meta, [mod_ast, fun]}, call_meta, []}
++
++      ast =
++        quote line: line do
++          Phoenix.LiveView.TagEngine.component(
++            &(unquote(call) / 1),
++            unquote(assigns),
++            {__MODULE__, __ENV__.function, __ENV__.file, unquote(line)}
++          )
++        end
++        |> tag_slots(slot_info)
++
++      substate = maybe_anno_caller(substate, call_meta, state.file, line, state)
++      substate = state.engine.handle_expr(substate, "=", ast)
++      {state, substate}
++    end)
++  end
++
++  ## EEx block helpers
++
++  defp all_spaces?(children) do
++    Enum.all?(children, fn
++      {:eex_comment, _} -> true
++      {:text, text, _} -> String.trim_leading(text) == ""
++      _ -> false
++    end)
++  end
++
++  # Replace __EEX__(key) placeholders with actual compiled content
++  # This is taken from EEx.Compiler
++  defp insert_quoted({:__EEX__, _, [key]}, quoted) do
++    {^key, value} = List.keyfind(quoted, key, 0)
++    value
++  end
++
++  defp insert_quoted({left, meta, right}, quoted) do
++    {insert_quoted(left, quoted), meta, insert_quoted(right, quoted)}
++  end
++
++  defp insert_quoted({left, right}, quoted) do
++    {insert_quoted(left, quoted), insert_quoted(right, quoted)}
++  end
++
++  defp insert_quoted(list, quoted) when is_list(list) do
++    Enum.map(list, &insert_quoted(&1, quoted))
++  end
++
++  defp insert_quoted(other, _quoted) do
++    other
++  end
++
++  ## Tag attributes
++
++  defp handle_tag_and_attrs(name, attrs, suffix, meta, substate, state) do
++    text =
++      if Application.get_env(:phoenix_live_view, :debug_attributes, false) do
++        "<#{name} data-phx-loc=\"#{meta[:line]}\""
++      else
++        "<#{name}"
++      end
++
++    substate = state.engine.handle_text(substate, meta, text)
++    substate = handle_tag_attrs(meta, attrs, substate, state)
++    state.engine.handle_text(substate, meta, suffix)
++  end
++
++  defp handle_tag_attrs(meta, attrs, substate, state) do
++    Enum.reduce(attrs, substate, fn
++      {:root, {:expr, _, _} = expr, _attr_meta}, substate ->
++        ast = parse_expr!(expr, state.file)
++
++        # If we have a map of literal keys, we unpack it as a list
++        # to simplify the downstream check.
++        ast =
++          with {:%{}, _meta, pairs} <- ast,
++               true <- literal_keys?(pairs) do
++            pairs
++          else
++            _ -> ast
++          end
++
++        handle_tag_expr_attrs(meta, ast, substate, state)
++
++      {name, {:expr, _, _} = expr, _attr_meta}, substate ->
++        handle_tag_expr_attrs(meta, [{name, parse_expr!(expr, state.file)}], substate, state)
++
++      {name, {:string, value, %{delimiter: ?"}}, _attr_meta}, substate ->
++        state.engine.handle_text(substate, meta, ~s( #{name}="#{value}"))
++
++      {name, {:string, value, %{delimiter: ?'}}, _attr_meta}, substate ->
++        state.engine.handle_text(substate, meta, ~s( #{name}='#{value}'))
++
++      {name, nil, _attr_meta}, substate ->
++        state.engine.handle_text(substate, meta, " #{name}")
++    end)
++  end
++
++  defp handle_tag_expr_attrs(meta, ast, substate, state) do
++    # It is safe to List.wrap/1 because if we receive nil,
++    # it would become the interpolation of nil, which is an
++    # empty string anyway.
++    case state.tag_handler.handle_attributes(ast, meta) do
++      {:attributes, attrs} ->
++        Enum.reduce(attrs, substate, fn
++          {name, value}, substate ->
++            substate = state.engine.handle_text(substate, meta, ~s( #{name}="))
++
++            substate =
++              value
++              |> List.wrap()
++              |> Enum.reduce(substate, fn
++                binary, substate when is_binary(binary) ->
++                  state.engine.handle_text(substate, meta, binary)
++
++                expr, substate ->
++                  state.engine.handle_expr(substate, "=", expr)
++              end)
++
++            state.engine.handle_text(substate, meta, ~s("))
++
++          quoted, substate ->
++            state.engine.handle_expr(substate, "=", quoted)
++        end)
++
++      {:quoted, quoted} ->
++        state.engine.handle_expr(substate, "=", quoted)
++    end
++  end
++
++  defp parse_expr!({:expr, value, %{line: line, column: col}}, file) do
++    Code.string_to_quoted!(value, line: line, column: col, file: file)
++  end
++
++  defp literal_keys?([{key, _value} | rest]) when is_atom(key) or is_binary(key),
++    do: literal_keys?(rest)
++
++  defp literal_keys?([]), do: true
++  defp literal_keys?(_other), do: false
++
++  ## Component assign helpers
++
++  defp build_self_close_component_assigns(type_component, attrs, line, state) do
++    {special, roots, attrs, attr_info} = split_component_attrs(type_component, attrs, state)
++    raise_if_let!(special[":let"], state.file)
++    {merge_component_attrs(roots, attrs, line), attr_info}
++  end
++
++  defp build_component_assigns(
++         type_component,
++         attrs,
++         children,
++         tag_meta,
++         tag_close_meta,
++         substate,
++         state
++       ) do
++    %{line: line} = tag_meta
++    {special, roots, attrs, attr_info} = split_component_attrs(type_component, attrs, state)
++
++    {clauses, slots} =
++      build_component_clauses(
++        special[":let"],
++        :inner_block,
++        children,
++        tag_meta,
++        tag_close_meta,
++        substate,
++        state
++      )
++
++    inner_block =
++      quote line: line do
++        Phoenix.LiveView.TagEngine.inner_block(:inner_block, do: unquote(clauses))
++      end
++
++    inner_block_assigns =
++      quote line: line do
++        %{
++          __slot__: :inner_block,
++          inner_block: unquote(inner_block)
++        }
++      end
++
++    {slot_assigns, slot_info} = slots
++
++    slot_info = [
++      {:inner_block, [{tag_meta, add_inner_block({false, [], []}, inner_block, tag_meta)}]}
++      | slot_info
++    ]
++
++    attrs = attrs ++ [{:inner_block, [inner_block_assigns]} | slot_assigns]
++    {merge_component_attrs(roots, attrs, line), attr_info, slot_info}
++  end
++
++  defp split_component_attrs(type_component, attrs, state) do
++    {special, roots, attrs, locs} =
++      attrs
++      |> Enum.reverse()
++      |> Enum.reduce(
++        {%{}, [], [], []},
++        &split_component_attr(&1, &2, state, type_component)
++      )
++
++    {special, roots, attrs, {roots != [], attrs, locs}}
++  end
++
++  defp split_component_attr(
++         {:root, {:expr, value, %{line: line, column: col}}, _attr_meta},
++         {special, r, a, locs},
++         state,
++         _type_component
++       ) do
++    quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
++    quoted_value = quote line: line, do: Map.new(unquote(quoted_value))
++    {special, [quoted_value | r], a, locs}
++  end
++
++  @special_attrs ~w(:let :if :for :key)
++  defp split_component_attr(
++         {":key", _expr, attr_meta},
++         _,
++         state,
++         {"slot", slot_name}
++       ) do
++    message = ":key is not supported on slots: #{slot_name}"
++    raise_syntax_error!(message, attr_meta, state)
++  end
++
++  defp split_component_attr(
++         {attr, {:expr, value, %{line: line, column: col} = meta}, attr_meta},
++         {special, r, a, locs},
++         state,
++         _type_component
++       )
++       when attr in @special_attrs do
++    case special do
++      %{^attr => {_, attr_meta}} ->
++        message = """
++        cannot define multiple #{attr} attributes. \
++        Another #{attr} has already been defined at line #{meta.line}\
++        """
++
++        raise_syntax_error!(message, attr_meta, state)
++
++      %{} ->
++        quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
++        validate_quoted_special_attr!(attr, quoted_value, attr_meta, state)
++        {Map.put(special, attr, {quoted_value, attr_meta}), r, a, locs}
++    end
++  end
++
++  defp split_component_attr({attr, _, meta}, _state, state, {type, component_or_slot})
++       when attr in @special_attrs do
++    message = "#{attr} must be a pattern between {...} in #{type}: #{component_or_slot}"
++    raise_syntax_error!(message, meta, state)
++  end
++
++  defp split_component_attr({":" <> _ = name, _, meta}, _state, state, {type, component_or_slot}) do
++    message = "unsupported attribute #{inspect(name)} in #{type}: #{component_or_slot}"
++    raise_syntax_error!(message, meta, state)
++  end
++
++  defp split_component_attr(
++         {name, {:expr, value, %{line: line, column: col}}, attr_meta},
++         {special, r, a, locs},
++         state,
++         _type_component
++       ) do
++    quoted_value = Code.string_to_quoted!(value, line: line, column: col, file: state.file)
++    {special, r, [{String.to_atom(name), quoted_value} | a], [line_column(attr_meta) | locs]}
++  end
++
++  defp split_component_attr(
++         {name, {:string, value, _meta}, attr_meta},
++         {special, r, a, locs},
++         _state,
++         _type_component
++       ) do
++    {special, r, [{String.to_atom(name), value} | a], [line_column(attr_meta) | locs]}
++  end
++
++  defp split_component_attr(
++         {name, nil, attr_meta},
++         {special, r, a, locs},
++         _state,
++         _type_component
++       ) do
++    {special, r, [{String.to_atom(name), true} | a], [line_column(attr_meta) | locs]}
++  end
++
++  defp line_column(%{line: line, column: column}), do: {line, column}
++
++  defp merge_component_attrs(roots, attrs, line) do
++    entries =
++      case {roots, attrs} do
++        {[], []} -> [{:%{}, [], []}]
++        {_, []} -> roots
++        {_, _} -> roots ++ [{:%{}, [], attrs}]
++      end
++
++    Enum.reduce(entries, fn expr, acc ->
++      quote line: line, do: Map.merge(unquote(acc), unquote(expr))
++    end)
++  end
++
++  defp decompose_remote_component_tag!(tag_name, tag_meta, state) do
++    case String.split(tag_name, ".") |> Enum.reverse() do
++      [<<first, _::binary>> = fun_name | rest] when first in ?a..?z ->
++        size = Enum.sum(Enum.map(rest, &byte_size/1)) + length(rest) + 1
++        aliases = rest |> Enum.reverse() |> Enum.map(&String.to_atom/1)
++        fun = String.to_atom(fun_name)
++        %{line: line, column: column} = tag_meta
++        {{:__aliases__, [line: line, column: column], aliases}, size, fun}
++
++      _ ->
++        message = "invalid tag <#{tag_meta.tag_name}>"
++        raise_syntax_error!(message, tag_meta, state)
++    end
++  end
++
++  defp raise_if_let!(let, file) do
++    with {_pattern, %{line: line}} <- let do
++      message = "cannot use :let on a component without inner content"
++      raise CompileError, line: line, file: file, description: message
++    end
++  end
++
++  # Given the child nodes, this function builds the clause AST for a component.
++  # If a component is defined as <.my_component>, this looks like this:
++  #
++  # _ -> ast
++  #
++  # If a component is defined as as <.my_component :let={%{foo: foo, bar: bar}}, we get:
++  #
++  # %{foo: foo, bar: bar} -> ast
++  # other -> Phoenix.LiveView.TagEngine.__unmatched_let__!("%{foo: foo, bar: bar}", other)
++  #
++  # Which is later wrapped by the inner_block macro.
++  #
++  # If there are any named slots that are part of the children,
++  # those are recursively converted into clauses (slots can also use :let)
++  # and returned as {slot_assigns, slot_info}.
++  defp build_component_clauses(
++         let,
++         name,
++         children,
++         tag_meta,
++         tag_close_meta,
++         substate,
++         %{caller: caller} = state
++       ) do
++    inner_substate = state.engine.handle_begin(substate)
++    state = init_slots(state)
++    {inner_state, inner_substate} = handle_node(children, inner_substate, state)
++    {slot_assigns, slot_info, _state} = pop_slots(inner_state)
++
++    opts =
++      if annotation =
++           caller && has_tags?(children) &&
++             state.tag_handler.annotate_slot(name, tag_meta, tag_close_meta, caller) do
++        [meta: [template_annotation: annotation]]
++      else
++        []
++      end
++
++    ast = state.engine.handle_end(inner_substate, opts)
++
++    clauses =
++      case let do
++        # If we have a var, we can skip the catch-all clause
++        {{var, _, ctx} = pattern, %{line: line}} when is_atom(var) and is_atom(ctx) ->
++          quote line: line do
++            unquote(pattern) -> unquote(ast)
++          end
++
++        {pattern, %{line: line}} ->
++          quote line: line do
++            unquote(pattern) -> unquote(ast)
++          end ++
++            quote generated: true do
++              other ->
++                Phoenix.LiveView.TagEngine.__unmatched_let__!(
++                  unquote(Macro.to_string(pattern)),
++                  other
++                )
++            end
++
++        _ ->
++          quote do
++            _ -> unquote(ast)
++          end
++      end
++
++    {clauses, {slot_assigns, slot_info}}
++  end
++
++  defp store_component_call(component, attr_info, slot_info, line, %{caller: caller} = state) do
++    module = caller.module
++
++    if module && Module.open?(module) do
++      pruned_slots =
++        for {slot_name, slot_values} <- slot_info, into: %{} do
++          values =
++            for {tag_meta, {root?, attrs, locs}} <- slot_values do
++              %{line: tag_meta.line, root: root?, attrs: attrs_for_call(attrs, locs)}
++            end
++
++          {slot_name, values}
++        end
++
++      {root?, attrs, locs} = attr_info
++      pruned_attrs = attrs_for_call(attrs, locs)
++
++      call = %{
++        component: component,
++        slots: pruned_slots,
++        attrs: pruned_attrs,
++        file: state.file,
++        line: line,
++        root: root?
++      }
++
++      # This may still fail under a very specific scenario where
++      # we are defining a template dynamically inside a function
++      # (most likely a test) that starts running while the module
++      # is still open.
++      try do
++        Module.put_attribute(module, :__components_calls__, call)
++      rescue
++        _ -> :ok
++      end
++    end
++  end
++
++  defp attrs_for_call(attrs, locs) do
++    for {{attr, value}, {line, column}} <- Enum.zip(attrs, locs),
++        do: {attr, {line, column, attr_type(value)}},
++        into: %{}
++  end
++
++  defp attr_type({:<<>>, _, _} = value), do: {:string, value}
++  defp attr_type(value) when is_list(value), do: {:list, value}
++  defp attr_type(value = {:%{}, _, _}), do: {:map, value}
++  defp attr_type(value) when is_binary(value), do: {:string, value}
++  defp attr_type(value) when is_integer(value), do: {:integer, value}
++  defp attr_type(value) when is_float(value), do: {:float, value}
++  defp attr_type(value) when is_boolean(value), do: {:boolean, value}
++  defp attr_type(value) when is_atom(value), do: {:atom, value}
++  defp attr_type({:fn, _, [{:->, _, [args, _]}]}), do: {:fun, length(args)}
++  defp attr_type({:&, _, [{:/, _, [_, arity]}]}), do: {:fun, arity}
++
++  # this could be a &myfun(&1, &2)
++  defp attr_type({:&, _, args}) do
++    {_ast, arity} =
++      Macro.prewalk(args, 0, fn
++        {:&, _, [n]} = ast, acc when is_integer(n) ->
++          {ast, max(n, acc)}
++
++        ast, acc ->
++          {ast, acc}
++      end)
++
++    (arity > 0 && {:fun, arity}) || :any
++  end
++
++  defp attr_type(_value), do: :any
++
++  ## Slot helpers
++
++  defp init_slots(state) do
++    %{state | slots: [[] | state.slots]}
++  end
++
++  defp add_inner_block({roots?, attrs, locs}, ast, tag_meta) do
++    {roots?, [{:inner_block, ast} | attrs], [line_column(tag_meta) | locs]}
++  end
++
++  defp add_slot(state, slot_name, slot_assigns, slot_info, tag_meta, special_attrs) do
++    %{slots: [slots | other_slots]} = state
++    slot = {slot_name, slot_assigns, special_attrs, {tag_meta, slot_info}}
++    %{state | slots: [[slot | slots] | other_slots]}
++  end
++
++  defp pop_slots(%{slots: [slots | other_slots]} = state) do
++    # Perform group_by by hand as we need to group two distinct maps.
++    {acc_assigns, acc_info, specials} =
++      Enum.reduce(slots, {%{}, %{}, %{}}, fn
++        {key, assigns, special, info}, {acc_assigns, acc_info, specials} ->
++          special? = Map.has_key?(special, ":if") or Map.has_key?(special, ":for")
++          specials = Map.update(specials, key, special?, &(&1 or special?))
++
++          case acc_assigns do
++            %{^key => existing_assigns} ->
++              acc_assigns = %{acc_assigns | key => [assigns | existing_assigns]}
++              %{^key => existing_info} = acc_info
++              acc_info = %{acc_info | key => [info | existing_info]}
++              {acc_assigns, acc_info, specials}
++
++            %{} ->
++              {Map.put(acc_assigns, key, [assigns]), Map.put(acc_info, key, [info]), specials}
++          end
++      end)
++
++    acc_assigns =
++      Enum.into(acc_assigns, %{}, fn {key, assigns_ast} ->
++        cond do
++          # No special entry, return it as a list
++          not Map.fetch!(specials, key) ->
++            {key, assigns_ast}
++
++          # We have a special entry and multiple entries, we have to flatten
++          match?([_, _ | _], assigns_ast) ->
++            {key, quote(do: List.flatten(unquote(assigns_ast)))}
++
++          # A single special entry is guaranteed to return a list from the expression
++          true ->
++            {key, hd(assigns_ast)}
++        end
++      end)
++
++    {Map.to_list(acc_assigns), Map.to_list(acc_info), %{state | slots: other_slots}}
++  end
++
++  defp wrap_special_slot(special, ast) do
++    case special do
++      %{":for" => {for_expr, %{line: line}}, ":if" => {if_expr, %{line: _line}}} ->
++        quote line: line do
++          for unquote(for_expr), unquote(if_expr), do: unquote(ast)
++        end
++
++      %{":for" => {for_expr, %{line: line}}} ->
++        quote line: line do
++          for unquote(for_expr), do: unquote(ast)
++        end
++
++      %{":if" => {if_expr, %{line: line}}} ->
++        quote line: line do
++          if unquote(if_expr), do: [unquote(ast)], else: []
++        end
++
++      %{} ->
++        ast
++    end
++  end
++
++  defp tag_slots({call, meta, args}, slot_info) do
++    {call, [slots: Keyword.keys(slot_info)] ++ meta, args}
++  end
++
++  ## Special expressions (:if, :for, :key)
++
++  # Handles :for, :if wrapping by executing the given function
++  # in a new handle_begin / handle_end block, and building the
++  # correct wrapper AST.
++  defp with_special_attrs(attrs, meta, substate, state, fun) do
++    case pop_special_attrs!(attrs, meta, state) do
++      {false, meta, attrs} ->
++        fun.(attrs, meta, substate, state)
++
++      {true, new_meta, new_attrs} ->
++        inner_substate = state.engine.handle_begin(substate)
++        {state, inner_substate} = fun.(new_attrs, new_meta, inner_substate, state)
++        inner_ast = state.engine.handle_end(inner_substate)
++
++        ast = handle_special_expr(new_meta, inner_ast, state)
++        substate = state.engine.handle_expr(substate, "=", ast)
++        {state, substate}
++    end
++  end
++
++  # Pops all special attributes from attrs. Raises if any given attr is duplicated within
++  # attrs.
++  #
++  # Examples:
++  #
++  #   attrs = [{":for", {...}}, {"class", {...}}]
++  #   pop_special_attrs!(attrs, %{}, state)
++  #   => {true, %{for: parsed_ast, ...}, [{"class", {...}]}}
++  #
++  #   attrs = [{"class", {...}}]
++  #   pop_special_attrs!(attrs, %{}, state)
++  #   => {false, %{}, [{"class", {...}}]}
++  defp pop_special_attrs!(attrs, tag_meta, state) do
++    Enum.reduce([for: ":for", if: ":if", key: ":key"], {false, tag_meta, attrs}, fn
++      {attr, string_attr}, {special_acc, meta_acc, attrs_acc} ->
++        attrs_acc
++        |> List.keytake(string_attr, 0)
++        |> raise_if_duplicated_special_attr!(state)
++        |> case do
++          {{^string_attr, {:expr, _, _} = expr, meta}, attrs} ->
++            parsed_expr = parse_expr!(expr, state.file)
++            validate_quoted_special_attr!(string_attr, parsed_expr, meta, state)
++            {true, Map.put(meta_acc, attr, parsed_expr), attrs}
++
++          {{^string_attr, _expr, meta}, _attrs} ->
++            message = "#{string_attr} must be an expression between {...}"
++            raise_syntax_error!(message, meta, state)
++
++          nil ->
++            {special_acc, meta_acc, attrs_acc}
++        end
++    end)
++  end
++
++  defp raise_if_duplicated_special_attr!({{attr, _expr, _meta}, attrs} = result, state) do
++    case List.keytake(attrs, attr, 0) do
++      {{attr, _expr, meta}, _attrs} ->
++        message =
++          "cannot define multiple #{inspect(attr)} attributes. Another #{inspect(attr)} has already been defined at line #{meta.line}"
++
++        raise_syntax_error!(message, meta, state)
++
++      nil ->
++        result
++    end
++  end
++
++  defp raise_if_duplicated_special_attr!(nil, _state), do: nil
++
++  defp handle_special_expr(tag_meta, inner_ast, state) do
++    case tag_meta do
++      %{for: _for_expr, if: if_expr} ->
++        for_expr = maybe_keyed(tag_meta)
++
++        quote do
++          for unquote(for_expr), unquote(if_expr), do: unquote(inner_ast)
++        end
++
++      %{for: _for_expr} ->
++        for_expr = maybe_keyed(tag_meta)
++
++        quote do
++          for unquote(for_expr), do: unquote(inner_ast)
++        end
++
++      %{if: if_expr} ->
++        quote do
++          if unquote(if_expr), do: unquote(inner_ast)
++        end
++
++      %{key: _} ->
++        raise_syntax_error!("cannot use :key without :for", tag_meta, state)
++    end
++  end
++
++  defp maybe_keyed(%{key: key_expr, for: for_expr}) do
++    # we already validated that the for expression has the correct shape in
++    # validate_quoted_special_attr
++    {:<-, for_meta, [lhs, rhs]} = for_expr
++    {:<-, [keyed_comprehension: true, key_expr: key_expr] ++ for_meta, [lhs, rhs]}
++  end
++
++  defp maybe_keyed(%{for: for_expr}), do: for_expr
++
++  ## Generic helpers
++
++  defp to_location(%{line: line, column: column}), do: [line: line, column: column]
++  defp to_location(_), do: []
++
++  defp actual_component_module(env, fun) do
++    case Macro.Env.lookup_import(env, {fun, 1}) do
++      [{_, module} | _] -> module
++      _ -> env.module
++    end
++  end
++
++  # removes phx-no-format, etc. and maps phx-hook=".name" to the fully qualified name
++  defp postprocess_attrs(attrs, state) do
++    attrs_to_remove = ~w(phx-no-format phx-no-curly-interpolation)
++
++    for {key, value, meta} <- attrs,
++        key not in attrs_to_remove do
++      case {key, value, meta} do
++        {"phx-hook", {:string, "." <> name, str_meta}, meta} ->
++          {key, {:string, "#{inspect(state.caller.module)}.#{name}", str_meta}, meta}
++
++        _ ->
++          {key, value, meta}
++      end
++    end
++  end
++
++  defp validate_tag_attrs!(attrs, %{tag_name: "input"}, state) do
++    # warn if using name="id" on an input
++    case Enum.find(attrs, &match?({"name", {:string, "id", _}, _}, &1)) do
++      {_name, _value, attr_meta} ->
++        meta = [
++          line: attr_meta.line,
++          column: attr_meta.column,
++          file: state.file,
++          module: state.caller.module,
++          function: state.caller.function
++        ]
++
++        IO.warn(
++          """
++          Setting the "name" attribute to "id" on an input tag overrides the ID of the corresponding form element.
++          This leads to unexpected behavior, especially when using LiveView, and is not recommended.
++
++          You should use a different value for the "name" attribute, e.g. "_id" and remap the value in the
++          corresponding handle_event/3 callback or controller.
++          """,
++          meta
++        )
++
++      _ ->
++        :ok
++    end
++  end
++
++  defp validate_tag_attrs!(_attrs, _meta, _state), do: :ok
++
++  # Check if `phx-update`, `phx-hook` is present in attrs and raises in case
++  # there is no ID attribute set.
++  defp validate_phx_attrs!(attrs, meta, state) do
++    validate_phx_attrs!(attrs, meta, state, nil, false)
++  end
++
++  defp validate_phx_attrs!([], meta, state, attr, false)
++       when attr in ["phx-update", "phx-hook"] do
++    message = "attribute \"#{attr}\" requires the \"id\" attribute to be set"
++
++    raise_syntax_error!(message, meta, state)
++  end
++
++  defp validate_phx_attrs!([], _meta, _state, _attr, _id?), do: :ok
++
++  # Handle <div phx-update="ignore" {@some_var}>Content</div> since here the ID
++  # might be inserted dynamically so we can't raise at compile time.
++  defp validate_phx_attrs!([{:root, _, _} | t], meta, state, attr, _id?),
++    do: validate_phx_attrs!(t, meta, state, attr, true)
++
++  defp validate_phx_attrs!([{"id", _, _} | t], meta, state, attr, _id?),
++    do: validate_phx_attrs!(t, meta, state, attr, true)
++
++  defp validate_phx_attrs!(
++         [{"phx-update", {:string, value, _meta}, attr_meta} | t],
++         meta,
++         state,
++         _attr,
++         id?
++       ) do
++    cond do
++      value in ~w(ignore stream replace) ->
++        validate_phx_attrs!(t, meta, state, "phx-update", id?)
++
++      value in ~w(append prepend) ->
++        line = meta[:line] || state.caller.line
++
++        IO.warn(
++          "phx-update=\"#{value}\" is deprecated, please use streams instead",
++          Macro.Env.stacktrace(%{state.caller | line: line})
++        )
++
++        validate_phx_attrs!(t, meta, state, "phx-update", id?)
++
++      true ->
++        message =
++          "the value of the attribute \"phx-update\" must be: ignore, stream, append, prepend, or replace"
++
++        raise_syntax_error!(message, attr_meta, state)
++    end
++  end
++
++  defp validate_phx_attrs!([{"phx-update", _attrs, _} | t], meta, state, _attr, id?) do
++    validate_phx_attrs!(t, meta, state, "phx-update", id?)
++  end
++
++  defp validate_phx_attrs!([{"phx-hook", _, _} | t], meta, state, _attr, id?),
++    do: validate_phx_attrs!(t, meta, state, "phx-hook", id?)
++
++  defp validate_phx_attrs!([{special, value, attr_meta} | t], meta, state, attr, id?)
++       when special in ~w(:if :for :type) do
++    case value do
++      {:expr, _, _} ->
++        validate_phx_attrs!(t, meta, state, attr, id?)
++
++      _ ->
++        message = "#{special} must be an expression between {...}"
++        raise_syntax_error!(message, attr_meta, state)
++    end
++  end
++
++  defp validate_phx_attrs!([{":" <> name, _, attr_meta} | _], _meta, state, _attr, _id?)
++       when name not in ~w(if for key) do
++    message = "unsupported attribute :#{name} in tags"
++    raise_syntax_error!(message, attr_meta, state)
++  end
++
++  defp validate_phx_attrs!([_h | t], meta, state, attr, id?),
++    do: validate_phx_attrs!(t, meta, state, attr, id?)
++
++  defp validate_quoted_special_attr!(attr, quoted_value, attr_meta, state) do
++    if attr == ":for" and not match?({:<-, _, [_, _]}, quoted_value) do
++      message = ":for must be a generator expression (pattern <- enumerable) between {...}"
++
++      raise_syntax_error!(message, attr_meta, state)
++    else
++      :ok
++    end
++  end
++
++  defp expand_with_line(ast, line, env) do
++    Macro.expand(ast, %{env | line: line})
++  end
++
++  defp raise_syntax_error!(message, meta, state) do
++    raise ParseError,
++      line: meta.line,
++      column: meta.column,
++      file: state.file,
++      description: message <> ParseError.code_snippet(state.source, meta, state.indentation)
++  end
++
++  defp maybe_anno_caller(substate, meta, file, line, state) do
++    if anno = state.tag_handler.annotate_caller(file, line) do
++      state.engine.handle_text(substate, meta, anno)
++    else
++      substate
++    end
++  end
++
++  defp has_tags?([]), do: false
++
++  defp has_tags?([{:text, _, _} | rest]), do: has_tags?(rest)
++  defp has_tags?([{:body_expr, _, _} | rest]), do: has_tags?(rest)
++  defp has_tags?([{:eex, _, _} | rest]), do: has_tags?(rest)
++  defp has_tags?([{:eex_comment, _} | rest]), do: has_tags?(rest)
++  defp has_tags?([{:html_comment, _} | rest]), do: has_tags?(rest)
++
++  # EEx blocks - check children in each clause
++  defp has_tags?([{:eex_block, _, blocks, _} | rest]) do
++    Enum.any?(blocks, fn {children, _clause_expr, _clause_meta} -> has_tags?(children) end) or
++      has_tags?(rest)
++  end
++
++  # Skip slots
++  defp has_tags?([{:self_close, :slot, _, _, _} | rest]), do: has_tags?(rest)
++  defp has_tags?([{:block, :slot, _, _, _, _, _} | rest]), do: has_tags?(rest)
++
++  # Tags and components count as having tags
++  defp has_tags?([{:self_close, _type, _, _, _} | _]), do: true
++  defp has_tags?([{:block, _type, _, _, _, _, _} | _]), do: true
++end
+diff --git a/lib/phoenix_live_view/tag_engine/parser.ex b/lib/phoenix_live_view/tag_engine/parser.ex
+new file mode 100644
+index 00000000..b36f960a
+--- /dev/null
++++ b/lib/phoenix_live_view/tag_engine/parser.ex
+@@ -0,0 +1,650 @@
++defmodule Phoenix.LiveView.TagEngine.Parser do
++  @moduledoc false
++
++  alias Phoenix.LiveView.TagEngine.Tokenizer
++  alias Phoenix.Component.MacroComponent
++
++  defguardp is_tag_open(tag_type) when tag_type not in [:close, :eex]
++
++  defguardp is_tag_block(node)
++            when is_tuple(node) and tuple_size(node) == 7 and elem(node, 0) == :block
++
++  defguardp is_self_close(node)
++            when is_tuple(node) and tuple_size(node) == 5 and elem(node, 0) == :self_close
++
++  defguardp is_macro_component(node)
++            when (is_tag_block(node) and is_map_key(elem(node, 5), :macro_component)) or
++                   (is_self_close(node) and is_map_key(elem(node, 4), :macro_component))
++
++  def parse(source, opts \\ []) do
++    tag_handler = Keyword.fetch!(opts, :tag_handler)
++    caller = Keyword.get(opts, :caller)
++    skip_macro_components = Keyword.get(opts, :skip_macro_components, false)
++    prune_text_after_slots = Keyword.get(opts, :prune_text_after_slots, true)
++    process_buffer = Keyword.get(opts, :process_buffer)
++
++    source
++    |> tokenize(opts)
++    |> to_tree([], [], %{
++      tag_handler: tag_handler,
++      caller: caller,
++      skip_macro_components: skip_macro_components,
++      prune_text_after_slots: prune_text_after_slots,
++      process_buffer: process_buffer
++    })
++  catch
++    {:syntax_error, line, column, message} ->
++      {:error, line, column, message}
++  end
++
++  def parse!(source, opts \\ []) do
++    case parse(source, opts) do
++      {:ok, nodes} ->
++        nodes
++
++      {:error, line, column, message} ->
++        raise Tokenizer.ParseError,
++          line: line,
++          column: column,
++          file: opts[:file] || "nofile",
++          description:
++            message <>
++              Tokenizer.ParseError.code_snippet(
++                source,
++                %{line: line, column: column},
++                opts[:indentation] || 0
++              )
++    end
++  end
++
++  # Tokenize contents using EEx.tokenize and Phoenix.LiveView.TagEngine.Tokenizer respectively.
++  #
++  # The following content:
++  #
++  # "<section>\n  <p><%= user.name %></p>\n  <%= if true do %> <p>this</p><% else %><p>that</p><% end %>\n</section>\n"
++  #
++  # Will be tokenized as:
++  #
++  # [
++  #   {:tag, "section", [], %{column: 1, line: 1}},
++  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
++  #   {:tag, "p", [], %{column: 3, line: 2}},
++  #   {:eex, :start_expr, "<%= user.name ></p>\n  <%= if true do %>", %{block?: true, column: 6, line: 1}},
++  #   {:text, " ", %{column_end: 2, line_end: 1}},
++  #   {:tag, "p", [], %{column: 2, line: 1}},
++  #   {:text, "this", %{column_end: 12, line_end: 1}},
++  #   {:close, :tag, "p", %{column: 12, line: 1}},
++  #   {:eex, :middle_expr, "<% else %>", %{block?: false, column: 35, line: 2}},
++  #   {:tag, "p", [], %{column: 1, line: 1}},
++  #   {:text, "that", %{column_end: 14, line_end: 1}},
++  #   {:close, :tag, "p", %{column: 14, line: 1}},
++  #   {:eex, :end_expr, "<% end %>", %{block?: false, column: 62, line: 2}},
++  #   {:text, "\n", %{column_end: 1, line_end: 2}},
++  #   {:close, :tag, "section", %{column: 1, line: 2}}
++  # ]
++  #
++  @eex_expr [:start_expr, :expr, :end_expr, :middle_expr]
++
++  @doc false
++  def tokenize(source, opts) do
++    file = Keyword.get(opts, :file, "nofile")
++    indentation = Keyword.get(opts, :indentation, 0)
++    trim_eex = Keyword.get(opts, :trim_eex, true)
++    {:ok, eex_nodes} = EEx.tokenize(source, opts)
++
++    {tokens, cont} =
++      Enum.reduce(
++        eex_nodes,
++        {[], {:text, :enabled}},
++        &do_tokenize(&1, &2, source, %{file: file, indentation: indentation, trim_eex: trim_eex})
++      )
++
++    Tokenizer.finalize(tokens, file, cont, source)
++  end
++
++  defp do_tokenize({:text, text, meta}, {tokens, cont}, source, %{
++         file: file,
++         indentation: indentation
++       }) do
++    text = List.to_string(text)
++    meta = [line: meta.line, column: meta.column]
++    state = Tokenizer.init(indentation, file, source, Phoenix.LiveView.HTMLEngine)
++    Tokenizer.tokenize(text, meta, tokens, cont, state)
++  end
++
++  defp do_tokenize({:comment, text, meta}, {tokens, cont}, _contents, _opts) do
++    {[{:eex_comment, List.to_string(text), meta} | tokens], cont}
++  end
++
++  defp do_tokenize(
++         {type, opt, expr, %{column: column, line: line}},
++         {tokens, cont},
++         _contents,
++         opts
++       )
++       when type in @eex_expr do
++    meta = %{opt: opt, line: line, column: column}
++
++    {[{:eex, type, expr |> List.to_string() |> maybe_trim_eex(opts.trim_eex), meta} | tokens],
++     cont}
++  end
++
++  defp do_tokenize(_node, acc, _contents, _opts) do
++    acc
++  end
++
++  defp maybe_trim_eex(string, true), do: String.trim(string)
++  defp maybe_trim_eex(string, _), do: string
++
++  # Build an HTML Tree according to the tokens from the EEx and HTML tokenizers.
++  #
++  # This is a recursive algorithm that will build an HTML tree from a flat list of
++  # tokens. For instance, given this input:
++  #
++  # [
++  #   {:tag, "div", [], %{column: 1, line: 1}},
++  #   {:tag, "h1", [], %{column: 6, line: 1}},
++  #   {:text, "Hello", %{column_end: 15, line_end: 1}},
++  #   {:close, :tag, "h1", %{column: 15, line: 1}},
++  #   {:close, :tag, "div", %{column: 20, line: 1}},
++  #   {:tag, "div", [], %{column: 1, line: 2}},
++  #   {:tag, "h1", [], %{column: 6, line: 2}},
++  #   {:text, "World", %{column_end: 15, line_end: 2}},
++  #   {:close, :tag, "h1", %{column: 15, line: 2}},
++  #   {:close, :tag, "div", %{column: 20, line: 2}}
++  # ]
++  #
++  # The output will be:
++  #
++  # [
++  #   {:block, :tag, "div", [],
++  #    [{:block, :tag, "h1", [],
++  #      [{:text, "Hello", %{...}}],
++  #      %{line: 1, column: 6, ...},
++  #      %{line: 1, column: 15, ...}}],
++  #    %{line: 1, column: 1, ...},
++  #    %{line: 1, column: 20, ...}},
++  #   {:block, :tag, "div", [],
++  #    [{:block, :tag, "h1", [],
++  #      [{:text, "World", %{...}}],
++  #      %{line: 2, column: 6, ...},
++  #      %{line: 2, column: 15, ...}}],
++  #    %{line: 2, column: 1, ...},
++  #    %{line: 2, column: 20, ...}}
++  # ]
++  #
++  # Note that a `:block` has been created so that its fifth argument is a list of
++  # its nested content, followed by open_meta and close_meta.
++  #
++  # ### How does this algorithm work?
++  #
++  # As this is a recursive algorithm, it starts with an empty buffer and an empty
++  # stack. The buffer will be accumulated until it finds a `{:tag, ..., ...}`.
++  #
++  # As soon as the `tag_open` arrives, a new buffer will be started and we move
++  # the previous buffer to the stack along with the `tag_open`:
++  #
++  #   ```
++  #   defp to_tree([{type, name, attrs, meta} | tokens], buffer, stack, state)
++  #        when is_tag_open(type) do
++  #     to_tree(tokens, [], [{type, name, attrs, meta, buffer} | stack], state)
++  #   end
++  #   ```
++  #
++  # Then, we start to populate the buffer again until a `{:close, :tag, ...} arrives:
++  #
++  #   ```
++  #   defp to_tree([{:close, type, name, close_meta} | tokens], buffer, [{type, name, attrs, open_meta, upper_buffer} | stack], state) do
++  #     to_tree(tokens, [{:block, type, name, attrs, Enum.reverse(buffer), open_meta, close_meta} | upper_buffer], stack)
++  #   end
++  #   ```
++  #
++  # In the snippet above, we build the `:block` tuple with the accumulated buffer,
++  # putting the buffer accumulated before the tag open (upper_buffer) on top.
++  #
++  # We apply the same logic for `eex` expressions but, instead of `tag_open` and
++  # `tag_close`, eex expressions use `start_expr`, `middle_expr` and `end_expr`.
++  # The only real difference is that also need to handle `middle_buffer`.
++  #
++  # So given this eex input:
++  #
++  # ```elixir
++  # [
++  #   {:eex, :start_expr, "if true do", %{column: 0, line: 0, opt: '='}},
++  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
++  #   {:eex, :expr, "\"Hello\"", %{column: 3, line: 1, opt: '='}},
++  #   {:text, "\n", %{column_end: 1, line_end: 2}},
++  #   {:eex, :middle_expr, "else", %{column: 1, line: 2, opt: []}},
++  #   {:text, "\n  ", %{column_end: 3, line_end: 2}},
++  #   {:eex, :expr, "\"World\"", %{column: 3, line: 3, opt: '='}},
++  #   {:text, "\n", %{column_end: 1, line_end: 2}},
++  #   {:eex, :end_expr, "end", %{column: 1, line: 4, opt: []}}
++  # ]
++  # ```
++  #
++  # The output will be:
++  #
++  # ```elixir
++  # [
++  #   {:eex_block, "if true do",
++  #    [
++  #      {[{:eex, "\"Hello\"", %{column: 3, line: 1, opt: '='}}], "else", %{line: 2, column: 1}},
++  #      {[{:eex, "\"World\"", %{column: 3, line: 3, opt: '='}}], "end", %{line: 4, column: 1}}
++  #    ], %{line: 0, column: 0, opt: '='}}
++  # ]
++  # ```
++  defp to_tree([], buffer, [], _state) do
++    {:ok, Enum.reverse(buffer)}
++  end
++
++  defp to_tree(
++         [],
++         _buffer,
++         [{_type, _name, _, %{line: line, column: column} = meta, _} | _],
++         _state
++       ) do
++    message = "end of template reached without closing tag for <#{meta.tag_name}>"
++    {:error, line, column, message}
++  end
++
++  defp to_tree([{:text, text, meta} | tokens], buffer, stack, state) do
++    # Preserve context for HTML comment handling in formatter
++    text_meta = Map.take(meta, [:context])
++    buffer = process_buffer([{:text, text, text_meta} | buffer], state)
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  defp to_tree([{:body_expr, value, meta} | tokens], buffer, stack, state) do
++    buffer = process_buffer([{:body_expr, value, meta} | buffer], state)
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  # Self-closing slot - valid only as direct child of component
++  defp to_tree(
++         [{:slot, name, attrs, %{closing: _} = meta} | tokens],
++         buffer,
++         [{parent_type, _, _, _, _} | _] = stack,
++         state
++       )
++       when parent_type in [:local_component, :remote_component] do
++    meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
++
++    {tokens, buffer} =
++      maybe_process_macro_component(
++        {:self_close, :slot, name, attrs, meta},
++        tokens,
++        buffer,
++        state
++      )
++
++    tokens = if state.prune_text_after_slots, do: prune_text(tokens), else: tokens
++
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  # Self-closing slot - invalid context (not direct child of component)
++  defp to_tree(
++         [{:slot, name, _attrs, %{closing: _} = meta} | _tokens],
++         _buffer,
++         _stack,
++         _state
++       ) do
++    %{line: line, column: column} = meta
++    message = "invalid slot entry <:#{name}>. A slot entry must be a direct child of a component"
++    {:error, line, column, message}
++  end
++
++  # Opening slot - valid only as direct child of component
++  defp to_tree(
++         [{:slot, name, attrs, meta} | tokens],
++         buffer,
++         [{parent_type, _, _, _, _} | _] = stack,
++         state
++       )
++       when parent_type in [:local_component, :remote_component] do
++    meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
++    to_tree(tokens, [], [{:slot, name, attrs, meta, buffer} | stack], state)
++  end
++
++  # Opening slot - invalid context (not direct child of component)
++  defp to_tree([{:slot, name, _attrs, meta} | _tokens], _buffer, _stack, _state) do
++    %{line: line, column: column} = meta
++    message = "invalid slot entry <:#{name}>. A slot entry must be a direct child of a component"
++    {:error, line, column, message}
++  end
++
++  # Closing a slot
++  defp to_tree(
++         [{:close, :slot, _name, close_meta} | tokens],
++         reversed_buffer,
++         [{:slot, tag_name, attrs, open_meta, upper_buffer} | stack],
++         state
++       ) do
++    block = Enum.reverse(reversed_buffer)
++    tag_block = {:block, :slot, tag_name, attrs, block, open_meta, close_meta}
++    tokens = if state.prune_text_after_slots, do: prune_text(tokens), else: tokens
++    to_tree(tokens, [tag_block | upper_buffer], stack, state)
++  end
++
++  # Self-closing tag or component
++  defp to_tree([{type, name, attrs, %{closing: _} = meta} | tokens], buffer, stack, state)
++       when is_tag_open(type) do
++    meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
++
++    {tokens, buffer} =
++      maybe_process_macro_component({:self_close, type, name, attrs, meta}, tokens, buffer, state)
++
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  # Opening tag or component
++  defp to_tree([{type, name, attrs, meta} | tokens], buffer, stack, state)
++       when is_tag_open(type) do
++    meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
++    to_tree(tokens, [], [{type, name, attrs, meta, buffer} | stack], state)
++  end
++
++  # Matching close tag
++  defp to_tree(
++         [{:close, _type, name, close_meta} | tokens],
++         reversed_buffer,
++         [{type, name, attrs, open_meta, upper_buffer} | stack],
++         state
++       ) do
++    block = Enum.reverse(reversed_buffer)
++
++    {tokens, buffer} =
++      maybe_process_macro_component(
++        {:block, type, name, attrs, block, open_meta, close_meta},
++        tokens,
++        upper_buffer,
++        state
++      )
++
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  # Mismatched close tag
++  defp to_tree(
++         [{:close, _close_type, close_name, close_meta} | _tokens],
++         _buffer,
++         [{_open_type, open_name, _attrs, open_meta, _upper_buffer} | _stack],
++         state
++       ) do
++    %{line: line, column: column} = close_meta
++    void_note = void_tag_note(close_name, state)
++
++    message =
++      "unmatched closing tag. Expected </#{open_name}> for <#{open_name}> at line #{open_meta.line}, got: </#{close_name}>#{void_note}"
++
++    {:error, line, column, message}
++  end
++
++  # Orphaned close tag - no matching open tag on stack
++  defp to_tree([{:close, _type, name, meta} | _tokens], _buffer, [], state) do
++    %{line: line, column: column} = meta
++    void_note = void_tag_note(name, state)
++    message = "missing opening tag for </#{name}>#{void_note}"
++    {:error, line, column, message}
++  end
++
++  # EEx
++
++  defp to_tree([{:eex_comment, text, _meta} | tokens], buffer, stack, state) do
++    to_tree(tokens, [{:eex_comment, text} | buffer], stack, state)
++  end
++
++  defp to_tree([{:eex, :start_expr, expr, meta} | tokens], buffer, stack, state) do
++    to_tree(tokens, [], [{:eex_block, expr, meta, buffer} | stack], state)
++  end
++
++  defp to_tree(
++         [{:eex, :middle_expr, middle_expr, middle_meta} | tokens],
++         buffer,
++         [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
++         state
++       ) do
++    middle_buffer = [{Enum.reverse(buffer), middle_expr, middle_meta} | middle_buffer]
++
++    to_tree(
++      tokens,
++      [],
++      [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
++      state
++    )
++  end
++
++  defp to_tree(
++         [{:eex, :middle_expr, middle_expr, middle_meta} | tokens],
++         buffer,
++         [{:eex_block, expr, meta, upper_buffer} | stack],
++         state
++       ) do
++    middle_buffer = [{Enum.reverse(buffer), middle_expr, middle_meta}]
++
++    to_tree(
++      tokens,
++      [],
++      [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
++      state
++    )
++  end
++
++  defp to_tree(
++         [{:eex, :end_expr, end_expr, end_meta} | tokens],
++         buffer,
++         [{:eex_block, expr, meta, upper_buffer, middle_buffer} | stack],
++         state
++       ) do
++    block = Enum.reverse([{Enum.reverse(buffer), end_expr, end_meta} | middle_buffer])
++    to_tree(tokens, [{:eex_block, expr, block, meta} | upper_buffer], stack, state)
++  end
++
++  defp to_tree(
++         [{:eex, :end_expr, end_expr, end_meta} | tokens],
++         buffer,
++         [{:eex_block, expr, meta, upper_buffer} | stack],
++         state
++       ) do
++    block = [{Enum.reverse(buffer), end_expr, end_meta}]
++    to_tree(tokens, [{:eex_block, expr, block, meta} | upper_buffer], stack, state)
++  end
++
++  # end_expr reached but unclosed tag on stack (inside a do-block)
++  defp to_tree(
++         [{:eex, :end_expr, _end_expr, _end_meta} | _tokens],
++         _buffer,
++         [{_type, _name, _attrs, %{line: line, column: column} = meta, _upper_buffer} | _stack],
++         _state
++       ) do
++    message = "end of do-block reached without closing tag for <#{meta.tag_name}>"
++    {:error, line, column, message}
++  end
++
++  defp to_tree([{:eex, _type, expr, meta} | tokens], buffer, stack, state) do
++    buffer = process_buffer([{:eex, expr, meta} | buffer], state)
++    to_tree(tokens, buffer, stack, state)
++  end
++
++  @special_attrs ~w(:if :for :key)
++  defp extract_special_attrs(attrs) do
++    for {name, _, _} <- attrs, name in @special_attrs, do: name
++  end
++
++  # Prune leading whitespace from the next text token (used after slots)
++  defp prune_text([{:text, text, meta} | tokens]) do
++    [{:text, String.trim_leading(text), meta} | tokens]
++  end
++
++  defp prune_text(tokens), do: tokens
++
++  # Allow callers to hook into buffer processing (used by formatter for preserve mode propagation)
++  defp process_buffer(buffer, %{process_buffer: fun}) when is_function(fun), do: fun.(buffer)
++  defp process_buffer(buffer, _state), do: buffer
++
++  # Removes empty whitespace nodes at the start of the tokens (used after macro components)
++  defp strip_text([{:text, "", _meta} | tokens]), do: strip_text(tokens)
++
++  defp strip_text([{:text, text, meta} | tokens]) do
++    case String.trim_leading(text) do
++      "" ->
++        strip_text(tokens)
++
++      text ->
++        [{:text, text, meta} | tokens]
++    end
++  end
++
++  defp strip_text(tokens), do: tokens
++
++  defp void_tag_note(name, state) do
++    if state.tag_handler.void?(name) do
++      " (note <#{name}> is a void tag and cannot have any content)"
++    else
++      ""
++    end
++  end
++
++  ## Macro component handling
++
++  defp maybe_macro_component(meta, attrs) do
++    case List.keyfind(attrs, ":type", 0) do
++      {":type", {:expr, code, _expr_meta}, _attr_meta} ->
++        Map.put(meta, :macro_component, code)
++
++      _ ->
++        meta
++    end
++  end
++
++  defguardp skip_macro_components(state)
++            when is_map_key(state, :skip_macro_components) and state.skip_macro_components == true
++
++  defp maybe_process_macro_component(tree_node, tokens, buffer, state)
++       when is_macro_component(tree_node) and not skip_macro_components(state) do
++    # Remove :type from attrs for the macro component AST
++    tree_node =
++      case tree_node do
++        {:self_close, :tag, name, attrs, meta} ->
++          {:self_close, :tag, name, List.keydelete(attrs, ":type", 0), meta}
++
++        {:block, :tag, name, attrs, children, meta, close_meta} ->
++          {:block, :tag, name, List.keydelete(attrs, ":type", 0), children, meta, close_meta}
++
++        # Macro components are currently only allowed on non-special tags
++        {:self_close, type, _name, _attrs, meta} ->
++          throw_syntax_error!(
++            "macro components are only supported on HTML tags, not #{format_type(type)}",
++            meta
++          )
++
++        {:block, type, _name, _attrs, _children, meta, _close_meta} ->
++          throw_syntax_error!(
++            "macro components are only supported on HTML tags, not #{format_type(type)}",
++            meta
++          )
++      end
++
++    case process_macro_component(tree_node, state) do
++      {:text, "", _} ->
++        {strip_text(tokens), buffer}
++
++      new_node ->
++        {strip_text(tokens), [new_node | buffer]}
++    end
++  end
++
++  defp maybe_process_macro_component(tree_node, tokens, buffer, _state) do
++    {tokens, [tree_node | buffer]}
++  end
++
++  # Process a macro component: call transform and convert result back to tree nodes
++  defp process_macro_component(tree_node, state) do
++    # Macro components work by converting the tree nodes into a macro AST
++    # (see Phoenix.Component.MacroComponent) and then calling the transform
++    # function on the macro component module, which can return a transformed
++    # AST.
++    #
++    # The AST is limited in functionality and we convert it back to the regular
++    # node format afterwards.
++    caller = state.caller
++
++    if is_nil(caller) do
++      raise ArgumentError, "macro components require a caller environment"
++    end
++
++    Macro.Env.required?(caller, Phoenix.Component) ||
++      raise ArgumentError,
++            "macro components are only supported in modules that `use Phoenix.Component`"
++
++    meta = get_meta(tree_node)
++    module_string = meta.macro_component
++    module = validate_module!(module_string, meta, state)
++
++    # Build the macro component AST
++    case MacroComponent.build_ast(tree_node, caller) do
++      {:ok, macro_ast} ->
++        try do
++          # Call the transform function
++          case module.transform(macro_ast, %{env: caller}) do
++            {:ok, new_ast} ->
++              MacroComponent.ast_to_tree(new_ast, meta)
++
++            {:ok, new_ast, data} ->
++              Module.put_attribute(caller.module, :__macro_components__, {module, data})
++              MacroComponent.ast_to_tree(new_ast, meta)
++
++            other ->
++              throw_syntax_error!(
++                "a macro component must return {:ok, ast} or {:ok, ast, data}, got: #{inspect(other)}",
++                meta
++              )
++          end
++        rescue
++          e in ArgumentError ->
++            throw_syntax_error!(Exception.message(e), meta)
++        end
++
++      {:error, message, error_meta} ->
++        throw_syntax_error!(message, error_meta)
++    end
++  end
++
++  defp get_meta({:self_close, _type, _name, _attrs, meta}), do: meta
++  defp get_meta({:block, _type, _name, _attrs, _children, meta, _close_meta}), do: meta
++
++  defp validate_module!(module_string, tag_meta, state) do
++    module =
++      Code.string_to_quoted!(module_string,
++        file: state.caller.file,
++        line: tag_meta.line,
++        column: tag_meta.column
++      )
++      |> Macro.expand(state.caller)
++
++    if not is_atom(module) do
++      throw_syntax_error!(
++        "the given macro component #{inspect(module_string)} is not a valid module",
++        tag_meta
++      )
++    end
++
++    _ = Code.ensure_compiled!(module)
++
++    if not function_exported?(module, :transform, 2) do
++      throw_syntax_error!(
++        "the given macro component #{inspect(module)} does not implement the `Phoenix.Component.MacroComponent` behaviour",
++        tag_meta
++      )
++    end
++
++    module
++  end
++
++  defp throw_syntax_error!(message, meta) do
++    throw({:syntax_error, meta.line, meta.column, message})
++  end
++
++  defp format_type(:slot), do: "slots"
++  defp format_type(_), do: "components"
++end
+diff --git a/lib/phoenix_live_view/tag_engine/tokenizer.ex b/lib/phoenix_live_view/tag_engine/tokenizer.ex
+new file mode 100644
+index 00000000..94361309
+--- /dev/null
++++ b/lib/phoenix_live_view/tag_engine/tokenizer.ex
+@@ -0,0 +1,754 @@
++defmodule Phoenix.LiveView.TagEngine.Tokenizer do
++  @moduledoc false
++  @space_chars ~c"\s\t\f"
++  @quote_chars ~c"\"'"
++  @stop_chars ~c">/=\r\n" ++ @quote_chars ++ @space_chars
++
++  defmodule ParseError do
++    @moduledoc false
++    defexception [:file, :line, :column, :description]
++
++    @impl true
++    def message(exception) do
++      location =
++        exception.file
++        |> Path.relative_to_cwd()
++        |> Exception.format_file_line_column(exception.line, exception.column)
++
++      "#{location} #{exception.description}"
++    end
++
++    def code_snippet(source, meta, indentation \\ 0) do
++      line_start = max(meta.line - 3, 1)
++      line_end = meta.line
++      digits = line_end |> Integer.to_string() |> byte_size()
++      number_padding = String.duplicate(" ", digits)
++      indentation = String.duplicate(" ", indentation)
++
++      source
++      |> String.split(["\r\n", "\n"])
++      |> Enum.slice((line_start - 1)..(line_end - 1))
++      |> Enum.map_reduce(line_start, fn
++        expr, line_number when line_number == line_end ->
++          arrow = String.duplicate(" ", meta.column - 1) <> "^"
++          acc = "#{line_number} | #{indentation}#{expr}\n #{number_padding}| #{arrow}"
++          {acc, line_number + 1}
++
++        expr, line_number ->
++          line_number_padding = String.pad_leading("#{line_number}", digits)
++          {"#{line_number_padding} | #{indentation}#{expr}", line_number + 1}
++      end)
++      |> case do
++        {[], _} ->
++          ""
++
++        {snippet, _} ->
++          Enum.join(["\n #{number_padding}|" | snippet], "\n")
++      end
++    end
++  end
++
++  def finalize(_tokens, file, {:comment, line, column}, source) do
++    message = "expected closing `-->` for comment"
++    meta = %{line: line, column: column}
++    raise_syntax_error!(message, meta, %{source: source, file: file, indentation: 0})
++  end
++
++  def finalize(tokens, _file, _cont, _source) do
++    tokens
++    |> strip_text_token_fully()
++    |> Enum.reverse()
++    |> strip_text_token_fully()
++  end
++
++  @doc """
++  Initiate the Tokenizer state.
++
++  ### Params
++
++  * `indentation` - An integer that indicates the current indentation.
++  * `file` - Can be either a file or a string "nofile".
++  * `source` - The contents of the file as binary used to be tokenized.
++  * `tag_handler` - Tag handler to classify the tags. See `Phoenix.LiveView.TagEngine`
++    behaviour.
++  """
++  def init(indentation, file, source, tag_handler) do
++    %{
++      file: file,
++      column_offset: indentation + 1,
++      braces: :enabled,
++      context: [],
++      source: source,
++      indentation: indentation,
++      tag_handler: tag_handler
++    }
++  end
++
++  @doc """
++  Tokenize the given text according to the given params.
++
++  ### Params
++
++  * `text` - The content to be tokenized.
++  * `meta` - A keyword list with `:line` and `:column`. Both must be integers.
++  * `tokens` - A list of tokens.
++  * `cont` - An atom that is `:text`, `:style`, or `:script`, or a tuple
++    {:comment, line, column}.
++  * `state` - The tokenizer state that must be initiated by `Tokenizer.init/4`
++
++  ### Examples
++
++      iex> alias Phoenix.LiveView.Tokenizer
++
++      iex> state =
++        Tokenizer.init(indent, file, [text: "<section><div/></section>"], HTMLEngine)
++
++      iex> Tokenizer.tokenize(state)
++      {[
++         {:close, :tag, "section", %{column: 16, line: 1}},
++         {:tag, "div", [], %{column: 10, line: 1, closing: :self}},
++         {:tag, "section", [], %{column: 1, line: 1}}
++       ], {:text, :enabled}}
++  """
++  def tokenize(text, meta, tokens, cont, state) do
++    line = Keyword.get(meta, :line, 1)
++    column = Keyword.get(meta, :column, 1)
++
++    case cont do
++      {:text, braces} -> handle_text(text, line, column, [], tokens, %{state | braces: braces})
++      :style -> handle_style(text, line, column, [], tokens, state)
++      :script -> handle_script(text, line, column, [], tokens, state)
++      {:comment, _, _} -> handle_comment(text, line, column, [], tokens, state)
++    end
++  end
++
++  ## handle_text
++
++  defp handle_text("\r\n" <> rest, line, _column, buffer, acc, state) do
++    handle_text(rest, line + 1, state.column_offset, ["\r\n" | buffer], acc, state)
++  end
++
++  defp handle_text("\n" <> rest, line, _column, buffer, acc, state) do
++    handle_text(rest, line + 1, state.column_offset, ["\n" | buffer], acc, state)
++  end
++
++  defp handle_text("<!doctype" <> rest, line, column, buffer, acc, state) do
++    handle_doctype(rest, line, column + 9, ["<!doctype" | buffer], acc, state)
++  end
++
++  defp handle_text("<!DOCTYPE" <> rest, line, column, buffer, acc, state) do
++    handle_doctype(rest, line, column + 9, ["<!DOCTYPE" | buffer], acc, state)
++  end
++
++  defp handle_text("<!--" <> rest, line, column, buffer, acc, state) do
++    state = update_in(state.context, &[:comment_start | &1])
++    handle_comment(rest, line, column + 4, ["<!--" | buffer], acc, state)
++  end
++
++  defp handle_text("</" <> rest, line, column, buffer, acc, state) do
++    text_to_acc = text_to_acc(buffer, acc, line, column, state.context)
++    handle_tag_close(rest, line, column + 2, text_to_acc, %{state | context: []})
++  end
++
++  defp handle_text("<" <> rest, line, column, buffer, acc, state) do
++    text_to_acc = text_to_acc(buffer, acc, line, column, state.context)
++    handle_tag_open(rest, line, column + 1, text_to_acc, %{state | context: []})
++  end
++
++  defp handle_text("{" <> rest, line, column, buffer, acc, %{braces: :enabled} = state) do
++    text_to_acc = text_to_acc(buffer, acc, line, column, state.context)
++    state = put_in(state.context, [])
++
++    case handle_interpolation(rest, line, column + 1, [], 0, state) do
++      {:ok, value, new_line, new_column, rest} ->
++        acc = [{:body_expr, value, %{line: line, column: column}} | text_to_acc]
++        handle_text(rest, new_line, new_column, [], acc, state)
++
++      {:error, message} ->
++        meta = %{line: line, column: column}
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  defp handle_text(<<c::utf8, rest::binary>>, line, column, buffer, acc, state) do
++    handle_text(rest, line, column + 1, [char_or_bin(c) | buffer], acc, state)
++  end
++
++  defp handle_text(<<>>, line, column, buffer, acc, state) do
++    ok(text_to_acc(buffer, acc, line, column, state.context), {:text, state.braces})
++  end
++
++  ## handle_doctype
++
++  defp handle_doctype(<<?>, rest::binary>>, line, column, buffer, acc, state) do
++    handle_text(rest, line, column + 1, [?> | buffer], acc, state)
++  end
++
++  defp handle_doctype("\r\n" <> rest, line, _column, buffer, acc, state) do
++    handle_doctype(rest, line + 1, state.column_offset, ["\r\n" | buffer], acc, state)
++  end
++
++  defp handle_doctype("\n" <> rest, line, _column, buffer, acc, state) do
++    handle_doctype(rest, line + 1, state.column_offset, ["\n" | buffer], acc, state)
++  end
++
++  defp handle_doctype(<<c::utf8, rest::binary>>, line, column, buffer, acc, state) do
++    handle_doctype(rest, line, column + 1, [char_or_bin(c) | buffer], acc, state)
++  end
++
++  defp handle_doctype(<<>>, line, column, _buffer, _acc, state) do
++    raise_syntax_error!(
++      "unexpected end of string inside tag",
++      %{line: line, column: column},
++      state
++    )
++  end
++
++  ## handle_script
++
++  defp handle_script("</script>" <> rest, line, column, buffer, acc, state) do
++    acc = [
++      {:close, :tag, "script", %{line: line, column: column, inner_location: {line, column}}}
++      | text_to_acc(buffer, acc, line, column, [])
++    ]
++
++    handle_text(rest, line, column + 9, [], acc, state)
++  end
++
++  defp handle_script("\r\n" <> rest, line, _column, buffer, acc, state) do
++    handle_script(rest, line + 1, state.column_offset, ["\r\n" | buffer], acc, state)
++  end
++
++  defp handle_script("\n" <> rest, line, _column, buffer, acc, state) do
++    handle_script(rest, line + 1, state.column_offset, ["\n" | buffer], acc, state)
++  end
++
++  defp handle_script(<<c::utf8, rest::binary>>, line, column, buffer, acc, state) do
++    handle_script(rest, line, column + 1, [char_or_bin(c) | buffer], acc, state)
++  end
++
++  defp handle_script(<<>>, line, column, buffer, acc, _state) do
++    ok(text_to_acc(buffer, acc, line, column, []), :script)
++  end
++
++  ## handle_style
++
++  defp handle_style("</style>" <> rest, line, column, buffer, acc, state) do
++    acc = [
++      {:close, :tag, "style", %{line: line, column: column, inner_location: {line, column}}}
++      | text_to_acc(buffer, acc, line, column, [])
++    ]
++
++    handle_text(rest, line, column + 9, [], acc, state)
++  end
++
++  defp handle_style("\r\n" <> rest, line, _column, buffer, acc, state) do
++    handle_style(rest, line + 1, state.column_offset, ["\r\n" | buffer], acc, state)
++  end
++
++  defp handle_style("\n" <> rest, line, _column, buffer, acc, state) do
++    handle_style(rest, line + 1, state.column_offset, ["\n" | buffer], acc, state)
++  end
++
++  defp handle_style(<<c::utf8, rest::binary>>, line, column, buffer, acc, state) do
++    handle_style(rest, line, column + 1, [char_or_bin(c) | buffer], acc, state)
++  end
++
++  defp handle_style(<<>>, line, column, buffer, acc, _state) do
++    ok(text_to_acc(buffer, acc, line, column, []), :style)
++  end
++
++  ## handle_comment
++
++  defp handle_comment(rest, line, column, buffer, acc, state) do
++    case handle_comment(rest, line, column, buffer, state) do
++      {:text, rest, line, column, buffer} ->
++        state = update_in(state.context, &[:comment_end | &1])
++        handle_text(rest, line, column, buffer, acc, state)
++
++      {:ok, line_end, column_end, buffer} ->
++        acc = text_to_acc(buffer, acc, line_end, column_end, state.context)
++        # We do column - 4 to point to the opening <!--
++        ok(acc, {:comment, line, column - 4})
++    end
++  end
++
++  defp handle_comment("\r\n" <> rest, line, _column, buffer, state) do
++    handle_comment(rest, line + 1, state.column_offset, ["\r\n" | buffer], state)
++  end
++
++  defp handle_comment("\n" <> rest, line, _column, buffer, state) do
++    handle_comment(rest, line + 1, state.column_offset, ["\n" | buffer], state)
++  end
++
++  defp handle_comment("-->" <> rest, line, column, buffer, _state) do
++    {:text, rest, line, column + 3, ["-->" | buffer]}
++  end
++
++  defp handle_comment(<<c::utf8, rest::binary>>, line, column, buffer, state) do
++    handle_comment(rest, line, column + 1, [char_or_bin(c) | buffer], state)
++  end
++
++  defp handle_comment(<<>>, line, column, buffer, _state) do
++    {:ok, line, column, buffer}
++  end
++
++  ## handle_tag_open
++
++  defp handle_tag_open(text, line, column, acc, state) do
++    case handle_tag_name(text, column, []) do
++      {:ok, name, new_column, rest} ->
++        meta = %{line: line, column: column - 1, inner_location: nil, tag_name: name}
++
++        case state.tag_handler.classify_type(name) do
++          {:error, message} ->
++            raise_syntax_error!(message, %{line: line, column: column}, state)
++
++          {type, name} ->
++            acc = [{type, name, [], meta} | acc]
++            handle_maybe_tag_open_end(rest, line, new_column, acc, state)
++        end
++
++      :error ->
++        message =
++          "expected tag name after <. If you meant to use < as part of a text, use &lt; instead"
++
++        meta = %{line: line, column: column}
++
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  ## handle_tag_close
++
++  defp handle_tag_close(text, line, column, acc, state) do
++    case handle_tag_name(text, column, []) do
++      {:ok, name, new_column, ">" <> rest} ->
++        meta = %{
++          line: line,
++          column: column - 2,
++          inner_location: {line, column - 2},
++          tag_name: name
++        }
++
++        case state.tag_handler.classify_type(name) do
++          {:error, message} ->
++            raise_syntax_error!(message, meta, state)
++
++          {type, name} ->
++            acc = [{:close, type, name, meta} | acc]
++            handle_text(rest, line, new_column + 1, [], acc, pop_braces(state))
++        end
++
++      {:ok, _, new_column, _} ->
++        message = "expected closing `>`"
++        meta = %{line: line, column: new_column}
++        raise_syntax_error!(message, meta, state)
++
++      :error ->
++        message = "expected tag name after </"
++        meta = %{line: line, column: column}
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  ## handle_tag_name
++
++  defp handle_tag_name(<<c::utf8, _rest::binary>> = text, column, buffer)
++       when c in @stop_chars do
++    done_tag_name(text, column, buffer)
++  end
++
++  defp handle_tag_name(<<c::utf8, rest::binary>>, column, buffer) do
++    handle_tag_name(rest, column + 1, [char_or_bin(c) | buffer])
++  end
++
++  defp handle_tag_name(<<>>, column, buffer) do
++    done_tag_name(<<>>, column, buffer)
++  end
++
++  defp done_tag_name(_text, _column, []) do
++    :error
++  end
++
++  defp done_tag_name(text, column, buffer) do
++    {:ok, buffer_to_string(buffer), column, text}
++  end
++
++  ## handle_maybe_tag_open_end
++
++  defp handle_maybe_tag_open_end("\r\n" <> rest, line, _column, acc, state) do
++    handle_maybe_tag_open_end(rest, line + 1, state.column_offset, acc, state)
++  end
++
++  defp handle_maybe_tag_open_end("\n" <> rest, line, _column, acc, state) do
++    handle_maybe_tag_open_end(rest, line + 1, state.column_offset, acc, state)
++  end
++
++  defp handle_maybe_tag_open_end(<<c::utf8, rest::binary>>, line, column, acc, state)
++       when c in @space_chars do
++    handle_maybe_tag_open_end(rest, line, column + 1, acc, state)
++  end
++
++  defp handle_maybe_tag_open_end("/>" <> rest, line, column, acc, state) do
++    acc = normalize_tag(acc, line, column + 2, true, state)
++    handle_text(rest, line, column + 2, [], acc, state)
++  end
++
++  defp handle_maybe_tag_open_end(">" <> rest, line, column, acc, state) do
++    case normalize_tag(acc, line, column + 1, false, state) do
++      [{:tag, "script", _, _} | _] = acc ->
++        handle_script(rest, line, column + 1, [], acc, state)
++
++      [{:tag, "style", _, _} | _] = acc ->
++        handle_style(rest, line, column + 1, [], acc, state)
++
++      acc ->
++        handle_text(rest, line, column + 1, [], acc, push_braces(state))
++    end
++  end
++
++  defp handle_maybe_tag_open_end("{" <> rest, line, column, acc, state) do
++    handle_root_attribute(rest, line, column + 1, acc, state)
++  end
++
++  defp handle_maybe_tag_open_end(<<>>, line, column, _acc, state) do
++    message = ~S"""
++    expected closing `>` or `/>`
++
++    Make sure the tag is properly closed. This may happen if there
++    is an EEx interpolation inside a tag, which is not supported.
++    For instance, instead of
++
++        <div id="<%= @id %>">Content</div>
++
++    do
++
++        <div id={@id}>Content</div>
++
++    If @id is nil or false, then no attribute is sent at all.
++
++    Inside {...} you can place any Elixir expression. If you want
++    to interpolate in the middle of an attribute value, instead of
++
++        <a class="foo bar <%= @class %>">Text</a>
++
++    you can pass an Elixir string with interpolation:
++
++        <a class={"foo bar #{@class}"}>Text</a>
++    """
++
++    raise_syntax_error!(message, %{line: line, column: column}, state)
++  end
++
++  defp handle_maybe_tag_open_end(text, line, column, acc, state) do
++    handle_attribute(text, line, column, acc, state)
++  end
++
++  ## handle_attribute
++
++  defp handle_attribute(text, line, column, acc, state) do
++    case handle_attr_name(text, column, []) do
++      {:ok, name, new_column, rest} ->
++        attr_meta = %{line: line, column: column}
++        {text, line, column, value} = handle_maybe_attr_value(rest, line, new_column, state)
++        acc = put_attr(acc, name, attr_meta, value)
++
++        state =
++          if name == "phx-no-curly-interpolation" and state.braces == :enabled and
++               not script_or_style?(acc) do
++            %{state | braces: 0}
++          else
++            state
++          end
++
++        handle_maybe_tag_open_end(text, line, column, acc, state)
++
++      {:error, message, column} ->
++        meta = %{line: line, column: column}
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  defp script_or_style?([{:tag, name, _, _} | _]) when name in ~w(script style), do: true
++  defp script_or_style?(_), do: false
++
++  ## handle_root_attribute
++
++  defp handle_root_attribute(text, line, column, acc, state) do
++    case handle_interpolation(text, line, column, [], 0, state) do
++      {:ok, value, new_line, new_column, rest} ->
++        meta = %{line: line, column: column}
++        acc = put_attr(acc, :root, meta, {:expr, value, meta})
++        handle_maybe_tag_open_end(rest, new_line, new_column, acc, state)
++
++      {:error, message} ->
++        # We do column - 1 to point to the opening {
++        meta = %{line: line, column: column - 1}
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  ## handle_attr_name
++
++  defp handle_attr_name(<<c::utf8, _rest::binary>>, column, _buffer)
++       when c in @quote_chars do
++    {:error, "invalid character in attribute name: #{<<c>>}", column}
++  end
++
++  defp handle_attr_name(<<c::utf8, _rest::binary>>, column, [])
++       when c in @stop_chars do
++    {:error, "expected attribute name", column}
++  end
++
++  defp handle_attr_name(<<c::utf8, _rest::binary>> = text, column, buffer)
++       when c in @stop_chars do
++    {:ok, buffer_to_string(buffer), column, text}
++  end
++
++  defp handle_attr_name(<<c::utf8, rest::binary>>, column, buffer) do
++    handle_attr_name(rest, column + 1, [char_or_bin(c) | buffer])
++  end
++
++  defp handle_attr_name(<<>>, column, _buffer) do
++    {:error, "unexpected end of string inside tag", column}
++  end
++
++  ## handle_maybe_attr_value
++
++  defp handle_maybe_attr_value("\r\n" <> rest, line, _column, state) do
++    handle_maybe_attr_value(rest, line + 1, state.column_offset, state)
++  end
++
++  defp handle_maybe_attr_value("\n" <> rest, line, _column, state) do
++    handle_maybe_attr_value(rest, line + 1, state.column_offset, state)
++  end
++
++  defp handle_maybe_attr_value(<<c::utf8, rest::binary>>, line, column, state)
++       when c in @space_chars do
++    handle_maybe_attr_value(rest, line, column + 1, state)
++  end
++
++  defp handle_maybe_attr_value("=" <> rest, line, column, state) do
++    handle_attr_value_begin(rest, line, column + 1, state)
++  end
++
++  defp handle_maybe_attr_value(text, line, column, _state) do
++    {text, line, column, nil}
++  end
++
++  ## handle_attr_value_begin
++
++  defp handle_attr_value_begin("\r\n" <> rest, line, _column, state) do
++    handle_attr_value_begin(rest, line + 1, state.column_offset, state)
++  end
++
++  defp handle_attr_value_begin("\n" <> rest, line, _column, state) do
++    handle_attr_value_begin(rest, line + 1, state.column_offset, state)
++  end
++
++  defp handle_attr_value_begin(<<c::utf8, rest::binary>>, line, column, state)
++       when c in @space_chars do
++    handle_attr_value_begin(rest, line, column + 1, state)
++  end
++
++  defp handle_attr_value_begin("\"" <> rest, line, column, state) do
++    handle_attr_value_quote(rest, ?", line, column + 1, [], state)
++  end
++
++  defp handle_attr_value_begin("'" <> rest, line, column, state) do
++    handle_attr_value_quote(rest, ?', line, column + 1, [], state)
++  end
++
++  defp handle_attr_value_begin("{" <> rest, line, column, state) do
++    handle_attr_value_as_expr(rest, line, column + 1, state)
++  end
++
++  defp handle_attr_value_begin(_text, line, column, state) do
++    message =
++      "invalid attribute value after `=`. Expected either a value between quotes " <>
++        "(such as \"value\" or \'value\') or an Elixir expression between curly braces (such as `{expr}`)"
++
++    meta = %{line: line, column: column}
++    raise_syntax_error!(message, meta, state)
++  end
++
++  ## handle_attr_value_quote
++
++  defp handle_attr_value_quote("\r\n" <> rest, delim, line, _column, buffer, state) do
++    column = state.column_offset
++    handle_attr_value_quote(rest, delim, line + 1, column, ["\r\n" | buffer], state)
++  end
++
++  defp handle_attr_value_quote("\n" <> rest, delim, line, _column, buffer, state) do
++    column = state.column_offset
++    handle_attr_value_quote(rest, delim, line + 1, column, ["\n" | buffer], state)
++  end
++
++  defp handle_attr_value_quote(<<delim, rest::binary>>, delim, line, column, buffer, _state) do
++    value = buffer_to_string(buffer)
++    {rest, line, column + 1, {:string, value, %{delimiter: delim}}}
++  end
++
++  defp handle_attr_value_quote(<<c::utf8, rest::binary>>, delim, line, column, buffer, state) do
++    handle_attr_value_quote(rest, delim, line, column + 1, [char_or_bin(c) | buffer], state)
++  end
++
++  defp handle_attr_value_quote(<<>>, delim, line, column, _buffer, state) do
++    message = """
++    expected closing `#{<<delim>>}` for attribute value
++
++    Make sure the attribute is properly closed. This may also happen if
++    there is an EEx interpolation inside a tag, which is not supported.
++    Instead of
++
++        <div <%= @some_attributes %>>
++        </div>
++
++    do
++
++        <div {@some_attributes}>
++        </div>
++
++    Where @some_attributes must be a keyword list or a map.
++    """
++
++    meta = %{line: line, column: column}
++    raise_syntax_error!(message, meta, state)
++  end
++
++  ## handle_attr_value_as_expr
++
++  defp handle_attr_value_as_expr(text, line, column, state) do
++    case handle_interpolation(text, line, column, [], 0, state) do
++      {:ok, value, new_line, new_column, rest} ->
++        {rest, new_line, new_column, {:expr, value, %{line: line, column: column}}}
++
++      {:error, message} ->
++        # We do column - 1 to point to the opening {
++        meta = %{line: line, column: column - 1}
++        raise_syntax_error!(message, meta, state)
++    end
++  end
++
++  ## handle_interpolation
++
++  defp handle_interpolation("\r\n" <> rest, line, _column, buffer, braces, state) do
++    handle_interpolation(rest, line + 1, state.column_offset, ["\r\n" | buffer], braces, state)
++  end
++
++  defp handle_interpolation("\n" <> rest, line, _column, buffer, braces, state) do
++    handle_interpolation(rest, line + 1, state.column_offset, ["\n" | buffer], braces, state)
++  end
++
++  defp handle_interpolation("}" <> rest, line, column, buffer, 0, _state) do
++    value = buffer_to_string(buffer)
++    {:ok, value, line, column + 1, rest}
++  end
++
++  defp handle_interpolation(~S(\}) <> rest, line, column, buffer, braces, state) do
++    handle_interpolation(rest, line, column + 2, [~S(\}) | buffer], braces, state)
++  end
++
++  defp handle_interpolation(~S(\{) <> rest, line, column, buffer, braces, state) do
++    handle_interpolation(rest, line, column + 2, [~S(\{) | buffer], braces, state)
++  end
++
++  defp handle_interpolation("}" <> rest, line, column, buffer, braces, state) do
++    handle_interpolation(rest, line, column + 1, ["}" | buffer], braces - 1, state)
++  end
++
++  defp handle_interpolation("{" <> rest, line, column, buffer, braces, state) do
++    handle_interpolation(rest, line, column + 1, ["{" | buffer], braces + 1, state)
++  end
++
++  defp handle_interpolation(<<c::utf8, rest::binary>>, line, column, buffer, braces, state) do
++    handle_interpolation(rest, line, column + 1, [char_or_bin(c) | buffer], braces, state)
++  end
++
++  defp handle_interpolation(<<>>, _line, _column, _buffer, _braces, _state) do
++    {:error,
++     """
++     expected closing `}` for expression
++
++     In case you don't want `{` to begin a new interpolation, \
++     you may write it using `&lbrace;` or using `<%= "{" %>`\
++     """}
++  end
++
++  ## helpers
++
++  @compile {:inline, ok: 2, char_or_bin: 1}
++  defp ok(acc, cont), do: {acc, cont}
++
++  defp char_or_bin(c) when c <= 127, do: c
++  defp char_or_bin(c), do: <<c::utf8>>
++
++  defp buffer_to_string(buffer) do
++    IO.iodata_to_binary(Enum.reverse(buffer))
++  end
++
++  defp text_to_acc(buffer, acc, line, column, context)
++
++  defp text_to_acc([], acc, _line, _column, _context),
++    do: acc
++
++  defp text_to_acc(buffer, acc, line, column, context) do
++    meta = %{line_end: line, column_end: column}
++
++    meta =
++      if context == [] do
++        meta
++      else
++        Map.put(meta, :context, trim_context(context))
++      end
++
++    [{:text, buffer_to_string(buffer), meta} | acc]
++  end
++
++  defp trim_context([:comment_end, :comment_start | [_ | _] = rest]), do: trim_context(rest)
++  defp trim_context(rest), do: Enum.reverse(rest)
++
++  defp push_braces(%{braces: :enabled} = state), do: state
++  defp push_braces(%{braces: braces} = state), do: %{state | braces: braces + 1}
++
++  defp pop_braces(%{braces: :enabled} = state), do: state
++  defp pop_braces(%{braces: 1} = state), do: %{state | braces: :enabled}
++  defp pop_braces(%{braces: braces} = state), do: %{state | braces: braces - 1}
++
++  defp put_attr([{type, name, attrs, meta} | acc], attr, attr_meta, value) do
++    attrs = [{attr, value, attr_meta} | attrs]
++    [{type, name, attrs, meta} | acc]
++  end
++
++  defp normalize_tag([{type, name, attrs, meta} | acc], line, column, self_close?, state) do
++    attrs = Enum.reverse(attrs)
++    meta = %{meta | inner_location: {line, column}}
++
++    meta =
++      cond do
++        type == :tag and state.tag_handler.void?(name) -> Map.put(meta, :closing, :void)
++        self_close? -> Map.put(meta, :closing, :self)
++        true -> meta
++      end
++
++    [{type, name, attrs, meta} | acc]
++  end
++
++  defp strip_text_token_fully(tokens) do
++    with [{:text, text, _} | rest] <- tokens,
++         "" <- String.trim_leading(text) do
++      strip_text_token_fully(rest)
++    else
++      _ -> tokens
++    end
++  end
++
++  defp raise_syntax_error!(message, meta, state) do
++    raise ParseError,
++      file: state.file,
++      line: meta.line,
++      column: meta.column,
++      description: message <> ParseError.code_snippet(state.source, meta, state.indentation)
++  end
++end

@@ -1,0 +1,890 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f7871..0dfef74b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,8 +18,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + #1689, Add the ability to run without `db-anon-role` disabling anonymous access. - @wolfgangwalther
+  - #1543, Allow access to fields of composite types in select=, order= and filters through JSON operators -> and ->>. - @wolfgangwalther
+  - #2075, Allow access to array items in ?select=, ?order= and filters through JSON operators -> and ->>. - @wolfgangwalther
+- - #2156, #2211, Allow applying `limit/offset` to UPDATE/DELETE to only affect a subset of rows - @steve-chavez
+-   + It requires an explicit `order` on a unique column(s)
++ - #2156, Allow applying `limit/offset` to UPDATE/DELETE to only affect a subset of rows - @steve-chavez
++   + Uses the table primary key, so it needs a select privilege on the primary key columns
++   + If no primary key is available, it will fallback to using the "ctid" system column(will also require a select privilege on it)
++   + Doesn't work on views and it will throw an error if tried
+  - #1917, Add error codes with the `"PGRST"` prefix to the error response body to differentiate PostgREST errors from PostgreSQL errors - @laurenceisla
+  - #1917, Normalize the error response body by always having the `detail` and `hint` error fields with a `null` value if they are empty - @laurenceisla
+  - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index b284c822..dadc2add 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -62,7 +62,8 @@ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..))
+ import PostgREST.Config.PgVersion        (PgVersion (..))
+ import PostgREST.ContentType             (ContentType (..))
+-import PostgREST.DbStructure             (DbStructure (..))
++import PostgREST.DbStructure             (DbStructure (..),
++                                          findIfView)
+ import PostgREST.DbStructure.Identifiers (FieldName,
+                                           QualifiedIdentifier (..),
+                                           Schema)
+@@ -346,7 +347,10 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+       response HTTP.status201 headers mempty
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
++handleUpdate identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
++    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
++
+   WriteQueryResult{..} <- writeQuery MutationUpdate identifier False mempty context
+ 
+   let
+@@ -361,15 +365,17 @@ handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+       RangeQuery.contentRangeH 0 (resQueryTotal - 1) $
+         if shouldCount iPreferCount then Just resQueryTotal else Nothing
+ 
+-  failChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resQueryTotal =<<
+-    failNotSingular iAcceptContentType resQueryTotal (
+-      if fullRepr then
+-        response status (contentTypeHeaders context ++ [contentRangeHeader]) (LBS.fromStrict resBody)
+-      else
+-        response status [contentRangeHeader] mempty)
++  failNotSingular iAcceptContentType resQueryTotal $
++    if fullRepr then
++      response status (contentTypeHeaders context ++ [contentRangeHeader]) (LBS.fromStrict resBody)
++    else
++      response status [contentRangeHeader] mempty
+ 
+ handleSingleUpsert :: QualifiedIdentifier -> RequestContext-> DbHandler Wai.Response
+ handleSingleUpsert identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++  when (iTopLevelRange /= RangeQuery.allRange) $
++    throwError Error.PutRangeNotAllowedError
++
+   let pkCols = maybe mempty tablePKCols $ M.lookup identifier $ dbTables ctxDbStructure
+ 
+   WriteQueryResult{..} <- writeQuery MutationSingleUpsert identifier False pkCols context
+@@ -392,7 +398,10 @@ handleSingleUpsert identifier context@(RequestContext _ ctxDbStructure ApiReques
+       response HTTP.status204 [] mempty
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
++handleDelete identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
++    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
++
+   WriteQueryResult{..} <- writeQuery MutationDelete identifier False mempty context
+ 
+   let
+@@ -401,14 +410,13 @@ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+       RangeQuery.contentRangeH 1 0 $
+         if shouldCount iPreferCount then Just resQueryTotal else Nothing
+ 
+-  failChangesOffLimits (RangeQuery.rangeLimit iTopLevelRange) resQueryTotal =<<
+-    failNotSingular iAcceptContentType resQueryTotal (
+-      if iPreferRepresentation == Full then
+-        response HTTP.status200
+-          (contentTypeHeaders context ++ [contentRangeHeader])
+-          (LBS.fromStrict resBody)
+-      else
+-        response HTTP.status204 [contentRangeHeader] mempty)
++  failNotSingular iAcceptContentType resQueryTotal $
++    if iPreferRepresentation == Full then
++      response HTTP.status200
++        (contentTypeHeaders context ++ [contentRangeHeader])
++        (LBS.fromStrict resBody)
++    else
++      response HTTP.status204 [contentRangeHeader] mempty
+ 
+ handleInfo :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m Wai.Response
+ handleInfo identifier RequestContext{..} =
+@@ -576,16 +584,6 @@ failNotSingular contentType queryTotal response =
+   else
+     return response
+ 
+-failChangesOffLimits :: Maybe Integer -> Int64 -> Wai.Response -> DbHandler Wai.Response
+-failChangesOffLimits (Just maxChanges) queryTotal response =
+-  if queryTotal > fromIntegral maxChanges
+-  then do
+-      lift SQL.condemn
+-      throwError $ Error.OffLimitsChangesError queryTotal maxChanges
+-  else
+-    return response
+-failChangesOffLimits _ _ response = return response
+-
+ shouldCount :: Maybe PreferCount -> Bool
+ shouldCount preferCount =
+   preferCount == Just ExactCount || preferCount == Just EstimatedCount
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 5e581941..7404fcb6 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -23,6 +23,7 @@ module PostgREST.DbStructure
+   , queryDbStructure
+   , accessibleTables
+   , accessibleProcs
++  , findIfView
+   , schemaDescription
+   ) where
+ 
+@@ -65,6 +66,9 @@ data DbStructure = DbStructure
+   }
+   deriving (Generic, JSON.ToJSON)
+ 
++findIfView :: QualifiedIdentifier -> TablesMap -> Bool
++findIfView identifier tbls = maybe False tableIsView $ M.lookup identifier tbls
++
+ -- | A view foreign key or primary key dependency detected on its source table
+ data ViewKeyDependency = ViewKeyDependency {
+   keyDepTable :: QualifiedIdentifier
+diff --git a/src/PostgREST/DbStructure/Table.hs b/src/PostgREST/DbStructure/Table.hs
+index 3c6ab5a2..ed2302a9 100644
+--- a/src/PostgREST/DbStructure/Table.hs
++++ b/src/PostgREST/DbStructure/Table.hs
+@@ -21,8 +21,8 @@ data Table = Table
+   { tableSchema      :: Schema
+   , tableName        :: TableName
+   , tableDescription :: Maybe Text
+-     -- TODO Find a better way to separate tables and views
+-   , tableIsView     :: Bool
++    -- TODO Find a better way to separate tables and views
++  , tableIsView      :: Bool
+     -- The following fields identify what can be done on the table/view, they're not related to the privileges granted to it
+   , tableInsertable  :: Bool
+   , tableUpdatable   :: Bool
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 10a9276b..599a823d 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -54,21 +54,19 @@ class (JSON.ToJSON a) => PgrstError a where
+   errorResponseFor err = responseLBS (status err) (headers err) $ errorPayload err
+ 
+ instance PgrstError ApiRequestError where
+-  status ActionInappropriate     = HTTP.status405
+-  status AmbiguousRelBetween{}   = HTTP.status300
+-  status AmbiguousRpc{}          = HTTP.status300
+-  status ContentTypeError{}      = HTTP.status415
+-  status InvalidBody{}           = HTTP.status400
+-  status InvalidFilters          = HTTP.status405
+-  status InvalidRange            = HTTP.status416
+-  status NoRelBetween{}          = HTTP.status400
+-  status NoRpc{}                 = HTTP.status404
+-  status NotEmbedded{}           = HTTP.status400
+-  status ParseRequestError{}     = HTTP.status400
+-  status PutRangeNotAllowedError = HTTP.status400
+-  status QueryParamError{}       = HTTP.status400
+-  status UnacceptableSchema{}    = HTTP.status406
+-  status LimitNoOrderError       = HTTP.status400
++  status ActionInappropriate   = HTTP.status405
++  status AmbiguousRelBetween{} = HTTP.status300
++  status AmbiguousRpc{}        = HTTP.status300
++  status ContentTypeError{}    = HTTP.status415
++  status InvalidBody{}         = HTTP.status400
++  status InvalidFilters        = HTTP.status405
++  status InvalidRange          = HTTP.status416
++  status NoRelBetween{}        = HTTP.status400
++  status NoRpc{}               = HTTP.status404
++  status NotEmbedded{}         = HTTP.status400
++  status ParseRequestError{}   = HTTP.status400
++  status QueryParamError{}     = HTTP.status400
++  status UnacceptableSchema{}  = HTTP.status406
+ 
+   headers _ = [ContentType.toHeader CTApplicationJSON]
+ 
+@@ -98,11 +96,6 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= message,
+     "details" .= details,
+     "hint"    .= JSON.Null]
+-  toJSON PutRangeNotAllowedError = JSON.object [
+-    "code"    .= GeneralErrorCode03,
+-    "message" .= ("Range header and limit/offset querystring parameters are not allowed for PUT" :: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+   toJSON InvalidFilters = JSON.object [
+     "code"    .= ApiRequestErrorCode05,
+     "message" .= ("Filters must include all and only primary key columns with 'eq' operators" :: Text),
+@@ -124,12 +117,6 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= ("Verify that '" <> resource <> "' is included in the 'select' query parameter." :: Text)]
+ 
+-  toJSON LimitNoOrderError = JSON.object [
+-    "code"    .= ApiRequestErrorCode09,
+-    "message" .= ("A 'limit' was applied without an explicit 'order'":: Text),
+-    "details" .= JSON.Null,
+-    "hint"    .= ("Apply an 'order' using unique column(s)" :: Text)]
+-
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+@@ -327,11 +314,12 @@ data Error
+   | JwtTokenInvalid Text
+   | JwtTokenMissing
+   | JwtTokenRequired
++  | NotImplemented Text
+   | NoSchemaCacheError
+   | NotFound
+-  | OffLimitsChangesError Int64 Integer
+   | PgErr PgError
+   | PutMatchingPkError
++  | PutRangeNotAllowedError
+   | SingularityError Integer
+   | UnsupportedVerb Text
+ 
+@@ -345,9 +333,10 @@ instance PgrstError Error where
+   status JwtTokenRequired        = HTTP.unauthorized401
+   status NoSchemaCacheError      = HTTP.status503
+   status NotFound                = HTTP.status404
+-  status OffLimitsChangesError{} = HTTP.status400
+   status (PgErr err)             = status err
+   status PutMatchingPkError      = HTTP.status400
++  status PutRangeNotAllowedError = HTTP.status400
++  status (NotImplemented _)      = HTTP.status501
+   status SingularityError{}      = HTTP.status406
+   status UnsupportedVerb{}       = HTTP.status405
+ 
+@@ -397,6 +386,11 @@ instance JSON.ToJSON Error where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
++  toJSON PutRangeNotAllowedError = JSON.object [
++    "code"    .= GeneralErrorCode03,
++    "message" .= ("Range header and limit/offset querystring parameters are not allowed for PUT" :: Text),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
+   toJSON PutMatchingPkError = JSON.object [
+     "code"    .= GeneralErrorCode04,
+     "message" .= ("Payload values do not match URL in primary key column(s)" :: Text),
+@@ -415,10 +409,10 @@ instance JSON.ToJSON Error where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (OffLimitsChangesError n maxs) = JSON.object [
+-    "code"    .= ApiRequestErrorCode10,
+-    "message" .= ("The maximum number of rows allowed to change was surpassed" :: Text),
+-    "details" .= T.unwords ["Results contain", show n, "rows changed but the maximum number allowed is", show maxs],
++  toJSON (NotImplemented msg) = JSON.object [
++    "code"    .= GeneralErrorCode07,
++    "message" .= msg,
++    "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
+   toJSON NotFound = JSON.object []
+@@ -451,8 +445,6 @@ data ErrorCode
+   | ApiRequestErrorCode06
+   | ApiRequestErrorCode07
+   | ApiRequestErrorCode08
+-  | ApiRequestErrorCode09
+-  | ApiRequestErrorCode10
+   -- Schema Cache errors
+   | SchemaCacheErrorCode00
+   | SchemaCacheErrorCode01
+@@ -476,6 +468,7 @@ data ErrorCode
+   | GeneralErrorCode04
+   | GeneralErrorCode05
+   | GeneralErrorCode06
++  | GeneralErrorCode07
+ 
+ instance JSON.ToJSON ErrorCode where
+   toJSON e = JSON.toJSON (buildErrorCode e)
+@@ -497,8 +490,6 @@ buildErrorCode code = "PGRST" <> case code of
+   ApiRequestErrorCode06  -> "106"
+   ApiRequestErrorCode07  -> "107"
+   ApiRequestErrorCode08  -> "108"
+-  ApiRequestErrorCode09  -> "109"
+-  ApiRequestErrorCode10  -> "110"
+ 
+   SchemaCacheErrorCode00 -> "200"
+   SchemaCacheErrorCode01 -> "201"
+@@ -522,3 +513,4 @@ buildErrorCode code = "PGRST" <> case code of
+   GeneralErrorCode04     -> "504"
+   GeneralErrorCode05     -> "505"
+   GeneralErrorCode06     -> "506"
++  GeneralErrorCode07     -> "507"
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 440ea74d..761d22ca 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -39,10 +39,9 @@ readRequestToQuery (Node (Select colSelects mainQi tblAlias implJoins logicFores
+   intercalateSnippet ", " ((pgFmtSelectItem qi <$> colSelects) ++ selects) <>
+   "FROM " <> SQL.sql (BS.intercalate ", " (tabl : implJs)) <> " " <>
+   intercalateSnippet " " joins <> " " <>
+-  (if null logicForest && null joinConditions_
+-    then mempty
+-    else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition joinConditions_)) <> " " <>
+-  orderF qi ordts <> " " <>
++  (if null logicForest && null joinConditions_ then mempty else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree qi) logicForest ++ map pgFmtJoinCondition joinConditions_))
++  <> " " <>
++  (if null ordts then mempty else "ORDER BY " <> intercalateSnippet ", " (map (pgFmtOrderTerm qi) ordts)) <> " " <>
+   limitOffsetF range
+   where
+     implJs = fromQi <$> implJoins
+@@ -107,7 +106,7 @@ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returning
+   where
+     cols = BS.intercalate ", " $ pgFmtIdent <$> S.toList iCols
+ 
+-mutateRequestToQuery (Update mainQi uCols body logicForest range ordts returnings)
++mutateRequestToQuery (Update mainQi uCols body logicForest (range, rangeId) returnings)
+   | S.null uCols =
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+@@ -126,9 +125,8 @@ mutateRequestToQuery (Update mainQi uCols body logicForest range ordts returning
+     "pgrst_update_body AS (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " ) LIMIT 1), " <>
+     "pgrst_affected_rows AS (" <>
+       "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
+-      whereLogic <> " " <>
+-      orderF mainQi ordts <> " " <>
+-      limitOffsetF range <>
++       whereLogic <> " " <>
++      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
+     ") " <>
+     "UPDATE " <> mainTbl <> " SET " <> SQL.sql rangeCols <>
+     "FROM pgrst_affected_rows " <>
+@@ -141,9 +139,9 @@ mutateRequestToQuery (Update mainQi uCols body logicForest range ordts returning
+     emptyBodyReturnedColumns = if null returnings then "NULL" else BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+     nonRangeCols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
+     rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent col <> " = (SELECT " <> pgFmtIdent col <> " FROM pgrst_update_body) ") <$> S.toList uCols)
+-    (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
++    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
+ 
+-mutateRequestToQuery (Delete mainQi logicForest range ordts returnings)
++mutateRequestToQuery (Delete mainQi logicForest (range, rangeId) returnings)
+   | range == allRange =
+     "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+     whereLogic <> " " <>
+@@ -154,8 +152,7 @@ mutateRequestToQuery (Delete mainQi logicForest range ordts returnings)
+     "pgrst_affected_rows AS (" <>
+       "SELECT " <> SQL.sql rangeIdF <> " FROM " <> SQL.sql (fromQi mainQi) <>
+        whereLogic <> " " <>
+-      orderF mainQi ordts <> " " <>
+-      limitOffsetF range <>
++      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
+     ") " <>
+     "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+     "USING pgrst_affected_rows " <>
+@@ -164,7 +161,7 @@ mutateRequestToQuery (Delete mainQi logicForest range ordts returnings)
+ 
+   where
+     whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+-    (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
++    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
+ 
+ requestToCallProcQuery :: CallRequest -> SQL.Snippet
+ requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 2ca2e0b9..9ec9d95e 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -20,7 +20,6 @@ module PostgREST.Query.SqlFragment
+   , locationF
+   , mutRangeF
+   , normalizedBody
+-  , orderF
+   , pgFmtColumn
+   , pgFmtIdent
+   , pgFmtJoinCondition
+@@ -332,17 +331,6 @@ currentSettingF setting =
+   -- nullif is used because of https://gist.github.com/steve-chavez/8d7033ea5655096903f3b52f8ed09a15
+   "nullif(current_setting('" <> setting <> "', true), '')"
+ 
+-mutRangeF :: QualifiedIdentifier -> [FieldName] -> (SqlFragment, SqlFragment)
+-mutRangeF mainQi rangeId =
+-  (
+-    BS.intercalate " AND " $ (\col -> pgFmtColumn mainQi col <> " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_affected_rows") col) <$> rangeId
+-  , BS.intercalate ", " (pgFmtColumn mainQi <$> rangeId)
+-  )
+-
+-orderF :: QualifiedIdentifier -> [OrderTerm] -> SQL.Snippet
+-orderF _ []    = mempty
+-orderF qi ordts = "ORDER BY " <> intercalateSnippet ", " (pgFmtOrderTerm qi <$> ordts)
+-
+ -- Hasql Snippet utilities
+ unknownEncoder :: ByteString -> SQL.Snippet
+ unknownEncoder = SQL.encoderAndParam (HE.nonNullable HE.unknown)
+@@ -353,3 +341,12 @@ unknownLiteral = unknownEncoder . encodeUtf8
+ intercalateSnippet :: ByteString -> [SQL.Snippet] -> SQL.Snippet
+ intercalateSnippet _ [] = mempty
+ intercalateSnippet frag snippets = foldr1 (\a b -> a <> SQL.sql frag <> b) snippets
++
++-- the "ctid" system column is always available to tables
++mutRangeF :: QualifiedIdentifier -> [FieldName] -> (SqlFragment, SqlFragment)
++mutRangeF mainQi rangeId = (
++    BS.intercalate " AND " $
++          (\col -> pgFmtColumn mainQi col <> " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_affected_rows") col) <$>
++          (if null rangeId then ["ctid"] else rangeId)
++  , if null rangeId then pgFmtColumn mainQi "ctid" else BS.intercalate ", " (pgFmtColumn mainQi <$> rangeId)
++  )
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 85422a1f..76294137 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -185,8 +185,6 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+   | isInvalidRange = Left InvalidRange
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
+   | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+-  | method `elem` ["PATCH", "DELETE"] && not (null qsRanges) && null qsOrder = Left LimitNoOrderError
+-  | method == "PUT" && topLevelRange /= allRange = Left PutRangeNotAllowedError
+   | otherwise = do
+      acceptContentType <- findAcceptContentType conf action path accepts
+      checkedTarget <- target
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 91373575..3e5c00d4 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -258,9 +258,7 @@ addFilters ApiRequest{..} rReq =
+ 
+ addOrders :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addOrders ApiRequest{..} rReq =
+-  case iAction of
+-    ActionMutate _ -> Right rReq
+-    _              -> foldr addOrderToNode (Right rReq) qsOrder
++  foldr addOrderToNode (Right rReq) qsOrder
+   where
+     QueryParams.QueryParams{..} = iQueryParams
+ 
+@@ -307,7 +305,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+   case mutation of
+     MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+-    MutationUpdate -> Right $ Update qi iColumns body combinedLogic iTopLevelRange rootOrder returnings
++    MutationUpdate -> Right $ Update qi iColumns body combinedLogic (iTopLevelRange, pkCols) returnings
+     MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+@@ -318,7 +316,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+           then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
+         else
+           Left InvalidFilters
+-    MutationDelete -> Right $ Delete qi combinedLogic iTopLevelRange rootOrder returnings
++    MutationDelete -> Right $ Delete qi combinedLogic (iTopLevelRange, pkCols) returnings
+   where
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+@@ -330,7 +328,6 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+     -- update/delete filters can be only on the root table
+     filters = map snd qsFiltersRoot
+     logic = map snd qsLogic
+-    rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+     combinedLogic = foldr addFilterToLogicForest logic filters
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+ 
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 2dda4738..de0feb48 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -65,12 +65,10 @@ data ApiRequestError
+   | InvalidBody ByteString
+   | InvalidFilters
+   | InvalidRange
+-  | LimitNoOrderError
+   | NoRelBetween Text Text Text
+   | NoRpc Text Text [Text] Bool ContentType Bool
+   | NotEmbedded Text
+   | ParseRequestError Text Text
+-  | PutRangeNotAllowedError
+   | QueryParamError QPError
+   | UnacceptableSchema [Text]
+ 
+@@ -137,15 +135,13 @@ data MutateQuery
+       , updCols   :: S.Set FieldName
+       , updBody   :: Maybe LBS.ByteString
+       , where_    :: [LogicTree]
+-      , mutRange  :: NonnegRange
+-      , mutOrder  :: [OrderTerm]
++      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+   | Delete
+       { in_       :: QualifiedIdentifier
+       , where_    :: [LogicTree]
+-      , mutRange  :: NonnegRange
+-      , mutOrder  :: [OrderTerm]
++      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+ 
+diff --git a/test/memory/memory-tests.sh b/test/memory/memory-tests.sh
+index 3002d264..032ef978 100755
+--- a/test/memory/memory-tests.sh
++++ b/test/memory/memory-tests.sh
+@@ -102,21 +102,21 @@ postJsonArrayTest(){
+ 
+ echo "Running memory usage tests.."
+ 
+-jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "16M"
+-jsonKeyTest "1M" "POST" "/leak?columns=blob" "16M"
+-jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "16M"
++jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "15M"
++jsonKeyTest "1M" "POST" "/leak?columns=blob" "15M"
++jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "15M"
+ 
+-jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "44M"
+-jsonKeyTest "10M" "POST" "/leak?columns=blob" "44M"
+-jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "44M"
++jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "43M"
++jsonKeyTest "10M" "POST" "/leak?columns=blob" "43M"
++jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "43M"
+ 
+-jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "172M"
+-jsonKeyTest "50M" "POST" "/leak?columns=blob" "172M"
+-jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "172M"
++jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "171M"
++jsonKeyTest "50M" "POST" "/leak?columns=blob" "171M"
++jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "171M"
+ 
+-postJsonArrayTest "1000" "/perf_articles?columns=id,body" "14M"
+-postJsonArrayTest "10000" "/perf_articles?columns=id,body" "14M"
+-postJsonArrayTest "100000" "/perf_articles?columns=id,body" "24M"
++postJsonArrayTest "1000" "/perf_articles?columns=id,body" "13M"
++postJsonArrayTest "10000" "/perf_articles?columns=id,body" "13M"
++postJsonArrayTest "100000" "/perf_articles?columns=id,body" "23M"
+ 
+ trap - int term exit
+ 
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 3ed807a2..eb211fd4 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -126,7 +126,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodDelete "/limited_delete_items?order=id&limit=1&offset=1"
++        request methodDelete "/limited_delete_items?limit=1&offset=1"
+             [("Prefer", "tx=commit")]
+             mempty
+           `shouldRespondWith`
+@@ -158,7 +158,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodDelete "/limited_delete_items?order=id&limit=1&id=gt.1"
++        request methodDelete "/limited_delete_items?limit=1&id=gt.1"
+             [("Prefer", "tx=commit")]
+             mempty
+           `shouldRespondWith`
+@@ -181,34 +181,8 @@ spec =
+           `shouldRespondWith` ""
+           { matchStatus  = 204 }
+ 
+-      it "fails without an explicit order by" $
+-        request methodDelete "/limited_delete_items?limit=1&offset=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            [json| {
+-              "code":"PGRST109",
+-              "hint": "Apply an 'order' using unique column(s)",
+-              "details": null,
+-              "message": "A 'limit' was applied without an explicit 'order'"
+-              }|]
+-            { matchStatus  = 400 }
+-
+-      it "fails when not ordering by a unique column" $
+-        request methodDelete "/limited_delete_items_wnonuniq_view?order=static&limit=1"
+-            [("Prefer", "tx=commit")]
+-            mempty
+-          `shouldRespondWith`
+-            [json| {
+-              "code":"PGRST110",
+-              "hint": null,
+-              "details":"Results contain 3 rows changed but the maximum number allowed is 1",
+-              "message":"The maximum number of rows allowed to change was surpassed"
+-              }|]
+-            { matchStatus  = 400 }
+-
+-      it "works with views with an explicit order by unique col" $ do
+-        get "/limited_delete_items_view"
++      it "works on a table with a composite pk" $ do
++        get "/limited_delete_items_cpk"
+           `shouldRespondWith`
+             [json|[
+               { "id": 1, "name": "item-1" }
+@@ -216,7 +190,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodDelete "/limited_delete_items_view?order=id&limit=1&offset=1"
++        request methodDelete "/limited_delete_items_cpk?limit=1&offset=1"
+             [("Prefer", "tx=commit")]
+             mempty
+           `shouldRespondWith`
+@@ -226,7 +200,7 @@ spec =
+                              , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+-        get "/limited_delete_items_view"
++        get "/limited_delete_items_cpk"
+           `shouldRespondWith`
+             [json|[
+               { "id": 1, "name": "item-1" }
+@@ -235,12 +209,21 @@ spec =
+ 
+         request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items_view"} |]
++          [json| {"tbl_name": "limited_delete_items_cpk"} |]
+           `shouldRespondWith` ""
+           { matchStatus  = 204 }
+ 
+-      it "works with views with an explicit order by composite pk" $ do
+-        get "/limited_delete_items_cpk_view"
++      it "doesn't work with views" $
++        request methodDelete "/limited_delete_items_view?limit=1&offset=1"
++            [("Prefer", "tx=commit")]
++            mempty
++          `shouldRespondWith`
++            [json| {"hint":null,"details":null,"code":"PGRST507","message":"limit/offset is not implemented for views"} |]
++            { matchStatus  = 501 }
++
++      it "works with views with an inferred pk" $ do
++        pendingWith "not implemented yet"
++        get "/limited_delete_items_view"
+           `shouldRespondWith`
+             [json|[
+               { "id": 1, "name": "item-1" }
+@@ -248,7 +231,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodDelete "/limited_delete_items_cpk_view?order=id,name&limit=1&offset=1"
++        request methodDelete "/limited_delete_items_view?limit=1&offset=1"
+             [("Prefer", "tx=commit")]
+             mempty
+           `shouldRespondWith`
+@@ -258,7 +241,7 @@ spec =
+                              , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+-        get "/limited_delete_items_cpk_view"
++        get "/limited_delete_items_view"
+           `shouldRespondWith`
+             [json|[
+               { "id": 1, "name": "item-1" }
+@@ -267,11 +250,11 @@ spec =
+ 
+         request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+-          [json| {"tbl_name": "limited_delete_items_cpk_view"} |]
++          [json| {"tbl_name": "limited_delete_items_view"} |]
+           `shouldRespondWith` ""
+           { matchStatus  = 204 }
+ 
+-      it "works on a table without a pk by ordering by 'ctid'" $ do
++      it "works on a table without a pk" $ do
+         get "/limited_delete_items_no_pk"
+           `shouldRespondWith`
+             [json|[
+@@ -280,7 +263,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodDelete "/limited_delete_items_no_pk?order=ctid&limit=1&offset=1"
++        request methodDelete "/limited_delete_items_no_pk?limit=1&offset=1"
+             [("Prefer", "tx=commit")]
+             mempty
+           `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 088e7a77..7edc2543 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -397,7 +397,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items?order=id&limit=2"
++      request methodPatch "/limited_update_items?limit=2"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+@@ -430,7 +430,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items?order=id&limit=1&id=gt.2"
++      request methodPatch "/limited_update_items?limit=1&id=gt.2"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+@@ -463,7 +463,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items?order=id&limit=1&offset=1"
++      request methodPatch "/limited_update_items?limit=1&offset=1"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+@@ -487,34 +487,8 @@ spec = do
+         `shouldRespondWith` ""
+         { matchStatus  = 204 }
+ 
+-    it "fails without an explicit order by" $
+-      request methodPatch "/limited_update_items?limit=1&offset=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          [json| {
+-            "code":"PGRST109",
+-            "hint": "Apply an 'order' using unique column(s)",
+-            "details": null,
+-            "message": "A 'limit' was applied without an explicit 'order'"
+-            }|]
+-          { matchStatus  = 400 }
+-
+-    it "fails when not ordering by a unique column" $
+-      request methodPatch "/limited_update_items_wnonuniq_view?order=static&limit=1"
+-          [("Prefer", "tx=commit")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          [json| {
+-            "code":"PGRST110",
+-            "hint": null,
+-            "details":"Results contain 3 rows changed but the maximum number allowed is 1",
+-            "message":"The maximum number of rows allowed to change was surpassed"
+-            }|]
+-          { matchStatus  = 400 }
+-
+-    it "works with views with an explicit order by unique col" $ do
+-      get "/limited_update_items_view"
++    it "works on a table with a composite pk" $ do
++      get "/limited_update_items_cpk"
+         `shouldRespondWith`
+           [json|[
+             { "id": 1, "name": "item-1" }
+@@ -522,7 +496,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items_view?order=id&limit=1&offset=1"
++      request methodPatch "/limited_update_items_cpk?limit=1&offset=1"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+@@ -532,7 +506,7 @@ spec = do
+                            , "Preference-Applied" <:> "tx=commit" ]
+           }
+ 
+-      get "/limited_update_items_view?order=id"
++      get "/limited_update_items_cpk?order=id,name"
+         `shouldRespondWith`
+           [json|[
+             { "id": 1, "name": "item-1" }
+@@ -542,12 +516,21 @@ spec = do
+ 
+       request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items_view"} |]
++        [json| {"tbl_name": "limited_update_items_cpk"} |]
+         `shouldRespondWith` ""
+         { matchStatus  = 204 }
+ 
+-    it "works with views with an explicit order by composite pk" $ do
+-      get "/limited_update_items_cpk_view"
++    it "doesn't work with views" $
++      request methodPatch "/limited_update_items_view?limit=1&offset=1"
++          [("Prefer", "tx=commit")]
++          [json| {"name": "updated-item"} |]
++        `shouldRespondWith`
++          [json| {"hint":null,"details":null,"code":"PGRST507","message":"limit/offset is not implemented for views"} |]
++          { matchStatus  = 501 }
++
++    it "works with views with an inferred pk" $ do
++      pendingWith "not implemented yet"
++      get "/limited_update_items_view"
+         `shouldRespondWith`
+           [json|[
+             { "id": 1, "name": "item-1" }
+@@ -555,7 +538,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items_cpk_view?order=id,name&limit=1&offset=1"
++      request methodPatch "/limited_update_items_view?limit=1&offset=1"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+@@ -565,7 +548,7 @@ spec = do
+                            , "Preference-Applied" <:> "tx=commit" ]
+           }
+ 
+-      get "/limited_update_items_cpk_view?order=id,name"
++      get "/limited_update_items_view?order=id"
+         `shouldRespondWith`
+           [json|[
+             { "id": 1, "name": "item-1" }
+@@ -575,12 +558,11 @@ spec = do
+ 
+       request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "limited_update_items_cpk_view"} |]
++        [json| {"tbl_name": "limited_update_items_view"} |]
+         `shouldRespondWith` ""
+         { matchStatus  = 204 }
+ 
+-
+-    it "works on a table without a pk by ordering by 'ctid'" $ do
++    it "works on a table without a pk" $ do
+       get "/limited_update_items_no_pk"
+         `shouldRespondWith`
+           [json|[
+@@ -589,7 +571,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPatch "/limited_update_items_no_pk?order=ctid&limit=1"
++      request methodPatch "/limited_update_items_no_pk?limit=1"
+           [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index e25b35dc..de3a9824 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -168,16 +168,12 @@ GRANT ALL ON TABLE
+     , limited_update_items_cpk
+     , limited_update_items_no_pk
+     , limited_update_items_view
+-    , limited_update_items_wnonuniq_view
+     , limited_delete_items
+     , limited_delete_items_cpk
+     , limited_delete_items_no_pk
+     , limited_delete_items_view
+     , plate
+     , well
+-    , limited_delete_items_wnonuniq_view
+-    , limited_delete_items_cpk_view
+-    , limited_update_items_cpk_view
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 7db770c3..12a0a94e 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2493,12 +2493,6 @@ create table limited_update_items_no_pk(
+ create view limited_update_items_view as
+ select * from limited_update_items;
+ 
+-create view limited_update_items_wnonuniq_view as
+-select *, 'static'::text as static from limited_update_items;
+-
+-create view limited_update_items_cpk_view as
+-select * from limited_update_items_cpk;
+-
+ create table limited_delete_items(
+   id int primary key
+ , name text
+@@ -2518,12 +2512,6 @@ create table limited_delete_items_no_pk(
+ create view limited_delete_items_view as
+ select * from limited_delete_items;
+ 
+-create view limited_delete_items_wnonuniq_view as
+-select *, 'static'::text as static from limited_delete_items;
+-
+-create view limited_delete_items_cpk_view as
+-select * from limited_delete_items_cpk;
+-
+ create function reset_limited_items(tbl_name text default '') returns void as $_$ begin
+   execute format(
+   $$

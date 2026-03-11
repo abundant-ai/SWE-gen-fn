@@ -1,0 +1,506 @@
+diff --git a/.depend b/.depend
+index 3d6674ead9..4aca810afa 100644
+--- a/.depend
++++ b/.depend
+@@ -7064,7 +7064,6 @@ driver/compile_common.cmo : \
+     parsing/pprintast.cmi \
+     driver/pparse.cmi \
+     utils/misc.cmi \
+-    parsing/location.cmi \
+     typing/includemod.cmi \
+     typing/env.cmi \
+     driver/compmisc.cmi \
+@@ -7085,7 +7084,6 @@ driver/compile_common.cmx : \
+     parsing/pprintast.cmx \
+     driver/pparse.cmx \
+     utils/misc.cmx \
+-    parsing/location.cmx \
+     typing/includemod.cmx \
+     typing/env.cmx \
+     driver/compmisc.cmx \
+diff --git a/Changes b/Changes
+index 858e0429a5..5f0eb9f79e 100644
+--- a/Changes
++++ b/Changes
+@@ -537,11 +537,6 @@ OCaml 5.5.0
+   ```
+   (Malo Monin, Florian Angeletti, review by Gabriel Scherer)
+ 
+-- #14205: Make inclusion check error message reference the user-written file
+-  when operating on a ppx-generated file.
+-  (Liam Stevenson, review by Florian Angeletti)
+-
+-
+ ### Internal/compiler-libs changes:
+ 
+ - #13839, #14008: Reimplement `let open`, `let module` and `let exception` in
+diff --git a/asmcomp/asmgen.ml b/asmcomp/asmgen.ml
+index 6bff912de4..64fbe83a54 100644
+--- a/asmcomp/asmgen.ml
++++ b/asmcomp/asmgen.ml
+@@ -306,7 +306,7 @@ let compile_implementation_linear target =
+     ~asm_filename:(asm_filename output_prefix) ~keep_asm:!keep_asm_file
+     ~obj_filename:(output_prefix ^ ext_obj)
+     (fun () ->
+-      linear_gen_implementation (Unit_info.input_source_file target))
++      linear_gen_implementation (Unit_info.source_file target))
+ 
+ (* Error report *)
+ module Style = Misc.Style
+diff --git a/driver/compile_common.ml b/driver/compile_common.ml
+index 81a7f7d804..9b56c542c6 100644
+--- a/driver/compile_common.ml
++++ b/driver/compile_common.ml
+@@ -37,31 +37,14 @@ let with_info ~native ~tool_name ~dump_ext unit_info k =
+     native;
+   }
+ 
+-module Parse_result = struct
+-  type 'a t = { ast : 'a; info : info }
+-
+-  let update_unit_info ~info ast =
+-    let source_file = !Location.input_name in
+-    let new_target =
+-      Unit_info.update_human_source_file_name info.target source_file
+-    in
+-    { ast; info = { info with target = new_target } }
+-
+-  let print_ast_if flag ppf { ast; info } =
+-    { ast = print_if info.ppf_dump flag ppf ast; info }
+-end
+-
+ (** Compile a .mli file *)
+ 
+ let parse_intf i =
+-  Pparse.parse_interface
+-    ~tool_name:i.tool_name
+-    (Unit_info.human_source_file i.target)
+-  |> Parse_result.update_unit_info ~info:i
+-  |> Parse_result.print_ast_if Clflags.dump_parsetree Printast.interface
+-  |> Parse_result.print_ast_if Clflags.dump_source Pprintast.signature
++  Pparse.parse_interface ~tool_name:i.tool_name (Unit_info.source_file i.target)
++  |> print_if i.ppf_dump Clflags.dump_parsetree Printast.interface
++  |> print_if i.ppf_dump Clflags.dump_source Pprintast.signature
+ 
+-let typecheck_intf { Parse_result.ast; info } =
++let typecheck_intf info ast =
+   Profile.(record_call typing) @@ fun () ->
+   let tsg =
+     ast
+@@ -73,8 +56,7 @@ let typecheck_intf { Parse_result.ast; info } =
+   if !Clflags.print_types then
+     Printtyp.wrap_printing_env ~error:false info.env (fun () ->
+         Format.(fprintf std_formatter) "%a@."
+-          (Printtyp.printed_signature
+-             (Unit_info.human_source_file info.target))
++          (Printtyp.printed_signature (Unit_info.source_file info.target))
+           sg);
+   ignore (Includemod.signatures info.env ~mark:true sg sg);
+   Typecore.force_delayed_checks ();
+@@ -90,10 +72,10 @@ let emit_signature info alerts tsg =
+   Typemod.save_signature info.target tsg info.env sg
+ 
+ let interface info =
+-  Profile.record_call (Unit_info.input_source_file info.target) @@ fun () ->
+-  let parse_result = parse_intf info in
++  Profile.record_call (Unit_info.source_file info.target) @@ fun () ->
++  let ast = parse_intf info in
+   if Clflags.(should_stop_after Compiler_pass.Parsing) then () else begin
+-    let alerts, tsg = typecheck_intf parse_result in
++    let alerts, tsg = typecheck_intf info ast in
+     if not !Clflags.print_types then begin
+       emit_signature info alerts tsg
+     end
+@@ -103,14 +85,12 @@ let interface info =
+ (** Frontend for a .ml file *)
+ 
+ let parse_impl i =
+-  Pparse.parse_implementation
+-    ~tool_name:i.tool_name
+-    (Unit_info.human_source_file i.target)
+-  |> Parse_result.update_unit_info ~info:i
+-  |> Parse_result.print_ast_if Clflags.dump_parsetree Printast.implementation
+-  |> Parse_result.print_ast_if Clflags.dump_source Pprintast.structure
++  let sourcefile = Unit_info.source_file i.target in
++  Pparse.parse_implementation ~tool_name:i.tool_name sourcefile
++  |> print_if i.ppf_dump Clflags.dump_parsetree Printast.implementation
++  |> print_if i.ppf_dump Clflags.dump_source Pprintast.structure
+ 
+-let typecheck_impl { Parse_result.ast = parsetree; info = i } =
++let typecheck_impl i parsetree =
+   parsetree
+   |> Profile.(record typing)
+     (Typemod.type_implementation i.target i.env)
+@@ -120,7 +100,7 @@ let typecheck_impl { Parse_result.ast = parsetree; info = i } =
+     (fun fmt {Typedtree.shape; _} -> Shape.print fmt shape)
+ 
+ let implementation info ~backend =
+-  Profile.record_call (Unit_info.input_source_file info.target) @@ fun () ->
++  Profile.record_call (Unit_info.source_file info.target) @@ fun () ->
+   let exceptionally () =
+     let sufs =
+       if info.native then Unit_info.[ cmx; obj ]
+@@ -130,9 +110,9 @@ let implementation info ~backend =
+       sufs;
+   in
+   Misc.try_finally ?always:None ~exceptionally (fun () ->
+-    let parse_result = parse_impl info in
++    let parsed = parse_impl info in
+     if Clflags.(should_stop_after Compiler_pass.Parsing) then () else begin
+-      let typed = typecheck_impl parse_result in
++      let typed = typecheck_impl info parsed in
+       if Clflags.(should_stop_after Compiler_pass.Typing) then () else begin
+         backend info typed
+       end;
+diff --git a/driver/compile_common.mli b/driver/compile_common.mli
+index 0ee08ede66..e3cb0fce7f 100644
+--- a/driver/compile_common.mli
++++ b/driver/compile_common.mli
+@@ -42,17 +42,13 @@ val with_info :
+    calling [with_info] several times.
+ *)
+ 
+-module Parse_result : sig
+-  type 'a t = { ast : 'a; info : info }
+-end
+-
+ (** {2 Interfaces} *)
+ 
+-val parse_intf : info -> Parsetree.signature Parse_result.t
++val parse_intf : info -> Parsetree.signature
+ (** [parse_intf info] parses an interface (usually an [.mli] file). *)
+ 
+ val typecheck_intf :
+-  Parsetree.signature Parse_result.t -> Misc.alerts * Typedtree.signature
++  info -> Parsetree.signature -> Misc.alerts * Typedtree.signature
+ (** [typecheck_intf info parsetree] typechecks an interface and returns the
+     typedtree of the associated signature, together with the alerts appearing at
+     the top of the signature (before any other non-attribute item).
+@@ -69,11 +65,10 @@ val interface : info -> unit
+ 
+ (** {2 Implementations} *)
+ 
+-val parse_impl : info -> Parsetree.structure Parse_result.t
++val parse_impl : info -> Parsetree.structure
+ (** [parse_impl info] parses an implementation (usually an [.ml] file). *)
+ 
+-val typecheck_impl :
+-  Parsetree.structure Parse_result.t -> Typedtree.implementation
++val typecheck_impl : info -> Parsetree.structure -> Typedtree.implementation
+ (** [typecheck_impl info parsetree] typechecks an implementation and returns
+     the typedtree of the associated module, its public interface, and a
+     coercion against that public interface.
+diff --git a/file_formats/cmt_format.ml b/file_formats/cmt_format.ml
+index b85aa56446..c21335a008 100644
+--- a/file_formats/cmt_format.ml
++++ b/file_formats/cmt_format.ml
+@@ -461,16 +461,7 @@ let save_cmt target binary_annots initial_env cmi shape =
+            | None -> None
+            | Some cmi -> Some (output_cmi temp_file_name oc cmi)
+          in
+-         (* We use the input_source_file because the human_source_file may not
+-            exist (or may have changed), so computing the digest may fail or
+-            produce inconsistent results. Merlin expects the cmt_sourcefile to
+-            be the file we computed the digest of, which is why we use the
+-            input_source_file for that as well.
+-
+-            Or from another perspective, cmt files are meant to be metadata
+-            for a compiled file, which is why we want to associate it with
+-            the input_source_file rather than the human_source_file. *)
+-         let sourcefile = Unit_info.Artifact.input_source_file target in
++         let sourcefile = Unit_info.Artifact.source_file target in
+          let cmt_ident_occurrences =
+           if !Clflags.store_occurrences then
+             index_occurrences binary_annots
+diff --git a/parsing/unit_info.ml b/parsing/unit_info.ml
+index d66fd3eff1..66ad51b7cb 100644
+--- a/parsing/unit_info.ml
++++ b/parsing/unit_info.ml
+@@ -22,15 +22,13 @@ type error = Invalid_encoding of string
+ exception Error of error
+ 
+ type t = {
+-  human_source_file: filename;
+-  input_source_file: filename;
++  source_file: filename;
+   prefix: file_prefix;
+   modname: modname;
+   kind: intf_or_impl;
+ }
+ 
+-let human_source_file (x: t) = x.human_source_file
+-let input_source_file (x: t) = x.input_source_file
++let source_file (x: t) = x.source_file
+ let modname (x: t) = x.modname
+ let kind (x: t) = x.kind
+ let prefix (x: t) = x.prefix
+@@ -67,43 +65,30 @@ let is_unit_name name = Misc.Utf8_lexeme.is_valid_identifier name
+ 
+ let check_unit_name file =
+   if not (is_unit_name (modname file)) then
+-    Location.prerr_warning (Location.in_file (human_source_file file))
++    Location.prerr_warning (Location.in_file (source_file file))
+       (Warnings.Bad_module_name (modname file))
+ 
+ let make ?(check_modname=true) ~source_file kind prefix =
+   let modname = strict_modname_from_source prefix in
+-  let p =
+-    {
+-      modname;
+-      prefix;
+-      human_source_file = source_file;
+-      input_source_file = source_file;
+-      kind
+-    }
+-  in
++  let p = { modname; prefix; source_file; kind } in
+   if check_modname then check_unit_name p;
+   p
+ 
+-let update_human_source_file_name x human_source_file =
+-  { x with human_source_file }
+-
+ module Artifact = struct
+   type t =
+    {
+-     human_source_file: filename option;
+-     input_source_file: filename option;
++     source_file: filename option;
+      filename: filename;
+      modname: modname;
+    }
+-  let human_source_file x = x.human_source_file
+-  let input_source_file x = x.input_source_file
++  let source_file x = x.source_file
+   let filename x = x.filename
+   let modname x = x.modname
+   let prefix x = Filename.remove_extension (filename x)
+ 
+   let from_filename filename =
+     let modname = lax_modname_from_source filename in
+-    { modname; filename; human_source_file = None; input_source_file = None }
++    { modname; filename; source_file = None }
+ 
+ end
+ 
+@@ -111,8 +96,7 @@ let mk_artifact ext u =
+   {
+     Artifact.filename = u.prefix ^ ext;
+     modname = u.modname;
+-    human_source_file = Some u.human_source_file;
+-    input_source_file = Some u.input_source_file;
++    source_file = Some u.source_file;
+   }
+ 
+ let companion_artifact ext x =
+@@ -135,7 +119,7 @@ let companion_cmi f =
+ 
+ let mli_from_artifact f = Artifact.prefix f ^ !Config.interface_suffix
+ let mli_from_source u =
+-   let prefix = Filename.remove_extension (human_source_file u) in
++   let prefix = Filename.remove_extension (source_file u) in
+    prefix  ^ !Config.interface_suffix
+ 
+ let is_cmi f = Filename.check_suffix (Artifact.filename f) ".cmi"
+@@ -143,12 +127,7 @@ let is_cmi f = Filename.check_suffix (Artifact.filename f) ".cmi"
+ let find_normalized_cmi f =
+   let filename = modname f ^ ".cmi" in
+   let filename = Load_path.find_normalized filename in
+-  {
+-    Artifact.filename;
+-    modname = modname f;
+-    human_source_file = Some f.human_source_file;
+-    input_source_file = Some f.input_source_file;
+-  }
++  { Artifact.filename; modname = modname f; source_file = Some f.source_file  }
+ 
+ let report_error = function
+   | Invalid_encoding name ->
+diff --git a/parsing/unit_info.mli b/parsing/unit_info.mli
+index 573ec12a5e..ccf12a90a9 100644
+--- a/parsing/unit_info.mli
++++ b/parsing/unit_info.mli
+@@ -58,28 +58,15 @@ type t
+     - the module name associated to the unit
+     - the filename prefix (dirname + basename with all extensions stripped)
+       for compilation artifacts
+-    - the human-oriented name of the source file
+     - the input source file
+     For instance, when calling [ocamlopt dir/x.mli -o target/y.cmi],
+     - the input source file is [dir/x.mli]
+     - the module name is [Y]
+     - the prefix is [target/y]
+-
+-    When calling, for example, [ocamlopt foo.pp.ml] (where foo.pp.ml is a
+-    serialized, ppx-expanded AST of foo.ml), the "input" source file is
+-    foo.pp.ml, while foo.ml is the "human" source file.
+ *)
+ 
+-(** [human_source_file u] is the original source file of [u]. When calling,
+-    for example, [ocamlopt foo.pp.ml] (where foo.pp.ml is a serialized,
+-    ppx-expanded AST of foo.ml), foo.ml is the "original" source file. *)
+-val human_source_file: t -> filename
+-
+-(** [input_source_file u] is the source file of [u] that was explicitly passed
+-    to the compiler. When calling, for example, [ocamlopt foo.pp.ml] (where
+-    foo.pp.ml is a serialized, ppx-expanded AST of foo.ml), foo.pp.ml is the
+-    "input" source file.) *)
+-val input_source_file: t -> filename
++(** [source_file u] is the source file of [u]. *)
++val source_file: t -> filename
+ 
+ (** [prefix u] is the filename prefix of the unit. *)
+ val prefix: t -> file_prefix
+@@ -107,8 +94,6 @@ val make:
+     ?check_modname:bool -> source_file:filename ->
+     intf_or_impl -> file_prefix -> t
+ 
+-val update_human_source_file_name : t -> filename -> t
+-
+ (** {1:artifact_function Build artifacts }*)
+ module Artifact: sig
+   type t
+@@ -118,17 +103,8 @@ module Artifact: sig
+     - the input source file if it exists
+ *)
+ 
+-   (** [human_source_file a] is the original source file of [a] if it exists.
+-       See [Unit_info.human_source_file] for a description of the distinction
+-       of "human" vs "input" source file
+-    *)
+-   val human_source_file: t -> filename option
+-
+-   (** [input_source_file a] is the raw source file of [a] if it exists. See
+-       [Unit_info.input_source_file] for a description of the distinction of
+-       "human" vs "input" source file
+-    *)
+-   val input_source_file: t -> filename option
++   (** [source_file a] is the source file of [a] if it exists. *)
++   val source_file: t -> filename option
+ 
+   (** [prefix a] is the filename prefix of the compilation artifact. *)
+    val prefix: t ->  file_prefix
+diff --git a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.ml b/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.ml
+deleted file mode 100644
+index 81d320bc07..0000000000
+--- a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.ml
++++ /dev/null
+@@ -1 +0,0 @@
+-let foo = 0
+diff --git a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.mli b/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.mli
+deleted file mode 100644
+index 5a03fc9122..0000000000
+--- a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/foo.mli
++++ /dev/null
+@@ -1 +0,0 @@
+-val foo : unit
+diff --git a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/parse_and_marshall.ml b/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/parse_and_marshall.ml
+deleted file mode 100644
+index be0fffe285..0000000000
+--- a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/parse_and_marshall.ml
++++ /dev/null
+@@ -1,12 +0,0 @@
+-(* usage: parse_and_marshall.exe [input] [output]
+-
+-   This program parses [input] (which is expected to be an .ml file) and write a
+-   marshalled ast to [output]. *)
+-let () =
+-  if Array.length Sys.argv != 3 then failwith "Expected two arguments";
+-  let input_name = Sys.argv.(1) in
+-  let output_name = Sys.argv.(2) in
+-  let ast =
+-    Pparse.parse_implementation ~tool_name:"parse_and_marshall" input_name
+-  in
+-  Pparse.write_ast Pparse.Structure output_name ast
+diff --git a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.compilers.reference b/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.compilers.reference
+deleted file mode 100644
+index 67aae4e94c..0000000000
+--- a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.compilers.reference
++++ /dev/null
+@@ -1,6 +0,0 @@
+-File "foo.ml", line 1:
+-Error: The implementation foo.ml does not match the interface foo.mli: 
+-       Values do not match: val foo : int is not included in val foo : unit
+-       The type int is not compatible with the type unit
+-       File "foo.mli", line 1, characters 0-14: Expected declaration
+-       File "foo.ml", line 1, characters 4-7: Actual declaration
+diff --git a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.ml b/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.ml
+deleted file mode 100644
+index fd3ada6f3e..0000000000
+--- a/testsuite/tests/typing-modules/inclusion_errors_with_renamed_source_file/test_renamed.ml
++++ /dev/null
+@@ -1,37 +0,0 @@
+-(* TEST
+- readonly_files = "foo.ml foo.mli parse_and_marshall.ml";
+- setup-ocamlc.byte-build-env;
+-
+- (* Build parse_and_marshall.exe, which is used to create a serialized AST. *)
+- include ocamlcommon;
+- program = "${test_build_directory}/parse_and_marshall.exe";
+- all_modules = "parse_and_marshall.ml";
+- ocamlc.byte;
+-
+- (* Run parse_and_marshall.exe to create a serialized AST. *)
+- script = "${program} foo.ml foo.pp.ml";
+- script;
+-
+- (* Now delete foo.ml. In a real-world scenario, the original source file may
+-    no longer exist (for example, due to dune sandboxing). *)
+- script = "rm foo.ml";
+- script;
+-
+- (* Compile the .mli file. *)
+- module = "foo.mli";
+- ocamlc.byte;
+-
+- (* Feed the compiler the serialzed AST. We also pass -bin-annot and to verify that .cmt
+-    generation works as expected when the original source file no longer exists. *)
+- module = "-impl foo.pp.ml";
+- flags = "-cmi-file foo.cmi -bin-annot";
+- ocamlc_byte_exit_status = "2";
+- ocamlc.byte;
+- check-ocamlc.byte-output;
+-*)
+-
+-(* This test checks that when the compiler is fed a serialized AST rather than a .ml file,
+-   it reports the name of the original file rather than the name of the serialized file in
+-   error messages. This can happen if Dune runs the ppx stage separately from compilation
+-   and feeds the compiler the ppx-expanded AST. In this case, reporting the original .ml
+-   file is a better user experience. *)
+diff --git a/typing/typemod.ml b/typing/typemod.ml
+index 97b6b774d7..75bb6c1d0b 100644
+--- a/typing/typemod.ml
++++ b/typing/typemod.ml
+@@ -3271,12 +3271,12 @@ let () =
+ let gen_annot target annots =
+   let annot = Unit_info.annot target in
+   Cmt2annot.gen_annot (Some (Unit_info.Artifact.filename annot))
+-    ~sourcefile:(Unit_info.Artifact.human_source_file annot)
++    ~sourcefile:(Unit_info.Artifact.source_file annot)
+     ~use_summaries:false
+     annots
+ 
+ let type_implementation target initial_env ast =
+-  let sourcefile = Unit_info.human_source_file target in
++  let sourcefile = Unit_info.source_file target in
+   let save_cmt target annots initial_env cmi shape =
+     Cmt_format.save_cmt (Unit_info.cmt target)
+       annots initial_env cmi shape;
+@@ -3300,7 +3300,7 @@ let type_implementation target initial_env ast =
+         let shape = Shape_reduce.local_reduce Env.empty shape in
+         Printtyp.wrap_printing_env ~error:false initial_env
+           Format.(fun () -> fprintf std_formatter "%a@."
+-              (Printtyp.printed_signature sourcefile)
++              (Printtyp.printed_signature @@ Unit_info.source_file target)
+               simple_sg
+           );
+         gen_annot target (Cmt_format.Implementation str);
+@@ -3341,7 +3341,7 @@ let type_implementation target initial_env ast =
+           }
+         end else begin
+           Location.prerr_warning
+-            (Location.in_file sourcefile)
++            (Location.in_file (Unit_info.source_file target))
+             Warnings.Missing_mli;
+           let coercion, shape =
+             Includemod.compunit initial_env ~mark:true

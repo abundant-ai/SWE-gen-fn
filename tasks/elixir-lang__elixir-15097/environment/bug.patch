@@ -1,0 +1,188 @@
+diff --git a/lib/mix/lib/mix/local/installer.ex b/lib/mix/lib/mix/local/installer.ex
+index 103ecbc15..2dc14451b 100644
+--- a/lib/mix/lib/mix/local/installer.ex
++++ b/lib/mix/lib/mix/local/installer.ex
+@@ -91,23 +91,17 @@ def install(module, argv, switches) do
+         end
+ 
+         fetch(dep_spec, fn _ ->
+-          local_install(module, build(module, install_spec, opts), opts)
++          local_install(module, module.build(install_spec, opts), opts)
+         end)
+ 
+       {path_or_url, src} when path_or_url in [:local, :url] ->
+         local_install(module, src, opts)
+ 
+       :project ->
+-        local_install(module, build(module, install_spec, opts), opts)
++        local_install(module, module.build(install_spec, opts), opts)
+     end
+   end
+ 
+-  defp build(module, install_spec, opts) do
+-    Mix.Tasks.Loadconfig.preserve_config(fn ->
+-      module.build(install_spec, opts)
+-    end)
+-  end
+-
+   defp task(module) do
+     Mix.Utils.module_name_to_command(module, 2)
+   end
+diff --git a/lib/mix/lib/mix/state.ex b/lib/mix/lib/mix/state.ex
+index 425707c34..74200f276 100644
+--- a/lib/mix/lib/mix/state.ex
++++ b/lib/mix/lib/mix/state.ex
+@@ -45,8 +45,8 @@ def update(key, fun) do
+ 
+   ## Persistent term cache (persistent, cleared in tests)
+ 
+-  def read_cache(key, default \\ nil) do
+-    :persistent_term.get({__MODULE__, key}, default)
++  def read_cache(key) do
++    :persistent_term.get({__MODULE__, key}, nil)
+   end
+ 
+   def write_cache(key, value) do
+diff --git a/lib/mix/lib/mix/tasks/loadconfig.ex b/lib/mix/lib/mix/tasks/loadconfig.ex
+index 32662f97e..22dff3606 100644
+--- a/lib/mix/lib/mix/tasks/loadconfig.ex
++++ b/lib/mix/lib/mix/tasks/loadconfig.ex
+@@ -51,7 +51,7 @@ defp load_default do
+ 
+   @doc false
+   def read_compile() do
+-    Mix.State.read_cache(__MODULE__, [])
++    Mix.State.read_cache(__MODULE__) || []
+   end
+ 
+   @doc false
+@@ -70,25 +70,6 @@ def load_runtime(file) do
+     config
+   end
+ 
+-  @doc false
+-  def preserve_config(fun) do
+-    config = read_compile()
+-
+-    try do
+-      delete_all_config(config)
+-      fun.()
+-    after
+-      delete_all_config(read_compile())
+-      Application.put_all_env(config, persistent: true)
+-    end
+-  end
+-
+-  defp delete_all_config(config) do
+-    for {app, kv} <- config, Application.spec(app, :vsn) == nil, {key, _} <- kv do
+-      Application.delete_env(app, key, persistent: true)
+-    end
+-  end
+-
+   defp hydrate_apps(config) do
+     for {app, pairs} <- config do
+       hd(Config.Reader.merge([{app, Application.get_all_env(app)}], [{app, pairs}]))
+diff --git a/lib/mix/test/fixtures/escript_test/lib/escript_test.ex b/lib/mix/test/fixtures/escript_test/lib/escript_test.ex
+index 2dd248824..c5b6b4efe 100644
+--- a/lib/mix/test/fixtures/escript_test/lib/escript_test.ex
++++ b/lib/mix/test/fixtures/escript_test/lib/escript_test.ex
+@@ -30,13 +30,6 @@ def main(["--list-priv", app_name]) do
+     :erl_prim_loader.list_dir(~c"#{:code.lib_dir(app)}/priv") |> IO.inspect()
+   end
+ 
+-  @parent Application.compile_env(:foobar, :parent, "NIL")
+-
+-  def main(["--config"]) do
+-    IO.puts(["VALUE=", Application.get_env(:foobar, :value, "TEST")])
+-    IO.puts(["PARENT=", @parent])
+-  end
+-
+   def main(_argv) do
+     IO.puts(Application.get_env(:foobar, :value, "TEST"))
+   end
+diff --git a/lib/mix/test/mix/tasks/escript_test.exs b/lib/mix/test/mix/tasks/escript_test.exs
+index 56898cb26..ce363baf9 100644
+--- a/lib/mix/test/mix/tasks/escript_test.exs
++++ b/lib/mix/test/mix/tasks/escript_test.exs
+@@ -83,6 +83,7 @@ test "generate escript with --no-compile option" do
+   test "generate escript with compile config" do
+     in_fixture("escript_test", fn ->
+       push_project_with_config(Escript)
++
+       File.mkdir_p!("config")
+ 
+       File.write!("config/config.exs", ~S"""
+@@ -92,7 +93,6 @@ test "generate escript with compile config" do
+ 
+       Mix.Tasks.Escript.Build.run([])
+       assert_received {:mix_shell, :info, ["Generated escript escript_test with MIX_ENV=dev"]}
+-
+       assert System.cmd("escript", ["escript_test"]) == {"COMPILE dev TARGET host\n", 0}
+     end)
+   end
+@@ -100,6 +100,7 @@ test "generate escript with compile config" do
+   test "generate escript with runtime config" do
+     in_fixture("escript_test", fn ->
+       push_project_with_config(Escript)
++
+       File.mkdir_p!("config")
+ 
+       File.write!("config/config.exs", """
+@@ -126,6 +127,7 @@ test "generate escript with runtime config" do
+   test "generate escript with debug information" do
+     in_fixture("escript_test", fn ->
+       push_project_with_config(Escript, escript: [main_module: EscriptTest, strip_beams: false])
++
+       Mix.Tasks.Escript.Build.run([])
+ 
+       msg = "Generated escript escript_test with MIX_ENV=dev"
+@@ -209,6 +211,7 @@ test "generate escript with deps" do
+   test "generate escript with Erlang and deps" do
+     in_fixture("escript_test", fn ->
+       push_project_with_config(EscriptErlangWithDeps)
++
+       Mix.Tasks.Escript.Build.run([])
+ 
+       message = "Generated escript escript_test with MIX_ENV=dev"
+@@ -258,20 +261,7 @@ test "generate escript with priv" do
+   end
+ 
+   test "escript install and uninstall" do
+-    escripts = tmp_path(".mix/escripts")
+-    File.rm_rf!(escripts)
+-
+-    # Configuration in the parent should not impact the escript
+-    in_tmp("config", fn ->
+-      File.mkdir_p!("config")
+-
+-      File.write!("config/config.exs", ~S"""
+-      import Config
+-      config :foobar, :parent, "SET_ON_PARENT"
+-      """)
+-
+-      Mix.Tasks.Loadconfig.run([])
+-    end)
++    File.rm_rf!(tmp_path(".mix/escripts"))
+ 
+     in_fixture("escript_test", fn ->
+       push_project_with_config(Escript)
+@@ -284,10 +274,6 @@ test "escript install and uninstall" do
+       send(self(), {:mix_shell_input, :yes?, true})
+       Mix.Tasks.Escript.Install.run([])
+ 
+-      # execute the script
+-      assert System.cmd("escript", [Path.join(escripts, "escript_test"), "--config"]) ==
+-               {"VALUE=TEST\nPARENT=NIL\n", 0}
+-
+       # check that it shows in the list
+       Mix.Tasks.Escript.run([])
+       assert_received {:mix_shell, :info, ["* escript_test"]}
+@@ -414,7 +400,7 @@ def project do
+       end)
+     after
+       System.delete_env("MIX_OS_DEPS_COMPILE_PARTITION_COUNT")
+-      purge([GitRepo, SourceRepo.Escript, SourceRepo.MixProject, Mix.Local.Installer.MixProject])
++      purge([SourceRepo.Escript, SourceRepo.MixProject, Mix.Local.Installer.MixProject])
+     end
+   end
+ 

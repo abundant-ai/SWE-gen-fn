@@ -1,0 +1,12 @@
+When using database-level soft deletes (for example, a DELETE rule that performs an UPDATE and returns no rows, combined with querying through a view), calling `Repo.delete/2` can result in zero affected/returned rows even though the record effectively exists and the operation succeeded at the database level. Currently, when `Repo.delete(struct)` results in no returned rows, Ecto treats it as a stale entry and raises `Ecto.StaleEntryError` (or returns an error tuple when configured via `:stale_error_field`). This makes it difficult to support soft-delete patterns where a delete is intentionally “idempotent” or handled via rules/triggers that don’t return the deleted row.
+
+Add support for an `:allow_stale` option to `Repo.insert/2`, `Repo.update/2`, and `Repo.delete/2` (and their bang variants where applicable) so callers can opt out of stale-entry errors in scenarios where the database legitimately returns no rows.
+
+Expected behavior:
+
+- With `allow_stale: true`, `Repo.delete/2` must not raise `Ecto.StaleEntryError` (and must not return `{:error, changeset}` solely due to staleness) when the adapter reports zero rows/returns nothing. Instead, it should treat the operation as successful and return `{:ok, struct}` (or the corresponding successful return for the function).
+- The same `allow_stale: true` behavior should apply consistently to `Repo.update/2` when an update affects/returns no rows due to database rules or views.
+- `Repo.insert/2` should also accept `allow_stale: true` and behave consistently with the stale-entry handling semantics for inserts in cases where a no-row result would otherwise be treated as stale.
+- Default behavior must remain unchanged: without `allow_stale: true`, stale operations should continue to raise `Ecto.StaleEntryError` (or follow existing `:stale_error_field` behavior).
+
+Reproduction example (soft delete via rules/views): define a schema that points to a view filtering out soft-deleted rows; implement a database rule so `DELETE FROM items` performs an UPDATE setting `_deleted_at` and does not actually delete the row. Then calling `Repo.delete(item)` should be able to succeed without raising staleness when `allow_stale: true` is given, even if the underlying delete returns no rows.

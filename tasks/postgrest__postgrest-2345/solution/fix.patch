@@ -1,0 +1,71 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bbd2bcd5..693d554b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,6 +53,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+     + You can still use a column or an inferred FK on a view to embed a table(`/view?select=*,col-or-fk(*)`)
+  - #1959, An accidental full table PATCH(without filters) is not possible anymore, it requires filters or a `limit` parameter - @steve-chavez, @laurenceisla
+  - #2317, Increase the `db-pool-timeout` to 1 hour to prevent frequent high connection latency - @steve-chavez
++ - #2341, The search path now correctly identifies schemas with uppercase and special characters in their names (regression) - @laurenceisla
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Middleware.hs b/src/PostgREST/Middleware.hs
+index 507202d2..09981aab 100644
+--- a/src/PostgREST/Middleware.hs
++++ b/src/PostgREST/Middleware.hs
+@@ -14,7 +14,6 @@ import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
+-import qualified Data.Text                         as T
+ import qualified Data.Text.Encoding                as T
+ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL hiding (sql)
+@@ -32,7 +31,7 @@ import PostgREST.Config.PgVersion   (PgVersion (..), pgVersion140)
+ import PostgREST.Error              (Error, errorResponseFor)
+ import PostgREST.GucHeader          (addHeadersIfNotIncluded)
+ import PostgREST.Query.SqlFragment  (fromQi, intercalateSnippet,
+-                                     unknownEncoder)
++                                     pgFmtIdentList, unknownEncoder)
+ import PostgREST.Request.ApiRequest (ApiRequest (..), Target (..))
+ 
+ import PostgREST.Request.Preferences
+@@ -64,8 +63,8 @@ runPgLocals conf claims role app req jsonDbS actualPgVersion = do
+     roleSql = [setConfigLocal mempty ("role", toUtf8 role)]
+     appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings conf)
+     searchPathSql =
+-      let schemas = T.intercalate ", " (iSchema req : configDbExtraSearchPath conf) in
+-      setConfigLocal mempty ("search_path", toUtf8 schemas)
++      let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath conf) in
++      setConfigLocal mempty ("search_path", schemas)
+     preReqSql = (\f -> "select " <> fromQi f <> "();") <$> configDbPreRequest conf
+     specSql = case iTarget req of
+       TargetProc{tpIsRootSpec=True} -> [setConfigLocal mempty ("request.spec", jsonDbS)]
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 269b76c4..1e70fae9 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -24,6 +24,7 @@ module PostgREST.Query.SqlFragment
+   , orderF
+   , pgFmtColumn
+   , pgFmtIdent
++  , pgFmtIdentList
+   , pgFmtJoinCondition
+   , pgFmtLogicTree
+   , pgFmtOrderTerm
+@@ -156,6 +157,14 @@ pgFmtIdent x = encodeUtf8 $ "\"" <> T.replace "\"" "\"\"" (trimNullChars x) <> "
+ trimNullChars :: Text -> Text
+ trimNullChars = T.takeWhile (/= '\x0')
+ 
++-- |
++-- Format a list of identifiers and separate them by commas.
++--
++-- >>> pgFmtIdentList ["schema_1", "schema_2", "SPECIAL \"@/\\#~_-"]
++-- "\"schema_1\", \"schema_2\", \"SPECIAL \"\"@/\\#~_-\""
++pgFmtIdentList :: [Text] -> SqlFragment
++pgFmtIdentList schemas = BS.intercalate ", " $ pgFmtIdent <$> schemas
++
+ asCsvF :: SqlFragment
+ asCsvF = asCsvHeaderF <> " || '\n' || " <> asCsvBodyF
+   where

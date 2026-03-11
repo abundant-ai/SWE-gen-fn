@@ -1,0 +1,210 @@
+diff --git a/lib/elixir/lib/inspect.ex b/lib/elixir/lib/inspect.ex
+index 169ddfac7..4362ae2c5 100644
+--- a/lib/elixir/lib/inspect.ex
++++ b/lib/elixir/lib/inspect.ex
+@@ -567,7 +567,6 @@ defp translate_options([:extended | t], acc), do: translate_options(t, [?x | acc
+   defp translate_options([:firstline | t], acc), do: translate_options(t, [?f | acc])
+   defp translate_options([:ungreedy | t], acc), do: translate_options(t, [?U | acc])
+   defp translate_options([:multiline | t], acc), do: translate_options(t, [?m | acc])
+-  defp translate_options([:export | t], acc), do: translate_options(t, [?E | acc])
+   defp translate_options([], acc), do: acc
+   defp translate_options(_t, _acc), do: :error
+ 
+diff --git a/lib/elixir/lib/regex.ex b/lib/elixir/lib/regex.ex
+index 805da91a6..836f2c62d 100644
+--- a/lib/elixir/lib/regex.ex
++++ b/lib/elixir/lib/regex.ex
+@@ -101,13 +101,6 @@ defmodule Regex do
+     * `:ungreedy` (U) - inverts the "greediness" of the regexp
+       (the previous `r` option is deprecated in favor of `U`)
+ 
+-    * `:export` (E) (since Elixir 1.20) - uses an exported pattern
+-      which can be shared across nodes or through config, at the cost of a runtime
+-      overhead every time to re-import it every time it is executed.
+-      This modifier only has an effect starting on Erlang/OTP 28, and it is ignored
+-      on older versions (i.e. `~r/foo/E == ~r/foo/`). This is because patterns cannot
+-      and do not need to be exported in order to be shared in these versions.
+-
+   ## Captures
+ 
+   Many functions in this module handle what to capture in a regex
+@@ -522,7 +515,7 @@ def to_embed(%Regex{source: source, opts: regex_opts}, embed_opts \\ []) do
+   """
+   @spec names(t) :: [String.t()]
+   def names(%Regex{re_pattern: re_pattern}) do
+-    {:namelist, names} = :re.inspect(maybe_import_pattern(re_pattern), :namelist)
++    {:namelist, names} = :re.inspect(re_pattern, :namelist)
+     names
+   end
+ 
+@@ -592,16 +585,10 @@ defp safe_run(%Regex{re_pattern: re_pattern} = regex, string, options) do
+       %Regex{source: source, opts: compile_opts} = regex
+       :re.run(string, source, compile_opts ++ options)
+     else
+-      _ -> :re.run(string, maybe_import_pattern(re_pattern), options)
++      _ -> :re.run(string, re_pattern, options)
+     end
+   end
+ 
+-  @compile {:inline, maybe_import_pattern: 1}
+-  defp maybe_import_pattern({:re_exported_pattern, _, _, _, _} = exported),
+-    do: :re.import(exported)
+-
+-  defp maybe_import_pattern(pattern), do: pattern
+-
+   @typedoc """
+   Options for regex functions that capture matches.
+   """
+@@ -1020,16 +1007,6 @@ defp translate_options(<<?r, t::binary>>, acc) do
+     translate_options(t, [:ungreedy | acc])
+   end
+ 
+-  defp translate_options(<<?E, t::binary>>, acc) do
+-    # on OTP 27-, the E modifier is a no-op since the feature doesn't exist but isn't needed
+-    # (regexes aren't using references and can be shared across nodes or stored in config)
+-    # TODO: remove this check on Erlang/OTP 28+ and update docs
+-    case Code.ensure_loaded?(:re) and function_exported?(:re, :import, 1) do
+-      true -> translate_options(t, [:export | acc])
+-      false -> translate_options(t, acc)
+-    end
+-  end
+-
+   defp translate_options(<<>>, acc), do: acc
+   defp translate_options(t, _acc), do: {:error, t}
+ 
+@@ -1045,9 +1022,6 @@ def __escape__(%{__struct__: Regex} = regex) do
+         :erlang.system_info(:otp_release) < [?2, ?8] ->
+           Macro.escape(regex.re_pattern)
+ 
+-        :lists.member(:export, regex.opts) ->
+-          Macro.escape(regex.re_pattern)
+-
+         # OTP 28.1+ introduced the ability to export and import regexes from compiled binaries
+         Code.ensure_loaded?(:re) and function_exported?(:re, :import, 1) ->
+           {:ok, exported} = :re.compile(regex.source, [:export] ++ regex.opts)
+diff --git a/lib/elixir/test/elixir/inspect_test.exs b/lib/elixir/test/elixir/inspect_test.exs
+index 67a1544c9..be589836b 100644
+--- a/lib/elixir/test/elixir/inspect_test.exs
++++ b/lib/elixir/test/elixir/inspect_test.exs
+@@ -906,11 +906,6 @@ test "regex" do
+     assert inspect(Regex.compile!("foo", [:ucp])) == ~S'Regex.compile!("foo", [:ucp])'
+   end
+ 
+-  @tag :re_import
+-  test "exported regex" do
+-    assert inspect(~r/foo/E) == "~r/foo/E"
+-  end
+-
+   test "inspect_fun" do
+     fun = fn
+       integer, _opts when is_integer(integer) ->
+diff --git a/lib/elixir/test/elixir/regex_test.exs b/lib/elixir/test/elixir/regex_test.exs
+index 1fed09c24..1145b0d0a 100644
+--- a/lib/elixir/test/elixir/regex_test.exs
++++ b/lib/elixir/test/elixir/regex_test.exs
+@@ -52,20 +52,6 @@ test "multiline" do
+     assert Regex.match?(~r/^b$/m, "a\nb\nc")
+   end
+ 
+-  @tag :re_import
+-  test "export" do
+-    # exported patterns have no structs, so these are structurally equal
+-    assert ~r/foo/E == Regex.compile!("foo", [:export])
+-
+-    assert Regex.match?(~r/foo/E, "foo")
+-    refute Regex.match?(~r/foo/E, "Foo")
+-
+-    assert Regex.run(~r/c(d)/E, "abcd") == ["cd", "d"]
+-    assert Regex.run(~r/e/E, "abcd") == nil
+-
+-    assert Regex.names(~r/(?<FOO>foo)/E) == ["FOO"]
+-  end
+-
+   test "precedence" do
+     assert {"aa", :unknown} |> elem(0) =~ ~r/(a)\1/
+   end
+diff --git a/lib/mix/lib/mix/tasks/compile.app.ex b/lib/mix/lib/mix/tasks/compile.app.ex
+index 798763395..cc62e464c 100644
+--- a/lib/mix/lib/mix/tasks/compile.app.ex
++++ b/lib/mix/lib/mix/tasks/compile.app.ex
+@@ -217,14 +217,6 @@ defp to_erl_term(list) when is_list(list) do
+     [?[, to_erl_head(list), ?]]
+   end
+ 
+-  defp to_erl_term(%Regex{re_pattern: {:re_pattern, _, _, _, ref}} = regex)
+-       when is_reference(ref) do
+-    Mix.raise("""
+-    \"def application\" has a term which cannot be written to .app files: #{inspect(regex)}.
+-    Use the E modifier to store regexes in application config.
+-    """)
+-  end
+-
+   defp to_erl_term(map) when is_map(map) do
+     inner =
+       Enum.map_intersperse(
+diff --git a/lib/mix/test/mix/tasks/compile.app_test.exs b/lib/mix/test/mix/tasks/compile.app_test.exs
+index 8d6f9343f..2bd9b6711 100644
+--- a/lib/mix/test/mix/tasks/compile.app_test.exs
++++ b/lib/mix/test/mix/tasks/compile.app_test.exs
+@@ -263,33 +263,6 @@ test "validates properties" do
+     end)
+   end
+ 
+-  @tag :re_import
+-  test "accepts only regexes without a reference" do
+-    in_fixture("no_mixfile", fn ->
+-      Mix.Project.push(CustomProject)
+-
+-      Process.put(:application, env: [regex: ~r/foo/])
+-
+-      message = """
+-      "def application" has a term which cannot be written to \.app files: ~r\/foo\/.
+-      Use the E modifier to store regexes in application config.
+-      """
+-
+-      assert_raise Mix.Error, message, fn ->
+-        Mix.Tasks.Compile.App.run([])
+-      end
+-
+-      Process.put(:application, env: [exported: ~r/foo/E])
+-
+-      Mix.Tasks.Compile.Elixir.run([])
+-      Mix.Tasks.Compile.App.run([])
+-
+-      properties = parse_resource_file(:custom_project)
+-
+-      assert properties[:env] == [exported: ~r/foo/E]
+-    end)
+-  end
+-
+   test ".app contains description and registered (as required by systools)" do
+     in_fixture("no_mixfile", fn ->
+       Mix.Project.push(MixTest.Case.Sample)
+diff --git a/lib/mix/test/test_helper.exs b/lib/mix/test/test_helper.exs
+index 671e4e0f5..e6bce9251 100644
+--- a/lib/mix/test/test_helper.exs
++++ b/lib/mix/test/test_helper.exs
+@@ -43,22 +43,12 @@
+     []
+   end
+ 
+-# OTP 28.1+
+-re_import_exclude =
+-  if Code.ensure_loaded?(:re) and function_exported?(:re, :import, 1) do
+-    []
+-  else
+-    [:re_import]
+-  end
+-
+ Code.require_file("../../elixir/scripts/cover_record.exs", __DIR__)
+ CoverageRecorder.maybe_record("mix")
+ 
+ ExUnit.start(
+   trace: !!System.get_env("TRACE"),
+-  exclude:
+-    epmd_exclude ++
+-      os_exclude ++ git_exclude ++ line_exclude ++ cover_exclude ++ re_import_exclude,
++  exclude: epmd_exclude ++ os_exclude ++ git_exclude ++ line_exclude ++ cover_exclude,
+   include: line_include,
+   assert_receive_timeout: String.to_integer(System.get_env("ELIXIR_ASSERT_TIMEOUT", "300"))
+ )

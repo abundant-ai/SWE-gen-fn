@@ -1,0 +1,182 @@
+diff --git a/bin/common.ml b/bin/common.ml
+index 8d3e9f492..9f2eea4b8 100644
+--- a/bin/common.ml
++++ b/bin/common.ml
+@@ -132,6 +132,7 @@ module Options_implied_by_dash_p = struct
+     ; always_show_command_line : bool
+     ; promote_install_files : bool
+     ; require_dune_project_file : bool
++    ; ignore_lock_dir : bool
+     }
+ 
+   let docs = copts_sect
+@@ -250,6 +251,9 @@ module Options_implied_by_dash_p = struct
+         last
+         & opt_all ~vopt:true bool [ false ]
+         & info [ "require-dune-project-file" ] ~docs ~doc:(Some doc))
++    and+ ignore_lock_dir =
++      let doc = "Ignore dune.lock/ directory." in
++      Arg.(value & flag & info [ "ignore-lock-dir" ] ~docs ~doc:(Some doc))
+     in
+     { root
+     ; only_packages = No_restriction
+@@ -260,6 +264,7 @@ module Options_implied_by_dash_p = struct
+     ; always_show_command_line
+     ; promote_install_files
+     ; require_dune_project_file
++    ; ignore_lock_dir
+     }
+   ;;
+ 
+@@ -569,6 +574,7 @@ module Builder = struct
+     ; ignore_promoted_rules : bool
+     ; force : bool
+     ; no_print_directory : bool
++    ; ignore_lock_dir : bool
+     ; store_orig_src_dir : bool
+     ; default_target : Arg.Dep.t (* For build & runtest only *)
+     ; watch : Dune_rpc_impl.Watch_mode_config.t
+@@ -744,6 +750,7 @@ module Builder = struct
+          ; always_show_command_line
+          ; promote_install_files
+          ; require_dune_project_file
++         ; ignore_lock_dir
+          }
+       =
+       Options_implied_by_dash_p.term
+@@ -927,6 +934,7 @@ module Builder = struct
+     ; ignore_promoted_rules
+     ; force
+     ; no_print_directory
++    ; ignore_lock_dir
+     ; store_orig_src_dir
+     ; default_target
+     ; watch
+@@ -982,6 +990,7 @@ module Builder = struct
+         ; ignore_promoted_rules
+         ; force
+         ; no_print_directory
++        ; ignore_lock_dir
+         ; store_orig_src_dir
+         ; default_target
+         ; watch
+@@ -1014,6 +1023,7 @@ module Builder = struct
+     && Bool.equal t.ignore_promoted_rules ignore_promoted_rules
+     && Bool.equal t.force force
+     && Bool.equal t.no_print_directory no_print_directory
++    && Bool.equal t.ignore_lock_dir ignore_lock_dir
+     && Bool.equal t.store_orig_src_dir store_orig_src_dir
+     && Arg.Dep.equal t.default_target default_target
+     && Dune_rpc_impl.Watch_mode_config.equal t.watch watch
+@@ -1255,6 +1265,7 @@ let init_with_root ~(root : Workspace_root.t) (builder : Builder.t) =
+   Dune_rules.Clflags.promote_install_files := c.builder.promote_install_files;
+   Dune_engine.Clflags.always_show_command_line := c.builder.always_show_command_line;
+   Dune_rules.Clflags.ignore_promoted_rules := c.builder.ignore_promoted_rules;
++  Dune_rules.Clflags.ignore_lock_dir := c.builder.ignore_lock_dir;
+   Source.Clflags.on_missing_dune_project_file
+   := if c.builder.require_dune_project_file then Error else Warn;
+   (Dune_engine.Clflags.can_go_in_shared_cache_default
+diff --git a/bin/pkg/pkg_enabled.ml b/bin/pkg/pkg_enabled.ml
+index 71e812134..f80a6cb87 100644
+--- a/bin/pkg/pkg_enabled.ml
++++ b/bin/pkg/pkg_enabled.ml
+@@ -5,7 +5,7 @@ let term =
+   let common, config = Common.init builder in
+   Scheduler_setup.go_with_rpc_server ~common ~config (fun () ->
+     Memo.run
+-    (* CR-ElectreAAS: we should be using lock_dir_active *)
++    (* CR-ElectreAAS: we should be using lock_dir_active (and not ignore --ignore-lock-dir) *)
+     @@
+     let open Memo.O in
+     let+ workspace = Workspace.workspace () in
+diff --git a/src/dune_rules/clflags.ml b/src/dune_rules/clflags.ml
+index 6d2e2eee0..d34346c00 100644
+--- a/src/dune_rules/clflags.ml
++++ b/src/dune_rules/clflags.ml
+@@ -4,4 +4,5 @@ let promote_install_files = ref false
+ let display = Dune_engine.Clflags.display
+ let capture_outputs = Dune_engine.Clflags.capture_outputs
+ let debug_package_logs = ref false
++let ignore_lock_dir = ref false
+ let concurrency = ref 1
+diff --git a/src/dune_rules/clflags.mli b/src/dune_rules/clflags.mli
+index e26c51879..db173df2a 100644
+--- a/src/dune_rules/clflags.mli
++++ b/src/dune_rules/clflags.mli
+@@ -16,4 +16,7 @@ val capture_outputs : bool ref
+ (** Print package output when building with package management *)
+ val debug_package_logs : bool ref
+ 
++(** Whether we are ignoring "dune.lock/". *)
++val ignore_lock_dir : bool ref
++
+ val concurrency : int ref
+diff --git a/src/dune_rules/lock_dir.ml b/src/dune_rules/lock_dir.ml
+index dee65925e..461613e81 100644
+--- a/src/dune_rules/lock_dir.ml
++++ b/src/dune_rules/lock_dir.ml
+@@ -289,15 +289,18 @@ let lock_dirs_of_workspace (workspace : Workspace.t) =
+ 
+ let lock_dir_active ctx =
+   let open Memo.O in
+-  let* workspace = Workspace.workspace () in
+-  match workspace.config.pkg_enabled with
+-  | Set (_, `Enabled) -> Memo.return true
+-  | Set (_, `Disabled) -> Memo.return false
+-  | Unset ->
+-    get_source_path_for_context ctx
+-    >>= (function
+-     | None -> Memo.return false
+-     | Some source -> Source_tree.find_dir source >>| Option.is_some)
++  if !Clflags.ignore_lock_dir
++  then Memo.return false
++  else
++    let* workspace = Workspace.workspace () in
++    match workspace.config.pkg_enabled with
++    | Set (_, `Enabled) -> Memo.return true
++    | Set (_, `Disabled) -> Memo.return false
++    | Unset ->
++      get_source_path_for_context ctx
++      >>= (function
++       | None -> Memo.return false
++       | Some source -> Source_tree.find_dir source >>| Option.is_some)
+ ;;
+ 
+ let source_kind (source : Dune_pkg.Source.t) =
+diff --git a/test/blackbox-tests/test-cases/pkg/pkg-enabled-cli.t b/test/blackbox-tests/test-cases/pkg/pkg-enabled-cli.t
+index fdc9221dd..a9101510c 100644
+--- a/test/blackbox-tests/test-cases/pkg/pkg-enabled-cli.t
++++ b/test/blackbox-tests/test-cases/pkg/pkg-enabled-cli.t
+@@ -55,6 +55,32 @@ With the CLI option disabled
+   $ dune pkg enabled --pkg disabled --workspace=./dune-workspace.disabled
+   [1]
+ 
++## With a lock directory, but we ignore it
++
++  $ test -d dune.lock
++
++  $ dune pkg enabled --ignore-lock-dir
++^^^ This is a bug. It should be disabled.
++We have a lock directory, but it is ignored.
++It should behave the same as if there was no lockdir
++
++This translates to explicitly asking for autolocking
++  $ dune pkg enabled --ignore-lock-dir --workspace=./dune-workspace.enabled
++  $ dune pkg enabled --ignore-lock-dir --workspace=./dune-workspace.disabled
++  [1]
++
++These 3 translate to explicitly asking for autolocking
++  $ dune pkg enabled --pkg enabled --ignore-lock-dir
++  $ dune pkg enabled --pkg enabled --ignore-lock-dir --workspace=./dune-workspace.enabled
++  $ dune pkg enabled --pkg enabled --ignore-lock-dir --workspace=./dune-workspace.disabled
++
++  $ dune pkg enabled --pkg disabled --ignore-lock-dir
++  [1]
++  $ dune pkg enabled --pkg disabled --ignore-lock-dir --workspace=./dune-workspace.enabled
++  [1]
++  $ dune pkg enabled --pkg disabled --ignore-lock-dir --workspace=./dune-workspace.disabled
++  [1]
++
+ ## With a project file
+ 
+   $ cat > dune-project << EOF

@@ -1,0 +1,427 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 21d926ab..86f3c77b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,10 +9,25 @@ A preview of the next release can be installed from
+ 
+ ## Unreleased
+ 
++- Support rebel-readline as external REPL provider
++  - Add proxy support for `Completer`, `Highlighter`, `ParsedLine`, `Writer`, `Reader`
++  - Add `clojure.repl/special-doc` and `clojure.repl/set-break-handler!`
++  - Add `clojure.main/repl-read`
++  - Add `org.jline.reader.Buffer` to class allowlist
++  - Add `:inherit` mechanism for reflection config to inherit interface methods
++  - `start-repl!` bypasses jline when custom `:read` is provided
++- Fix nREPL server test using `"localhost"` instead of `"127.0.0.1"`
+ - Add `java.lang.reflect.Constructor`, `java.lang.reflect.Executable`, `java.util.stream.Collectors`, `java.lang.StackOverflowError`, `clojure.lang.IType`, `java.util.Comparator` (reify)
+ - Add JLine classes for rebel-readline compatibility: `Highlighter`, `LineReader$Option`, `Attributes$InputFlag`, `Attributes$LocalFlag`
+ - Hide redundant `(keyword)` description in REPL completions
+ - SCI: add `proxy-super`, `proxy-call-with-super`, `update-proxy` and `proxy-mappings`
++- SCI: add `.ns` and `.sym` field access on vars for compliment compatibility
++- SCI: `ns-aliases` now returns identical namespace objects as `find-ns`
++- SCI: `alias` now accepts namespace objects in addition to symbols
++- SCI: `copy-var` and `copy-var*` now preserve `:private` metadata
++- SCI: private vars are no longer included in `ns-refers`
++- Add `ref-max-history`, `ref-min-history`, `ref-history-count`
++- Add `java.lang.reflect.Member` `getName` and `getDeclaringClass` to reflection config
+ 
+ ## 1.12.215 (2026-02-17)
+ 
+diff --git a/doc/adr/0001-jline-providers/decision.md b/doc/adr/0001-jline-providers/decision.md
+index 69d32aaf..19b1b5b8 100644
+--- a/doc/adr/0001-jline-providers/decision.md
++++ b/doc/adr/0001-jline-providers/decision.md
+@@ -86,21 +86,80 @@ Include both FFM and Exec providers with the following strategy:
+ 
+ Goal: run rebel-readline from source on babashka.
+ 
+-### Done
++### Architecture changes in rebel-readline
+ 
+-Classes added to babashka:
+-- `org.jline.reader.Highlighter` (interface, reify support added)
+-- `org.jline.reader.LineReader$Option` (enum)
+-- `org.jline.terminal.Attributes$InputFlag` (enum)
+-- `org.jline.terminal.Attributes$LocalFlag` (enum)
++Proxying `LineReaderImpl` with `IDeref`/`IAtom` (as rebel-readline originally did) adds ~200KB to the native binary. Instead:
+ 
+-### Remaining blockers
++- Replaced `(proxy [LineReaderImpl IDeref IAtom] ...)` with a normal `LineReaderBuilder`-created reader
++- Store service state in a `*state*` atom instead of making the reader derefable/swappable
++- Replaced the `selfInsert` proxy-super pattern with a widget wrapper:
++  ```clojure
++  (let [widgets (.getWidgets reader)
++        orig    (.get widgets LineReader/SELF_INSERT)]
++    (.put widgets "self-insert"
++      (reify Widget
++        (apply [_]
++          (run-hooks)
++          (.apply ^Widget orig)))))
++  ```
++- Changed `proxy [java.util.function.Supplier]` to `reify` (Supplier already in bb's reify interfaces)
++- Changed `catch NoSuchFieldException` to `catch Exception` in `get-accessible-field` for bb compatibility
++- Added `^Widget` type hint on `.apply orig` so SCI resolves through the interface (anonymous inner classes aren't directly accessible)
++- Bumped compliment from 0.6.0 to 0.7.1 (0.6.0 had `^Package` type hint that bb couldn't resolve)
+ 
+-1. **`proxy-super` in SCI**: SCI's `proxy` macro doesn't support `proxy-super` in user code. Rebel-readline needs `(proxy-super parse line cursor context)` to fall back to `DefaultParser`'s parse method. This requires SCI changes.
++### Classes added to babashka
+ 
+-2. **`org.jline.reader.impl.DefaultParser`**: rebel-readline uses `(proxy [DefaultParser] ...)` to extend the default parser, overriding `isDelimiterChar` and `parse`. DefaultParser is stable (since 2002) and babashka already exposes `impl.LineReaderImpl`, so exposing it is consistent. Needs a proxy case in `babashka.impl.proxy`.
++- `java.util.stream.Collectors` (for compliment)
++- `java.lang.reflect.Constructor` with getName/getModifiers/getParameterTypes/getParameterCount (for compliment)
++- `java.lang.reflect.Executable` with getParameterCount (for compliment)
++- `java.lang.StackOverflowError` (instance check + import)
++- `org.jline.reader.Buffer` (interface, with public-class upcast from BufferImpl)
++- `java.util.Comparator` added to reify interfaces (impl-java)
+ 
+-3. **`org.jline.reader.impl.BufferImpl`**: only used in a dev helper (`buffer*`), not needed at runtime. Can be avoided on the rebel-readline side.
++### LineReaderImpl reflection config
+ 
+-4. **`org.jline.terminal.impl.DumbTerminal`**: only used for an `instance?` check to detect bad terminals. Can be avoided on the rebel-readline side (e.g. check `.getType` instead).
++`LineReaderImpl` is removed from the bare `:all` list (which gave full reflection) and moved to `:custom` with explicit methods and fields:
++
++- Fields: `post` (for eldoc display), `size` (for terminal size)
++- Impl-only methods: `redisplay`, `readBinding`, `defaultKeyMaps`, `setCompleter`, `setHighlighter`, `setParser`
++- Inherited methods via `:inherit [org.jline.reader.LineReader]` — pulls in all public declared methods from the LineReader interface
++
++The `:inherit` mechanism in `classes.clj` solves a GraalVM reflection problem: when a class has explicit `:methods` (not `:all`), type-hinting as `^LineReaderImpl` can't find inherited interface methods like `setOpt` via reflection. The `:inherit` key declares which superclass/interface methods to include in the reflection config, so inherited methods resolve correctly without needing `:all`.
++
++### No LineReaderImpl references in rebel-readline
++
++rebel-readline no longer imports or type-hints `LineReaderImpl`. All method calls resolve via reflection at runtime, which works because babashka's `:inherit` mechanism includes the full LineReader interface methods in the LineReaderImpl reflection config. The nested import syntax `impl.LineReaderImpl` under `org.jline.reader` is not supported by SCI — use `[org.jline.reader.impl LineReaderImpl]` if ever needed.
++
++### Proxy cases added
++
++- `org.jline.reader.Completer`
++- `org.jline.reader.Highlighter`
++- `org.jline.reader.ParsedLine` (with `clojure.lang.IMeta`)
++- `java.io.Writer`
++- `java.io.Reader`
++
++### Vars added to babashka
++
++In `clojure.repl` (as bb overrides, not in SCI):
++- `special-doc` (private) — inlined special-doc-map for special form documentation
++- `set-break-handler!` — signal handler registration; zero-arg is no-op since `Thread.stop` doesn't work in modern JVMs
++
++In `clojure.main`:
++- `repl-read`
++
++### Babashka REPL integration
++
++- `start-repl!` skips `repl-with-jline` when custom `:read` is provided in opts, so rebel-readline's read hook isn't clobbered by bb's own JLine REPL
++- bb.edn for rebel-readline excludes jline-terminal, jline-terminal-jni, jline-terminal-ffm (keeps jline-reader) to avoid conflicts with bb's built-in JLine
++- rebel-readline's deps.edn needs `org.jline/jline-terminal-ffm` for JVM development
++
++### Public-class upcasts for JLine anonymous inner classes
++
++JLine uses anonymous inner classes internally (e.g. `LineReaderImpl$2` for Widget, `LineReaderImpl$3` for ParsedLine). SCI can't resolve methods on these directly. Fixed with public-class upcasts in `classes.clj`:
++- `org.jline.reader.Buffer` (from `BufferImpl`)
++- `org.jline.reader.ParsedLine` (from `LineReaderImpl$3`)
++
++### TODO
++
++- Completion triggers `NoSuchFieldException: ns` — compliment's `populate-global-members-cache` calls `.getField dc name` without a try/catch. When a class has a field whose declaring class doesn't expose it publicly, it throws. Fix in compliment: wrap `.getField` in try/catch like rebel-readline's `get-accessible-field`.
+ 
+diff --git a/sci b/sci
+index fd3bce6d..9a6a082b 160000
+--- a/sci
++++ b/sci
+@@ -1 +1 @@
+-Subproject commit fd3bce6dc1479bc49284efc1c8251338cb8869c6
++Subproject commit 9a6a082b13e93912a98f87c404ad066f0106b0a2
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index 37640d6a..c2eb9154 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -27,7 +27,9 @@
+   ;; SciMap is the backing type for deftype with map interfaces.
+   ;; Reflection config is needed for untyped Java interop on these
+   ;; instances in SCI-evaluated code (e.g. (.hasheq x) without type hint).
+-  `{babashka.impl.SciMap {:allPublicConstructors true
++  `{sci.lang.Var {:fields [{:name "ns"}
++                            {:name "sym"}]}
++    babashka.impl.SciMap {:allPublicConstructors true
+                           :allPublicMethods true}
+     clojure.lang.LineNumberingPushbackReader {:allPublicConstructors true
+                                               :allPublicMethods true}
+@@ -107,7 +109,9 @@
+     java.lang.Package
+     {:methods [{:name "getName"}]}
+     java.lang.reflect.Member
+-    {:methods [{:name "getModifiers"}]}
++    {:methods [{:name "getModifiers"}
++               {:name "getName"}
++               {:name "getDeclaringClass"}]}
+     java.lang.reflect.Method
+     {:methods [{:name "invoke"}
+                {:name "getName"}
+@@ -227,7 +231,14 @@
+     clojure.lang.TaggedLiteral
+     {:methods [{:name "create"}]}
+     org.jline.reader.impl.LineReaderImpl
+-    {:fields [{:name "post"}]}})
++    {:fields [{:name "post"} {:name "size"}]
++     :methods [{:name "redisplay"}
++               {:name "readBinding"}
++               {:name "defaultKeyMaps"}
++               {:name "setCompleter"}
++               {:name "setHighlighter"}
++               {:name "setParser"}]
++     :inherit [org.jline.reader.LineReader]}})
+ 
+ (def custom-map
+   (cond->
+@@ -706,7 +717,7 @@
+           org.jline.reader.LineReader$Option
+           org.jline.reader.LineReader$SuggestionType
+           org.jline.reader.LineReaderBuilder
+-          org.jline.reader.impl.LineReaderImpl
++          org.jline.reader.Buffer
+           org.jline.reader.EndOfFileException
+           org.jline.reader.UserInterruptException
+           org.jline.reader.Completer
+@@ -902,6 +913,10 @@
+                                    java.nio.channels.SocketChannel
+                                    (instance? java.net.CookieStore v)
+                                    java.net.CookieStore
++                                   (instance? org.jline.reader.Buffer v)
++                                   org.jline.reader.Buffer
++                                   (instance? org.jline.reader.ParsedLine v)
++                                   org.jline.reader.ParsedLine
+                                    ;; this makes interop on reified classes work
+                                    ;; see java_net_http_test/interop-test
+                                    (instance? sci.impl.types.ICustomType v)
+@@ -1077,6 +1092,20 @@
+ 
+ ;; (eval (vec (keys imports)))
+ 
++(defn public-declared-method? [^Class c ^java.lang.reflect.Method m]
++  (and (= c (.getDeclaringClass m))
++       (not (.getAnnotation m Deprecated))))
++
++(defn public-declared-method-names [^Class c]
++  (->> (.getMethods c)
++       (keep (fn [^java.lang.reflect.Method m]
++               (when (public-declared-method? c m)
++                 {:class c
++                  :name (.getName m)})))
++       (distinct)
++       (sort-by :name)
++       (vec)))
++
+ (defn reflection-file-entries []
+   (let [entries (vec (for [c (sort (concat (:all classes)
+                                            (when features/java-net-http?
+@@ -1104,7 +1133,15 @@
+                                {:name class-name}))
+         custom-entries (for [[c v] (:custom classes)
+                              :let [class-name (str c)]]
+-                         (assoc v :name class-name))
++                         (let [v (if-let [inherit-from (seq (:inherit v))]
++                                   (let [inherited (mapcat #(public-declared-method-names (Class/forName (str %)))
++                                                           inherit-from)
++                                         inherited-methods (mapv #(select-keys % [:name]) inherited)]
++                                     (-> v
++                                         (dissoc :inherit)
++                                         (update :methods into inherited-methods)))
++                                   (dissoc v :inherit))]
++                           (assoc v :name class-name)))
+         all-entries (concat entries constructors methods fields instance-checks custom-entries)]
+     all-entries))
+ 
+@@ -1117,20 +1154,6 @@
+            "resources/META-INF/native-image/babashka/babashka/reflect-config.json")
+           (json/generate-string all-entries {:pretty true}))))
+ 
+-(defn public-declared-method? [^Class c ^java.lang.reflect.Method m]
+-  (and (= c (.getDeclaringClass m))
+-       (not (.getAnnotation m Deprecated))))
+-
+-(defn public-declared-method-names [^Class c]
+-  (->> (.getMethods c)
+-       (keep (fn [^java.lang.reflect.Method m]
+-               (when (public-declared-method? c m)
+-                 {:class c
+-                  :name (.getName m)})))
+-       (distinct)
+-       (sort-by :name)
+-       (vec)))
+-
+ (defn all-classes
+   "Returns every java.lang.Class instance Babashka supports."
+   []
+diff --git a/src/babashka/impl/clojure/core.clj b/src/babashka/impl/clojure/core.clj
+index 7574e338..85d96067 100644
+--- a/src/babashka/impl/clojure/core.clj
++++ b/src/babashka/impl/clojure/core.clj
+@@ -206,6 +206,9 @@
+    'sync (sci/copy-var sync clojure-core-ns)
+    'ref (sci/copy-var ref clojure-core-ns)
+    'ref-set (sci/copy-var ref-set clojure-core-ns)
++   'ref-max-history (sci/copy-var ref-max-history clojure-core-ns)
++   'ref-min-history (sci/copy-var ref-min-history clojure-core-ns)
++   'ref-history-count (sci/copy-var ref-history-count clojure-core-ns)
+    'ensure (sci/copy-var ensure clojure-core-ns)
+    ;; end STM
+    'update-vals (sci/copy-var update-vals clojure-core-ns)
+diff --git a/src/babashka/impl/proxy.clj b/src/babashka/impl/proxy.clj
+index 8b1c61aa..e1534476 100644
+--- a/src/babashka/impl/proxy.clj
++++ b/src/babashka/impl/proxy.clj
+@@ -145,6 +145,41 @@
+         (initialValue []
+           ((method-or-bust methods 'initialValue) this)))
+ 
++      ["org.jline.reader.Completer" #{}]
++      (proxy [org.jline.reader.Completer] []
++        (complete [reader line candidates]
++          ((method-or-bust methods 'complete) this reader line candidates)))
++
++      ["org.jline.reader.Highlighter" #{}]
++      (proxy [org.jline.reader.Highlighter] []
++        (highlight [reader buffer]
++          ((method-or-bust methods 'highlight) this reader buffer)))
++
++      ["org.jline.reader.ParsedLine" #{}]
++      (proxy [org.jline.reader.ParsedLine] []
++        (word [] ((method-or-bust methods 'word) this))
++        (wordIndex [] ((method-or-bust methods 'wordIndex) this))
++        (wordCursor [] ((method-or-bust methods 'wordCursor) this))
++        (words [] ((method-or-bust methods 'words) this))
++        (line [] ((method-or-bust methods 'line) this))
++        (cursor [] ((method-or-bust methods 'cursor) this)))
++
++      ["java.io.Writer" #{}]
++      (proxy [java.io.Writer] []
++        (flush [] ((method-or-bust methods 'flush) this))
++        (close [] ((method-or-bust methods 'close) this))
++        (write
++          ([str-cbuf off len]
++           ((method-or-bust methods 'write) this str-cbuf off len))))
++
++      ["java.io.Reader" #{}]
++      (proxy [java.io.Reader] []
++        (read
++          ([] ((method-or-bust methods 'read) this))
++          ([out-array] ((method-or-bust methods 'read) this out-array))
++          ([out-array off len] ((method-or-bust methods 'read) this out-array off len)))
++        (close [] (when-let [m (get methods 'close)] (m this))))
++
+       ["java.lang.Object" #{}]
+       (proxy [java.lang.Object] []
+         (equals [obj]
+diff --git a/src/babashka/impl/repl.clj b/src/babashka/impl/repl.clj
+index 2d05abd6..273b1fd0 100644
+--- a/src/babashka/impl/repl.clj
++++ b/src/babashka/impl/repl.clj
+@@ -602,7 +602,8 @@
+ (defn start-repl!
+   ([sci-ctx] (start-repl! sci-ctx nil))
+   ([sci-ctx opts]
+-   (if (terminal/tty? :stdin)
++   (if (and (terminal/tty? :stdin)
++            (not (:read opts)))
+      (repl-with-jline sci-ctx opts)
+      (repl sci-ctx opts))))
+ 
+diff --git a/src/babashka/main.clj b/src/babashka/main.clj
+index 08b3d6d4..b15f3358 100644
+--- a/src/babashka/main.clj
++++ b/src/babashka/main.clj
+@@ -390,6 +390,83 @@ Use bb run --help to show this help output.
+        'clojure.instant instant/instant-namespace
+        'clojure.stacktrace stacktrace-namespace
+        'clojure.zip zip-namespace
++       'clojure.repl
++       (let [crns (sci/create-ns 'clojure.repl)]
++         {'special-doc
++          (sci/new-var
++           'special-doc
++           (let [m '{. {:url "java_interop#dot"
++                        :forms [(.instanceMember instance args*)
++                                (.instanceMember Classname args*)
++                                (Classname/staticMethod args*)
++                                Classname/staticField]
++                        :doc "The instance member form works for both fields and methods.
++  They all expand into calls to the dot operator at macroexpansion time."}
++                     def {:forms [(def symbol doc-string? init?)]
++                          :doc "Creates and interns a global var with the name
++  of symbol in the current namespace (*ns*) or locates such a var if
++  it already exists.  If init is supplied, it is evaluated, and the
++  root binding of the var is set to the resulting value.  If init is
++  not supplied, the root binding of the var is unaffected."}
++                     do {:forms [(do exprs*)]
++                         :doc "Evaluates the expressions in order and returns the value of
++  the last. If no expressions are supplied, returns nil."}
++                     if {:forms [(if test then else?)]
++                         :doc "Evaluates test. If not the singular values nil or false,
++  evaluates and yields then, otherwise, evaluates and yields else. If
++  else is not supplied it defaults to nil."}
++                     monitor-enter {:forms [(monitor-enter x)]
++                                    :doc "Synchronization primitive that should be avoided
++  in user code. Use the 'locking' macro."}
++                     monitor-exit {:forms [(monitor-exit x)]
++                                   :doc "Synchronization primitive that should be avoided
++  in user code. Use the 'locking' macro."}
++                     new {:forms [(Classname. args*) (new Classname args*)]
++                          :url "java_interop#new"
++                          :doc "The args, if any, are evaluated from left to right, and
++  passed to the constructor of the class named by Classname. The
++  constructed object is returned."}
++                     quote {:forms [(quote form)]
++                            :doc "Yields the unevaluated form."}
++                     recur {:forms [(recur exprs*)]
++                            :doc "Evaluates the exprs in order, then, in parallel, rebinds
++  the bindings of the recursion point to the values of the exprs.
++  Execution then jumps back to the recursion point, a loop or fn method."}
++                     set! {:forms [(set! var-symbol expr)
++                                   (set! (. instance-expr instanceFieldName-symbol) expr)
++                                   (set! (. Classname-symbol staticFieldName-symbol) expr)]
++                           :url "vars#set"
++                           :doc "Used to set thread-local-bound vars, Java object instance
++fields, and Java class static fields."}
++                     throw {:forms [(throw expr)]
++                            :doc "The expr is evaluated and thrown, therefore it should
++  yield an instance of some derivee of Throwable."}
++                     try {:forms [(try expr* catch-clause* finally-clause?)]
++                          :doc "catch-clause => (catch classname name expr*)
++  finally-clause => (finally expr*)
++
++  Catches and handles Java exceptions."}
++                     var {:forms [(var symbol)]
++                          :doc "The symbol must resolve to a var, and the Var object
++itself (not its value) is returned. The reader macro #'x expands to (var x)."}}]
++             (fn [name-symbol]
++               (when-let [doc (m name-symbol)]
++                 (assoc doc :name name-symbol :special-form true))))
++           {:ns crns :private true})
++          'set-break-handler!
++          (sci/new-var
++           'set-break-handler!
++           (fn
++             ([] nil)
++             ([f]
++              (sun.misc.Signal/handle
++                (sun.misc.Signal. "INT")
++                (proxy [sun.misc.SignalHandler] []
++                  (handle [signal]
++                    (f (str "-- caught signal " signal)))))))
++           {:ns crns
++            :doc "Register INT signal handler.  After calling this, Ctrl-C will cause\n  the given function f to be called with a single argument, the signal.\n  Uses thread-stopper if no function given."
++            :arglists '([] [f])})})
+        'clojure.main {:obj clojure-main-ns
+                       'demunge (sci/copy-var demunge clojure-main-ns)
+                       'repl-requires (sci/copy-var clojure-main/repl-requires clojure-main-ns)
+@@ -399,6 +476,10 @@ Use bb run --help to show this help output.
+                                              (repl/start-repl! (common/ctx) opts))) {:ns clojure-main-ns})
+                       'with-bindings (sci/copy-var clojure-main/with-bindings clojure-main-ns)
+                       'repl-caught (sci/copy-var repl/repl-caught clojure-main-ns)
++                      'repl-read (sci/new-var 'repl-read
++                                              (fn [request-prompt request-exit]
++                                                (repl/repl-read (common/ctx) @sci/in request-prompt request-exit))
++                                              {:ns clojure-main-ns})
+                       'with-read-known (sci/copy-var clojure-main/with-read-known clojure-main-ns)
+                       'main main-var}
+        'clojure.test t/clojure-test-namespace

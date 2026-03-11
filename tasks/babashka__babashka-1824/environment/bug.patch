@@ -1,0 +1,138 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 19832e62..c780b500 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,8 +18,6 @@ A preview of the next release can be installed from
+ - [#1822](https://github.com/babashka/babashka/issues/1822): type should prioritize :type metadata
+ - `ns-name` should work on symbols
+ - `:clojure.core/eval-file` should affect `*file*` during eval
+-- [#1179](https://github.com/babashka/babashka/issues/1179): run `:init` in tasks only once
+-- [#1823](https://github.com/babashka/babashka/issues/1823): run `:init` in tasks before task specific requires
+ 
+ ## 1.12.200 (2025-04-26)
+ 
+diff --git a/src/babashka/impl/tasks.clj b/src/babashka/impl/tasks.clj
+index 92b0b7a5..3fe45785 100644
+--- a/src/babashka/impl/tasks.clj
++++ b/src/babashka/impl/tasks.clj
+@@ -212,14 +212,11 @@
+ 
+ (def rand-ns (delay (symbol (str "user-" (java.util.UUID/randomUUID)))))
+ 
+-(defn format-task [init extra-paths extra-deps global-requires requires prog]
++(defn format-task [init extra-paths extra-deps requires prog]
+   (format "
+ %s ;; deps
+ 
+-(ns %s
+-;; global requires
+-%s)
+-
++(ns %s %s)
+ (require '[babashka.tasks #_#_:refer [log]])
+ (when-not (resolve 'clojure)
+   ;; we don't use refer so users can override this
+@@ -237,17 +234,9 @@
+ (when-not (resolve 'exec)
+   (intern *ns* 'exec @(var babashka.tasks/exec)))
+ 
+-;; init
+-(defmacro init []
+-  (when-not (resolve '%s/__init?)
+-   (intern '%s '__init? true)
+-   '%s))
+-
+-(init)
+-;; task requires
+ %s
+-;; task
+ %s
++
+ "
+           (let [deps (cond-> {}
+                        (seq extra-deps) (assoc :deps extra-deps)
+@@ -256,18 +245,10 @@
+               (format "(babashka.deps/add-deps '%s)" (pr-str deps))
+               ""))
+           @rand-ns
+-          (if (seq global-requires)
+-            (format "(:require %s)" (str/join " " global-requires))
+-            "")
+-          @rand-ns @rand-ns
+-          (pr-str init)
+           (if (seq requires)
+-            (format "(require %s)"
+-                    (str/join "\n"
+-                              (map (fn [req]
+-                                     (str "'" req))
+-                                   requires)))
++            (format "(:require %s)" (str/join " " requires))
+             "")
++          (pr-str init)
+           prog))
+ 
+ (defn target-order
+@@ -305,7 +286,7 @@
+     (binding [*print-meta* true]
+       (if task
+         (let [m? (map? task)
+-              global-requires (get tasks :requires)
++              requires (get tasks :requires)
+               init (get tasks :init)
+               prog (if (when m? (:depends task))
+                      (let [[targets error]
+@@ -324,7 +305,7 @@
+                                 done []
+                                 extra-paths []
+                                 extra-deps nil
+-                                requires []]
++                                requires requires]
+                            (let [t (first targets)
+                                  targets (next targets)
+                                  task-map (assoc task-map
+@@ -347,15 +328,14 @@
+                                        extra-paths (concat extra-paths (:extra-paths task))
+                                        extra-deps (merge extra-deps (:extra-deps task))
+                                        requires (concat requires (:requires task))]
+-                                   [[(format-task init extra-paths extra-deps global-requires requires prog)] nil])
++                                   [[(format-task init extra-paths extra-deps requires prog)] nil])
+                                  [(binding [*out* *err*]
+                                     (println "No such task:" t)) 1]))))))
+                      [[(format-task
+                         init
+                         (:extra-paths task)
+                         (:extra-deps task)
+-                        global-requires
+-                        (:requires task)
++                        (concat requires (:requires task))
+                         (assemble-task-1 (cond-> {:name task-name}
+                                            enter (assoc :enter enter)
+                                            leave (assoc :leave leave)
+diff --git a/test/babashka/bb_edn_test.clj b/test/babashka/bb_edn_test.clj
+index 9e081333..6d5868d9 100644
+--- a/test/babashka/bb_edn_test.clj
++++ b/test/babashka/bb_edn_test.clj
+@@ -547,23 +547,3 @@ even more stuff here\"
+   (when-not test-utils/native?
+     (binding [*out* *err*]
+       (is (str/includes? (with-out-str (bb "-Sdeps" "{:tasks {run {:task 1}}}" "run")) "'run' override")))))
+-
+-(deftest init-is-ran-before-task-specific-requires-but-after-global-requires-and-init-is-ran-only-once-test
+-  (fs/with-temp-dir [dir {}]
+-    (let [f (fs/file dir "bb.edn")
+-          pre-init-file (fs/file dir "pre_init.clj")
+-          after-init-file (fs/file dir "after_init.clj")
+-          config (str f)]
+-      (spit config
+-            '{:tasks {:requires ([pre-init] [babashka.fs :as fs])
+-                      :init (prn :init (fs/exists? "."))
+-                      task-b {:requires ([after-init])}
+-                      task-a {:extra-paths ["."]
+-                              :requires ([after-init])
+-                              :task
+-                              ;; this caused init to be re-ran
+-                              (run 'task-b)}}})
+-      (spit pre-init-file "(ns pre-init) (prn :pre-init)")
+-      (spit after-init-file "(ns after-init) (prn :after-init)")
+-      (let [out (str/split-lines (test-utils/bb nil "--config" config "task-a"))]
+-        (is (= [":pre-init" ":init true" ":after-init"] out))))))

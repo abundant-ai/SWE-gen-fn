@@ -1,0 +1,129 @@
+diff --git a/lib/ecto/query/builder/from.ex b/lib/ecto/query/builder/from.ex
+index e5aa708e..9622cd99 100644
+--- a/lib/ecto/query/builder/from.ex
++++ b/lib/ecto/query/builder/from.ex
+@@ -59,7 +59,7 @@ defmodule Ecto.Query.Builder.From do
+ 
+       ^query ->
+         case query do
+-          {left, right} -> {escape_source(left, env), Macro.expand(right, env)}
++          {left, right} -> {left, Macro.expand(right, env)}
+           _ -> query
+         end
+ 
+@@ -118,10 +118,6 @@ defmodule Ecto.Query.Builder.From do
+         {:ok, prefix} = prefix || {:ok, nil}
+         {query(prefix, fragment, params, as, hints, env.file, env.line), binds, 1}
+ 
+-      {{{:{}, _, [:fragment, _, _]} = fragment, params}, schema} when is_atom(schema) ->
+-        {:ok, prefix} = prefix || {:ok, nil}
+-        {query(prefix, {fragment, schema}, params, as, hints, env.file, env.line), binds, 1}
+-
+       {{:{}, _, [:values, _, _]} = values, prelude, params} ->
+         {:ok, prefix} = prefix || {:ok, nil}
+         query = query(prefix, values, params, as, hints, env.file, env.line)
+diff --git a/lib/ecto/query/inspect.ex b/lib/ecto/query/inspect.ex
+index aec9323c..0a509723 100644
+--- a/lib/ecto/query/inspect.ex
++++ b/lib/ecto/query/inspect.ex
+@@ -165,8 +165,7 @@ defimpl Inspect, for: Ecto.Query do
+     "values (#{Enum.join(fields, ", ")})"
+   end
+ 
+-  defp inspect_source(%{source: {source, schema}} = part, names) do
+-    source = if is_binary(source), do: source, else: "#{expr(source, names, part)}"
++  defp inspect_source(%{source: {source, schema}}, _names) do
+     inspect(if source == schema.__schema__(:source), do: schema, else: {source, schema})
+   end
+ 
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index c002daa6..2b7b2ff5 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -323,18 +323,10 @@ defmodule Ecto.Query.Planner do
+        when kind in [:fragment, :values],
+        do: {expr, source}
+ 
+-  defp plan_source(_query, %{source: {{:fragment, _, _} = source, schema}, prefix: nil} = expr, _adapter, _cte_names)
+-       when is_atom(schema) do
+-    {expr, {source, schema, nil}}
+-  end
+-
+   defp plan_source(query, %{source: {kind, _, _}, prefix: prefix} = expr, _adapter, _cte_names)
+        when kind in [:fragment, :values],
+        do: error!(query, expr, "cannot set prefix: #{inspect(prefix)} option for #{kind} sources")
+ 
+-  defp plan_source(query, %{source: {{:fragment, _, _}, _schema}, prefix: prefix} = expr, _adapter, _cte_names),
+-       do: error!(query, expr, "cannot set prefix: #{inspect(prefix)} option for fragment sources")
+-
+   defp plan_subquery(subquery, query, prefix, adapter, source?, cte_names) do
+     %{query: inner_query} = subquery
+ 
+diff --git a/test/ecto/query/inspect_test.exs b/test/ecto/query/inspect_test.exs
+index 08659e00..f85c2c38 100644
+--- a/test/ecto/query/inspect_test.exs
++++ b/test/ecto/query/inspect_test.exs
+@@ -81,9 +81,6 @@ defmodule Ecto.Query.InspectTest do
+ 
+     assert i(from(subquery(Post), [])) ==
+              ~s{from p0 in subquery(from p0 in Inspect.Post)}
+-
+-    assert i(from(x in {fragment("select generate_series(?::integer, ?::integer) as num", ^0, ^2), Inspect.Comment}, [])) ==
+-             ~s[from c0 in {"fragment(\\"select generate_series(?::integer, ?::integer) as num\\", ^0, ^2)", Inspect.Comment}]
+   end
+ 
+   test "CTE" do
+diff --git a/test/ecto/query/planner_test.exs b/test/ecto/query/planner_test.exs
+index ba6c773a..790db850 100644
+--- a/test/ecto/query/planner_test.exs
++++ b/test/ecto/query/planner_test.exs
+@@ -143,15 +143,6 @@ defmodule Ecto.Query.PlannerTest do
+     end
+   end
+ 
+-  defmodule Barebone do
+-    use Ecto.Schema
+-
+-    @primary_key false
+-    schema "barebone" do
+-      field :num, :integer
+-    end
+-  end
+-
+   defp plan(query, operation \\ :all) do
+     {query, params, key} = Planner.plan(query, operation, Ecto.TestAdapter)
+     {cast_params, dump_params} = Enum.unzip(params)
+@@ -948,16 +939,6 @@ defmodule Ecto.Query.PlannerTest do
+              ]
+   end
+ 
+-  test "plan: tuple source with fragment" do
+-    {query, cast_params, dump_params, cache_key} =
+-      plan(from {fragment("? as num", ^0), Barebone})
+-
+-    assert {{{:fragment, [], _}, Barebone, nil}} = query.sources
+-    assert cast_params == [0]
+-    assert dump_params == [0]
+-    assert [:all, {:from, {{:fragment, _, _}, Barebone, _, _}, []}] = cache_key
+-  end
+-
+   describe "plan: CTEs" do
+     test "with uncacheable queries are uncacheable" do
+       {_, _, _, cache} =
+@@ -2591,16 +2572,6 @@ defmodule Ecto.Query.PlannerTest do
+     end
+   end
+ 
+-  test "normalize: tuple source with fragment" do
+-    {query, _, _, select} =
+-      normalize_with_params(from {fragment("? as num", ^0), Barebone})
+-
+-    %{from: {_, {:source, {{:fragment, _, _}, Barebone}, nil, types}}} = select
+-    assert types == [num: :integer]
+-    assert {{:fragment, _, _}, Barebone} = query.from.source
+-    assert query.select.fields == [{{:., [writable: :always], [{:&, [], [0]}, :num]}, [], []}]
+-  end
+-
+   describe "normalize: subqueries in boolean expressions" do
+     test "replaces {:subquery, index} with an Ecto.SubQuery struct" do
+       subquery = from(p in Post, select: p.visits)

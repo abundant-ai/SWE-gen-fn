@@ -1,0 +1,160 @@
+diff --git a/integration_test/cases/repo.exs b/integration_test/cases/repo.exs
+index 5b3e3936..9a1bdc0d 100644
+--- a/integration_test/cases/repo.exs
++++ b/integration_test/cases/repo.exs
+@@ -89,6 +89,15 @@ defmodule Ecto.Integration.RepoTest do
+     assert catch_error(TestRepo.all("posts", prefix: "oops"))
+   end
+ 
++  test "all_by" do
++    post1 = TestRepo.insert!(%Post{title: "a"})
++    post2 = TestRepo.insert!(%Post{title: "a"})
++    post3 = TestRepo.insert!(%Post{title: "b"})
++
++    assert TestRepo.all_by(Post, title: "a") |> Enum.sort() == [post1, post2]
++    assert TestRepo.all_by(Post, title: "b") |> Enum.sort() == [post3]
++  end
++
+   test "insert, update and delete" do
+     post = %Post{title: "insert, update, delete", visits: 1}
+     meta = post.__meta__
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index 20ed4fe2..98407403 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -504,7 +504,7 @@ defmodule Ecto.Query.API do
+   The example above will inject the value of `limit` directly
+   into the query instead of treating it as a query parameter. It will
+   generate a query such as `SELECT p0.title FROM "posts" AS p0 LIMIT 1`
+-  as opposed to `SELECT p0.title FROM "posts" AS p0` LIMIT $1`.
++  as opposed to `SELECT p0.title FROM "posts" AS p0 LIMIT $1`.
+ 
+   Note that each different value of `limit` will emit a different query,
+   which will be independently prepared and cached.
+diff --git a/lib/ecto/repo.ex b/lib/ecto/repo.ex
+index 2a1d2017..54c3588a 100644
+--- a/lib/ecto/repo.ex
++++ b/lib/ecto/repo.ex
+@@ -440,6 +440,17 @@ defmodule Ecto.Repo do
+           )
+         end
+ 
++        def all_by(queryable, clauses, opts \\ []) do
++          repo = get_dynamic_repo()
++
++          Ecto.Repo.Queryable.all_by(
++            repo,
++            queryable,
++            clauses,
++            Ecto.Repo.Supervisor.tuplet(repo, prepare_opts(:all, opts))
++          )
++        end
++
+         def stream(queryable, opts \\ []) do
+           repo = get_dynamic_repo()
+ 
+@@ -824,6 +835,8 @@ defmodule Ecto.Repo do
+   Returns `nil` if no result was found. If the struct in the queryable
+   has no or more than one primary key, it will raise an argument error.
+ 
++  See also `c:get!/3`, `c:one/2`, and `c:all_by/3`.
++
+   ## Options
+ 
+     * `:prefix` - The prefix to run the query on (such as the schema path
+@@ -878,6 +891,8 @@ defmodule Ecto.Repo do
+ 
+   Returns `nil` if no result was found. Raises if more than one entry.
+ 
++  See also `c:get/3`, `c:one/2`, and `c:all_by/3`.
++
+   ## Options
+ 
+     * `:prefix` - The prefix to run the query on (such as the schema path
+@@ -1091,6 +1106,8 @@ defmodule Ecto.Repo do
+ 
+   Returns `nil` if no result was found. Raises if more than one entry.
+ 
++  See also `c:one!/2`, `c:get/3`, and `c:all/2`.
++
+   ## Options
+ 
+     * `:prefix` - The prefix to run the query on (such as the schema path
+@@ -1280,6 +1297,8 @@ defmodule Ecto.Repo do
+ 
+   May raise `Ecto.QueryError` if query validation fails.
+ 
++  See also `c:all_by/3`, `c:one/2`, and `c:get/3`.
++
+   ## Options
+ 
+     * `:prefix` - The prefix to run the query on (such as the schema path
+@@ -1296,12 +1315,47 @@ defmodule Ecto.Repo do
+ 
+       # Fetch all post titles
+       query = from p in Post,
+-           select: p.title
++                select: p.title
+       MyRepo.all(query)
+   """
+   @doc group: "Query API"
+   @callback all(queryable :: Ecto.Queryable.t(), opts :: Keyword.t()) :: [Ecto.Schema.t() | term]
+ 
++  @doc """
++  Fetches all entries from the data store matching the given query and conditions.
++
++  May raise `Ecto.QueryError` if query validation fails.
++
++  This function is a shortcut for `c:all/2` when adjusting the given query with simple conditions.
++
++  See also `c:all/2` and `c:get_by/3`.
++
++  ## Options
++
++    * `:prefix` - The prefix to run the query on (such as the schema path
++      in Postgres or the database in MySQL). This will be applied to all `from`
++      and `join`s in the query that did not have a prefix previously given
++      either via the `:prefix` option on `join`/`from` or via `@schema_prefix`
++      in the schema. For more information see the ["Query Prefix"](`m:Ecto.Query#module-query-prefix`) section of the
++      `Ecto.Query` documentation.
++
++  See the ["Shared options"](#module-shared-options) section at the module
++  documentation for more options.
++
++  ## Example
++
++      MyRepo.all_by(Post, author_id: 1)
++
++      query = from p in Post
++      MyRepo.all_by(query, author_id: 1)
++  """
++  @doc group: "Query API"
++  @callback all_by(
++              queryable :: Ecto.Queryable.t(),
++              clauses :: Keyword.t() | map,
++              opts :: Keyword.t()
++            ) :: [Ecto.Schema.t() | term]
++
+   @doc """
+   Returns a lazy enumerable that emits all entries from the data store
+   matching the given query.
+diff --git a/lib/ecto/repo/queryable.ex b/lib/ecto/repo/queryable.ex
+index f3caf32d..8e4ced5c 100644
+--- a/lib/ecto/repo/queryable.ex
++++ b/lib/ecto/repo/queryable.ex
+@@ -19,6 +19,15 @@ defmodule Ecto.Repo.Queryable do
+     execute(:all, name, query, tuplet) |> elem(1)
+   end
+ 
++  def all_by(name, queryable, clauses, tuplet) do
++    query =
++      queryable
++      |> Ecto.Query.where([], ^Enum.to_list(clauses))
++      |> Ecto.Query.Planner.ensure_select(true)
++
++    execute(:all, name, query, tuplet) |> elem(1)
++  end
++
+   def stream(_name, queryable, {adapter_meta, opts}) do
+     %{adapter: adapter, cache: cache, repo: repo} = adapter_meta
+ 

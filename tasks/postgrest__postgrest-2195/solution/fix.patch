@@ -1,0 +1,425 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b9b2d217..e3c71e57 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + #1689, Add the ability to run without `db-anon-role` disabling anonymous access. - @wolfgangwalther
+  - #1543, Allow access to fields of composite types in select=, order= and filters through JSON operators -> and ->>. - @wolfgangwalther
+  - #2075, Allow access to array items in ?select=, ?order= and filters through JSON operators -> and ->>. - @wolfgangwalther
++ - #2156, Allow applying `limit/offset` to UPDATE/DELETE to only affect a subset of rows - @steve-chavez
++   + Uses the table primary key, so it needs a select privilege on the primary key columns
++   + If no primary key is available, it will fallback to using the "ctid" system column(will also require a select privilege on it)
++   + Doesn't work on views and it will throw an error if tried
+ 
+ ### Fixed
+ 
+@@ -37,11 +41,17 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2153, Fix --dump-schema running with a wrong PG version. - @wolfgangwalther
+  - #2042, Keep working when EMFILE(Too many open files) is reached. - @steve-chavez
+  - #2147, Ignore `Content-Type` headers for `GET` requests when calling RPCs. Previously, `GET` without parameters, but with `Content-Type: text/plain` or `Content-Type: application/octet-stream` would fail with `404 Not Found`, even if a function without arguments was available.
++ - #2155, Ignore `max-rows` on POST, PATCH, PUT and DELETE - @steve-chavez
+ 
+ ### Changed
+ 
+  - #2001, Return 204 No Content without Content-Type for RPCs returning VOID - @wolfgangwalther
+    + Previously, those RPCs would return "null" as a body with Content-Type: application/json.
++ - #2156, `limit/offset` now limits the affected rows on UPDATE/DELETE  - @steve-chavez
++   + Previously, `limit/offset` only limited the returned rows but not the actual updated rows
++ - #2156, using PATCH/DELETE with `limit/offset` throws an error on views - @steve-chavez
++ - #2155, `max-rows` is no longer applied on POST/PATCH/PUT/DELETE returned rows - @steve-chavez
++   + This was misleading because the affected rows were not really affected by `max-rows`, only the returned rows were limited
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+@@ -62,7 +72,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2031, Improve error message for ambiguous embedding and add a relevant hint that includes unambiguous embedding suggestions - @laurenceisla
+  - #1917, Add error codes with the `"PGRST"` prefix to the error response body to differentiate PostgREST errors from PostgreSQL errors - @laurenceisla
+  - #1917, Normalize the error response body by always having the `detail` and `hint` error fields with a `null` value if they are empty - @laurenceisla
+- - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla 
++ - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 2fc905e4..72e1bab4 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -63,6 +63,7 @@ import PostgREST.Config                  (AppConfig (..),
+ import PostgREST.Config.PgVersion        (PgVersion (..))
+ import PostgREST.ContentType             (ContentType (..))
+ import PostgREST.DbStructure             (DbStructure (..),
++                                          findIfView, findTable,
+                                           tablePKCols)
+ import PostgREST.DbStructure.Identifiers (FieldName,
+                                           QualifiedIdentifier (..),
+@@ -345,7 +346,10 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+       response HTTP.status201 headers mempty
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
++handleUpdate identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
++    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
++
+   WriteQueryResult{..} <- writeQuery MutationUpdate identifier False mempty context
+ 
+   let
+@@ -391,7 +395,10 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+       response HTTP.status204 [] mempty
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
++handleDelete identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++  when (iTopLevelRange /= RangeQuery.allRange && findIfView identifier (dbTables ctxDbStructure)) $
++    throwError $ Error.NotImplemented "limit/offset is not implemented for views"
++
+   WriteQueryResult{..} <- writeQuery MutationDelete identifier False mempty context
+ 
+   let
+@@ -410,7 +417,7 @@ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+ 
+ handleInfo :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m Wai.Response
+ handleInfo identifier RequestContext{..} =
+-  case find tableMatches $ dbTables ctxDbStructure of
++  case findTable (qiSchema identifier) (qiName identifier) $ dbTables ctxDbStructure of
+     Just table ->
+       return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
+     Nothing ->
+@@ -426,9 +433,6 @@ handleInfo identifier RequestContext{..} =
+           ++ ["PATCH" | tableUpdatable table]
+           ++ ["DELETE" | tableDeletable table]
+       )
+-    tableMatches table =
+-      tableName table == qiName identifier
+-      && tableSchema table == qiSchema identifier
+     hasPK =
+       not $ null $ tablePKCols ctxDbStructure (qiSchema identifier) (qiName identifier)
+ 
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 24754d8f..7bbc92b6 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -23,6 +23,8 @@ module PostgREST.DbStructure
+   , queryDbStructure
+   , accessibleTables
+   , accessibleProcs
++  , findIfView
++  , findTable
+   , schemaDescription
+   , tableCols
+   , tablePKCols
+@@ -76,7 +78,13 @@ tableCols dbs tSchema tName = filter (\Column{colTable=Table{tableSchema=s, tabl
+ 
+ -- TODO Table could hold references to all its PrimaryKeys
+ tablePKCols :: DbStructure -> Schema -> TableName -> [Text]
+-tablePKCols dbs tSchema tName =  pkName <$> filter (\pk -> tSchema == (tableSchema . pkTable) pk && tName == (tableName . pkTable) pk) (dbPrimaryKeys dbs)
++tablePKCols dbs tSchema tName = pkName <$> filter (\pk -> tSchema == (tableSchema . pkTable) pk && tName == (tableName . pkTable) pk) (dbPrimaryKeys dbs)
++
++findTable :: Schema -> TableName -> [Table] -> Maybe Table
++findTable tSchema tName = find (\tbl -> tableSchema tbl == tSchema && tableName tbl == tName)
++
++findIfView :: QualifiedIdentifier -> [Table] -> Bool
++findIfView identifier tbls = maybe False tableIsView (findTable (qiSchema identifier) (qiName identifier) tbls)
+ 
+ -- | The source table column a view column refers to
+ type SourceColumn = (Column, ViewColumn)
+@@ -134,6 +142,7 @@ decodeTables =
+                  <*> column HD.bool
+                  <*> column HD.bool
+                  <*> column HD.bool
++                 <*> column HD.bool
+ 
+ decodeColumns :: [Table] -> HD.Result [Column]
+ decodeColumns tables =
+@@ -333,6 +342,7 @@ accessibleTables pgVer =
+       n.nspname as table_schema,
+       relname as table_name,
+       d.description as table_description,
++      c.relkind IN ('v','m') as is_view,
+       (
+         c.relkind IN ('r','p')
+         OR (
+@@ -468,6 +478,7 @@ allTables pgVer =
+       n.nspname AS table_schema,
+       c.relname AS table_name,
+       d.description AS table_description,
++      c.relkind IN ('v','m') as is_view,
+       (
+         c.relkind IN ('r','p')
+         OR (
+@@ -669,10 +680,9 @@ relFromRow :: [Table] -> [Column] -> (Text, Text, Text, [Text], Text, Text, [Tex
+ relFromRow allTabs allCols (rs, rt, cn, rcs, frs, frt, frcs) =
+   Relationship <$> table <*> cols <*> tableF <*> colsF <*> pure (M2O cn)
+   where
+-    findTable s t = find (\tbl -> tableSchema tbl == s && tableName tbl == t) allTabs
+     findCol s t c = find (\col -> tableSchema (colTable col) == s && tableName (colTable col) == t && colName col == c) allCols
+-    table  = findTable rs rt
+-    tableF = findTable frs frt
++    table  = findTable rs rt allTabs
++    tableF = findTable frs frt allTabs
+     cols  = mapM (findCol rs rt) rcs
+     colsF = mapM (findCol frs frt) frcs
+ 
+diff --git a/src/PostgREST/DbStructure/Table.hs b/src/PostgREST/DbStructure/Table.hs
+index 2dab546d..fa6c77c1 100644
+--- a/src/PostgREST/DbStructure/Table.hs
++++ b/src/PostgREST/DbStructure/Table.hs
+@@ -20,6 +20,8 @@ data Table = Table
+   { tableSchema      :: Schema
+   , tableName        :: TableName
+   , tableDescription :: Maybe Text
++    -- TODO Find a better way to separate tables and views
++  , tableIsView      :: Bool
+     -- The following fields identify what can be done on the table/view, they're not related to the privileges granted to it
+   , tableInsertable  :: Bool
+   , tableUpdatable   :: Bool
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 60880c1e..8c5a5632 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -314,6 +314,7 @@ data Error
+   | JwtTokenInvalid Text
+   | JwtTokenMissing
+   | JwtTokenRequired
++  | NotImplemented Text
+   | NoSchemaCacheError
+   | NotFound
+   | PgErr PgError
+@@ -335,6 +336,7 @@ instance PgrstError Error where
+   status (PgErr err)             = status err
+   status PutMatchingPkError      = HTTP.status400
+   status PutRangeNotAllowedError = HTTP.status400
++  status (NotImplemented _)      = HTTP.status501
+   status SingularityError{}      = HTTP.status406
+   status UnsupportedVerb{}       = HTTP.status405
+ 
+@@ -407,6 +409,12 @@ instance JSON.ToJSON Error where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
++  toJSON (NotImplemented msg) = JSON.object [
++    "code"    .= GeneralErrorCode07,
++    "message" .= msg,
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
+   toJSON NotFound = JSON.object []
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+@@ -460,6 +468,7 @@ data ErrorCode
+   | GeneralErrorCode04
+   | GeneralErrorCode05
+   | GeneralErrorCode06
++  | GeneralErrorCode07
+ 
+ instance JSON.ToJSON ErrorCode where
+   toJSON e = JSON.toJSON (buildErrorCode e)
+@@ -504,3 +513,4 @@ buildErrorCode code = "PGRST" <> case code of
+   GeneralErrorCode04     -> "504"
+   GeneralErrorCode05     -> "505"
+   GeneralErrorCode06     -> "506"
++  GeneralErrorCode07     -> "507"
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 133e149c..2f1d2668 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -29,6 +29,7 @@ import PostgREST.DbStructure.Table        (Table (..))
+ import PostgREST.Request.Preferences      (PreferResolution (..))
+ 
+ import PostgREST.Query.SqlFragment
++import PostgREST.RangeQuery        (allRange)
+ import PostgREST.Request.Types
+ 
+ import Protolude
+@@ -105,28 +106,63 @@ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returning
+     ])
+   where
+     cols = BS.intercalate ", " $ pgFmtIdent <$> S.toList iCols
+-mutateRequestToQuery (Update mainQi uCols body logicForest returnings) =
+-  if S.null uCols
++
++mutateRequestToQuery (Update mainQi uCols body logicForest (range, rangeId) returnings)
++  | S.null uCols =
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+     -- the select has to be based on "returnings" to make computed overloaded functions not throw
+-    then SQL.sql ("SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false")
+-    else
+-      "WITH " <> normalizedBody body <> " " <>
+-      "UPDATE " <> SQL.sql (fromQi mainQi) <> " SET " <> SQL.sql cols <> " " <>
+-      "FROM (SELECT * FROM json_populate_recordset (null::" <> SQL.sql (fromQi mainQi) <> " , " <> SQL.sql selectBody <> " )) _ " <>
+-      (if null logicForest then mempty else "WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)) <> " " <>
+-      SQL.sql (returningF mainQi returnings)
++    SQL.sql $ "SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false"
++
++  | range == allRange =
++    "WITH " <> normalizedBody body <> " " <>
++    "UPDATE " <> mainTbl <> " SET " <> SQL.sql nonRangeCols <> " " <>
++    "FROM (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " )) _ " <>
++    whereLogic <> " " <>
++    SQL.sql (returningF mainQi returnings)
++
++  | otherwise =
++    "WITH " <> normalizedBody body <> ", " <>
++    "pgrst_update_body AS (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " ) LIMIT 1), " <>
++    "pgrst_affected_rows AS (" <>
++      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
++       whereLogic <> " " <>
++      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
++    ") " <>
++    "UPDATE " <> mainTbl <> " SET " <> SQL.sql rangeCols <>
++    "FROM pgrst_affected_rows " <>
++    "WHERE " <> SQL.sql whereRangeIdF <> " " <>
++    SQL.sql (returningF mainQi returnings)
++
++  where
++    whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
++    mainTbl = SQL.sql (fromQi mainQi)
++    emptyBodyReturnedColumns = if null returnings then "NULL" else BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
++    nonRangeCols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
++    rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent col <> " = (SELECT " <> pgFmtIdent col <> " FROM pgrst_update_body) ") <$> S.toList uCols)
++    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
++
++mutateRequestToQuery (Delete mainQi logicForest (range, rangeId) returnings)
++  | range == allRange =
++    "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
++    whereLogic <> " " <>
++    SQL.sql (returningF mainQi returnings)
++
++  | otherwise =
++    "WITH " <>
++    "pgrst_affected_rows AS (" <>
++      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> SQL.sql (fromQi mainQi) <>
++       whereLogic <> " " <>
++      "ORDER BY " <> SQL.sql rangeIdF <> " " <> limitOffsetF range <>
++    ") " <>
++    "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
++    "USING pgrst_affected_rows " <>
++    "WHERE " <> SQL.sql whereRangeIdF <> " " <>
++    SQL.sql (returningF mainQi returnings)
++
+   where
+-    cols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
+-    emptyBodyReturnedColumns :: SqlFragment
+-    emptyBodyReturnedColumns
+-      | null returnings = "NULL"
+-      | otherwise       = BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+-mutateRequestToQuery (Delete mainQi logicForest returnings) =
+-  "DELETE FROM " <> SQL.sql (fromQi mainQi) <> " " <>
+-  (if null logicForest then mempty else "WHERE " <> intercalateSnippet " AND " (map (pgFmtLogicTree mainQi) logicForest)) <> " " <>
+-  SQL.sql (returningF mainQi returnings)
++    whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
++    (whereRangeIdF, rangeIdF) = mutRangeF mainQi rangeId
+ 
+ requestToCallProcQuery :: CallRequest -> SQL.Snippet
+ requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall returnings) =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 32eda78b..0c275f9f 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -17,6 +17,7 @@ module PostgREST.Query.SqlFragment
+   , fromQi
+   , limitOffsetF
+   , locationF
++  , mutRangeF
+   , normalizedBody
+   , pgFmtColumn
+   , pgFmtIdent
+@@ -334,3 +335,12 @@ unknownLiteral = unknownEncoder . encodeUtf8
+ intercalateSnippet :: ByteString -> [SQL.Snippet] -> SQL.Snippet
+ intercalateSnippet _ [] = mempty
+ intercalateSnippet frag snippets = foldr1 (\a b -> a <> SQL.sql frag <> b) snippets
++
++-- the "ctid" system column is always available to tables
++mutRangeF :: QualifiedIdentifier -> [FieldName] -> (SqlFragment, SqlFragment)
++mutRangeF mainQi rangeId = (
++    BS.intercalate " AND " $
++          (\col -> pgFmtColumn mainQi col <> " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_affected_rows") col) <$>
++          (if null rangeId then ["ctid"] else rangeId)
++  , if null rangeId then pgFmtColumn mainQi "ctid" else BS.intercalate ", " (pgFmtColumn mainQi <$> rangeId)
++  )
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 609192df..3c8da764 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -151,7 +151,7 @@ targetToJsonRpcParams target params =
+ -}
+ data ApiRequest = ApiRequest {
+     iAction               :: Action                           -- ^ Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
+-  , iRange                :: M.HashMap Text NonnegRange -- ^ Requested range of rows within response
++  , iRange                :: M.HashMap Text NonnegRange       -- ^ Requested range of rows within response
+   , iTopLevelRange        :: NonnegRange                      -- ^ Requested range of rows from the top level
+   , iTarget               :: Target                           -- ^ The target, be it calling a proc or accessing a table
+   , iPayload              :: Maybe Payload                    -- ^ Data sent by client and used for mutation actions
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index f9df1b84..44de9e99 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -63,7 +63,7 @@ import Protolude hiding (from)
+ readRequest :: Schema -> TableName -> Maybe Integer -> [Relationship] -> ApiRequest -> Either Error ReadRequest
+ readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+-  treeRestrictRange maxRows =<<
++  treeRestrictRange maxRows (iAction apiRequest) =<<
+   augmentRequestWithJoin schema rootRels =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+@@ -115,8 +115,9 @@ initReadRequest rootQi =
+               fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+-treeRestrictRange :: Maybe Integer -> ReadRequest -> Either ApiRequestError ReadRequest
+-treeRestrictRange maxRows request = pure $ nodeRestrictRange maxRows <$> request
++treeRestrictRange :: Maybe Integer -> Action -> ReadRequest -> Either ApiRequestError ReadRequest
++treeRestrictRange _ (ActionMutate _) request = Right request
++treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> request
+   where
+     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
+     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+@@ -283,7 +284,9 @@ addOrders ApiRequest{..} rReq =
+ 
+ addRanges :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addRanges ApiRequest{..} rReq =
+-  foldr addRangeToNode (Right rReq) =<< ranges
++  case iAction of
++    ActionMutate _ -> Right rReq
++    _              -> foldr addRangeToNode (Right rReq) =<< ranges
+   where
+     ranges :: Either ApiRequestError [(EmbedPath, NonnegRange)]
+     ranges = first QueryParamError $ QueryParams.pRequestRange `traverse` M.toList iRange
+@@ -319,7 +322,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+   case mutation of
+     MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+-    MutationUpdate -> Right $ Update qi iColumns body combinedLogic returnings
++    MutationUpdate -> Right $ Update qi iColumns body combinedLogic (iTopLevelRange, pkCols) returnings
+     MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+@@ -330,7 +333,7 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+           then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
+         else
+           Left InvalidFilters
+-    MutationDelete -> Right $ Delete qi combinedLogic returnings
++    MutationDelete -> Right $ Delete qi combinedLogic (iTopLevelRange, pkCols) returnings
+   where
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index a4241711..4506aab8 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -135,11 +135,13 @@ data MutateQuery
+       , updCols   :: S.Set FieldName
+       , updBody   :: Maybe LBS.ByteString
+       , where_    :: [LogicTree]
++      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+   | Delete
+       { in_       :: QualifiedIdentifier
+       , where_    :: [LogicTree]
++      , mutRange  :: (NonnegRange, [FieldName])
+       , returning :: [FieldName]
+       }
+ 

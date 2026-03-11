@@ -1,0 +1,11 @@
+When building an escript or archive, Mix currently propagates the parent project configuration into the build process for the generated artifact. This can cause the build to run with unexpected compile-time configuration and compilation settings inherited from whatever Mix project is invoking the build/install.
+
+A concrete failure case happens when installing an escript from a Git repository using `mix escript.install git ...` while parallel compilation is enabled via `MIX_OS_DEPS_COMPILE_PARTITION_COUNT` (for example `MIX_OS_DEPS_COMPILE_PARTITION_COUNT=4`). In this scenario, the escript installation can fail during compilation, while the same install succeeds with `MIX_OS_DEPS_COMPILE_PARTITION_COUNT=1`. The build should not depend on, nor be destabilized by, compilation settings/config coming from the parent project.
+
+The escript/archive build process must run in an isolated configuration context so that:
+
+- Application environment read at runtime from the generated escript (for example `Application.get_env(:foobar, :value, "TEST")`) reflects only the escript project’s configuration defaults (or its own config files when explicitly included), not values from the parent Mix project.
+- Compile-time configuration read via `Application.compile_env/3` inside the escript’s modules (for example a module attribute like `@parent Application.compile_env(:foobar, :parent, "NIL")`) must not pick up values from the parent project’s configuration. If the escript project does not define `:foobar, :parent`, the compile-time value must remain the fallback (for example "NIL").
+- Installing/building escripts should succeed under parallel compilation (e.g., `MIX_OS_DEPS_COMPILE_PARTITION_COUNT=4`) in the same way it succeeds with `MIX_OS_DEPS_COMPILE_PARTITION_COUNT=1`, assuming the escript project itself is compatible.
+
+In short: building archives/escripts must not propagate the parent project config into the child build, and escript installation should work reliably with parallel compilation enabled.

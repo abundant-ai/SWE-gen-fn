@@ -1,0 +1,494 @@
+diff --git a/lib/elixir/lib/module/types/apply.ex b/lib/elixir/lib/module/types/apply.ex
+index e5a853e04..61e851144 100644
+--- a/lib/elixir/lib/module/types/apply.ex
++++ b/lib/elixir/lib/module/types/apply.ex
+@@ -477,7 +477,6 @@ defp do_remote(mod, fun, args, expected, expr, stack, context, _of_fun) do
+     remote_domain(mod, fun, args, expected, elem(expr, 1), stack, context)
+   end
+ 
+-  @number union(integer(), float())
+   @empty_list empty_list()
+   @non_empty_list non_empty_list(term())
+   @empty_map empty_map()
+@@ -523,65 +522,21 @@ defp custom_compare(
+ 
+         {actual, context} = of_fun.(arg, expected, expr, stack, context)
+         result = if compatible?(actual, expected), do: return, else: boolean()
+-
+-        # We can skip return compare because literal is always an integer,
+-        # so it cannot be a disjoint comparison
+         {result, context}
+     end
+   end
+ 
+-  defp custom_compare(name, arg, literal, expected, expr, stack, context, of_fun) do
+-    case booleaness(expected) do
+-      booleaness when booleaness in [:maybe_both, :none] ->
+-        compare(name, arg, literal, false, expr, stack, context, of_fun)
+-
+-      booleaness ->
+-        {literal_type, context} = of_fun.(literal, term(), expr, stack, context)
+-
+-        {polarity, return} =
+-          case booleaness do
+-            :maybe_true -> {name in [:==, :"=:="], @atom_true}
+-            :maybe_false -> {name in [:"/=", :"=/="], @atom_false}
+-          end
+-
+-        # If it is a singleton, we can always be precise
+-        if singleton?(literal_type) do
+-          expected = if polarity, do: literal_type, else: negation(literal_type)
+-          {arg_type, context} = of_fun.(arg, expected, expr, stack, context)
+-          result = if compatible?(arg_type, expected), do: return, else: boolean()
+-
+-          # Because reverse polarity means we will infer negated types
+-          # (which are naturally disjoint), we skip checks in such cases
+-          skip_check? = not polarity
+-          return_compare(name, arg_type, literal_type, result, skip_check?, expr, stack, context)
+-        else
+-          expected =
+-            cond do
+-              # We are checking for `not x == 1` or similar, we can't say anything about x
+-              polarity == false -> term()
+-              # We are checking for `x == 1`, make sure x is integer or float
+-              number_type?(literal_type) and name in [:==, :"/="] -> union(literal_type, @number)
+-              # Otherwise we have the literal type as is
+-              true -> literal_type
+-            end
+-
+-          {arg_type, context} = of_fun.(arg, expected, expr, stack, context)
+-          return_compare(name, arg_type, literal_type, boolean(), false, expr, stack, context)
+-        end
+-    end
++  defp custom_compare(name, left, right, _expected, expr, stack, context, of_fun) do
++    compare(name, left, right, false, expr, stack, context, of_fun)
+   end
+ 
+-  defp compare(name, left, right, both_literal?, expr, stack, context, of_fun) do
++  defp compare(name, left, right, literal?, expr, stack, context, of_fun) do
+     {left_type, context} = of_fun.(left, term(), expr, stack, context)
+     {right_type, context} = of_fun.(right, term(), expr, stack, context)
+-    return_compare(name, left_type, right_type, boolean(), both_literal?, expr, stack, context)
+-  end
+-
+-  defp return_compare(name, left_type, right_type, result, skip_check?, expr, stack, context) do
+-    result = return(result, [left_type, right_type], stack)
++    result = return(boolean(), [left_type, right_type], stack)
+ 
+     cond do
+-      skip_check? or not is_warning(stack) ->
++      literal? or not is_warning(stack) ->
+         {result, context}
+ 
+       name in [:==, :"/="] and number_type?(left_type) and number_type?(right_type) ->
+diff --git a/lib/elixir/lib/module/types/descr.ex b/lib/elixir/lib/module/types/descr.ex
+index 34a16d58d..a594fd515 100644
+--- a/lib/elixir/lib/module/types/descr.ex
++++ b/lib/elixir/lib/module/types/descr.ex
+@@ -270,7 +270,7 @@ def domain_to_args(descr) do
+   end
+ 
+   defp unwrap_domain_tuple(%{tuple: bdd} = descr, transform) when map_size(descr) == 1 do
+-    tuple_bdd_to_dnf(bdd) |> Enum.map(transform)
++    tuple_normalize(bdd) |> Enum.map(transform)
+   end
+ 
+   defp unwrap_domain_tuple(descr, _transform) when descr == %{}, do: []
+@@ -604,56 +604,6 @@ defp empty_key?(:list, value), do: list_empty?(value)
+   defp empty_key?(:tuple, value), do: tuple_empty?(value)
+   defp empty_key?(_, _value), do: false
+ 
+-  @doc """
+-  Returns if the type is a singleton.
+-  """
+-  def singleton?(:term), do: false
+-  def singleton?(descr), do: static_singleton?(Map.get(descr, :dynamic, descr))
+-
+-  defp static_singleton?(:term), do: false
+-  defp static_singleton?(%{optional: _}), do: false
+-  defp static_singleton?(%{list: _}), do: false
+-  defp static_singleton?(%{fun: _}), do: false
+-  defp static_singleton?(descr), do: each_singleton?(descr, [:atom, :bitmap, :map, :tuple], false)
+-
+-  defp each_singleton?(descr, [key | keys], acc) do
+-    case descr do
+-      %{^key => value} ->
+-        case each_singleton?(key, value) do
+-          true when acc == true -> false
+-          true -> each_singleton?(descr, keys, true)
+-          false -> false
+-          :empty -> each_singleton?(descr, keys, acc)
+-        end
+-
+-      %{} ->
+-        each_singleton?(descr, keys, acc)
+-    end
+-  end
+-
+-  defp each_singleton?(_descr, [], acc), do: acc
+-
+-  # Implement for each type
+-  defp each_singleton?(:bitmap, bitmap), do: bitmap == @bit_empty_list
+-
+-  defp each_singleton?(:atom, atoms), do: match?({:union, set} when map_size(set) == 1, atoms)
+-
+-  defp each_singleton?(:tuple, bdd) do
+-    case tuple_bdd_to_dnf(bdd) do
+-      [] -> :empty
+-      [{:closed, entries}] -> Enum.all?(entries, &static_singleton?/1)
+-      _ -> false
+-    end
+-  end
+-
+-  defp each_singleton?(:map, bdd) do
+-    case map_bdd_to_dnf(bdd) do
+-      [] -> :empty
+-      [{:closed, fields, _negs}] -> Enum.all?(fields, fn {_, v} -> static_singleton?(v) end)
+-      _ -> false
+-    end
+-  end
+-
+   @doc """
+   Converts a descr to its quoted representation.
+ 
+@@ -3900,6 +3850,15 @@ defp map_split_negative_domain(negs, domain_key) do
+     end)
+   end
+ 
++  # Use heuristics to normalize a map bdd for pretty printing.
++  defp map_normalize(bdd) do
++    map_bdd_to_dnf(bdd)
++    |> Enum.map(fn {tag, fields, negs} ->
++      map_eliminate_while_negs_decrease(tag, fields, negs)
++    end)
++    |> map_fusion()
++  end
++
+   # Continue to eliminate negations while length of list of negs decreases
+   defp map_eliminate_while_negs_decrease(tag, fields, []), do: {tag, fields, []}
+ 
+@@ -3991,12 +3950,7 @@ defp map_all_but_one(tag1, fields1, tag2, fields2) do
+   end
+ 
+   defp map_to_quoted(bdd, opts) do
+-    bdd
+-    |> map_bdd_to_dnf()
+-    |> Enum.map(fn {tag, fields, negs} ->
+-      map_eliminate_while_negs_decrease(tag, fields, negs)
+-    end)
+-    |> map_fusion()
++    map_normalize(bdd)
+     |> Enum.map(&map_each_to_quoted(&1, opts))
+   end
+ 
+@@ -4518,14 +4472,14 @@ defp tuple_union_next_strategy(_index, v1, v2, :right_subtype_of_left) do
+   end
+ 
+   defp tuple_to_quoted(bdd, opts) do
+-    tuple_bdd_to_dnf(bdd)
++    tuple_normalize(bdd)
+     |> tuple_fusion()
+     |> Enum.map(&tuple_literal_to_quoted(&1, opts))
+   end
+ 
+   # Transforms a bdd into a union of tuples with no negations.
+   # Note: it is important to compose the results with tuple_dnf_union/2 to avoid duplicates
+-  defp tuple_bdd_to_dnf(bdd) do
++  defp tuple_normalize(bdd) do
+     bdd_to_dnf(bdd)
+     |> Enum.reduce([], fn {positive_tuples, negative_tuples}, acc ->
+       case non_empty_tuple_literals_intersection(positive_tuples) do
+@@ -4685,7 +4639,7 @@ defp tuple_fetch_static(descr, index) when is_integer(index) do
+   end
+ 
+   defp tuple_get(bdd, index) do
+-    tuple_bdd_to_dnf(bdd)
++    tuple_normalize(bdd)
+     |> Enum.reduce(none(), fn
+       {tag, elements}, acc -> Enum.at(elements, index, tuple_tag_to_type(tag)) |> union(acc)
+     end)
+@@ -4716,7 +4670,7 @@ def tuple_values(descr) do
+   end
+ 
+   defp process_tuples_values(bdd) do
+-    tuple_bdd_to_dnf(bdd)
++    tuple_normalize(bdd)
+     |> Enum.reduce(none(), fn {tag, elements}, acc ->
+       cond do
+         Enum.any?(elements, &empty?/1) -> none()
+@@ -4854,7 +4808,7 @@ defp tuple_of_size_at_least(n) when is_integer(n) and n >= 0 do
+   defp tuple_of_size_at_least_static?(descr, index) do
+     case descr do
+       %{tuple: bdd} ->
+-        tuple_bdd_to_dnf(bdd)
++        tuple_normalize(bdd)
+         |> Enum.all?(fn {_, elements} -> length(elements) >= index end)
+ 
+       %{} ->
+diff --git a/lib/elixir/test/elixir/application_test.exs b/lib/elixir/test/elixir/application_test.exs
+index 16a6f393a..7c1b380e8 100644
+--- a/lib/elixir/test/elixir/application_test.exs
++++ b/lib/elixir/test/elixir/application_test.exs
+@@ -163,11 +163,9 @@ test "application specification" do
+     assert is_list(Application.spec(:elixir))
+     assert Application.spec(:unknown) == nil
+     assert Application.spec(:unknown, :description) == nil
+-    assert Application.spec(:elixir, :description) == ~c"elixir"
+ 
+-    assert_raise FunctionClauseError, fn ->
+-      Application.spec(:elixir, Process.get(:unknown, :unknown))
+-    end
++    assert Application.spec(:elixir, :description) == ~c"elixir"
++    assert_raise FunctionClauseError, fn -> Application.spec(:elixir, :unknown) end
+   end
+ 
+   test "application module" do
+diff --git a/lib/elixir/test/elixir/calendar/iso_test.exs b/lib/elixir/test/elixir/calendar/iso_test.exs
+index 91ccb4e76..8a77e9f57 100644
+--- a/lib/elixir/test/elixir/calendar/iso_test.exs
++++ b/lib/elixir/test/elixir/calendar/iso_test.exs
+@@ -142,6 +142,16 @@ test "allows enforcing extended formats" do
+       assert Calendar.ISO.parse_date("20150123", :extended) == {:error, :invalid_format}
+       assert Calendar.ISO.parse_date("2015-01-23", :extended) == {:ok, {2015, 1, 23}}
+     end
++
++    test "errors on other format names" do
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_date("20150123", :other)
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_date("2015-01-23", :other)
++      end
++    end
+   end
+ 
+   describe "parse_time/1" do
+@@ -215,6 +225,16 @@ test "allows enforcing extended formats" do
+       assert Calendar.ISO.parse_time("235007", :extended) == {:error, :invalid_format}
+       assert Calendar.ISO.parse_time("23:50:07", :extended) == {:ok, {23, 50, 7, {0, 0}}}
+     end
++
++    test "errors on other format names" do
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_time("235007", :other)
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_time("23:50:07", :other)
++      end
++    end
+   end
+ 
+   describe "parse_naive_datetime/1" do
+@@ -292,6 +312,16 @@ test "allows enforcing extended formats" do
+       assert Calendar.ISO.parse_naive_datetime("2015-01-23 23:50:07.123", :extended) ==
+                {:ok, {2015, 1, 23, 23, 50, 7, {123_000, 3}}}
+     end
++
++    test "errors on other format names" do
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_naive_datetime("20150123 235007.123", :other)
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_naive_datetime("2015-01-23 23:50:07.123", :other)
++      end
++    end
+   end
+ 
+   describe "parse_utc_datetime/1" do
+@@ -370,6 +400,16 @@ test "allows enforcing extended formats" do
+                {:ok, {2015, 1, 23, 23, 50, 7, {123_000, 3}}, 0}
+     end
+ 
++    test "errors on other format names" do
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_naive_datetime("20150123 235007.123Z", :other)
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        Calendar.ISO.parse_naive_datetime("2015-01-23 23:50:07.123Z", :other)
++      end
++    end
++
+     test "errors on mixed basic and extended formats" do
+       assert Calendar.ISO.parse_utc_datetime("20150123 23:50:07.123Z", :basic) ==
+                {:error, :invalid_format}
+diff --git a/lib/elixir/test/elixir/module/types/descr_test.exs b/lib/elixir/test/elixir/module/types/descr_test.exs
+index 92830159b..123622195 100644
+--- a/lib/elixir/test/elixir/module/types/descr_test.exs
++++ b/lib/elixir/test/elixir/module/types/descr_test.exs
+@@ -1222,57 +1222,6 @@ test "static and dynamic" do
+     end
+   end
+ 
+-  describe "singleton?" do
+-    test "non-singleton?" do
+-      refute singleton?(term())
+-      refute singleton?(none())
+-      refute singleton?(dynamic())
+-      refute singleton?(integer())
+-      refute singleton?(float())
+-      refute singleton?(pid())
+-      refute singleton?(reference())
+-      refute singleton?(fun(1))
+-      refute singleton?(non_empty_list(atom([:foo])))
+-    end
+-
+-    @disguised_empty_map closed_map(key: atom([:value]))
+-                         |> difference(open_map(key: atom(), optional: if_set(atom())))
+-
+-    test "atoms" do
+-      assert singleton?(atom([:foo]))
+-      refute singleton?(atom([:foo, :bar]))
+-      assert singleton?(atom([:foo]) |> union(@disguised_empty_map))
+-      refute singleton?(atom() |> difference(atom([:foo])))
+-    end
+-
+-    test "empty list" do
+-      assert singleton?(empty_list())
+-      refute singleton?(non_empty_list(term()))
+-      refute singleton?(union(empty_list(), atom([:foo])))
+-      assert singleton?(union(empty_list(), @disguised_empty_map))
+-    end
+-
+-    test "maps" do
+-      assert singleton?(empty_map())
+-      assert singleton?(closed_map(key: atom([:value])))
+-      assert singleton?(closed_map(key: atom([:value])) |> union(@disguised_empty_map))
+-      refute singleton?(closed_map(key: binary()))
+-      refute singleton?(closed_map(key: if_set(atom([:value]))))
+-      refute singleton?(open_map())
+-      refute singleton?(open_map(key: atom([:value])))
+-      refute singleton?(union(closed_map(key: atom([:value])), closed_map(other: atom([:value]))))
+-    end
+-
+-    test "tuples" do
+-      assert singleton?(tuple([]))
+-      assert singleton?(tuple([atom([:foo])]))
+-      refute singleton?(tuple([binary()]))
+-      refute singleton?(open_tuple([]))
+-      refute singleton?(union(tuple([atom([:value])]), tuple([atom([:other_value])])))
+-      refute singleton?(union(tuple([atom([:value])]), closed_map(other: atom([:value]))))
+-    end
+-  end
+-
+   describe "projections" do
+     test "booleaness" do
+       for type <- [none(), open_map(), negation(boolean()), difference(atom(), boolean())] do
+diff --git a/lib/elixir/test/elixir/module/types/pattern_test.exs b/lib/elixir/test/elixir/module/types/pattern_test.exs
+index c14f8302c..af4f3ccb5 100644
+--- a/lib/elixir/test/elixir/module/types/pattern_test.exs
++++ b/lib/elixir/test/elixir/module/types/pattern_test.exs
+@@ -818,110 +818,6 @@ test "errors in guards" do
+     end
+   end
+ 
+-  describe "equality in guards" do
+-    test "with non-singleton literals" do
+-      assert typecheck!([x], x == "foo", x) == dynamic(binary())
+-      assert typecheck!([x], x === "foo", x) == dynamic(binary())
+-      assert typecheck!([x], not (x == "foo"), x) == dynamic()
+-      assert typecheck!([x], not (x === "foo"), x) == dynamic()
+-
+-      assert typecheck!([x], x != "foo", x) == dynamic()
+-      assert typecheck!([x], x !== "foo", x) == dynamic()
+-      assert typecheck!([x], not (x != "foo"), x) == dynamic(binary())
+-      assert typecheck!([x], not (x !== "foo"), x) == dynamic(binary())
+-    end
+-
+-    test "with number literals" do
+-      assert typecheck!([x], x == 1, x) == dynamic(union(integer(), float()))
+-      assert typecheck!([x], x === 1, x) == dynamic(integer())
+-      assert typecheck!([x], not (x == 1), x) == dynamic()
+-      assert typecheck!([x], not (x === 1), x) == dynamic()
+-
+-      assert typecheck!([x], x != 1, x) == dynamic()
+-      assert typecheck!([x], x !== 1, x) == dynamic()
+-      assert typecheck!([x], not (x != 1), x) == dynamic(union(integer(), float()))
+-      assert typecheck!([x], not (x !== 1), x) == dynamic(integer())
+-
+-      assert typecheck!([x], x == 1.0, x) == dynamic(union(integer(), float()))
+-      assert typecheck!([x], x === 1.0, x) == dynamic(float())
+-      assert typecheck!([x], not (x == 1.0), x) == dynamic()
+-      assert typecheck!([x], not (x === 1.0), x) == dynamic()
+-
+-      assert typecheck!([x], x != 1.0, x) == dynamic()
+-      assert typecheck!([x], x !== 1.0, x) == dynamic()
+-      assert typecheck!([x], not (x != 1.0), x) == dynamic(union(integer(), float()))
+-      assert typecheck!([x], not (x !== 1.0), x) == dynamic(float())
+-    end
+-
+-    test "with singleton literals" do
+-      assert typecheck!([x], x == :foo, x) == dynamic(atom([:foo]))
+-      assert typecheck!([x], x === :foo, x) == dynamic(atom([:foo]))
+-      assert typecheck!([x], not (x == :foo), x) == dynamic(negation(atom([:foo])))
+-      assert typecheck!([x], not (x === :foo), x) == dynamic(negation(atom([:foo])))
+-
+-      assert typecheck!([x], x != :foo, x) == dynamic(negation(atom([:foo])))
+-      assert typecheck!([x], x !== :foo, x) == dynamic(negation(atom([:foo])))
+-      assert typecheck!([x], not (x != :foo), x) == dynamic(atom([:foo]))
+-      assert typecheck!([x], not (x !== :foo), x) == dynamic(atom([:foo]))
+-
+-      assert typecheck!([x], x == [], x) == dynamic(empty_list())
+-      assert typecheck!([x], x === [], x) == dynamic(empty_list())
+-      assert typecheck!([x], not (x == []), x) == dynamic(negation(empty_list()))
+-      assert typecheck!([x], not (x === []), x) == dynamic(negation(empty_list()))
+-
+-      assert typecheck!([x], x != [], x) == dynamic(negation(empty_list()))
+-      assert typecheck!([x], x !== [], x) == dynamic(negation(empty_list()))
+-      assert typecheck!([x], not (x != []), x) == dynamic(empty_list())
+-      assert typecheck!([x], not (x !== []), x) == dynamic(empty_list())
+-    end
+-
+-    test "warnings" do
+-      assert typeerror!([x = {}], x == 0, x) =~ ~l"""
+-             comparison between distinct types found:
+-
+-                 x == 0
+-
+-             given types:
+-
+-                 dynamic({}) == integer()
+-             """
+-
+-      assert typeerror!([x = {}], x != 0, x) =~ ~l"""
+-             comparison between distinct types found:
+-
+-                 x != 0
+-
+-             given types:
+-
+-                 dynamic({}) != integer()
+-             """
+-
+-      assert typeerror!([x = {}], x == :foo, x) =~ ~l"""
+-             comparison between distinct types found:
+-
+-                 x == :foo
+-
+-             given types:
+-
+-                 dynamic({}) == :foo
+-             """
+-
+-      assert typeerror!([x = {}], not (x != :foo), x) =~ ~l"""
+-             comparison between distinct types found:
+-
+-                 x != :foo
+-
+-             given types:
+-
+-                 dynamic({}) != :foo
+-             """
+-
+-      # We cannot warn in this case because the inference itself will lead to disjoint types
+-      assert typecheck!([x = {}], not (x == :foo), x) == dynamic(tuple([]))
+-      assert typecheck!([x = {}], x != :foo, x) == dynamic(tuple([]))
+-    end
+-  end
+-
+   describe "comparison in guards" do
+     test "length equality" do
+       assert typecheck!([x], length(x) != 0, x) == dynamic(non_empty_list(term()))

@@ -1,0 +1,331 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0408a775..61591736 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -49,8 +49,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2155, Ignore `max-rows` on POST, PATCH, PUT and DELETE - @steve-chavez
+  - #2239, Fix misleading disambiguation error where the content of the `relationship` key looks like valid syntax - @laurenceisla
+  - #2254, Fix inferring a foreign key column as a primary key column on views - @steve-chavez
+- - #2070, Restrict generated many-to-many relationships - @steve-chavez
+-   + Only adds many-to-many relationships when: a table has FKs to two other tables and these FK columns are part of the table's PK columns.
+ 
+ ### Changed
+ 
+@@ -61,8 +59,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2156, using PATCH/DELETE with `limit/offset` throws an error on views - @steve-chavez
+  - #2155, `max-rows` is no longer applied on POST/PATCH/PUT/DELETE returned rows - @steve-chavez
+    + This was misleading because the affected rows were not really affected by `max-rows`, only the returned rows were limited
+- - #2070, Restrict generated many-to-many relationships - @steve-chavez
+-   + A primary key that contains the foreign key columns is now needed for generating many-to-many relationships.
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 66b1ed98..91787ac9 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -29,7 +29,6 @@ module PostgREST.DbStructure
+ 
+ import qualified Data.Aeson          as JSON
+ import qualified Data.HashMap.Strict as M
+-import qualified Data.Set            as S
+ import qualified Hasql.Decoders      as HD
+ import qualified Hasql.Encoders      as HE
+ import qualified Hasql.Statement     as SQL
+@@ -94,8 +93,8 @@ queryDbStructure schemas extraSearchPath prepared = do
+   m2oRels <- SQL.statement mempty $ allM2ORels pgVer prepared
+   procs   <- SQL.statement schemas $ allProcs pgVer prepared
+ 
+-  let tabsWViewsPks = addViewPrimaryKeys tabs keyDeps
+-      rels          = addO2MRels $ addM2MRels tabsWViewsPks $ addViewM2ORels keyDeps m2oRels
++  let rels          = addO2MRels $ addM2MRels $ addViewM2ORels keyDeps m2oRels
++      tabsWViewsPks = addViewPrimaryKeys tabs keyDeps
+ 
+   return $ removeInternal schemas $ DbStructure {
+       dbTables = tabsWViewsPks
+@@ -371,19 +370,13 @@ addO2MRels :: [Relationship] -> [Relationship]
+ addO2MRels rels = rels ++ [ Relationship ft t (O2M cons (swap <$> cols))
+                           | Relationship t ft (M2O cons cols) <- rels ]
+ 
+--- | Adds a m2m relationship if a table has FKs to two other tables and the FK columns are part of the PK columns
+-addM2MRels :: TablesMap -> [Relationship] -> [Relationship]
+-addM2MRels tbls rels = rels ++ catMaybes
+-  [ let
+-      jtCols = S.fromList $ (fst <$> cols) ++ (fst <$> fcols)
+-      pkCols = S.fromList $ maybe mempty tablePKCols $ M.lookup jt1 tbls
+-    in if S.isSubsetOf jtCols pkCols
+-      then Just $ Relationship t ft (M2M $ Junction jt1 cons1 cons2 (swap <$> cols) (swap <$> fcols))
+-      else Nothing
+-  | Relationship jt1 t  (M2O cons1 cols)  <- rels
+-  , Relationship jt2 ft (M2O cons2 fcols) <- rels
+-  , jt1 == jt2
+-  , cons1 /= cons2]
++addM2MRels :: [Relationship] -> [Relationship]
++addM2MRels rels = rels ++ [ Relationship t ft
++                              (M2M $ Junction jt1 cons1 cons2 (swap <$> cols) (swap <$> fcols))
++                          | Relationship jt1 t  (M2O cons1 cols)  <- rels
++                          , Relationship jt2 ft (M2O cons2 fcols) <- rels
++                          , jt1 == jt2
++                          , cons1 /= cons2]
+ 
+ addViewPrimaryKeys :: TablesMap -> [ViewKeyDependency] -> TablesMap
+ addViewPrimaryKeys tabs keyDeps =
+diff --git a/test/io/big_schema.sql b/test/io/big_schema.sql
+index 81ba15a2..8074ef3f 100644
+--- a/test/io/big_schema.sql
++++ b/test/io/big_schema.sql
+@@ -1,84 +1,28 @@
+ /*
+ This is a 2018 version of the apflora schema https://github.com/barbalex/apf2/tree/master/sql/apflora - latest version likely has differing contents
+ 
+-We use it to test our metadata generation because it contains a good amount of db objects.
++We use it to test our metadata generation because it contains a good amount of views(281).
+ 
+ Custom roles and privileges where removed.
+ 
+ postgrest-with-postgresql-14 -f test/io/big_schema.sql psql
+ 
+-Has 12 functions:
+-
+ select count(*)  from information_schema.routines where specific_schema = 'apflora';
+  count
+ -------
+     12
+ 
+-Has 45 tables:
+-
+ select count(*)  from information_schema.tables where table_schema = 'apflora' and table_type = 'BASE TABLE';
+  count
+ -------
+     45
+ (1 row)
+ 
+-Has 281 views:
+-
+ select count(*)  from information_schema.views where table_schema = 'apflora';
+  count
+ -------
+    281
+ (1 row)
+-
+-Has 45 pkcols where none of them is a composite primary key:
+-
+-with pkcols as (
+-  select kcu.table_schema,
+-         kcu.table_name,
+-         tco.constraint_name,
+-         array_agg(kcu.column_name order by kcu.ordinal_position) as key_columns
+-  from information_schema.table_constraints tco
+-  join information_schema.key_column_usage kcu
+-       on kcu.constraint_name = tco.constraint_name
+-       and kcu.constraint_schema = tco.constraint_schema
+-       and kcu.constraint_name = tco.constraint_name
+-  where tco.constraint_type = 'PRIMARY KEY' and kcu.table_schema = 'apflora'
+-  group by kcu.table_schema, kcu.table_name, tco.constraint_name
+-)
+-select count(*) from pkcols
+-where array_length(key_columns, 1) > 1;
+- count
+--------
+-     0
+-(1 row)
+-
+-Has 50 foreign key relationships:
+-
+-with fk_rel as (
+-  select ns1.nspname as table_schema,
+-             tab.relname as table_name,
+-             ns2.nspname as foreign_table_schema,
+-             other.relname as foreign_table_name,
+-             conname     as constraint_name,
+-             column_info.cols as columns
+-  from pg_constraint,
+-  lateral (
+-    select array_agg(row(cols.attname, refs.attname) order by cols.attnum) as cols
+-    from ( select unnest(conkey) as col, unnest(confkey) as ref) k,
+-    lateral (select * from pg_attribute where attrelid = conrelid and attnum = col) as cols,
+-    lateral (select * from pg_attribute where attrelid = confrelid and attnum = ref) as refs) as column_info,
+-  lateral (select * from pg_namespace where pg_namespace.oid = connamespace) as ns1,
+-  lateral (select * from pg_class where pg_class.oid = conrelid) as tab,
+-  lateral (select * from pg_class where pg_class.oid = confrelid) as other,
+-  lateral (select * from pg_namespace where pg_namespace.oid = other.relnamespace) as ns2
+-  where contype = 'f' and conparentid = 0
+-)
+-select count(*) from fk_rel;
+-
+- count
+--------
+-    50
+-(1 row)
+ */
+ 
+ SET statement_timeout = 0;
+@@ -1047,7 +991,7 @@ Declare
+ BEGIN
+   execute i_text into v_val;
+   return v_val;
+-END;
++END; 
+ $$;
+ 
+ 
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index ddc6b717..e9f6a059 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -434,12 +434,12 @@ spec actualPgVersion = do
+ 
+     it "requesting data using many<->many relation defined by composite keys" $
+       get "/users_tasks?user_id=eq.1&task_id=eq.1&select=user_id,files(filename,content)" `shouldRespondWith`
+-        [json|[{"user_id":1,"files":[{"filename":"autoexec.bat","content":"@ECHO OFF"},{"filename":"command.com","content":"#include <unix.h>"},{"filename":"README.md","content":"# make $$$!"}]}]|]
++        [json|[{"user_id":1,"files":[{"filename":"command.com","content":"#include <unix.h>"},{"filename":"autoexec.bat","content":"@ECHO OFF"},{"filename":"README.md","content":"# make $$$!"}]}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+     it "requesting data using many<->many (composite keys) relation using hint" $
+       get "/users_tasks?user_id=eq.1&task_id=eq.1&select=user_id,files!touched_files(filename,content)" `shouldRespondWith`
+-        [json|[{"user_id":1,"files":[{"filename":"autoexec.bat","content":"@ECHO OFF"},{"filename":"command.com","content":"#include <unix.h>"},{"filename":"README.md","content":"# make $$$!"}]}]|]
++        [json|[{"user_id":1,"files":[{"filename":"command.com","content":"#include <unix.h>"},{"filename":"autoexec.bat","content":"@ECHO OFF"},{"filename":"README.md","content":"# make $$$!"}]}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+     it "requesting children with composite key" $
+@@ -447,12 +447,6 @@ spec actualPgVersion = do
+         [json|[{"user_id":2,"task_id":6,"comments":[{"content":"Needs to be delivered ASAP"}]}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    -- https://github.com/PostgREST/postgrest/issues/2070
+-    it "one-to-many embeds without a disambiguation error due to wrongly generated many-to-many relationships" $
+-      get "/plate?select=*,well(*)" `shouldRespondWith`
+-        [json|[]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+     describe "computed columns" $ do
+       it "computed column on table" $
+         get "/items?id=eq.1&select=id,always_true" `shouldRespondWith`
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index de3a9824..d516d332 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -172,8 +172,6 @@ GRANT ALL ON TABLE
+     , limited_delete_items_cpk
+     , limited_delete_items_no_pk
+     , limited_delete_items_view
+-    , plate
+-    , well
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 83c0dabd..b57a9480 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -791,13 +791,18 @@ CREATE TABLE files (
+ );
+ 
+ CREATE TABLE touched_files (
+-  user_id integer NOT NULL,
+-  task_id integer NOT NULL,
+-  project_id integer NOT NULL,
+-  filename text NOT NULL,
+-  constraint fk_users_tasks foreign key (user_id, task_id) references users_tasks (user_id, task_id) on delete cascade on update cascade,
+-  constraint fk_upload foreign key (project_id, filename) references files (project_id,filename) on delete cascade on update cascade,
+-  primary key(user_id, task_id, project_id, filename)
++    user_id integer NOT NULL,
++    task_id integer NOT NULL,
++    project_id integer NOT NULL,
++    filename text NOT NULL,
++    CONSTRAINT fk_users_tasks
++	FOREIGN KEY (user_id, task_id)
++	REFERENCES users_tasks (user_id, task_id)
++	ON DELETE CASCADE ON UPDATE CASCADE,
++    CONSTRAINT fk_upload
++	FOREIGN KEY (project_id, filename)
++	REFERENCES files (project_id,filename)
++	ON DELETE CASCADE ON UPDATE CASCADE
+ );
+ 
+ create table private.articles (
+@@ -1210,8 +1215,7 @@ create table test.part (
+ 
+ create table test.being_part (
+   being int not null references test.being(being),
+-  part int not null references test.part(part),
+-  primary key(being, part)
++  part int not null references test.part(part)
+ );
+ 
+ create function test.single_out_param(num int, OUT num_plus_one int) AS $$
+@@ -1923,11 +1927,10 @@ create table sites (
+ alter table sites rename constraint sites_main_project_id_fkey to main_project;
+ 
+ create table jobs (
+-  job_id          uuid
++  job_id          uuid    primary key
+ , name text
+ , site_id         int     not null references sites (site_id)
+ , big_project_id  int     not null references big_projects (big_project_id)
+-, primary key(job_id, site_id, big_project_id)
+ );
+ 
+ create view main_jobs as
+@@ -1952,13 +1955,12 @@ create table whatev_sites (
+ );
+ 
+ create table whatev_jobs (
+-  job_id        uuid
++  job_id        uuid    primary key
+ , name text
+ , site_id_1     int not null references whatev_sites (id)
+ , project_id_1  int not null references whatev_projects (id)
+ , site_id_2     int not null references whatev_sites (id)
+ , project_id_2  int not null references whatev_projects (id)
+-, primary key(job_id, site_id_1, project_id_1, site_id_2, project_id_2)
+ );
+ 
+ -- circular reference
+@@ -2292,8 +2294,7 @@ A test for partitioned tables$$;
+         car_dealer_city varchar(64) not null,
+         quantity int not null,
+         foreign key (car_model_name, car_model_year) references test.car_models (name, year),
+-        foreign key (car_dealer_name, car_dealer_city) references test.car_dealers (name, city),
+-        primary key (car_model_name, car_model_year, car_dealer_name, car_dealer_city, quantity)
++        foreign key (car_dealer_name, car_dealer_city) references test.car_dealers (name, city)
+       ) partition by range (quantity);
+ 
+       create table test.car_models_car_dealers_10to20 partition of test.car_models_car_dealers
+@@ -2520,36 +2521,3 @@ create function reset_limited_items(tbl_name text default '') returns void as $_
+   $$::text,
+   tbl_name, tbl_name);
+ end; $_$ language plpgsql volatile;
+-
+--- tables for ensuring we generate real junctions for many-to-many relationships
+-create table plate (
+-    plate_id int primary key
+-);
+-
+-create table well (
+-    well_id int primary key,
+-    plate_id int not null,
+-    parent_well_id int,
+-   CONSTRAINT well_parent_well_id_fkey
+-      FOREIGN KEY(parent_well_id)
+-	  REFERENCES well(well_id),
+-   CONSTRAINT well_plate_id_fkey
+-      FOREIGN KEY(plate_id)
+-	  REFERENCES plate(plate_id)
+-);
+-
+-create table plate_plan_step (
+-    plate_plan_step_id int primary key,
+-    from_well_id int,
+-    to_well_id int,
+-    to_plate_id int,
+-   CONSTRAINT plate_plan_step_from_well_id_fkey
+-      FOREIGN KEY(from_well_id)
+-	  REFERENCES well(well_id),
+-   CONSTRAINT plate_plan_step_to_plate_id_fkey
+-      FOREIGN KEY(to_plate_id)
+-	  REFERENCES plate(plate_id),
+-   CONSTRAINT plate_plan_step_to_well_id_fkey
+-      FOREIGN KEY(to_well_id)
+-	  REFERENCES well(well_id)
+-);

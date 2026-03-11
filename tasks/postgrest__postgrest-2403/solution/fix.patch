@@ -1,0 +1,91 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 973af53f..287388e0 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -132,7 +132,7 @@ run installHandlers maybeRunWithSocket appState = do
+           AppState.logWithZTime appState $ "Listening on unix socket " <> show socket
+           runWithSocket (serverSettings conf) app configServerUnixSocketMode socket
+         Nothing ->
+-          panic "Cannot run with unix socket on non-unix plattforms."
++          panic "Cannot run with unix socket on non-unix platforms."
+     Nothing ->
+       do
+         AppState.logWithZTime appState $ "Listening on port " <> show configServerPort
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 682567f1..72ad8ad3 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -2,6 +2,7 @@
+ 
+ module PostgREST.AppState
+   ( AppState
++  , destroy
+   , getConfig
+   , getDbStructure
+   , getIsListenerOn
+@@ -89,6 +90,9 @@ initWithPool newPool conf =
+     <*> myThreadId
+     <*> newIORef 0
+ 
++destroy :: AppState -> IO ()
++destroy = releasePool
++
+ initPool :: AppConfig -> IO SQL.Pool
+ initPool AppConfig{..} =
+   SQL.acquire (configDbPoolSize, configDbPoolTimeout, toUtf8 configDbUri)
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index cd21c349..b9c912de 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -34,13 +34,19 @@ main :: App.SignalHandlerInstaller -> Maybe App.SocketRunner -> CLI -> IO ()
+ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+   conf@AppConfig{..} <-
+     either panic identity <$> Config.readAppConfig mempty cliPath Nothing
+-  appState <- AppState.init conf
+-  case cliCommand of
+-    CmdDumpConfig -> do
+-      when configDbConfig $ reReadConfig True appState
+-      putStr . Config.toText =<< AppState.getConfig appState
+-    CmdDumpSchema -> putStrLn =<< dumpSchema appState
+-    CmdRun -> App.run installSignalHandlers runAppWithSocket appState
++
++  -- Per https://github.com/PostgREST/postgrest/issues/268, we want to
++  -- explicitly close the connections to PostgreSQL on shutdown.
++  -- 'AppState.destroy' takes care of that.
++  bracket
++    (AppState.init conf)
++    AppState.destroy
++    (\appState -> case cliCommand of
++      CmdDumpConfig -> do
++        when configDbConfig $ reReadConfig True appState
++        putStr . Config.toText =<< AppState.getConfig appState
++      CmdDumpSchema -> putStrLn =<< dumpSchema appState
++      CmdRun -> App.run installSignalHandlers runAppWithSocket appState)
+ 
+ -- | Dump DbStructure schema to JSON
+ dumpSchema :: AppState -> IO LBS.ByteString
+@@ -54,7 +60,6 @@ dumpSchema appState = do
+           (toList configDbSchemas)
+           configDbExtraSearchPath
+           configDbPreparedStatements
+-  AppState.releasePool appState
+   case result of
+     Left e -> do
+       hPutStrLn stderr $ "An error ocurred when loading the schema cache:\n" <> show e
+diff --git a/src/PostgREST/Unix.hs b/src/PostgREST/Unix.hs
+index acc1256f..c6926121 100644
+--- a/src/PostgREST/Unix.hs
++++ b/src/PostgREST/Unix.hs
+@@ -43,11 +43,7 @@ runAppWithSocket settings app socketFileMode socketFilePath =
+ -- | Set signal handlers, only for systems with signals
+ installSignalHandlers :: AppState.AppState -> IO ()
+ installSignalHandlers appState = do
+-  -- Releases the connection pool whenever the program is terminated,
+-  -- see https://github.com/PostgREST/postgrest/issues/268
+-  let interrupt = do
+-        AppState.releasePool appState
+-        throwTo (AppState.getMainThreadId appState) UserInterrupt
++  let interrupt = throwTo (AppState.getMainThreadId appState) UserInterrupt
+   install Signals.sigINT interrupt
+   install Signals.sigTERM interrupt
+ 

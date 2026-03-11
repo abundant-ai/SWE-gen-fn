@@ -1,0 +1,268 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 693d554b..bbd2bcd5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -53,7 +53,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+     + You can still use a column or an inferred FK on a view to embed a table(`/view?select=*,col-or-fk(*)`)
+  - #1959, An accidental full table PATCH(without filters) is not possible anymore, it requires filters or a `limit` parameter - @steve-chavez, @laurenceisla
+  - #2317, Increase the `db-pool-timeout` to 1 hour to prevent frequent high connection latency - @steve-chavez
+- - #2341, The search path now correctly identifies schemas with uppercase and special characters in their names (regression) - @laurenceisla
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Middleware.hs b/src/PostgREST/Middleware.hs
+index 09981aab..507202d2 100644
+--- a/src/PostgREST/Middleware.hs
++++ b/src/PostgREST/Middleware.hs
+@@ -14,6 +14,7 @@ import qualified Data.Aeson.Key                    as K
+ import qualified Data.Aeson.KeyMap                 as KM
+ import qualified Data.ByteString.Lazy.Char8        as LBS
+ import qualified Data.HashMap.Strict               as HM
++import qualified Data.Text                         as T
+ import qualified Data.Text.Encoding                as T
+ import qualified Hasql.Decoders                    as HD
+ import qualified Hasql.DynamicStatements.Snippet   as SQL hiding (sql)
+@@ -31,7 +32,7 @@ import PostgREST.Config.PgVersion   (PgVersion (..), pgVersion140)
+ import PostgREST.Error              (Error, errorResponseFor)
+ import PostgREST.GucHeader          (addHeadersIfNotIncluded)
+ import PostgREST.Query.SqlFragment  (fromQi, intercalateSnippet,
+-                                     pgFmtIdentList, unknownEncoder)
++                                     unknownEncoder)
+ import PostgREST.Request.ApiRequest (ApiRequest (..), Target (..))
+ 
+ import PostgREST.Request.Preferences
+@@ -63,8 +64,8 @@ runPgLocals conf claims role app req jsonDbS actualPgVersion = do
+     roleSql = [setConfigLocal mempty ("role", toUtf8 role)]
+     appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings conf)
+     searchPathSql =
+-      let schemas = pgFmtIdentList (iSchema req : configDbExtraSearchPath conf) in
+-      setConfigLocal mempty ("search_path", schemas)
++      let schemas = T.intercalate ", " (iSchema req : configDbExtraSearchPath conf) in
++      setConfigLocal mempty ("search_path", toUtf8 schemas)
+     preReqSql = (\f -> "select " <> fromQi f <> "();") <$> configDbPreRequest conf
+     specSql = case iTarget req of
+       TargetProc{tpIsRootSpec=True} -> [setConfigLocal mempty ("request.spec", jsonDbS)]
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 1e70fae9..269b76c4 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -24,7 +24,6 @@ module PostgREST.Query.SqlFragment
+   , orderF
+   , pgFmtColumn
+   , pgFmtIdent
+-  , pgFmtIdentList
+   , pgFmtJoinCondition
+   , pgFmtLogicTree
+   , pgFmtOrderTerm
+@@ -157,14 +156,6 @@ pgFmtIdent x = encodeUtf8 $ "\"" <> T.replace "\"" "\"\"" (trimNullChars x) <> "
+ trimNullChars :: Text -> Text
+ trimNullChars = T.takeWhile (/= '\x0')
+ 
+--- |
+--- Format a list of identifiers and separate them by commas.
+---
+--- >>> pgFmtIdentList ["schema_1", "schema_2", "SPECIAL \"@/\\#~_-"]
+--- "\"schema_1\", \"schema_2\", \"SPECIAL \"\"@/\\#~_-\""
+-pgFmtIdentList :: [Text] -> SqlFragment
+-pgFmtIdentList schemas = BS.intercalate ", " $ pgFmtIdent <$> schemas
+-
+ asCsvF :: SqlFragment
+ asCsvF = asCsvHeaderF <> " || '\n' || " <> asCsvBodyF
+   where
+diff --git a/test/doc/Main.hs b/test/doc/Main.hs
+index e6843031..064efbf2 100644
+--- a/test/doc/Main.hs
++++ b/test/doc/Main.hs
+@@ -12,7 +12,6 @@ main =
+     , "-XNoImplicitPrelude"
+     , "-XStandaloneDeriving"
+     , "-isrc"
+-    , "src/PostgREST/Query/SqlFragment.hs"
+     , "src/PostgREST/Request/Preferences.hs"
+     , "src/PostgREST/Request/QueryParams.hs"
+     ]
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index b24f0468..bf4f4cb9 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -645,7 +645,7 @@ def test_db_schema_reload(tmp_path, defaultenv):
+ 
+     with run(configfile, env=defaultenv) as postgrest:
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+-        assert response.text == '"\\"public\\", \\"public\\""'
++        assert response.text == '"public, public"'
+ 
+         # change setting
+         configfile.write_text(
+@@ -663,7 +663,7 @@ def test_db_schema_reload(tmp_path, defaultenv):
+         time.sleep(1)
+ 
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+-        assert response.text == '"\\"v1\\", \\"public\\""'
++        assert response.text == '"v1, public"'
+ 
+ 
+ def test_db_schema_notify_reload(defaultenv):
+@@ -673,7 +673,7 @@ def test_db_schema_notify_reload(defaultenv):
+ 
+     with run(env=env) as postgrest:
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+-        assert response.text == '"\\"public\\", \\"public\\""'
++        assert response.text == '"public, public"'
+ 
+         # change db-schemas config on the db and reload config and cache with notify
+         postgrest.session.post(
+@@ -683,7 +683,7 @@ def test_db_schema_notify_reload(defaultenv):
+         time.sleep(0.1)
+ 
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+-        assert response.text == '"\\"v1\\", \\"public\\""'
++        assert response.text == '"v1, public"'
+ 
+         # reset db-schemas config on the db
+         response = postgrest.session.post("/rpc/reset_db_schema_config")
+diff --git a/test/spec/Feature/ExtraSearchPathSpec.hs b/test/spec/Feature/ExtraSearchPathSpec.hs
+index 1ed7e4f5..0d4a8e27 100644
+--- a/test/spec/Feature/ExtraSearchPathSpec.hs
++++ b/test/spec/Feature/ExtraSearchPathSpec.hs
+@@ -58,10 +58,5 @@ spec = describe "extra search path" $ do
+       `shouldRespondWith` [json|true|]
+       { matchHeaders = [matchContentTypeJson] }
+ 
+-  it "finds a function on a schema with uppercase and special characters in its name" $
+-    request methodGet "/rpc/special_extended_schema?val=value" [] ""
+-      `shouldRespondWith` [json|"value"|]
+-      { matchHeaders = [matchContentTypeJson] }
+-
+   it "can detect fk relations through multiple views recursively when middle views are in extra search path" $
+     get "/consumers_extra_view?select=*,orders_view(*)" `shouldRespondWith` 200
+diff --git a/test/spec/Feature/Query/MultipleSchemaSpec.hs b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+index 28bb2ab3..d1306b5c 100644
+--- a/test/spec/Feature/Query/MultipleSchemaSpec.hs
++++ b/test/spec/Feature/Query/MultipleSchemaSpec.hs
+@@ -68,22 +68,11 @@ spec =
+ 
+       it "fails trying to read table from unkown schema" $
+         request methodGet "/parents" [("Accept-Profile", "unkown")] "" `shouldRespondWith`
+-          [json|{"message":"The schema must be one of the following: v1, v2, SPECIAL \"@/\\#~_-","code":"PGRST106","details":null,"hint":null}|]
++          [json|{"message":"The schema must be one of the following: v1, v2","code":"PGRST106","details":null,"hint":null}|]
+           {
+             matchStatus = 406
+           }
+ 
+-      it "succeeds in reading a table from a schema with uppercase and special characters in its name" $
+-        request methodGet "/names" [("Accept-Profile", "SPECIAL \"@/\\#~_-")] "" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"name":"John"},
+-            {"id":2,"name":"Mary"}
+-          ]|]
+-          {
+-            matchStatus = 200
+-          , matchHeaders = [matchContentTypeJson, "Content-Profile" <:> "SPECIAL \"@/\\#~_-"]
+-          }
+-
+     context "Inserting tables on different schemas" $ do
+       it "succeeds inserting on default schema and returning it" $
+         request methodPost "/children"
+@@ -122,7 +111,7 @@ spec =
+         request methodPost "/children" [("Content-Profile", "unknown")]
+           [json|{"name": "child 4", "parent_id": 4}|]
+           `shouldRespondWith`
+-          [json|{"message":"The schema must be one of the following: v1, v2, SPECIAL \"@/\\#~_-","code":"PGRST106","details":null,"hint":null}|]
++          [json|{"message":"The schema must be one of the following: v1, v2","code":"PGRST106","details":null,"hint":null}|]
+           {
+             matchStatus = 406
+           }
+@@ -336,7 +325,7 @@ spec =
+ 
+       it "fails trying to read definitions from unkown schema" $
+         request methodGet "/" [("Accept-Profile", "unkown")] "" `shouldRespondWith`
+-          [json|{"message":"The schema must be one of the following: v1, v2, SPECIAL \"@/\\#~_-","code":"PGRST106","details":null,"hint":null}|]
++          [json|{"message":"The schema must be one of the following: v1, v2","code":"PGRST106","details":null,"hint":null}|]
+           {
+             matchStatus = 406
+           }
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 78763696..d2b07c40 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -170,7 +170,7 @@ testNonexistentSchemaCfg :: AppConfig
+ testNonexistentSchemaCfg = baseCfg { configDbSchemas = fromList ["nonexistent"] }
+ 
+ testCfgExtraSearchPath :: AppConfig
+-testCfgExtraSearchPath = baseCfg { configDbExtraSearchPath = ["public", "extensions", "EXTRA \"@/\\#~_-"] }
++testCfgExtraSearchPath = baseCfg { configDbExtraSearchPath = ["public", "extensions"] }
+ 
+ testCfgRootSpec :: AppConfig
+ testCfgRootSpec = baseCfg { configDbRootSpec = Just $ QualifiedIdentifier mempty "root"}
+@@ -182,7 +182,7 @@ testCfgResponseHeaders :: AppConfig
+ testCfgResponseHeaders = baseCfg { configDbPreRequest = Just $ QualifiedIdentifier mempty "custom_headers" }
+ 
+ testMultipleSchemaCfg :: AppConfig
+-testMultipleSchemaCfg = baseCfg { configDbSchemas = fromList ["v1", "v2", "SPECIAL \"@/\\#~_-"] }
++testMultipleSchemaCfg = baseCfg { configDbSchemas = fromList ["v1", "v2"] }
+ 
+ testCfgLegacyGucs :: AppConfig
+ testCfgLegacyGucs = baseCfg { configDbUseLegacyGucs = False }
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index aeb3fbde..fd62da7d 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -795,6 +795,3 @@ INSERT INTO shop_bles(id, name, coords, shop_id, range_area) VALUES(1, 'Beacon-1
+   extensions.ST_GeomFromGeoJSON('{"type": "Polygon", "coordinates": [ [ [ -71.10045254230499, 42.37387083326593 ], [ -71.10048070549963, 42.37377126199953 ], [ -71.10039688646793, 42.37375838212269 ], [ -71.10037006437777, 42.37385844878863 ], [ -71.10045254230499, 42.37387083326593 ] ] ]}'));
+ INSERT INTO shop_bles(id, name, coords, shop_id, range_area) VALUES(2, 'Beacon-2', 'SRID=4326;POINT(-71.10044 42.373695)', 1,
+   extensions.ST_GeomFromGeoJSON('{"type": "Polygon", "coordinates": [ [ [ -71.10034391283989, 42.37385299961788 ], [ -71.10036939382553, 42.373756895982865 ], [ -71.1002916097641, 42.373745997623224 ], [ -71.1002641171217, 42.37384408279195 ], [ -71.10034391283989, 42.37385299961788 ] ] ]}'));
+-
+-TRUNCATE TABLE "SPECIAL ""@/\#~_-".names CASCADE;
+-INSERT INTO "SPECIAL ""@/\#~_-".names (id, name) VALUES (1, 'John'), (2, 'Mary');
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index 5177c6b6..d1230aaa 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -8,8 +8,6 @@ GRANT USAGE ON SCHEMA
+     , extensions
+     , v1
+     , v2
+-    , "SPECIAL ""@/\#~_-"
+-    , "EXTRA ""@/\#~_-"
+ TO postgrest_test_anonymous;
+ 
+ -- Schema test objects
+@@ -192,7 +190,6 @@ GRANT ALL ON TABLE
+     , bulk_update_items_cpk
+     , shops
+     , shop_bles
+-    , "SPECIAL ""@/\#~_-".names
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index a6230613..6f022259 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -20,8 +20,6 @@ CREATE SCHEMA تست;
+ CREATE SCHEMA extensions;
+ CREATE SCHEMA v1;
+ CREATE SCHEMA v2;
+-CREATE SCHEMA "SPECIAL ""@/\#~_-";
+-CREATE SCHEMA "EXTRA ""@/\#~_-";
+ 
+ COMMENT ON SCHEMA v1 IS 'v1 schema';
+ COMMENT ON SCHEMA v2 IS 'v2 schema';
+@@ -2671,16 +2669,3 @@ create table shop_bles (
+ create function get_shop(id int) returns shops as $$
+   select * from shops where id = $1;
+ $$ language sql;
+-
+-CREATE TABLE "SPECIAL ""@/\#~_-".names(
+-  id INT PRIMARY KEY,
+-  name TEXT
+-);
+-
+-CREATE FUNCTION "EXTRA ""@/\#~_-".get_val_special(val text) RETURNS text AS $$
+-  SELECT val;
+-$$ LANGUAGE sql;
+-
+-CREATE FUNCTION test.special_extended_schema(val text) RETURNS text AS $$
+-  SELECT get_val_special(val);
+-$$ LANGUAGE sql;

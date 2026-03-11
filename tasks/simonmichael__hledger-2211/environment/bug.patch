@@ -1,0 +1,356 @@
+diff --git a/hledger-lib/Hledger/Data/Amount.hs b/hledger-lib/Hledger/Data/Amount.hs
+index bfc089283..0b255e3ad 100644
+--- a/hledger-lib/Hledger/Data/Amount.hs
++++ b/hledger-lib/Hledger/Data/Amount.hs
+@@ -763,7 +763,7 @@ instance Num MixedAmount where
+     negate = maNegate
+     (+)    = maPlus
+     (*)    = error "error, mixed amounts do not support multiplication" -- PARTIAL:
+-    abs    = mapMixedAmount (\amt -> amt { aquantity = abs (aquantity amt)})
++    abs    = error "error, mixed amounts do not support abs"
+     signum = error "error, mixed amounts do not support signum"
+ 
+ -- | Calculate the key used to store an Amount within a MixedAmount.
+diff --git a/hledger-lib/Hledger/Reports/PostingsReport.hs b/hledger-lib/Hledger/Reports/PostingsReport.hs
+index 41059088b..701313e4c 100644
+--- a/hledger-lib/Hledger/Reports/PostingsReport.hs
++++ b/hledger-lib/Hledger/Reports/PostingsReport.hs
+@@ -15,18 +15,15 @@ module Hledger.Reports.PostingsReport (
+   PostingsReportItem,
+   postingsReport,
+   mkpostingsReportItem,
+-  SortSpec,
+-  defsortspec,
+ 
+   -- * Tests
+   tests_PostingsReport
+ )
+ where
+ 
+-import Data.List (nub, sortBy, sortOn)
++import Data.List (nub, sortOn)
+ import Data.List.Extra (nubSort)
+-import Data.Maybe (isJust, isNothing, fromMaybe)
+-import Data.Ord
++import Data.Maybe (isJust, isNothing)
+ import Data.Text (Text)
+ import Data.Time.Calendar (Day)
+ import Safe (headMay)
+@@ -85,12 +82,10 @@ postingsReport rspec@ReportSpec{_rsReportOpts=ropts@ReportOpts{..}} j = items
+           summariseps = summarisePostingsByInterval whichdate mdepth showempty colspans
+           showempty = empty_ || average_
+ 
+-      sortedps = if sortspec_ /= defsortspec then sortPostings ropts sortspec_ displayps else displayps
+-
+       -- Posting report items ready for display.
+       items =
+         dbg4 "postingsReport items" $
+-        postingsReportItems postings (nullposting,Nothing) whichdate mdepth startbal runningcalc startnum
++        postingsReportItems displayps (nullposting,Nothing) whichdate mdepth startbal runningcalc startnum
+         where
+           -- In historical mode we'll need a starting balance, which we
+           -- may be converting to value per hledger_options.m4.md "Effect
+@@ -105,10 +100,6 @@ postingsReport rspec@ReportSpec{_rsReportOpts=ropts@ReportOpts{..}} j = items
+ 
+           runningcalc = registerRunningCalculationFn ropts
+           startnum = if historical then length precedingps + 1 else 1
+-          postings | historical = if sortspec_ /= defsortspec 
+-                        then error "--historical and --sort should not be used together" 
+-                        else sortedps
+-                   | otherwise = sortedps
+ 
+ -- | Based on the given report options, return a function that does the appropriate
+ -- running calculation for the register report, ie a running average or running total.
+@@ -119,34 +110,6 @@ registerRunningCalculationFn ropts
+   | average_ ropts = \i avg amt -> avg `maPlus` divideMixedAmount (fromIntegral i) (amt `maMinus` avg)
+   | otherwise      = \_ bal amt -> bal `maPlus` amt
+ 
+--- | Sort two postings by the current list of value expressions (given in SortSpec).
+-comparePostings :: ReportOpts -> SortSpec -> (Posting, Maybe Period) -> (Posting, Maybe Period) -> Ordering
+-comparePostings _ [] _ _ = EQ
+-comparePostings ropts (ex:es) (a, pa) (b, pb) = 
+-    let 
+-    getDescription p = 
+-        let tx = ptransaction p 
+-            description = fmap (\t -> tdescription t) tx
+-        -- If there's no transaction attached, then use empty text for the description
+-        in fromMaybe "" description
+-    comparison = case ex of
+-          AbsAmount' False -> compare (abs (pamount a)) (abs (pamount b))
+-          Amount' False -> compare (pamount a) (pamount b)
+-          Account' False -> compare (paccount a) (paccount b)
+-          Date' False -> compare (postingDateOrDate2 (whichDate ropts) a) (postingDateOrDate2 (whichDate ropts) b)
+-          Description' False -> compare (getDescription a) (getDescription b)
+-          AbsAmount' True -> compare (Down (abs (pamount a))) (Down (abs (pamount b)))
+-          Amount' True -> compare (Down (pamount a)) (Down (pamount b))
+-          Account' True -> compare (Down (paccount a)) (Down (paccount b))
+-          Date' True -> compare (Down (postingDateOrDate2 (whichDate ropts) a)) (Down (postingDateOrDate2 (whichDate ropts) b))
+-          Description' True -> compare (Down (getDescription a)) (Down (getDescription b))
+-    in 
+-    if comparison == EQ then comparePostings ropts es (a, pa) (b, pb) else comparison
+-
+--- | Sort postings by the current SortSpec.
+-sortPostings :: ReportOpts -> SortSpec -> [(Posting, Maybe Period)] -> [(Posting, Maybe Period)]
+-sortPostings ropts sspec = sortBy (comparePostings ropts sspec)
+-
+ -- | Find postings matching a given query, within a given date span,
+ -- and also any similarly-matched postings before that date span.
+ -- Date restrictions and depth restrictions in the query are ignored.
+diff --git a/hledger-lib/Hledger/Reports/ReportOptions.hs b/hledger-lib/Hledger/Reports/ReportOptions.hs
+index f60d950d6..445adb51c 100644
+--- a/hledger-lib/Hledger/Reports/ReportOptions.hs
++++ b/hledger-lib/Hledger/Reports/ReportOptions.hs
+@@ -21,8 +21,6 @@ module Hledger.Reports.ReportOptions (
+   HasReportOpts(..),
+   ReportSpec(..),
+   HasReportSpec(..),
+-  SortField(..),
+-  SortSpec,
+   overEither,
+   setEither,
+   BalanceCalculation(..),
+@@ -33,7 +31,6 @@ module Hledger.Reports.ReportOptions (
+   defreportopts,
+   rawOptsToReportOpts,
+   defreportspec,
+-  defsortspec,
+   setDefaultConversionOp,
+   reportOptsToSpec,
+   updateReportSpec,
+@@ -74,7 +71,7 @@ import Data.Char (toLower)
+ import Data.Either (fromRight)
+ import Data.Either.Extra (eitherToMaybe)
+ import Data.Functor.Identity (Identity(..))
+-import Data.List.Extra (find, isPrefixOf, nubSort, stripPrefix)
++import Data.List.Extra (find, isPrefixOf, nubSort)
+ import Data.Maybe (fromMaybe, isJust, isNothing)
+ import qualified Data.Text as T
+ import Data.Time.Calendar (Day, addDays)
+@@ -145,8 +142,6 @@ data ReportOpts = ReportOpts {
+     ,average_          :: Bool
+     -- for posting reports (register)
+     ,related_          :: Bool
+-    -- for sorting reports (register)
+-    ,sortspec_             :: SortSpec
+     -- for account transactions reports (aregister)
+     ,txn_dates_        :: Bool
+     -- for balance reports (bal, bs, cf, is)
+@@ -202,7 +197,6 @@ defreportopts = ReportOpts
+     , querystring_      = []
+     , average_          = False
+     , related_          = False
+-    , sortspec_         = defsortspec 
+     , txn_dates_        = False
+     , balancecalc_      = def
+     , balanceaccum_     = def
+@@ -257,7 +251,6 @@ rawOptsToReportOpts d rawopts =
+           ,querystring_      = querystring
+           ,average_          = boolopt "average" rawopts
+           ,related_          = boolopt "related" rawopts
+-          ,sortspec_         = getSortSpec rawopts
+           ,txn_dates_        = boolopt "txn-dates" rawopts
+           ,balancecalc_      = balancecalcopt rawopts
+           ,balanceaccum_     = balanceaccumopt rawopts
+@@ -670,45 +663,6 @@ queryFromFlags ReportOpts{..} = simplifyQuery $ And flagsq
+     consIf f b = if b then (f True:) else id
+     consJust f = maybe id ((:) . f)
+ 
+--- Methods/types needed for --sort argument
+-
+--- Possible arguments taken by the --sort command
+--- Each of these takes a bool, which shows if it has been inverted
+--- (True -> has been inverted, reverse the order)
+-data SortField
+-    = AbsAmount' Bool
+-    | Account' Bool
+-    | Amount' Bool
+-    | Date' Bool
+-    | Description' Bool
+-    deriving (Show, Eq)
+-type SortSpec = [SortField]
+-
+--- By default, sort by date in ascending order
+-defsortspec :: SortSpec
+-defsortspec = [Date' False]
+-
+--- Load a SortSpec from the argument given to --sort
+--- If there is no spec given, then sort by [Date' False] by default
+-getSortSpec :: RawOpts -> SortSpec
+-getSortSpec opts = 
+-    let opt = maybestringopt "sort" opts
+-        optParser s = 
+-          let terms = map strip $ splitAtElement ',' s 
+-              termParser t = case trimmed of
+-                "date" -> Date' isNegated
+-                "account" -> Account' isNegated
+-                "amount" -> Amount' isNegated
+-                "desc" -> Description' isNegated
+-                "description" -> Description' isNegated
+-                "absamount" -> AbsAmount' isNegated
+-                _ -> error' $ "unsupported field '" ++ t ++ "' given to --sort"
+-                where isNegated = isPrefixOf "-" t
+-                      trimmed = fromMaybe t (stripPrefix "-" t)
+-          in map termParser terms
+-    in maybe defsortspec optParser opt 
+-
+-
+ -- Report dates.
+ 
+ -- | The effective report span is the start and end dates specified by
+diff --git a/hledger/Hledger/Cli/Commands/Register.hs b/hledger/Hledger/Cli/Commands/Register.hs
+index 4746b8b88..d03c277a0 100644
+--- a/hledger/Hledger/Cli/Commands/Register.hs
++++ b/hledger/Hledger/Cli/Commands/Register.hs
+@@ -49,8 +49,6 @@ registermode = hledgerCommandMode
+     ("fuzzy search for one recent posting with description closest to "++arg)
+   ,flagNone ["related","r"] (setboolopt "related") "show postings' siblings instead"
+   ,flagNone ["invert"] (setboolopt "invert") "display all amounts with reversed sign"
+-  ,flagReq  ["sort"] (\s opts -> Right $ setopt "sort" s opts) "FIELDS" 
+-    "comma-separated list of fields used to sort transactions"
+   ,flagReq  ["width","w"] (\s opts -> Right $ setopt "width" s opts) "N"
+      ("set output width (default: " ++
+ #ifdef mingw32_HOST_OS
+diff --git a/hledger/Hledger/Cli/Commands/Register.md b/hledger/Hledger/Cli/Commands/Register.md
+index c81a164dc..a983d5f80 100644
+--- a/hledger/Hledger/Cli/Commands/Register.md
++++ b/hledger/Hledger/Cli/Commands/Register.md
+@@ -16,8 +16,6 @@ Flags:
+                             description closest to DESC
+   -r --related              show postings' siblings instead
+      --invert               display all amounts with reversed sign
+-     --sort=FIELDS          comma-separated list of fields used to sort
+-                            transactions
+   -w --width=N              set output width (default: terminal width or
+                             $COLUMNS). -wN,M sets description width as well.
+      --align-all            guarantee alignment across all lines (slower)
+@@ -82,14 +80,6 @@ displayed as negative numbers.
+ It's also useful to show postings on the checking account together with the
+ related account:
+ 
+-The `--sort=FIELDS` flag sorts by the fields given, which can be any of 
+-`account`, `amount`, `absamount`, `date`, or `desc`/`description`, optionally
+-separated by commas.
+-For example, `--sort account,amount` will group all transactions in each
+-account, sorted by transaction amount.
+-Each field can be negated by a preceding `-`, so `--sort -amount` will show
+-transactions ordered from smallest amount to largest amount.
+-
+ ```cli
+ $ hledger register --related --invert assets:checking
+ ```
+diff --git a/hledger/test/register/sort.test b/hledger/test/register/sort.test
+deleted file mode 100644
+index c99c12c75..000000000
+--- a/hledger/test/register/sort.test
++++ /dev/null
+@@ -1,110 +0,0 @@
+-# * register command with --sort flag
+-
+-# ** 1. --sort with non-date sorts by the correct account
+-<
+-2024-01-01 Demo
+-    a   1
+-    b  
+-
+-2024-01-02 Other
+-    c   1
+-    a
+-$ hledger -f - register --sort account
+-2024-01-01 Demo                 a                                1             1
+-2024-01-02 Other                a                               -1             0
+-2024-01-01 Demo                 b                               -1            -1
+-2024-01-02 Other                c                                1             0
+-
+-# ** 2. --sort with two expressions sorts correctly
+-<
+-2024-01-01 Demo
+-    a   1
+-    b  
+-
+-2024-01-02 Other
+-    c   1
+-    a
+-$ hledger -f - register --sort account,amount
+-2024-01-02 Other                a                               -1            -1
+-2024-01-01 Demo                 a                                1             0
+-                                b                               -1            -1
+-2024-01-02 Other                c                                1             0
+-
+-# ** 3. --sort with negation reverses
+-<
+-2024-01-01 Demo
+-    a   1
+-    b  
+-
+-2024-01-02 Other
+-    c   1
+-    a
+-$ hledger -f - register --sort -account
+-2024-01-02 Other                c                                1             1
+-2024-01-01 Demo                 b                               -1             0
+-                                a                                1             1
+-2024-01-02 Other                a                               -1             0
+-
+-# ** 4. --sort with negation and multiple accounts
+-<
+-2024-01-01 Demo
+-    a   1
+-    b  
+-
+-2024-01-02 Other
+-    c   1
+-    a
+-$ hledger -f - register --sort amount,-account
+-2024-01-01 Demo                 b                               -1            -1
+-2024-01-02 Other                a                               -1            -2
+-                                c                                1            -1
+-2024-01-01 Demo                 a                                1             0
+-
+-# ** 5. --sort with date, reversed
+-<
+-2024-01-01 Demo
+-    a   1
+-    b  
+-
+-2024-01-02 Other
+-    c   1
+-    a
+-$ hledger -f - register --sort -date
+-2024-01-02 Other                c                                1             1
+-                                a                               -1             0
+-2024-01-01 Demo                 a                                1             1
+-                                b                               -1             0
+-
+-# ** 6. --sort with description
+-<
+-2024-01-01 Other
+-    a   1
+-    b  
+-
+-2024-01-02 Demo
+-    c   1
+-    a
+-$ hledger -f - register --sort desc
+-2024-01-02 Demo                 c                                1             1
+-                                a                               -1             0
+-2024-01-01 Other                a                                1             1
+-                                b                               -1             0
+-
+-# ** 7. --sort with absamount
+-<
+-2024-01-01 Demo
+-    a   15
+-    b   10
+-    c  -25
+-
+-2024-01-02 Other
+-    d   12
+-    e  -48
+-    f   36
+-$ hledger -f - register --sort -absamount
+-2024-01-02 Other                e                              -48           -48
+-                                f                               36           -12
+-2024-01-01 Demo                 c                              -25           -37
+-                                a                               15           -22
+-2024-01-02 Other                d                               12           -10
+-2024-01-01 Demo                 b                               10             0

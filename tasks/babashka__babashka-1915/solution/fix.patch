@@ -1,0 +1,407 @@
+diff --git a/babashka.nrepl b/babashka.nrepl
+index c021393e..bf677c4f 160000
+--- a/babashka.nrepl
++++ b/babashka.nrepl
+@@ -1 +1 @@
+-Subproject commit c021393eea1b51117ca9d317269a71c4a7c131c8
++Subproject commit bf677c4f82580ad77c86ad00e9099dc6286b48f2
+diff --git a/doc/adr/0004-jline-repl-completions/implementation-plan.md b/doc/adr/0004-jline-repl-completions/implementation-plan.md
+new file mode 100644
+index 00000000..9c903c74
+--- /dev/null
++++ b/doc/adr/0004-jline-repl-completions/implementation-plan.md
+@@ -0,0 +1,119 @@
++# JLine REPL Completions
++
++## Proposal
++
++Babashka now has a console REPL built with jline.
++Relevant code is in `/src/babashka/impl/repl.clj`
++Tests are in `/test/babashka/impl/repl_test.clj`.
++
++Leiningen and rebel-readline, two other Clojure REPLs built with jline, provide completions. We want this too.
++rebel-readline's code is in `~/dev/rebel-readline`. Lein's code is in `~/dev/leiningen`
++
++We already provide completions for the nREPL implementation in `babashka.nrepl/src/babashka/nrepl/impl/server.clj`.
++We should factor out this completion function so you only need a SCI context and you get back a list of maps that represent completions.
++Then we can use this completion function for the console REPL as well.
++For now it's ok that this completion logic stays in the nrepl submodule, although it's a bit weird to require an nrepl namespace for the console REPL, we'll think about that later.
++
++## Implementation Plan
++
++### Files to Modify
++
++1. **`babashka.nrepl/src/babashka/nrepl/impl/completions.clj`** (NEW) - Factored-out completion logic
++2. **`babashka.nrepl/src/babashka/nrepl/impl/server.clj`** - Update to use new completions namespace
++3. **`src/babashka/impl/classes.clj`** - Add Completer and Candidate classes
++4. **`src/babashka/impl/repl.clj`** - Add JLine Completer integration
++
++### Step 1: Create completions.clj
++
++Create new file `babashka.nrepl/src/babashka/nrepl/impl/completions.clj`:
++
++- Move helper functions from server.clj (lines 142-195):
++  - `fully-qualified-syms`
++  - `match`
++  - `ns-imports->completions`
++  - `import-symbols->completions`
++
++- Create new `completions` function with signature:
++  ```clojure
++  (defn completions [ctx query]
++    ;; Returns set of maps: {:candidate "name" :ns "ns" :type "type"}
++    ...)
++  ```
++
++- Extract core logic from server.clj `complete` function (lines 206-247) without the nREPL wrapping
++
++### Step 2: Update server.clj
++
++- Add require: `[babashka.nrepl.impl.completions :as completions]`
++- Remove the moved helper functions
++- Update `complete` function to call `completions/completions` and convert keyword keys to string keys for nREPL protocol
++
++### Step 3: Add JLine classes
++
++In `src/babashka/impl/classes.clj` at line 661 (before `;; end jline`):
++
++```clojure
++org.jline.reader.Completer
++org.jline.reader.Candidate
++```
++
++Michiel: this isn't necessary yet, this is only necessary when you want to expose these classes to script users.
++So skip this step.
++
++### Step 4: Implement Completer in repl.clj
++
++Add to imports:
++```clojure
++[org.jline.reader Completer Candidate]
++```
++
++Add require:
++```clojure
++[babashka.nrepl.impl.completions :as completions]
++```
++
++Create completer function:
++```clojure
++(defn- clojure-completer [sci-ctx]
++  (reify Completer
++    (complete [_ _ parsed-line candidates]
++      (let [word (.word parsed-line)]
++        (when (and word (pos? (count word)))
++          (try
++            (doseq [{:keys [candidate ns type]} (completions/completions sci-ctx word)]
++              (.add candidates
++                    (Candidate. candidate candidate nil
++                                (when (or ns type)
++                                  (str (when type (str type " "))
++                                       (when ns ns)))
++                                nil nil false)))
++            (catch Exception _ nil)))))))
++```
++
++Update `jline-parser` to handle `Parser$ParseContext/COMPLETE`:
++- Return a `CompletingParsedLine` that provides word-at-cursor for completion queries
++
++Update `jline-reader` to add completer:
++```clojure
++(.completer (clojure-completer sci-ctx))
++```
++
++## Testing
++
++### Manual Testing
++1. Build: `script/uberjar && script/compile`
++2. Start REPL: `./bb`
++3. Test completions:
++   - Type `ma<TAB>` - should show `map`, `mapv`, `mapcat`, etc.
++   - Type `str/<TAB>` - should show `str/join`, `str/split`, etc.
++   - Type `String/<TAB>` - should show static methods like `String/valueOf`
++
++### Automated Testing
++- Add unit tests for `completions/completions` in `babashka.nrepl/test/babashka/nrepl/impl/completions_test.clj`
++- Add integration test in `test/babashka/impl/repl_test.clj` verifying completer creation
++
++## Notes
++
++- The completion logic stays in the nrepl submodule per the proposal - the console REPL requires this namespace
++- Error handling: completions should never throw - silently return empty on errors
++- The `CompletingParsedLine` interface is needed to provide word context to the Completer
+diff --git a/doc/adr/jline-providers/benchmark.clj b/doc/adr/jline-providers/benchmark.clj
+deleted file mode 100755
+index 7072700f..00000000
+--- a/doc/adr/jline-providers/benchmark.clj
++++ /dev/null
+@@ -1,133 +0,0 @@
+-#!/usr/bin/env bb
+-
+-;; Benchmark to compare FFM vs Exec provider performance in JLine
+-;; Run with: bb jline-bench.clj
+-
+-(ns jline-bench
+-  (:import [org.jline.terminal TerminalBuilder]
+-           [org.jline.terminal.spi TerminalProvider TerminalExt SystemStream]
+-           [org.jline.utils AttributedString AttributedStringBuilder AttributedStyle Display]))
+-
+-(def results (atom {}))
+-
+-(defn bench [provider-name label n f]
+-  (let [start (System/nanoTime)
+-        _ (dotimes [_ n] (f))
+-        elapsed (/ (- (System/nanoTime) start) 1e6)
+-        per-op (/ elapsed n)]
+-    (swap! results assoc-in [label provider-name] {:total elapsed :per-op per-op :n n})
+-    per-op))
+-
+-(defn test-provider [provider-name]
+-  ;; First check if provider is available
+-  (let [provider (try
+-                   (TerminalProvider/load provider-name)
+-                   (catch Exception e
+-                     nil))]
+-    (when provider
+-      ;; Test isSystemStream (TTY detection)
+-      (bench provider-name "TTY detection" 100
+-             #(.isSystemStream provider SystemStream/Output))
+-
+-      ;; Create terminal for further tests - force same provider
+-      (let [terminal (-> (TerminalBuilder/builder)
+-                         (.provider provider-name)
+-                         (.system true)
+-                         (.build))
+-            ^TerminalExt terminal-ext terminal
+-            actual-provider (.name (.getProvider terminal-ext))]
+-        (swap! results assoc-in ["_provider" provider-name] actual-provider)
+-        (try
+-          (bench provider-name "getSize" 1000
+-                 #(let [size (.getSize terminal)]
+-                    (.getColumns size)
+-                    (.getRows size)))
+-
+-          (bench provider-name "getAttributes" 100
+-                 #(.getAttributes terminal))
+-
+-          (bench provider-name "enterRawMode" 50
+-                 #(let [saved (.enterRawMode terminal)]
+-                    (.setAttributes terminal saved)))
+-
+-          (let [writer (.writer terminal)]
+-            (bench provider-name "write+flush" 500
+-                   #(do (.write writer "████████████████████████████████████████████████████████████████████████████████\n")
+-                        (.flush writer))))
+-
+-          (let [display (Display. terminal false)
+-                width 40
+-                height 20
+-                style-green (-> AttributedStyle/DEFAULT (.foreground AttributedStyle/GREEN))
+-                build-frame (fn []
+-                              (let [lines (java.util.ArrayList.)]
+-                                (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
+-                                (doseq [y (range height)]
+-                                  (let [asb (AttributedStringBuilder.)]
+-                                    (.append asb "|")
+-                                    (doseq [x (range width)]
+-                                      (if (and (= x 10) (= y 10))
+-                                        (do (.style asb style-green) (.append asb "██") (.style asb AttributedStyle/DEFAULT))
+-                                        (.append asb "  ")))
+-                                    (.append asb "|")
+-                                    (.add lines (.toAttributedString asb))))
+-                                (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
+-                                lines))]
+-            (.resize display (+ height 2) (+ (* width 2) 2))
+-            (bench provider-name "Display.update (full)" 200
+-                   #(.update display (build-frame) 0)))
+-
+-          (let [display (Display. terminal false)
+-                width 40
+-                height 20
+-                lines (let [lines (java.util.ArrayList.)]
+-                        (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
+-                        (doseq [_ (range height)]
+-                          (.add lines (AttributedString. (str "|" (apply str (repeat (* width 2) " ")) "|"))))
+-                        (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
+-                        lines)]
+-            (.resize display (+ height 2) (+ (* width 2) 2))
+-            (.update display lines 0)
+-            (bench provider-name "Display.update (diff)" 500
+-                   #(.update display lines 0)))
+-
+-          (finally
+-            (.close terminal)))))))
+-
+-(defn print-results []
+-  (println "\nJLine Provider Performance Benchmark")
+-  (println "=====================================")
+-  (println (str "Platform: " (System/getProperty "os.name")))
+-  (println (str "Java: " (System/getProperty "java.version")))
+-  (println)
+-  (let [exec-actual (get-in @results ["_provider" "exec"])
+-        ffm-actual (get-in @results ["_provider" "ffm"])]
+-    (println (format "Exec provider: %s" (or exec-actual "N/A")))
+-    (println (format "FFM provider:  %s" (or ffm-actual "N/A"))))
+-  (println)
+-  (println (format "%-25s %12s %12s %12s" "Operation" "Exec (ms)" "FFM (ms)" "Speedup"))
+-  (println (apply str (repeat 63 "-")))
+-
+-  (doseq [label ["TTY detection" "getSize" "getAttributes" "enterRawMode"
+-                 "write+flush" "Display.update (full)" "Display.update (diff)"]]
+-    (let [exec-data (get-in @results [label "exec"])
+-          ffm-data (get-in @results [label "ffm"])]
+-      (when (and exec-data ffm-data)
+-        (let [exec-ms (:per-op exec-data)
+-              ffm-ms (:per-op ffm-data)
+-              speedup (/ exec-ms ffm-ms)]
+-          (println (format "%-25s %12.4f %12.4f %11.1fx" label exec-ms ffm-ms speedup))))))
+-
+-  (println))
+-
+-(defn -main [& _args]
+-  ;; Test both providers
+-  (test-provider "exec")
+-  (test-provider "ffm")
+-
+-  ;; Clear screen and print results
+-  (print "\u001b[2J\u001b[H")
+-  (flush)
+-  (print-results))
+-
+-(-main)
+diff --git a/src/babashka/impl/repl.clj b/src/babashka/impl/repl.clj
+index 4a5702c9..41576a46 100644
+--- a/src/babashka/impl/repl.clj
++++ b/src/babashka/impl/repl.clj
+@@ -5,6 +5,7 @@
+    [babashka.impl.clojure.core :as core-extras]
+    [babashka.impl.clojure.main :as m]
+    [babashka.impl.common :as common]
++   [babashka.nrepl.impl.completions :as completions]
+    [babashka.terminal :as terminal]
+    [clojure.java.io :as io]
+    [clojure.string :as str]
+@@ -16,7 +17,8 @@
+    [sci.impl.utils :as utils])
+   (:import
+    [org.jline.reader LineReaderBuilder EndOfFileException UserInterruptException
+-    Parser Parser$ParseContext ParsedLine CompletingParsedLine EOFError]
++    Parser Parser$ParseContext ParsedLine CompletingParsedLine EOFError
++    Completer Candidate]
+    [org.jline.terminal TerminalBuilder]))
+ 
+ (set! *warn-on-reflection* true)
+@@ -43,14 +45,14 @@
+                              " ")
+                            "[at " file
+                            (when line
+-                             (str ":" line ":" column))"]"))))
++                             (str ":" line ":" column)) "]"))))
+       (sio/flush))))
+ 
+ (defn skip-if-eol
+   "Inspired by skip-if-eol from clojure.main."
+   [s]
+   (let [c (r/read-char s)]
+-    (when-not (= \newline c )
++    (when-not (= \newline c)
+       (r/unread s c))))
+ 
+ (defn repl-read [sci-ctx in-stream _request-prompt request-exit]
+@@ -116,6 +118,60 @@
+     (rawWordCursor [_] 0)
+     (rawWordLength [_] 0)))
+ 
++(defn word-at-cursor
++  "Extracts the word being completed at the cursor position.
++   Returns [word word-start] or nil if no word found.
++   Word characters in Clojure: alphanumeric, -, _, ?, !, *, +, =, <, >, /, ., :, '"
++  [^String line ^long cursor]
++  (let [word-char? (fn [c]
++                     (or (Character/isLetterOrDigit ^char c)
++                         (contains? #{\- \_ \? \! \* \+ \= \< \> \/ \. \: \'} c)))]
++    (when (pos? cursor)
++      (let [start (loop [i (dec cursor)]
++                    (if (or (neg? i) (not (word-char? (.charAt line i))))
++                      (inc i)
++                      (recur (dec i))))
++            word (when (< start cursor) (subs line start cursor))]
++        (when (and word (pos? (count word)))
++          [word start])))))
++
++(defn- completing-parsed-line
++  "Creates a CompletingParsedLine with word information for completions."
++  ^CompletingParsedLine [^String line ^long cursor word ^long word-start]
++  (let [word-cursor (- cursor word-start)]
++    (reify CompletingParsedLine
++      (word [_] word)
++      (wordCursor [_] word-cursor)
++      (wordIndex [_] 0)
++      (words [_] [word])
++      (line [_] line)
++      (cursor [_] cursor)
++      (escape [_ candidate _complete] (str candidate))
++      (rawWordCursor [_] word-cursor)
++      (rawWordLength [_] (count word)))))
++
++(defn- clojure-completer
++  "Creates a JLine Completer that uses SCI for Clojure completions."
++  [sci-ctx]
++  (reify Completer
++    (complete [_ _ parsed-line candidates]
++      (let [word (.word ^ParsedLine parsed-line)]
++        (when (and word (pos? (count word)))
++          (let [{:keys [completions]} (completions/completions sci-ctx word)]
++            (doseq [{:keys [candidate ns type]} completions]
++              (.add ^java.util.List candidates
++                    (Candidate.
++                     candidate          ; value - what gets inserted
++                     candidate          ; display - what's shown in menu
++                     nil                ; group
++                     (when (or ns type) ; descr - description shown
++                       (str (when type type)
++                            (when (and type ns) " ")
++                            (when ns ns)))
++                     nil                ; suffix
++                     nil                ; key
++                     false)))))))))      ; complete - add space after?
++
+ (defn- try-parse-next
+   "Try to parse the next form from reader. Returns :ok, :incomplete, or :error."
+   [sci-ctx reader]
+@@ -154,10 +210,16 @@
+    Throws EOFError for incomplete input, allowing JLine to handle multi-line editing."
+   ^Parser [sci-ctx]
+   (reify Parser
+-    (^ParsedLine parse [_this ^String line ^int cursor ^Parser$ParseContext _context]
+-     (if (complete-form? sci-ctx line)
+-       (parsed-line line cursor)
+-       (throw (EOFError. -1 -1 "Incomplete Clojure form"))))))
++    (^ParsedLine parse [_this ^String line ^int cursor ^Parser$ParseContext context]
++      (if (identical? context Parser$ParseContext/COMPLETE)
++        ;; For completions, return parsed line with word information
++        (if-let [[word start] (word-at-cursor line cursor)]
++          (completing-parsed-line line cursor word start)
++          (parsed-line line cursor))
++        ;; For accept-line, check if form is complete
++        (if (complete-form? sci-ctx line)
++          (parsed-line line cursor)
++          (throw (EOFError. -1 -1 "Incomplete Clojure form")))))))
+ 
+ (defn- jline-reader
+   "Creates a JLine LineReader for interactive input with persistent history."
+@@ -169,6 +231,7 @@
+     (-> (LineReaderBuilder/builder)
+         (.terminal terminal)
+         (.parser (jline-parser sci-ctx))
++        (.completer (clojure-completer sci-ctx))
+         (.variable org.jline.reader.LineReader/HISTORY_FILE history-file)
+         (.variable org.jline.reader.LineReader/SECONDARY_PROMPT_PATTERN "%P #_=> ")
+         (.build))))
+@@ -294,5 +357,4 @@
+ (comment
+   (def in (-> (java.io.StringReader. "(+ 1 2 3)") clojure.lang.LineNumberingPushbackReader.))
+   (r/peek-char in)
+-  (r/read-char in)
+-  )
++  (r/read-char in))

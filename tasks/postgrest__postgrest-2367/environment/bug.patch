@@ -1,0 +1,111 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6109b44..3fd49355 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -55,7 +55,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2317, Increase the `db-pool-timeout` to 1 hour to prevent frequent high connection latency - @steve-chavez
+  - #2341, The search path now correctly identifies schemas with uppercase and special characters in their names (regression) - @laurenceisla
+  - #2364, "404 Not Found" on nested routes and "405 Method Not Allowed" errors no longer start an empty database transaction - @steve-chavez
+- - #2342, Fix inaccurate result count when an inner embed was selected after a normal embed in the query string - @laurenceisla
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index e0015dd7..a114892c 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -248,7 +248,7 @@ readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, implicitJ
+     existsSubquery readReq@(Node (_, (_, _, _, _, joinType, _)) _) rest =
+       if joinType == Just JTInner
+         then ("EXISTS (" <> readRequestToCountQuery readReq <> " )"):rest
+-        else rest
++        else mempty
+ 
+ limitedQuery :: SQL.Snippet -> Maybe Integer -> SQL.Snippet
+ limitedQuery query maxRows = query <> SQL.sql (maybe mempty (\x -> " LIMIT " <> BS.pack (show x)) maxRows)
+diff --git a/test/spec/Feature/Query/EmbedInnerJoinSpec.hs b/test/spec/Feature/Query/EmbedInnerJoinSpec.hs
+index 580bf5c3..5f90618d 100644
+--- a/test/spec/Feature/Query/EmbedInnerJoinSpec.hs
++++ b/test/spec/Feature/Query/EmbedInnerJoinSpec.hs
+@@ -200,7 +200,7 @@ spec =
+ 
+       it "works with views" $ do
+         get "/authors?select=*,books!inner(*)&books.title=eq.1984" `shouldRespondWith`
+-          [json| [{"id":1,"name":"George Orwell","books":[{"id":1,"title":"1984","publication_year":1949,"author_id":1,"first_publisher_id":1}]}] |]
++          [json| [{"id":1,"name":"George Orwell","books":[{"id":1,"title":"1984","publication_year":1949,"author_id":1}]}] |]
+           { matchHeaders = [matchContentTypeJson] }
+         request methodHead "/authors?select=*,books!inner(*)&books.title=eq.1984" [("Prefer", "count=exact")] mempty
+           `shouldRespondWith` ""
+@@ -354,25 +354,3 @@ spec =
+         , matchHeaders = [ matchContentTypeJson
+                          , "Content-Range" <:> "0-2/3" ]
+         }
+-
+-    it "works alongside another embedding" $ do
+-      -- https://github.com/PostgREST/postgrest/issues/2342
+-      get "/books?select=id,authors(name),publishers!inner(name)&id=gte.7"
+-        `shouldRespondWith`
+-        [json| [
+-          {"id":7,"authors":{"name":"Harper Lee"},"publishers":{"name":"J. B. Lippincott & Co."}},
+-          {"id":8,"authors":{"name":"Kurt Vonnegut"},"publishers":{"name":"Delacorte"}},
+-          {"id":9,"authors":{"name":"Ken Kesey"},"publishers":{"name":"Viking Press & Signet Books"}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-      request methodHead "/books?select=id,authors(name),publishers!inner(name)&id=gte.7" [("Prefer", "count=exact")] mempty
+-        `shouldRespondWith` ""
+-        { matchStatus  = 200
+-        , matchHeaders = [ matchContentTypeJson
+-                         , "Content-Range" <:> "0-2/3" ]
+-        }
+-      request methodHead "/books?select=id,publishers!inner(name),authors(name)&id=gte.7" [("Prefer", "count=exact")] mempty
+-        `shouldRespondWith` ""
+-        { matchStatus  = 200
+-        , matchHeaders = [ matchContentTypeJson
+-                         , "Content-Range" <:> "0-2/3" ]
+-        }
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index 3e36c858..aeb3fbde 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -445,7 +445,6 @@ INSERT INTO authors VALUES (6, 'William Golding');
+ INSERT INTO authors VALUES (7, 'Harper Lee');
+ INSERT INTO authors VALUES (8, 'Kurt Vonnegut');
+ INSERT INTO authors VALUES (9, 'Ken Kesey');
+-INSERT INTO authors VALUES (10, 'Fyodor Dostoevsky');
+ 
+ TRUNCATE TABLE publishers CASCADE;
+ INSERT INTO publishers VALUES (1, 'Secker & Warburg');
+@@ -468,7 +467,6 @@ INSERT INTO books VALUES (6, 'Lord of the Flies', 1954, 6, 6);
+ INSERT INTO books VALUES (7, 'To Kill a Mockingbird', 1960, 7, 7);
+ INSERT INTO books VALUES (8, 'Slaughterhouse-Five', 1969, 8, 8);
+ INSERT INTO books VALUES (9, 'One Flew Over the Cuckoo''s Nest', 1962, 9, 9);
+-INSERT INTO books VALUES (10, 'Crime and Punishment', 1866, 10, null);
+ 
+ SET search_path = test, pg_catalog;
+ 
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index 21e8ccab..5177c6b6 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -89,7 +89,6 @@ GRANT ALL ON TABLE
+     , managers
+     , organizations
+     , authors
+-    , publishers
+     , books
+     , forties_books
+     , fifties_books
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 71e26a75..a6230613 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -1461,9 +1461,8 @@ create table private.books(
+ );
+ 
+ create view test.authors as select id, name from private.authors;
+-create view test.publishers as select id, name from private.publishers;
+ 
+-create view test.books as select id, title, publication_year, author_id, first_publisher_id from private.books;
++create view test.books as select id, title, publication_year, author_id from private.books;
+ create view test.forties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1940 and publication_year < 1950;
+ create view test.fifties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1950 and publication_year < 1960;
+ create view test.sixties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1960 and publication_year < 1970;

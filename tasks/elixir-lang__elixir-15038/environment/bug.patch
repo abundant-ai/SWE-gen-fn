@@ -1,0 +1,985 @@
+diff --git a/lib/elixir/lib/module/types/apply.ex b/lib/elixir/lib/module/types/apply.ex
+index 61e851144..a06949580 100644
+--- a/lib/elixir/lib/module/types/apply.ex
++++ b/lib/elixir/lib/module/types/apply.ex
+@@ -168,13 +168,13 @@ def signature(_, _), do: :none
+         {:erlang, :binary_to_integer, [{[binary()], integer()}]},
+         {:erlang, :binary_to_integer, [{[binary(), integer()], integer()}]},
+         {:erlang, :binary_to_float, [{[binary()], float()}]},
+-        {:erlang, :bit_size, [{[bitstring()], integer()}]},
++        {:erlang, :bit_size, [{[binary()], integer()}]},
+         {:erlang, :bnot, [{[integer()], integer()}]},
+         {:erlang, :bor, [{[integer(), integer()], integer()}]},
+         {:erlang, :bsl, [{[integer(), integer()], integer()}]},
+         {:erlang, :bsr, [{[integer(), integer()], integer()}]},
+         {:erlang, :bxor, [{[integer(), integer()], integer()}]},
+-        {:erlang, :byte_size, [{[bitstring()], integer()}]},
++        {:erlang, :byte_size, [{[binary()], integer()}]},
+         {:erlang, :ceil, [{[union(integer(), float())], integer()}]},
+         {:erlang, :div, [{[integer(), integer()], integer()}]},
+         {:erlang, :error, [{[term()], none()}]},
+@@ -288,7 +288,7 @@ def signature(unquote(mod), unquote(fun), unquote(arity)),
+   is_guards = [
+     is_atom: atom(),
+     is_binary: binary(),
+-    is_bitstring: bitstring(),
++    is_bitstring: binary(),
+     is_boolean: boolean(),
+     is_float: float(),
+     is_function: fun(),
+@@ -303,10 +303,13 @@ def signature(unquote(mod), unquote(fun), unquote(arity)),
+   ]
+ 
+   for {guard, type} <- is_guards do
++    # is_binary can actually fail for binaries if they are bitstrings
++    return = if guard == :is_binary, do: boolean(), else: atom([true])
++
+     domain_clauses =
+       {:strong, [term()],
+        [
+-         {[type], atom([true])},
++         {[type], return},
+          {[negation(type)], atom([false])}
+        ]}
+ 
+@@ -1279,17 +1282,6 @@ def local_capture(fun, arity, meta, stack, context) do
+     end
+   end
+ 
+-  @doc """
+-  Computes the return type of an application.
+-  """
+-  def return(type, args_types, stack) do
+-    cond do
+-      stack.mode == :static -> type
+-      Enum.any?(args_types, &gradual?/1) -> dynamic(type)
+-      true -> type
+-    end
+-  end
+-
+   ## Map helpers
+ 
+   defp map_put_new(map, key, value, name, args_types, stack) do
+@@ -1333,6 +1325,14 @@ def map_update_or_replace_lazy(name, [map, key, fun] = args_types, stack, error)
+ 
+   ## Application helpers
+ 
++  defp return(type, args_types, stack) do
++    cond do
++      stack.mode == :static -> type
++      Enum.any?(args_types, &gradual?/1) -> dynamic(type)
++      true -> type
++    end
++  end
++
+   defp domain(nil, [{domain, _}]), do: domain
+   defp domain(domain, _clauses), do: domain
+ 
+diff --git a/lib/elixir/lib/module/types/descr.ex b/lib/elixir/lib/module/types/descr.ex
+index 4fa0409f2..e8a7e47c8 100644
+--- a/lib/elixir/lib/module/types/descr.ex
++++ b/lib/elixir/lib/module/types/descr.ex
+@@ -16,23 +16,14 @@ defmodule Module.Types.Descr do
+ 
+   import Bitwise
+ 
+-  @bit_binary 0b1
+-  @bit_bitstring_no_binary 0b10
+-  @bit_empty_list 0b100
+-  @bit_integer 0b1000
+-  @bit_float 0b10000
+-  @bit_pid 0b100000
+-  @bit_port 0b1000000
+-  @bit_reference 0b10000000
+-  @bit_top 0b11111111
+-
+-  # We use two bits to represent bitstrings and binaries,
+-  # which must be looked at together
+-  # bitstring = 0b11
+-  # bitstring and not binary = 0b10
+-  # binary = 0b01
+-  # none = 0b00
+-  @bit_bitstring @bit_binary ||| @bit_bitstring_no_binary
++  @bit_binary 1 <<< 0
++  @bit_empty_list 1 <<< 1
++  @bit_integer 1 <<< 2
++  @bit_float 1 <<< 3
++  @bit_pid 1 <<< 4
++  @bit_port 1 <<< 5
++  @bit_reference 1 <<< 6
++  @bit_top (1 <<< 7) - 1
+   @bit_number @bit_integer ||| @bit_float
+ 
+   defmacro bdd_leaf(arg1, arg2), do: {arg1, arg2}
+@@ -89,8 +80,6 @@ defp unfolded_term, do: @term
+   def atom(as), do: %{atom: atom_new(as)}
+   def atom(), do: %{atom: @atom_top}
+   def binary(), do: %{bitmap: @bit_binary}
+-  def bitstring(), do: %{bitmap: @bit_bitstring}
+-  def bitstring_no_binary(), do: %{bitmap: @bit_bitstring_no_binary}
+   def closed_map(pairs), do: map_descr(:closed, pairs)
+   def empty_list(), do: %{bitmap: @bit_empty_list}
+   def empty_map(), do: %{map: @map_empty}
+@@ -854,14 +843,29 @@ def empty_list_type?(_), do: false
+   @doc """
+   Optimized version of `not empty?(intersection(binary(), type))`.
+   """
+-  def bitstring_type?(:term), do: true
+-  def bitstring_type?(%{dynamic: :term}), do: true
++  def binary_type?(:term), do: true
++  def binary_type?(%{dynamic: :term}), do: true
++  def binary_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_binary) != 0, do: true
++  def binary_type?(%{bitmap: bitmap}) when (bitmap &&& @bit_binary) != 0, do: true
++  def binary_type?(_), do: false
+ 
+-  def bitstring_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_bitstring) != 0,
+-    do: true
++  @doc """
++  Optimized version of `not empty?(intersection(integer(), type))`.
++  """
++  def integer_type?(:term), do: true
++  def integer_type?(%{dynamic: :term}), do: true
++  def integer_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_integer) != 0, do: true
++  def integer_type?(%{bitmap: bitmap}) when (bitmap &&& @bit_integer) != 0, do: true
++  def integer_type?(_), do: false
+ 
+-  def bitstring_type?(%{bitmap: bitmap}) when (bitmap &&& @bit_bitstring) != 0, do: true
+-  def bitstring_type?(_), do: false
++  @doc """
++  Optimized version of `not empty?(intersection(float(), type))`.
++  """
++  def float_type?(:term), do: true
++  def float_type?(%{dynamic: :term}), do: true
++  def float_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_float) != 0, do: true
++  def float_type?(%{bitmap: bitmap}) when (bitmap &&& @bit_float) != 0, do: true
++  def float_type?(_), do: false
+ 
+   @doc """
+   Optimized version of `not empty?(intersection(integer() or float(), type))`.
+@@ -877,6 +881,7 @@ def number_type?(_), do: false
+   defp bitmap_to_quoted(val) do
+     pairs =
+       [
++        binary: @bit_binary,
+         empty_list: @bit_empty_list,
+         integer: @bit_integer,
+         float: @bit_float,
+@@ -885,17 +890,9 @@ defp bitmap_to_quoted(val) do
+         reference: @bit_reference
+       ]
+ 
+-    quoted =
+-      for {type, mask} <- pairs,
+-          (mask &&& val) !== 0,
+-          do: {type, [], []}
+-
+-    case val &&& @bit_bitstring do
+-      0 -> quoted
+-      1 -> [{:binary, [], []} | quoted]
+-      2 -> [{:and, [], [{:bitstring, [], []}, {:not, [], [{:binary, [], []}]}]} | quoted]
+-      3 -> [{:bitstring, [], []} | quoted]
+-    end
++    for {type, mask} <- pairs,
++        (mask &&& val) !== 0,
++        do: {type, [], []}
+   end
+ 
+   ## Atoms
+@@ -2371,7 +2368,7 @@ defp dynamic_to_quoted(descr, opts) do
+ 
+   defp indivisible_bitmap(descr, opts) do
+     with true <- Keyword.get(opts, :skip_dynamic_for_indivisible, true),
+-         %{bitmap: bitmap} when map_size(descr) == 1 and bitmap != @bit_bitstring <- descr,
++         %{bitmap: bitmap} when map_size(descr) == 1 <- descr,
+          [single] <- bitmap_to_quoted(bitmap) do
+       single
+     else
+@@ -2426,7 +2423,6 @@ def to_domain_keys(key_descr) do
+ 
+   defp bitmap_to_domain_keys(bitmap, acc) do
+     acc = if (bitmap &&& @bit_binary) != 0, do: [:binary | acc], else: acc
+-    acc = if (bitmap &&& @bit_bitstring_no_binary) != 0, do: [:bitstring | acc], else: acc
+     acc = if (bitmap &&& @bit_empty_list) != 0, do: [:list | acc], else: acc
+     acc = if (bitmap &&& @bit_integer) != 0, do: [:integer | acc], else: acc
+     acc = if (bitmap &&& @bit_float) != 0, do: [:float | acc], else: acc
+@@ -2437,7 +2433,6 @@ defp bitmap_to_domain_keys(bitmap, acc) do
+   end
+ 
+   defp domain_key_to_descr(:atom), do: atom()
+-  defp domain_key_to_descr(:bitstring), do: bitstring_no_binary()
+   defp domain_key_to_descr(:binary), do: binary()
+   defp domain_key_to_descr(:integer), do: integer()
+   defp domain_key_to_descr(:float), do: float()
+diff --git a/lib/elixir/lib/module/types/expr.ex b/lib/elixir/lib/module/types/expr.ex
+index 355b03ae1..4104cd657 100644
+--- a/lib/elixir/lib/module/types/expr.ex
++++ b/lib/elixir/lib/module/types/expr.ex
+@@ -122,8 +122,9 @@ def of_expr({:{}, _meta, exprs}, expected, expr, stack, context) do
+   end
+ 
+   # <<...>>>
+-  def of_expr({:<<>>, meta, args}, _expected, _expr, stack, context) do
+-    Of.bitstring(meta, args, :expr, stack, context)
++  def of_expr({:<<>>, _meta, args}, _expected, _expr, stack, context) do
++    context = Of.binary(args, :expr, stack, context)
++    {binary(), context}
+   end
+ 
+   def of_expr({:__CALLER__, _meta, var_context}, _expected, _expr, _stack, context)
+@@ -314,7 +315,7 @@ def of_expr({:case, meta, [case_expr, [{:do, clauses}]]}, expected, expr, stack,
+     |> dynamic_unless_static(stack)
+   end
+ 
+-  # fn pat -> expr end
++  # TODO: fn pat -> expr end
+   def of_expr({:fn, _meta, clauses}, _expected, _expr, stack, context) do
+     [{:->, _, [head, _]} | _] = clauses
+     {patterns, _guards} = extract_head(head)
+@@ -415,26 +416,20 @@ def of_expr({:for, meta, [_ | _] = args}, expected, expr, stack, context) do
+     else
+       # TODO: Use the collectable protocol for the output
+       into = Keyword.get(opts, :into, [])
+-      {into_type, into_kind, context} = for_into(into, meta, stack, context)
++      {into_wrapper, gradual?, context} = for_into(into, meta, stack, context)
+       {block_type, context} = of_expr(block, @pending, block, stack, context)
+ 
+-      case into_kind do
+-        :bitstring ->
+-          case compatible_intersection(block_type, bitstring()) do
+-            {:ok, intersection} ->
+-              {return_union(into_type, intersection, stack), context}
+-
+-            {:error, _} ->
+-              error = {:badbitbody, block_type, block, context}
+-              {error_type(), error(__MODULE__, error, meta, stack, context)}
++      for_type =
++        for type <- into_wrapper do
++          case type do
++            :binary -> binary()
++            :list -> list(block_type)
++            :term -> term()
+           end
++        end
++        |> Enum.reduce(&union/2)
+ 
+-        :non_empty_list ->
+-          {return_union(into_type, non_empty_list(block_type), stack), context}
+-
+-        :none ->
+-          {into_type, context}
+-      end
++      {if(gradual?, do: dynamic(for_type), else: for_type), context}
+     end
+   end
+ 
+@@ -474,7 +469,7 @@ def of_expr({{:., _, [remote, name]}, meta, args} = call, expected, _expr, stack
+     apply_many(mods, name, args, expected, call, stack, context)
+   end
+ 
+-  # &Foo.bar/1
++  # TODO: &Foo.bar/1
+   def of_expr(
+         {:&, _, [{:/, _, [{{:., _, [remote, name]}, meta, []}, arity]}]} = call,
+         _expected,
+@@ -488,7 +483,7 @@ def of_expr(
+     Apply.remote_capture(mods, name, arity, meta, stack, context)
+   end
+ 
+-  # &foo/1
++  # TODO: &foo/1
+   def of_expr({:&, _meta, [{:/, _, [{fun, meta, _}, arity]}]}, _expected, _expr, stack, context) do
+     Apply.local_capture(fun, arity, meta, stack, context)
+   end
+@@ -582,13 +577,13 @@ defp for_clause({:<-, meta, [left, right]}, stack, context) do
+   end
+ 
+   defp for_clause({:<<>>, _, [{:<-, meta, [left, right]}]} = expr, stack, context) do
+-    {right_type, context} = of_expr(right, bitstring(), expr, stack, context)
+-    context = Pattern.of_generator(left, [], bitstring(), :for, expr, stack, context)
++    {right_type, context} = of_expr(right, binary(), expr, stack, context)
++    context = Pattern.of_generator(left, [], binary(), :for, expr, stack, context)
+ 
+-    if compatible?(right_type, bitstring()) do
++    if compatible?(right_type, binary()) do
+       context
+     else
+-      error = {:badbitgenerator, right_type, right, context}
++      error = {:badbinary, right_type, right, context}
+       error(__MODULE__, error, meta, stack, context)
+     end
+   end
+@@ -598,13 +593,13 @@ defp for_clause(expr, stack, context) do
+     context
+   end
+ 
+-  @into_compile union(bitstring(), empty_list())
++  @into_compile union(binary(), empty_list())
+ 
+   defp for_into([], _meta, _stack, context),
+-    do: {empty_list(), :non_empty_list, context}
++    do: {[:list], false, context}
+ 
+   defp for_into(binary, _meta, _stack, context) when is_binary(binary),
+-    do: {binary(), :bitstring, context}
++    do: {[:binary], false, context}
+ 
+   defp for_into(into, meta, stack, context) do
+     meta =
+@@ -621,33 +616,21 @@ defp for_into(into, meta, stack, context) do
+     {type, context} = of_expr(into, domain, expr, stack, context)
+ 
+     # We use subtype? instead of compatible because we want to handle
+-    # only bitstring/list, even if a dynamic with something else is given.
++    # only binary/list, even if a dynamic with something else is given.
+     if subtype?(type, @into_compile) do
+-      case {bitstring_type?(type), empty_list_type?(type)} do
+-        # If they can be both be true, then we don't know
+-        # what the contents of the block are for
+-        {true, true} ->
+-          type = union(bitstring(), list(term()))
+-          {if(gradual?(type), do: dynamic(type), else: type), :none, context}
+-
+-        {false, true} ->
+-          {type, :non_empty_list, context}
+-
+-        {true, false} ->
+-          {type, :bitstring, context}
++      case {binary_type?(type), empty_list_type?(type)} do
++        {false, true} -> {[:list], gradual?(type), context}
++        {true, false} -> {[:binary], gradual?(type), context}
++        {_, _} -> {[:binary, :list], gradual?(type), context}
+       end
+     else
+       {_type, context} =
+         Apply.remote_apply(info, Collectable, :into, [type], expr, stack, context)
+ 
+-      {dynamic(), :none, context}
++      {[:term], true, context}
+     end
+   end
+ 
+-  defp return_union(left, right, stack) do
+-    Apply.return(union(left, right), [left, right], stack)
+-  end
+-
+   ## With
+ 
+   defp with_clause({:<-, _meta, [left, right]} = expr, stack, context) do
+@@ -883,28 +866,7 @@ def format_diagnostic({:baddomain, type, key_type, expr, context}) do
+     }
+   end
+ 
+-  def format_diagnostic({:badbitgenerator, type, expr, context}) do
+-    traces = collect_traces(expr, context)
+-
+-    %{
+-      details: %{typing_traces: traces},
+-      message:
+-        IO.iodata_to_binary([
+-          """
+-          expected the right side of <- in a binary generator to be a binary (or bitstring):
+-
+-              #{expr_to_string(expr) |> indent(4)}
+-
+-          but got type:
+-
+-              #{to_quoted_string(type) |> indent(4)}
+-          """,
+-          format_traces(traces)
+-        ])
+-    }
+-  end
+-
+-  def format_diagnostic({:badbitbody, type, expr, context}) do
++  def format_diagnostic({:badbinary, type, expr, context}) do
+     traces = collect_traces(expr, context)
+ 
+     %{
+@@ -912,7 +874,7 @@ def format_diagnostic({:badbitbody, type, expr, context}) do
+       message:
+         IO.iodata_to_binary([
+           """
+-          expected the body of a for-comprehension with into: binary() (or bitstring()) to be a binary (or bitstring):
++          expected the right side of <- in a binary generator to be a binary:
+ 
+               #{expr_to_string(expr) |> indent(4)}
+ 
+diff --git a/lib/elixir/lib/module/types/of.ex b/lib/elixir/lib/module/types/of.ex
+index d49996ef0..f37132841 100644
+--- a/lib/elixir/lib/module/types/of.ex
++++ b/lib/elixir/lib/module/types/of.ex
+@@ -16,7 +16,6 @@ defmodule Module.Types.Of do
+   @integer integer()
+   @float float()
+   @binary binary()
+-  @bitstring bitstring()
+ 
+   ## Variables
+ 
+@@ -209,7 +208,7 @@ def reduce_conditional_vars([{vars, cond} | vars_conds], expr, stack, context) d
+ 
+   impls = [
+     {Atom, atom()},
+-    {BitString, bitstring()},
++    {BitString, binary()},
+     {Float, float()},
+     {Function, fun()},
+     {Integer, integer()},
+@@ -468,54 +467,44 @@ def struct_type(struct, info, args_types \\ []) do
+     closed_map(pairs)
+   end
+ 
+-  ## Bitstrings
++  ## Binary
+ 
+   @doc """
+-  Handles bitstrings.
++  Handles binaries.
+ 
+   In the stack, we add nodes such as <<expr>>, <<..., expr>>, etc,
+   based on the position of the expression within the binary.
+   """
+-  def bitstring(meta, parts, kind, stack, context) do
+-    context = bitstring(parts, kind, stack, context)
+-
+-    case Keyword.get(meta, :alignment, :unknown) do
+-      :unknown -> {bitstring(), context}
+-      0 -> {binary(), context}
+-      _ -> {bitstring_no_binary(), context}
+-    end
+-  end
+-
+-  defp bitstring([], _kind, _stack, context) do
++  def binary([], _kind, _stack, context) do
+     context
+   end
+ 
+-  defp bitstring([head], kind, stack, context) do
+-    bitstring_segment(head, kind, [head], stack, context)
++  def binary([head], kind, stack, context) do
++    binary_segment(head, kind, [head], stack, context)
+   end
+ 
+-  defp bitstring([head | tail], kind, stack, context) do
+-    context = bitstring_segment(head, kind, [head, @suffix], stack, context)
+-    bitstring_tail(tail, kind, stack, context)
++  def binary([head | tail], kind, stack, context) do
++    context = binary_segment(head, kind, [head, @suffix], stack, context)
++    binary_many(tail, kind, stack, context)
+   end
+ 
+-  defp bitstring_tail([last], kind, stack, context) do
+-    bitstring_segment(last, kind, [@prefix, last], stack, context)
++  defp binary_many([last], kind, stack, context) do
++    binary_segment(last, kind, [@prefix, last], stack, context)
+   end
+ 
+-  defp bitstring_tail([head | tail], kind, stack, context) do
+-    context = bitstring_segment(head, kind, [@prefix, head, @suffix], stack, context)
+-    bitstring_tail(tail, kind, stack, context)
++  defp binary_many([head | tail], kind, stack, context) do
++    context = binary_segment(head, kind, [@prefix, head, @suffix], stack, context)
++    binary_many(tail, kind, stack, context)
+   end
+ 
+   # If the segment is a literal, the compiler has already checked its validity,
+   # so we just check the size.
+-  defp bitstring_segment({:"::", _meta, [left, right]}, kind, _args, stack, context)
++  defp binary_segment({:"::", _meta, [left, right]}, kind, _args, stack, context)
+        when is_binary(left) or is_number(left) do
+     specifier_size(kind, right, stack, context)
+   end
+ 
+-  defp bitstring_segment({:"::", meta, [left, right]}, kind, args, stack, context) do
++  defp binary_segment({:"::", meta, [left, right]}, kind, args, stack, context) do
+     type = specifier_type(kind, right)
+     expr = {:<<>>, meta, args}
+ 
+@@ -561,8 +550,8 @@ defp specifier_type(_kind, {:utf8, _, _}), do: @integer_or_binary
+   defp specifier_type(_kind, {:utf16, _, _}), do: @integer_or_binary
+   defp specifier_type(_kind, {:utf32, _, _}), do: @integer_or_binary
+   defp specifier_type(_kind, {:integer, _, _}), do: @integer
+-  defp specifier_type(_kind, {:bits, _, _}), do: @bitstring
+-  defp specifier_type(_kind, {:bitstring, _, _}), do: @bitstring
++  defp specifier_type(_kind, {:bits, _, _}), do: @binary
++  defp specifier_type(_kind, {:bitstring, _, _}), do: @binary
+   defp specifier_type(_kind, {:bytes, _, _}), do: @binary
+   defp specifier_type(_kind, {:binary, _, _}), do: @binary
+   defp specifier_type(_kind, _specifier), do: @integer
+diff --git a/lib/elixir/lib/module/types/pattern.ex b/lib/elixir/lib/module/types/pattern.ex
+index ce56b8f4d..3590c0235 100644
+--- a/lib/elixir/lib/module/types/pattern.ex
++++ b/lib/elixir/lib/module/types/pattern.ex
+@@ -401,8 +401,8 @@ def of_match_var(var, expected, expr, stack, context) when is_var(var) do
+     end
+   end
+ 
+-  def of_match_var({:<<>>, meta, args}, _expected, _expr, stack, context) do
+-    Of.bitstring(meta, args, :match, stack, context)
++  def of_match_var({:<<>>, _meta, args}, _expected, _expr, stack, context) do
++    {binary(), Of.binary(args, :match, stack, context)}
+   end
+ 
+   def of_match_var({:^, _meta, [{_, meta, _}]}, expected, expr, stack, context) do
+@@ -592,8 +592,9 @@ defp of_pattern({:%{}, _meta, args}, path, stack, context) do
+   end
+ 
+   # <<...>>>
+-  defp of_pattern({:<<>>, meta, args}, _path, stack, context) do
+-    Of.bitstring(meta, args, :match, stack, context)
++  defp of_pattern({:<<>>, _meta, args}, _path, stack, context) do
++    context = Of.binary(args, :match, stack, context)
++    {binary(), context}
+   end
+ 
+   # left ++ right
+@@ -851,8 +852,9 @@ def of_guard({:%{}, _meta, args}, expected, expr, stack, context) do
+   end
+ 
+   # <<>>
+-  def of_guard({:<<>>, meta, args}, _expected, _expr, stack, context) do
+-    Of.bitstring(meta, args, :guard, stack, context)
++  def of_guard({:<<>>, _meta, args}, _expected, _expr, stack, context) do
++    context = Of.binary(args, :guard, stack, context)
++    {binary(), context}
+   end
+ 
+   # ^var
+diff --git a/lib/elixir/pages/cheatsheets/types-cheat.cheatmd b/lib/elixir/pages/cheatsheets/types-cheat.cheatmd
+index 6b0df3a6f..93bbd776c 100644
+--- a/lib/elixir/pages/cheatsheets/types-cheat.cheatmd
++++ b/lib/elixir/pages/cheatsheets/types-cheat.cheatmd
+@@ -33,10 +33,9 @@ not type
+ 
+ ## Data types
+ 
+-### Broad types
++### Indivisible types
+ 
+ ```elixir
+-bitstring()
+ binary()
+ empty_list()
+ integer()
+@@ -46,8 +45,6 @@ port()
+ reference()
+ ```
+ 
+-`binary()` is a subtype of `bitstring()`.
+-
+ ### Atoms
+ 
+ #### All atoms
+@@ -170,20 +167,24 @@ tuple()
+ 
+ #### At least n-element tuples
+ 
+-```elixir
++```
+ {binary(), binary(), ...}
+ ```
+ 
+ ## Additional types for convenience
+ 
+-#### Common aliases
++#### Aliases
+ 
+ ```elixir
++bitstring() = binary()
+ boolean() = true or false
+ number() = integer() or float()
+ ```
+ 
+-#### List aliases
++The type system currently does not distinguish between
++binaries and bitstrings.
++
++#### Lists
+ 
+ ```elixir
+ list() = empty_list() or non_empty_list(term())
+diff --git a/lib/elixir/pages/references/gradual-set-theoretic-types.md b/lib/elixir/pages/references/gradual-set-theoretic-types.md
+index 528fa9eef..745504764 100644
+--- a/lib/elixir/pages/references/gradual-set-theoretic-types.md
++++ b/lib/elixir/pages/references/gradual-set-theoretic-types.md
+@@ -24,7 +24,6 @@ The basic types are:
+ ```elixir
+ atom()
+ binary()
+-bitstring()
+ empty_list()
+ integer()
+ float()
+@@ -55,13 +54,9 @@ You can find a complete reference in the [set-theoretic types cheatsheet](../che
+ 
+ In this section we will cover the syntax of all data types. At the moment, developers will interact with those types mostly through compiler warnings and diagnostics.
+ 
+-### Broad types
++### Indivisible types
+ 
+-These types are broad in that they cannot represent individual elements, only the whole set. For example, the numbers `1` and `42` are both represented by the type `integer()`.
+-
+-They are: `binary()`, `bitstring()`, `integer()`, `float()`, `pid()`, `port()`, `reference()`.
+-
+-The `binary()` type is a subtype of the less frequently used `bitstring()` type, as binaries are bitstrings where the number of bits is divisible by 8.
++These types are indivisibile and have no further representation. They are: `binary()`, `integer()`, `float()`, `pid()`, `port()`, `reference()`.  For example, the numbers `1` and `42` are both represented by the type `integer()`.
+ 
+ ### Atoms
+ 
+@@ -153,7 +148,7 @@ That's the same as specifying all lists:
+ %{list() => integer() or binary()}
+ ```
+ 
+-The supported domain keys are `atom()`, `bitstring()`, `binary()`, `integer()`, `float()`, `fun()`, `list()`, `map()`, `pid()`, `port()`, `reference()`, and `tuple()`. In the case of maps, the `bitstring()` domain stores exclusively keys which are not binary. The ones which are `binary()` are stored under the `binary()` domain.
++The supported domain keys are `atom()`, `binary()`, `integer()`, `float()`, `fun()`, `list()`, `map()`, `pid()`, `port()`, `reference()`, and `tuple()`.
+ 
+ Furthermore, it is important to note that domain keys are, by definition, optional. Whenever you have a `%{integer() => integer()}`and you try to fetch a key, we must assume the key may not exist (after all, it is not possible to store all integers as map keys as they are infinite).
+ 
+diff --git a/lib/elixir/src/elixir_erl.erl b/lib/elixir/src/elixir_erl.erl
+index 75fad7ab7..f56585ca8 100644
+--- a/lib/elixir/src/elixir_erl.erl
++++ b/lib/elixir/src/elixir_erl.erl
+@@ -11,7 +11,7 @@
+ -define(typespecs, 'Elixir.Kernel.Typespec').
+ 
+ checker_version() ->
+-  elixir_checker_v5.
++  elixir_checker_v4.
+ 
+ %% debug_info callback
+ 
+diff --git a/lib/elixir/test/elixir/module/types/descr_test.exs b/lib/elixir/test/elixir/module/types/descr_test.exs
+index 123622195..652cb04df 100644
+--- a/lib/elixir/test/elixir/module/types/descr_test.exs
++++ b/lib/elixir/test/elixir/module/types/descr_test.exs
+@@ -54,7 +54,7 @@ test "all primitive types" do
+         atom(),
+         integer(),
+         float(),
+-        bitstring(),
++        binary(),
+         open_map(),
+         non_empty_list(term(), term()),
+         empty_list(),
+@@ -182,6 +182,7 @@ test "optimizations (maps)" do
+              ) == closed_map(a: union(float(), integer()), b: atom())
+ 
+       # Optimization two: we can tell that one map is a subtype of the other:
++
+       assert union(
+                closed_map(a: term(), b: term()),
+                closed_map(a: float(), b: binary())
+@@ -215,7 +216,8 @@ test "optimizations (tuples)" do
+                tuple([integer(), atom()])
+              ) == tuple([union(float(), integer()), atom()])
+ 
+-      # Optimization two: we can tell that one tuple is a subtype of the other
++      # Optimization two: we can tell that one tuple is a subtype of the other:
++
+       assert union(
+                tuple([term(), term()]),
+                tuple([float(), binary()])
+@@ -2487,14 +2489,8 @@ test "map" do
+ 
+   describe "to_quoted" do
+     test "bitmap" do
+-      assert union(pid(), bitstring()) |> to_quoted_string() ==
+-               "bitstring() or pid()"
+-
+       assert union(integer(), union(float(), binary())) |> to_quoted_string() ==
+                "binary() or float() or integer()"
+-
+-      assert difference(bitstring(), binary()) |> union(integer()) |> to_quoted_string() ==
+-               "(bitstring() and not binary()) or integer()"
+     end
+ 
+     test "none" do
+@@ -2528,23 +2524,16 @@ test "boolean" do
+     test "dynamic" do
+       assert dynamic() |> to_quoted_string() == "dynamic()"
+ 
+-      assert intersection(atom(), dynamic()) |> to_quoted_string() == "dynamic(atom())"
+-
+       assert dynamic(union(atom(), integer())) |> union(integer()) |> to_quoted_string() ==
+                "dynamic(atom()) or integer()"
+ 
+-      assert intersection(binary(), dynamic()) |> to_quoted_string() ==
+-               "binary()"
+-
+-      assert intersection(bitstring(), dynamic()) |> to_quoted_string() ==
+-               "dynamic(bitstring())"
+-
+-      assert intersection(bitstring_no_binary(), dynamic()) |> to_quoted_string() ==
+-               "bitstring() and not binary()"
++      assert intersection(binary(), dynamic()) |> to_quoted_string() == "binary()"
+ 
+       assert intersection(union(binary(), pid()), dynamic()) |> to_quoted_string() ==
+                "dynamic(binary() or pid())"
+ 
++      assert intersection(atom(), dynamic()) |> to_quoted_string() == "dynamic(atom())"
++
+       assert union(atom([:foo, :bar]), dynamic()) |> to_quoted_string() ==
+                "dynamic() or :bar or :foo"
+ 
+diff --git a/lib/elixir/test/elixir/module/types/expr_test.exs b/lib/elixir/test/elixir/module/types/expr_test.exs
+index 27fcbdefe..4eab9a44a 100644
+--- a/lib/elixir/test/elixir/module/types/expr_test.exs
++++ b/lib/elixir/test/elixir/module/types/expr_test.exs
+@@ -31,15 +31,6 @@ test "generated" do
+     assert typecheck!([x = 1], generated(x)) == dynamic()
+   end
+ 
+-  describe "bitstrings" do
+-    test "alignment" do
+-      assert typecheck!(<<round(:rand.uniform())>>) == binary()
+-      assert typecheck!(<<round(:rand.uniform())::1>>) == difference(bitstring(), binary())
+-      assert typecheck!(<<round(:rand.uniform())::4, round(:rand.uniform())::4>>) == binary()
+-      assert typecheck!([size], <<round(:rand.uniform())::size(size)>>) == bitstring()
+-    end
+-  end
+-
+   describe "lists" do
+     test "creating lists" do
+       assert typecheck!([1, 2]) == non_empty_list(integer())
+@@ -687,7 +678,7 @@ test "warnings" do
+     end
+ 
+     test "size ok" do
+-      assert typecheck!([<<x, y>>, z], <<z::size(x - y)>>) == bitstring()
++      assert typecheck!([<<x, y>>, z], <<z::size(x - y)>>) == binary()
+     end
+ 
+     test "size error" do
+@@ -2049,10 +2040,10 @@ test "resets branches" do
+   end
+ 
+   describe "comprehensions" do
+-    test "bitstring generators" do
++    test "binary generators" do
+       assert typeerror!([<<x>>], for(<<y <- x>>, do: y)) ==
+                ~l"""
+-               expected the right side of <- in a binary generator to be a binary (or bitstring):
++               expected the right side of <- in a binary generator to be a binary:
+ 
+                    x
+ 
+@@ -2075,7 +2066,7 @@ test "bitstring generators" do
+                for(<<i <- if(:rand.uniform() > 0.5, do: x, else: y)>>, do: i)
+              ) =~
+                ~l"""
+-               expected the right side of <- in a binary generator to be a binary (or bitstring):
++               expected the right side of <- in a binary generator to be a binary:
+ 
+                    if :rand.uniform() > 0.5 do
+                      x
+@@ -2101,29 +2092,25 @@ test "bitstring generators" do
+                """
+     end
+ 
+-    test "infers bitstring generators" do
++    test "infers binary generators" do
+       assert typecheck!(
+                [x],
+                (
+                  for <<_ <- x>>, do: :ok
+                  x
+                )
+-             ) == dynamic(bitstring())
++             ) == dynamic(binary())
+     end
+ 
+     test ":into" do
+       assert typecheck!([binary], for(<<x <- binary>>, do: x)) == list(integer())
+       assert typecheck!([binary], for(<<x <- binary>>, do: x, into: [])) == list(integer())
+-      assert typecheck!([binary], for(<<x <- binary>>, do: <<x>>, into: "")) |> equal?(binary())
++      assert typecheck!([binary], for(<<x <- binary>>, do: x, into: "")) == binary()
+       assert typecheck!([binary, other], for(<<x <- binary>>, do: x, into: other)) == dynamic()
+ 
+-      assert typecheck!([enum], for(x <- enum, do: x)) ==
+-               union(list(dynamic()), empty_list())
+-
+-      assert typecheck!([enum], for(x <- enum, do: x, into: [])) ==
+-               union(list(dynamic()), empty_list())
+-
+-      assert typecheck!([enum], for(x <- enum, do: <<x>>, into: "")) |> equal?(binary())
++      assert typecheck!([enum], for(x <- enum, do: x)) == list(dynamic())
++      assert typecheck!([enum], for(x <- enum, do: x, into: [])) == list(dynamic())
++      assert typecheck!([enum], for(x <- enum, do: x, into: "")) == binary()
+       assert typecheck!([enum, other], for(x <- enum, do: x, into: other)) == dynamic()
+ 
+       assert typecheck!(
+@@ -2132,7 +2119,7 @@ test ":into" do
+                  into = if :rand.uniform() > 0.5, do: [], else: "0"
+                  for(<<x::float <- binary>>, do: x, into: into)
+                )
+-             ) == union(bitstring(), list(term()))
++             ) == union(binary(), list(float()))
+ 
+       assert typecheck!(
+                [binary, empty_list = []],
+@@ -2140,25 +2127,7 @@ test ":into" do
+                  into = if :rand.uniform() > 0.5, do: empty_list, else: "0"
+                  for(<<x::float <- binary>>, do: x, into: into)
+                )
+-             ) == union(bitstring(), list(term()))
+-    end
+-
+-    test ":into incompatibility" do
+-      assert typeerror!([binary], for(<<x <- binary>>, do: x, into: "")) =~ ~l"""
+-             expected the body of a for-comprehension with into: binary() (or bitstring()) to be a binary (or bitstring):
+-
+-                 x
+-
+-             but got type:
+-
+-                 integer()
+-
+-             where "x" was given the type:
+-
+-                 # type: integer()
+-                 # from: types_test.ex:LINE
+-                 <<x>>
+-             """
++             ) == dynamic(union(binary(), list(float())))
+     end
+ 
+     test ":reduce checks" do
+diff --git a/lib/elixir/test/elixir/module/types/integration_test.exs b/lib/elixir/test/elixir/module/types/integration_test.exs
+index 1a23fbf21..9177f41bb 100644
+--- a/lib/elixir/test/elixir/module/types/integration_test.exs
++++ b/lib/elixir/test/elixir/module/types/integration_test.exs
+@@ -240,7 +240,7 @@ def this_wont_warn(:ok), do: :ok
+       end
+ 
+       assert itself_arg.(Itself.Atom) == dynamic(atom())
+-      assert itself_arg.(Itself.BitString) == dynamic(bitstring())
++      assert itself_arg.(Itself.BitString) == dynamic(binary())
+       assert itself_arg.(Itself.Float) == dynamic(float())
+       assert itself_arg.(Itself.Function) == dynamic(fun())
+       assert itself_arg.(Itself.Integer) == dynamic(integer())
+@@ -583,8 +583,7 @@ def example2(_.._//_ = data), do: "hello \#{data} world"
+                 dynamic(
+                   %Date{} or %DateTime{} or %NaiveDateTime{} or %Time{} or %URI{} or %Version{} or
+                     %Version.Requirement{}
+-                ) or atom() or bitstring() or empty_list() or float() or integer() or
+-                  non_empty_list(term(), term())
++                ) or atom() or binary() or empty_list() or float() or integer() or non_empty_list(term(), term())
+         """,
+         """
+             warning: incompatible value given to string interpolation:
+@@ -668,7 +667,7 @@ def example3(), do: for(i <- [1, 2, 3], into: 456, do: i * 2)
+ 
+             hint: the Collectable protocol is implemented for the following types:
+ 
+-                dynamic(%File.Stream{} or %HashDict{} or %HashSet{} or %IO.Stream{} or %MapSet{}) or bitstring() or
++                dynamic(%File.Stream{} or %HashDict{} or %HashSet{} or %IO.Stream{} or %MapSet{}) or binary() or
+                   empty_list() or non_empty_list(term(), term()) or non_struct_map()
+         """,
+         """
+@@ -685,7 +684,7 @@ def example3(), do: for(i <- [1, 2, 3], into: 456, do: i * 2)
+ 
+             hint: the Collectable protocol is implemented for the following types:
+ 
+-                dynamic(%File.Stream{} or %HashDict{} or %HashSet{} or %IO.Stream{} or %MapSet{}) or bitstring() or
++                dynamic(%File.Stream{} or %HashDict{} or %HashSet{} or %IO.Stream{} or %MapSet{}) or binary() or
+                   empty_list() or non_empty_list(term(), term()) or non_struct_map()
+         """
+       ]
+@@ -1568,7 +1567,7 @@ defp generate_files(files) do
+ 
+   defp read_chunk(binary) do
+     assert {:ok, {_module, [{~c"ExCk", chunk}]}} = :beam_lib.chunks(binary, [~c"ExCk"])
+-    assert {:elixir_checker_v5, map} = :erlang.binary_to_term(chunk)
++    assert {:elixir_checker_v4, map} = :erlang.binary_to_term(chunk)
+     map
+   end
+ 
+diff --git a/lib/elixir/test/elixir/module/types/pattern_test.exs b/lib/elixir/test/elixir/module/types/pattern_test.exs
+index 607c3479f..53afa24ff 100644
+--- a/lib/elixir/test/elixir/module/types/pattern_test.exs
++++ b/lib/elixir/test/elixir/module/types/pattern_test.exs
+@@ -328,14 +328,7 @@ test "with lists inside tuples inside lists" do
+     end
+   end
+ 
+-  describe "bitstrings" do
+-    test "alignment" do
+-      assert typecheck!([<<_>> = x], x) == dynamic(binary())
+-      assert typecheck!([<<_::1>> = x], x) == dynamic(difference(bitstring(), binary()))
+-      assert typecheck!([<<_::4, _::4>> = x], x) == dynamic(binary())
+-      assert typecheck!([<<size, _::size(size)>> = x], x) == dynamic(bitstring())
+-    end
+-
++  describe "binaries" do
+     test "ok" do
+       assert typecheck!([<<x>>], x) == integer()
+       assert typecheck!([<<x::float>>], x) == float()
+@@ -344,27 +337,7 @@ test "ok" do
+     end
+ 
+     test "nested" do
+-      assert typecheck!([<<0, <<x::binary>>::binary>>], x) == binary()
+-
+-      assert typeerror!([<<0, <<x::bitstring>>::binary>>], x) == ~l"""
+-             incompatible types in binary matching:
+-
+-                 <<..., <<x::bitstring>>::binary>>
+-
+-             got type:
+-
+-                 bitstring()
+-
+-             but expected type:
+-
+-                 binary()
+-
+-             where "x" was given the type:
+-
+-                 # type: bitstring()
+-                 # from: types_test.ex:LINE
+-                 <<x::bitstring>>
+-             """
++      assert typecheck!([<<0, <<x::bitstring>>::binary>>], x) == binary()
+     end
+ 
+     test "error" do
+@@ -579,10 +552,10 @@ test "not" do
+ 
+     test "is_binary/1" do
+       assert typecheck!([x], is_binary(x), x) == dynamic(binary())
+-      assert typecheck!([x], not is_binary(x), x) == dynamic(negation(binary()))
++      assert typecheck!([x], not is_binary(x), x) == dynamic(term())
+ 
+-      assert typecheck!([x], is_bitstring(x), x) == dynamic(bitstring())
+-      assert typecheck!([x], not is_bitstring(x), x) == dynamic(negation(bitstring()))
++      assert typecheck!([x], is_bitstring(x), x) == dynamic(binary())
++      assert typecheck!([x], not is_bitstring(x), x) == dynamic(negation(binary()))
+     end
+ 
+     test "is_function/2" do
+diff --git a/lib/elixir/test/elixir/protocol/consolidation_test.exs b/lib/elixir/test/elixir/protocol/consolidation_test.exs
+index aa4f90f4d..7e46f5532 100644
+--- a/lib/elixir/test/elixir/protocol/consolidation_test.exs
++++ b/lib/elixir/test/elixir/protocol/consolidation_test.exs
+@@ -165,7 +165,7 @@ test "consolidation updates attributes" do
+ 
+     defp exports(binary) do
+       {:ok, {_, [{~c"ExCk", check_bin}]}} = :beam_lib.chunks(binary, [~c"ExCk"])
+-      assert {:elixir_checker_v5, contents} = :erlang.binary_to_term(check_bin)
++      assert {:elixir_checker_v4, contents} = :erlang.binary_to_term(check_bin)
+       Map.new(contents.exports)
+     end
+ 
+diff --git a/lib/mix/lib/mix/compilers/elixir.ex b/lib/mix/lib/mix/compilers/elixir.ex
+index 0b9a5f535..68e0b22e9 100644
+--- a/lib/mix/lib/mix/compilers/elixir.ex
++++ b/lib/mix/lib/mix/compilers/elixir.ex
+@@ -5,7 +5,7 @@
+ defmodule Mix.Compilers.Elixir do
+   @moduledoc false
+ 
+-  @manifest_vsn 31
++  @manifest_vsn 30
+   @checkpoint_vsn 4
+ 
+   import Record

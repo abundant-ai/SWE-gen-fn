@@ -1,0 +1,132 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 997775f3..c8357bfd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #3558, Add the `admin-server-host` config to set the host for the admin server - @develop7
+  - #3607, Log to stderr when the JWT secret is less than 32 characters long - @laurenceisla
+  - #2858, Performance improvements when calling RPCs via GET using indexes in more cases - @wolfgangwalther
++ - #3560, Log resolved host in "Listening on ..." messages - @develop7
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 1b75df15..556db776 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -66,6 +66,7 @@ library
+                       PostgREST.Logger
+                       PostgREST.MediaType
+                       PostgREST.Metrics
++                      PostgREST.Network
+                       PostgREST.Observation
+                       PostgREST.Query
+                       PostgREST.Query.QueryBuilder
+@@ -115,6 +116,7 @@ library
+                     , heredoc                   >= 0.2 && < 0.3
+                     , http-types                >= 0.12.2 && < 0.13
+                     , insert-ordered-containers >= 0.2.2 && < 0.3
++                    , iproute                   >= 1.7.0 && < 1.8
+                     , jose-jwt                  >= 0.9.6 && < 0.11
+                     , lens                      >= 4.14 && < 5.3
+                     , lens-aeson                >= 1.0.1 && < 1.3
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 325e95c0..e1b0f0b1 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -19,6 +19,7 @@ import Network.Socket.ByteString
+ import PostgREST.AppState    (AppState)
+ import PostgREST.Config      (AppConfig (..))
+ import PostgREST.Metrics     (metricsToText)
++import PostgREST.Network     (resolveHost)
+ import PostgREST.Observation (Observation (..))
+ 
+ import qualified PostgREST.AppState as AppState
+@@ -31,7 +32,8 @@ runAdmin :: AppState -> Warp.Settings -> IO ()
+ runAdmin appState settings = do
+   AppConfig{configAdminServerPort} <- AppState.getConfig appState
+   whenJust (AppState.getSocketAdmin appState) $ \adminSocket -> do
+-    observer $ AdminStartObs configAdminServerPort
++    host <- resolveHost adminSocket
++    observer $ AdminStartObs host configAdminServerPort
+     void . forkIO $ Warp.runSettingsSocket settings adminSocket adminApp
+   where
+     adminApp = admin appState
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 8026ff66..f99d8683 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -46,6 +46,7 @@ import PostgREST.Auth                 (AuthResult (..))
+ import PostgREST.Config               (AppConfig (..), LogLevel (..))
+ import PostgREST.Config.PgVersion     (PgVersion (..))
+ import PostgREST.Error                (Error)
++import PostgREST.Network              (resolveHost)
+ import PostgREST.Observation          (Observation (..))
+ import PostgREST.Response.Performance (ServerTiming (..),
+                                        serverTimingHeader)
+@@ -82,7 +83,8 @@ run appState = do
+       observer $ AppServerUnixObs path
+     Nothing   -> do
+       port <- NS.socketPort $ AppState.getSocketREST appState
+-      observer $ AppServerPortObs port
++      host <- resolveHost $ AppState.getSocketREST appState
++      observer $ AppServerPortObs (fromJust host) port
+ 
+   Warp.runSettingsSocket (serverSettings conf) (AppState.getSocketREST appState) app
+ 
+diff --git a/src/PostgREST/Network.hs b/src/PostgREST/Network.hs
+new file mode 100644
+index 00000000..f66afa58
+--- /dev/null
++++ b/src/PostgREST/Network.hs
+@@ -0,0 +1,17 @@
++module PostgREST.Network
++  ( resolveHost
++  ) where
++
++import           Data.IP        (fromHostAddress, fromHostAddress6)
++import           Data.String    (IsString (..))
++import qualified Network.Socket as NS
++
++import Protolude
++
++resolveHost :: NS.Socket -> IO (Maybe Text)
++resolveHost sock = do
++  sn <- NS.getSocketName sock
++  case sn of
++    NS.SockAddrInet _ hostAddr ->  pure $ Just $ fromString $ show $ fromHostAddress hostAddr
++    NS.SockAddrInet6 _ _ hostAddr6 _ -> pure $ Just $ fromString $ show $ fromHostAddress6 hostAddr6
++    _ -> pure Nothing
+diff --git a/src/PostgREST/Observation.hs b/src/PostgREST/Observation.hs
+index 884d5f30..fc3cbcaa 100644
+--- a/src/PostgREST/Observation.hs
++++ b/src/PostgREST/Observation.hs
+@@ -25,9 +25,9 @@ import Protolude
+ import Protolude.Partial (fromJust)
+ 
+ data Observation
+-  = AdminStartObs (Maybe Int)
++  = AdminStartObs (Maybe Text) (Maybe Int)
+   | AppStartObs ByteString
+-  | AppServerPortObs NS.PortNumber
++  | AppServerPortObs Text NS.PortNumber
+   | AppServerUnixObs FilePath
+   | ExitUnsupportedPgVersion PgVersion PgVersion
+   | ExitDBNoRecoveryObs
+@@ -60,12 +60,12 @@ type ObservationHandler = Observation -> IO ()
+ 
+ observationMessage :: Observation -> Text
+ observationMessage = \case
+-  AdminStartObs port ->
+-    "Admin server listening on port " <> show (fromIntegral (fromJust port) :: Integer)
++  AdminStartObs host port ->
++    "Admin server listening on " <> fromJust host <> ":" <> show (fromIntegral (fromJust port) :: Integer)
+   AppStartObs ver ->
+     "Starting PostgREST " <> T.decodeUtf8 ver <> "..."
+-  AppServerPortObs port ->
+-    "Listening on port " <> show port
++  AppServerPortObs host port ->
++    "Listening on " <> host <> ":" <> show port
+   AppServerUnixObs sock ->
+     "Listening on unix socket " <> show sock
+   DBConnectedObs ver ->

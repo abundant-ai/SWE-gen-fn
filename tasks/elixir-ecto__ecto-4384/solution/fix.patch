@@ -1,0 +1,175 @@
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index 4dfe57d9..30422a1e 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -579,13 +579,42 @@ defmodule Ecto.Query.API do
+   @doc """
+   Allows a field to be dynamically accessed.
+ 
++  The field name can be given as either an atom or a string. In a schemaless
++  query, the two types of names behave the same. However, when referencing
++  a field from a schema the behaviours are different.
++
++  Using an atom to reference a schema field will inherit all the properties from
++  the schema. For example, the field name will be changed to the value of `:source`
++  before generating the final query and its type behaviour will be dictated by the
++  one specified in the schema.
++
++  Using a string to reference a schema field is equivalent to bypassing all of the
++  above and accessing the field directly from the source (i.e. the underlying table).
++  This means the name will not be changed to the value of `:source` and the type
++  behaviour will be dictated by the underlying driver (e.g. Postgrex or MyXQL).
++
++  Take the following schema and query:
++
++      defmodule Car do
++        use Ecto.Schema
++
++        schema "cars" do
++          field :doors, source: :num_doors
++          field :tires, source: :num_tires
++        end
++      end
++
+       def at_least_four(doors_or_tires) do
+         from c in Car,
+           where: field(c, ^doors_or_tires) >= 4
+       end
+ 
+-  In the example above, both `at_least_four(:doors)` and `at_least_four(:tires)`
+-  would be valid calls as the field is dynamically generated.
++  In the example above, `at_least_four(:doors)` and `at_least_four("num_doors")`
++  would be valid ways to return the set of cars having at least 4 doors.
++
++  String names can be particularly useful when your application is dynamically
++  generating many schemaless queries at runtime and you want to avoid creating
++  a large number of atoms.
+   """
+   def field(source, field), do: doc!([source, field])
+ 
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index 38c9944d..4312d097 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -691,7 +691,7 @@ defmodule Ecto.Query.Builder do
+   defp escape_field!({var, _, context}, field, vars)
+        when is_atom(var) and is_atom(context) do
+     var = escape_var!(var, vars)
+-    field = quoted_atom!(field, "field/2")
++    field = quoted_atom_or_string!(field, "field/2")
+     dot = {:{}, [], [:., [], [var, field]]}
+     {:{}, [], [dot, [], []]}
+   end
+@@ -700,7 +700,7 @@ defmodule Ecto.Query.Builder do
+        when kind in [:as, :parent_as] do
+     value = late_binding!(kind, value)
+     as = {:{}, [], [kind, [], [value]]}
+-    field = quoted_atom!(field, "field/2")
++    field = quoted_atom_or_string!(field, "field/2")
+     dot = {:{}, [], [:., [], [as, field]]}
+     {:{}, [], [dot, [], []]}
+   end
+@@ -844,9 +844,8 @@ defmodule Ecto.Query.Builder do
+       do: {find_var!(var, vars), field}
+ 
+   def validate_type!({:field, _, [{var, _, context}, field]}, vars, _env)
+-      when is_atom(var) and is_atom(context) and is_atom(field),
+-      do: {find_var!(var, vars), field}
+-
++    when is_atom(var) and is_atom(context) and (is_atom(field) or is_binary(field)),
++    do: {find_var!(var, vars), field}
+   def validate_type!({:field, _, [{var, _, context}, {:^, _, [field]}]}, vars, _env)
+       when is_atom(var) and is_atom(context),
+       do: {find_var!(var, vars), field}
+@@ -1104,6 +1103,27 @@ defmodule Ecto.Query.Builder do
+           "`#{Macro.to_string(other)}`"
+       )
+ 
++  @doc """
++  Checks if the field is an atom or string at compilation time or
++  delegate the check to runtime for interpolation.
++  """
++  def quoted_atom_or_string!({:^, _, [expr]}, used_ref),
++    do: quote(do: Ecto.Query.Builder.atom_or_string!(unquote(expr), unquote(used_ref)))
++
++  def quoted_atom_or_string!(atom, _used_ref) when is_atom(atom),
++    do: atom
++
++  def quoted_atom_or_string!(string, _used_ref) when is_binary(string),
++    do: string
++
++  def quoted_atom_or_string!(other, used_ref),
++    do:
++      error!(
++        "expected literal atom or string or interpolated value in #{used_ref}, got: " <>
++        "`#{Macro.to_string(other)}`"
++      )
++
++
+   @doc """
+   Called by escaper at runtime to verify that value is an atom.
+   """
+@@ -1113,6 +1133,18 @@ defmodule Ecto.Query.Builder do
+   def atom!(other, used_ref),
+     do: error!("expected atom in #{used_ref}, got: `#{inspect(other)}`")
+ 
++  @doc """
++  Called by escaper at runtime to verify that value is an atom or string.
++  """
++  def atom_or_string!(atom, _used_ref) when is_atom(atom),
++    do: atom
++
++  def atom_or_string!(string, _used_ref) when is_binary(string),
++    do: string
++
++  def atom_or_string!(other, used_ref),
++    do: error!("expected atom or string in #{used_ref}, got: `#{inspect other}`")
++
+   @doc """
+   Checks if the value of a late binding is an interpolation or
+   a quoted atom.
+@@ -1278,11 +1310,11 @@ defmodule Ecto.Query.Builder do
+   end
+ 
+   def quoted_type({:field, _, [{var, _, context}, field]}, vars)
+-      when is_atom(var) and is_atom(context) and is_atom(field),
+-      do: {find_var!(var, vars), field}
++    when is_atom(var) and is_atom(context) and (is_atom(field) or is_binary(field)),
++    do: {find_var!(var, vars), field}
+ 
+   def quoted_type({:field, _, [{kind, _, [value]}, field]}, _vars)
+-      when kind in [:as, :parent_as] and is_atom(field) do
++      when kind in [:as, :parent_as] and (is_atom(field) or is_binary(field)) do
+     value = late_binding!(kind, value)
+     {{:{}, [], [kind, [], [value]]}, field}
+   end
+diff --git a/lib/ecto/query/inspect.ex b/lib/ecto/query/inspect.ex
+index b09d2602..0a509723 100644
+--- a/lib/ecto/query/inspect.ex
++++ b/lib/ecto/query/inspect.ex
+@@ -282,6 +282,12 @@ defimpl Inspect, for: Ecto.Query do
+     binding_to_expr(ix, names, part)
+   end
+ 
++  # Format field/2 with string name
++  defp postwalk({{:., _, [{_, _, _} = binding, field]}, meta, []}, _names, _part)
++       when is_binary(field) do
++    {:field, meta, [binding, field]}
++  end
++
+   # Remove parens from field calls
+   defp postwalk({{:., _, [_, _]} = dot, meta, []}, _names, _part) do
+     {dot, [no_parens: true] ++ meta, []}
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index ce57afe2..0f1a7a05 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -2420,6 +2420,8 @@ defmodule Ecto.Query.Planner do
+ 
+   defp type!(_kind, _query, _expr, nil, _field, _allow_virtuals?), do: :any
+ 
++  defp type!(_kind, _query, _expr, _ix, field, _allow_virtuals?) when is_binary(field), do: :any
++
+   defp type!(kind, query, expr, ix, field, allow_virtuals?) when is_integer(ix) do
+     case get_source!(kind, query, ix) do
+       {:fragment, _, _} ->

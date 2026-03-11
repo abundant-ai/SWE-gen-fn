@@ -1,0 +1,11 @@
+Highly dynamic queries that change structure frequently (for example, varying join combinations) can generate a large number of unique internal cache keys in Ecto’s query cache. This leads to unbounded cache growth (“cache bloat”) while providing little or no performance benefit. Ecto needs an option to selectively disable its internal query cache on a per-query/per-operation basis so callers can avoid polluting the cache for these cases.
+
+Implement support for a `:query_cache` option (boolean) that can be passed to repository query operations. When `query_cache: false` is set, the query must bypass Ecto’s internal query cache entirely: it must not perform cache lookup, must not insert new entries into the cache, and must not run any cache update callbacks/paths. Instead, it should always proceed through normal query normalization and adapter preparation/execution as if there were no cached entry.
+
+Expected behavior:
+
+Calling Repo operations (for example, fetching results with an `all`-style query, or executing write operations that go through query planning) with `query_cache: false` should cause the adapter’s query preparation step to run on every call, even when the same query is executed repeatedly. With default behavior (no option, or `query_cache: true`), repeated executions of the same query should continue to use the internal cache as they do today.
+
+The option should be respected consistently across different query execution forms supported by the repo (including streaming-style execution where applicable): if `query_cache: false` is provided, each execution should behave as uncached, and no cache entry should be created or updated as a side effect.
+
+The option should be opt-in and backwards compatible: existing code that does not pass `:query_cache` must keep the current caching behavior. The option should also be validated/handled safely so that setting it to `false` reliably disables caching without altering the semantics of the query result itself (only the caching behavior should change).

@@ -1,0 +1,7 @@
+When PostgREST starts, it prints a "Listening on ..." (or similarly worded "listening...") message for both the main server and (when enabled) the admin server. Currently, these messages only reflect the configured host value (e.g., a hostname like "localhost" or a bind value like "0.0.0.0"/"::"), which can be ambiguous or unhelpful for users trying to confirm the real network address the service is reachable on.
+
+Update the startup logging so that the "listening" message includes the resolved IP address(es) for the configured host. For example, if configured to bind to a hostname such as "localhost", the log line should include the concrete resolved address (e.g., 127.0.0.1 and/or ::1) alongside the displayed host/port. This behavior should apply consistently to both the primary API server and the admin server startup messages.
+
+If host resolution fails (e.g., DNS lookup failure or an unresolvable hostname), PostgREST should still start normally and log a sensible "listening" message without crashing; in this case, omit the resolved address portion or otherwise fall back to the original behavior.
+
+The change should be reflected in the process output observed immediately after startup: the "listening" lines must now contain the resolved host IP information for both servers (when the admin server is enabled).

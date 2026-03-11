@@ -1,0 +1,323 @@
+diff --git a/nix/tools/style.nix b/nix/tools/style.nix
+index dc716185..ea986e76 100644
+--- a/nix/tools/style.nix
++++ b/nix/tools/style.nix
+@@ -46,7 +46,7 @@ let
+ 
+         trap "echo postgrest-style-check failed. Run postgrest-style to fix issues automatically." ERR
+ 
+-        ${git}/bin/git diff-index --exit-code HEAD -- '*.hs' '*.lhs' '*.nix' '*.py'
++        ${git}/bin/git diff-index --exit-code HEAD -- '*.hs' '*.lhs' '*.nix'
+       '';
+ 
+   lint =
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index 3183c28c..f991e16f 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -11,6 +11,7 @@ import Network.Socket.ByteString
+ import qualified Network.HTTP.Types.Status as HTTP
+ import qualified Network.Wai               as Wai
+ 
++import qualified Hasql.Pool    as SQL
+ import qualified Hasql.Session as SQL
+ 
+ import qualified PostgREST.AppState as AppState
+@@ -26,7 +27,7 @@ postgrestAdmin appState appConfig req respond  = do
+   isConnectionUp      <-
+     if configDbChannelEnabled appConfig
+       then AppState.getIsListenerOn appState
+-      else isRight <$> AppState.usePool appState (SQL.sql "SELECT 1")
++      else isRight <$> SQL.use (AppState.getPool appState) (SQL.sql "SELECT 1")
+ 
+   case Wai.pathInfo req of
+     ["ready"] ->
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 891137dd..c1343084 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -31,6 +31,7 @@ import qualified Data.ByteString.Lazy            as LBS
+ import qualified Data.HashMap.Strict             as HM
+ import qualified Data.Set                        as S
+ import qualified Hasql.DynamicStatements.Snippet as SQL (Snippet)
++import qualified Hasql.Pool                      as SQL
+ import qualified Hasql.Transaction               as SQL
+ import qualified Hasql.Transaction.Sessions      as SQL
+ import qualified Network.HTTP.Types.Header       as HTTP
+@@ -166,7 +167,7 @@ postgrest logLevel appState connWorker =
+         let
+           eitherResponse :: IO (Either Error Wai.Response)
+           eitherResponse =
+-            runExceptT $ postgrestResponse appState conf maybeDbStructure jsonDbS pgVer authResult req
++            runExceptT $ postgrestResponse conf maybeDbStructure jsonDbS pgVer (AppState.getPool appState) authResult req
+ 
+         response <- either Error.errorResponseFor identity <$> eitherResponse
+         -- Launch the connWorker when the connection is down.  The postgrest
+@@ -184,15 +185,15 @@ addRetryHint shouldAdd appState response = do
+   return $ Wai.mapResponseHeaders (\hs -> if shouldAdd then h:hs else hs) response
+ 
+ postgrestResponse
+-  :: AppState.AppState
+-  -> AppConfig
++  :: AppConfig
+   -> Maybe DbStructure
+   -> ByteString
+   -> PgVersion
++  -> SQL.Pool
+   -> AuthResult
+   -> Wai.Request
+   -> Handler IO Wai.Response
+-postgrestResponse appState conf@AppConfig{..} maybeDbStructure jsonDbS pgVer AuthResult{..} req = do
++postgrestResponse conf@AppConfig{..} maybeDbStructure jsonDbS pgVer pool AuthResult{..} req = do
+   body <- lift $ Wai.strictRequestBody req
+ 
+   dbStructure <-
+@@ -211,15 +212,15 @@ postgrestResponse appState conf@AppConfig{..} maybeDbStructure jsonDbS pgVer Aut
+   if iAction apiRequest == ActionInfo then
+     handleInfo (iTarget apiRequest) (ctx apiRequest)
+   else
+-    runDbHandler appState (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
++    runDbHandler pool (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
+       Middleware.optionalRollback conf apiRequest $
+         Middleware.runPgLocals conf authClaims authRole (handleRequest . ctx) apiRequest jsonDbS pgVer
+ 
+-runDbHandler :: AppState.AppState -> SQL.Mode -> Bool -> Bool -> DbHandler b -> Handler IO b
+-runDbHandler appState mode authenticated prepared handler = do
++runDbHandler :: SQL.Pool -> SQL.Mode -> Bool -> Bool -> DbHandler a -> Handler IO a
++runDbHandler pool mode authenticated prepared handler = do
+   dbResp <-
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-    lift . AppState.usePool appState . transaction SQL.ReadCommitted mode $ runExceptT handler
++    lift . SQL.use pool . transaction SQL.ReadCommitted mode $ runExceptT handler
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 55b6e51b..c4da56fe 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -9,6 +9,7 @@ module PostgREST.AppState
+   , getJsonDbS
+   , getMainThreadId
+   , getPgVersion
++  , getPool
+   , getTime
+   , getRetryNextIn
+   , init
+@@ -23,12 +24,10 @@ module PostgREST.AppState
+   , putRetryNextIn
+   , releasePool
+   , signalListener
+-  , usePool
+   , waitListener
+   ) where
+ 
+-import qualified Hasql.Pool    as SQL
+-import qualified Hasql.Session as SQL
++import qualified Hasql.Pool as SQL
+ 
+ import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                            updateAction)
+@@ -94,11 +93,11 @@ initPool :: AppConfig -> IO SQL.Pool
+ initPool AppConfig{..} =
+   SQL.acquire (configDbPoolSize, configDbPoolTimeout, toUtf8 configDbUri)
+ 
+-usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+-usePool AppState{..} = SQL.use statePool
++getPool :: AppState -> SQL.Pool
++getPool = statePool
+ 
+ releasePool :: AppState -> IO ()
+-releasePool AppState{..} = SQL.release statePool
++releasePool AppState{..} = SQL.release statePool >> throwTo stateMainThreadId UserInterrupt
+ 
+ getPgVersion :: AppState -> IO PgVersion
+ getPgVersion = readIORef . statePgVersion
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index cd21c349..fcff5efc 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -11,6 +11,7 @@ module PostgREST.CLI
+ import qualified Data.Aeson                 as JSON
+ import qualified Data.ByteString.Char8      as BS
+ import qualified Data.ByteString.Lazy       as LBS
++import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Options.Applicative        as O
+ 
+@@ -35,12 +36,18 @@ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+   conf@AppConfig{..} <-
+     either panic identity <$> Config.readAppConfig mempty cliPath Nothing
+   appState <- AppState.init conf
+-  case cliCommand of
+-    CmdDumpConfig -> do
+-      when configDbConfig $ reReadConfig True appState
+-      putStr . Config.toText =<< AppState.getConfig appState
+-    CmdDumpSchema -> putStrLn =<< dumpSchema appState
+-    CmdRun -> App.run installSignalHandlers runAppWithSocket appState
++
++  -- Override the config with config options from the db
++  -- TODO: the same operation is repeated on connectionWorker, ideally this
++  -- would be done only once, but dump CmdDumpConfig needs it for tests.
++  when configDbConfig $ reReadConfig True appState
++
++  exec cliCommand appState
++  where
++    exec :: Command -> AppState -> IO ()
++    exec CmdDumpConfig appState = putStr . Config.toText =<< AppState.getConfig appState
++    exec CmdDumpSchema appState = putStrLn =<< dumpSchema appState
++    exec CmdRun appState = App.run installSignalHandlers runAppWithSocket appState
+ 
+ -- | Dump DbStructure schema to JSON
+ dumpSchema :: AppState -> IO LBS.ByteString
+@@ -48,13 +55,13 @@ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    AppState.usePool appState $
++    SQL.use (AppState.getPool appState) $
+       transaction SQL.ReadCommitted SQL.Read $
+         queryDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
+           configDbPreparedStatements
+-  AppState.releasePool appState
++  SQL.release $ AppState.getPool appState
+   case result of
+     Left e -> do
+       hPutStrLn stderr $ "An error ocurred when loading the schema cache:\n" <> show e
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 28d191dc..9e439ac1 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -10,6 +10,7 @@ import PostgREST.Config.PgVersion (PgVersion (..))
+ 
+ import qualified Hasql.Decoders             as HD
+ import qualified Hasql.Encoders             as HE
++import qualified Hasql.Pool                 as SQL
+ import           Hasql.Session              (Session, statement)
+ import qualified Hasql.Statement            as SQL
+ import qualified Hasql.Transaction          as SQL
+@@ -28,10 +29,11 @@ pgVersionStatement = SQL.Statement sql HE.noParams versionRow False
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+ 
+-queryDbSettings :: Bool -> Session [(Text, Text)]
+-queryDbSettings prepared =
++queryDbSettings :: SQL.Pool -> Bool -> IO (Either SQL.UsageError [(Text, Text)])
++queryDbSettings pool prepared =
+   let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+-  transaction SQL.ReadCommitted SQL.Read $ SQL.statement mempty dbSettingsStatement
++  SQL.use pool . transaction SQL.ReadCommitted SQL.Read $
++    SQL.statement mempty dbSettingsStatement
+ 
+ -- | Get db settings from the connection role. Global settings will be overridden by database specific settings.
+ dbSettingsStatement :: SQL.Statement () [(Text, Text)]
+diff --git a/src/PostgREST/Unix.hs b/src/PostgREST/Unix.hs
+index acc1256f..e003ccb2 100644
+--- a/src/PostgREST/Unix.hs
++++ b/src/PostgREST/Unix.hs
+@@ -45,11 +45,8 @@ installSignalHandlers :: AppState.AppState -> IO ()
+ installSignalHandlers appState = do
+   -- Releases the connection pool whenever the program is terminated,
+   -- see https://github.com/PostgREST/postgrest/issues/268
+-  let interrupt = do
+-        AppState.releasePool appState
+-        throwTo (AppState.getMainThreadId appState) UserInterrupt
+-  install Signals.sigINT interrupt
+-  install Signals.sigTERM interrupt
++  install Signals.sigINT $ AppState.releasePool appState
++  install Signals.sigTERM $ AppState.releasePool appState
+ 
+   -- The SIGUSR1 signal updates the internal 'DbStructure' by running
+   -- 'connectionWorker' exactly as before.
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 3097b2a2..9f059739 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -12,6 +12,7 @@ import qualified Data.ByteString            as BS
+ import qualified Data.ByteString.Lazy       as LBS
+ import qualified Data.Text.Encoding         as T
+ import qualified Hasql.Notifications        as SQL
++import qualified Hasql.Pool                 as SQL
+ import qualified Hasql.Transaction.Sessions as SQL
+ 
+ import Control.Retry    (RetryStatus, capDelay, exponentialBackoff,
+@@ -109,15 +110,16 @@ connectionWorker appState = do
+ connectionStatus :: AppState -> IO ConnectionStatus
+ connectionStatus appState =
+   retrying retrySettings shouldRetry $
+-    const $ AppState.releasePool appState >> getConnectionStatus
++    const $ SQL.release pool >> getConnectionStatus
+   where
++    pool = AppState.getPool appState
+     retrySettings = capDelay delayMicroseconds $ exponentialBackoff backoffMicroseconds
+     delayMicroseconds = 32000000 -- 32 seconds
+     backoffMicroseconds = 1000000 -- 1 second
+ 
+     getConnectionStatus :: IO ConnectionStatus
+     getConnectionStatus = do
+-      pgVersion <- AppState.usePool appState queryPgVersion
++      pgVersion <- SQL.use pool queryPgVersion
+       case pgVersion of
+         Left e -> do
+           let err = PgError False e
+@@ -153,7 +155,7 @@ loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    AppState.usePool appState . transaction SQL.ReadCommitted SQL.Read $
++    SQL.use (AppState.getPool appState) . transaction SQL.ReadCommitted SQL.Read $
+       queryDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
+   case result of
+     Left e -> do
+@@ -232,7 +234,7 @@ reReadConfig startingUp appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   dbSettings <-
+     if configDbConfig then do
+-      qDbSettings <- AppState.usePool appState $ queryDbSettings configDbPreparedStatements
++      qDbSettings <- queryDbSettings (AppState.getPool appState) configDbPreparedStatements
+       case qDbSettings of
+         Left e -> do
+           let
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index 753ec3a3..8f9587d6 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -840,7 +840,8 @@ def set_statement_timeout(postgrest, role, milliseconds):
+     use a postgrest instance that doesn't use the affected role."""
+ 
+     response = postgrest.session.post(
+-        "/rpc/set_statement_timeout", data={"role": role, "milliseconds": milliseconds}
++        "/rpc/set_statement_timeout",
++        data={"role": role, "milliseconds": milliseconds}
+     )
+     assert response.status_code == 204
+ 
+@@ -854,7 +855,7 @@ def test_statement_timeout(defaultenv, metapostgrest):
+     "Statement timeout times out slow statements"
+ 
+     role = "timeout_authenticator"
+-    set_statement_timeout(metapostgrest, role, 1000)  # 1 second
++    set_statement_timeout(metapostgrest, role, 1000) # 1 second
+ 
+     env = {
+         **defaultenv,
+@@ -889,7 +890,7 @@ def test_change_statement_timeout(defaultenv, metapostgrest):
+         response = postgrest.session.get("/rpc/sleep?seconds=1")
+         assert response.status_code == 204
+ 
+-        set_statement_timeout(metapostgrest, role, 500)  # 0.5s
++        set_statement_timeout(metapostgrest, role, 500) # 0.5s
+ 
+         # trigger schema refresh
+         postgrest.process.send_signal(signal.SIGUSR1)
+@@ -900,7 +901,7 @@ def test_change_statement_timeout(defaultenv, metapostgrest):
+         data = response.json()
+         assert data["message"] == "canceling statement due to statement timeout"
+ 
+-        set_statement_timeout(metapostgrest, role, 2000)  # 2s
++        set_statement_timeout(metapostgrest, role, 2000) # 2s
+ 
+         # trigger role setting refresh
+         postgrest.process.send_signal(signal.SIGUSR1)

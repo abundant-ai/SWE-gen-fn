@@ -1,0 +1,1811 @@
+diff --git a/ghc-tags.yaml b/ghc-tags.yaml
+index 07cd66c0b..04d126a07 100644
+--- a/ghc-tags.yaml
++++ b/ghc-tags.yaml
+@@ -6,5 +6,3 @@ source_paths:
+ cpp_options:
+ - -DMIN_VERSION_megaparsec(x,y,z)=1
+ - -DMIN_VERSION_aeson(x,y,z)=1
+-exclude_paths:
+-- hledger/test/addons
+diff --git a/hledger-lib/Hledger/Read/RulesReader.hs b/hledger-lib/Hledger/Read/RulesReader.hs
+index 4e88d5444..1f4babc92 100644
+--- a/hledger-lib/Hledger/Read/RulesReader.hs
++++ b/hledger-lib/Hledger/Read/RulesReader.hs
+@@ -235,7 +235,7 @@ validateCsvRules rules = do
+   unless (isAssigned "date")   $ Left "Please specify (at top level) the date field. Eg: date %1"
+   Right rules
+   where
+-    isAssigned f = isJust $ hledgerField rules [] f
++    isAssigned f = isJust $ getEffectiveAssignment rules [] f
+ 
+ --- *** rules types
+ _RULES_TYPES__________________________________________ = undefined
+@@ -710,50 +710,33 @@ csvRule rules = (`getDirective` rules)
+ -- list/field assignment rules, taking into account the current record and
+ -- conditional rules.
+ hledgerField :: CsvRules -> CsvRecord -> HledgerFieldName -> Maybe FieldTemplate
+-hledgerField rules record f = fmap
+-  (either id (lastCBAssignmentTemplate f))
+-  (getEffectiveAssignment rules record f)
++hledgerField = getEffectiveAssignment
+ 
+ -- | Look up the final value assigned to a hledger field, with csv field
+--- references and regular expression match group references interpolated.
++-- references interpolated.
+ hledgerFieldValue :: CsvRules -> CsvRecord -> HledgerFieldName -> Maybe Text
+-hledgerFieldValue rules record f = (flip fmap) (getEffectiveAssignment rules record f)
+-  $ either (renderTemplate rules record)
+-  $ \cb -> let
+-      t = lastCBAssignmentTemplate f cb
+-      r = rules { rconditionalblocks = [cb] } -- XXX handle rblocksassigning
+-      in renderTemplate r record t
+-
+-lastCBAssignmentTemplate :: HledgerFieldName -> ConditionalBlock -> FieldTemplate
+-lastCBAssignmentTemplate f = snd . last . filter ((==f).fst) . cbAssignments
++hledgerFieldValue rules record f = (fmap (renderTemplate rules record f) . hledgerField rules record) f
+ 
+ maybeNegate :: MatcherPrefix -> Bool -> Bool
+ maybeNegate Not origbool = not origbool
+ maybeNegate _ origbool = origbool
+ 
+ -- | Given the conversion rules, a CSV record and a hledger field name, find
+--- either the last applicable `ConditionalBlock`, or the final value template
+--- assigned to this field by a top-level field assignment, if any exist.
++-- the value template ultimately assigned to this field, if any, by a field
++-- assignment at top level or in a conditional block matching this record.
+ --
+ -- Note conditional blocks' patterns are matched against an approximation of the
+ -- CSV record: all the field values, without enclosing quotes, comma-separated.
+ --
+-getEffectiveAssignment
+-  :: CsvRules
+-     -> CsvRecord
+-     -> HledgerFieldName
+-     -> Maybe (Either FieldTemplate ConditionalBlock)
+-getEffectiveAssignment rules record f = lastMay assignments
++getEffectiveAssignment :: CsvRules -> CsvRecord -> HledgerFieldName -> Maybe FieldTemplate
++getEffectiveAssignment rules record f = lastMay $ map snd $ assignments
+   where
+     -- all active assignments to field f, in order
+-    assignments = dbg9 "csv assignments" $ toplevelassignments ++ conditionalassignments
++    assignments = dbg9 "csv assignments" $ filter ((==f).fst) $ toplevelassignments ++ conditionalassignments
+     -- all top level field assignments
+-    toplevelassignments    = map (Left . snd) $ filter ((==f).fst) $ rassignments rules
+-    -- all conditional blocks assigning to field f and active for the current csv record
+-    conditionalassignments = map Right
+-                           $ filter (any (==f) . map fst . cbAssignments)
+-                           $ filter (isBlockActive rules record)
+-                           $ (rblocksassigning rules) f
++    toplevelassignments    = rassignments rules 
++    -- all field assignments in conditional blocks assigning to field f and active for the current csv record
++    conditionalassignments = concatMap cbAssignments $ filter (isBlockActive rules record) $ (rblocksassigning rules) f
+ 
+ -- does this conditional block match the current csv record ?
+ isBlockActive :: CsvRules -> CsvRecord -> ConditionalBlock -> Bool
+@@ -796,12 +779,12 @@ isBlockActive rules record CB{..} = any (all matcherMatches) $ groupedMatchers c
+ 
+ -- | Render a field assignment's template, possibly interpolating referenced
+ -- CSV field values or match groups. Outer whitespace is removed from interpolated values.
+-renderTemplate ::  CsvRules -> CsvRecord -> FieldTemplate -> Text
+-renderTemplate rules record t =
++renderTemplate ::  CsvRules -> CsvRecord -> HledgerFieldName -> FieldTemplate -> Text
++renderTemplate rules record f t =
+   maybe t mconcat $ parseMaybe
+     (many
+       (   literaltextp
+-      <|> (matchrefp <&> replaceRegexGroupReference rules record)
++      <|> (matchrefp <&> replaceRegexGroupReference rules record f)
+       <|> (fieldrefp <&> replaceCsvFieldReference   rules record)
+       )
+     )
+@@ -819,18 +802,17 @@ renderTemplate rules record t =
+ 
+ -- | Replace something that looks like a Regex match group reference with the
+ -- resulting match group value after applying the Regex.
+-replaceRegexGroupReference :: CsvRules -> CsvRecord -> MatchGroupReference -> Text
+-replaceRegexGroupReference rules record s = case T.uncons s of
+-    Just ('\\', group) -> fromMaybe "" $ regexMatchValue rules record group
++replaceRegexGroupReference :: CsvRules -> CsvRecord -> HledgerFieldName -> MatchGroupReference -> Text
++replaceRegexGroupReference rules record f s = case T.uncons s of
++    Just ('\\', group) -> fromMaybe "" $ regexMatchValue rules record f group
+     _                  -> s
+ 
+-regexMatchValue :: CsvRules -> CsvRecord -> Text -> Maybe Text
+-regexMatchValue rules record sgroup = let
++regexMatchValue :: CsvRules -> CsvRecord -> HledgerFieldName -> Text -> Maybe Text
++regexMatchValue rules record f sgroup = let
+   matchgroups  = concatMap (getMatchGroups rules record)
+                $ concatMap cbMatchers
+                $ filter (isBlockActive rules record)
+-               $ rconditionalblocks rules
+-               -- ^ XXX adjusted to not use memoized field as caller might be sending a subset of rules with just one CB (hacky)
++               $ rblocksassigning rules f
+   group = (read (T.unpack sgroup) :: Int) - 1 -- adjust to 0-indexing
+   in atMay matchgroups group
+ 
+@@ -1020,7 +1002,7 @@ applyConditionalSkips rules (r:rest) =
+     Just cnt -> applyConditionalSkips rules $ drop (cnt-1) rest
+   where
+     skipnum r1 =
+-      case (hledgerField rules r1 "end", hledgerField rules r1 "skip") of
++      case (getEffectiveAssignment rules r1 "end", getEffectiveAssignment rules r1 "skip") of
+         (Nothing, Nothing) -> Nothing
+         (Just _, _) -> Just maxBound
+         (Nothing, Just "") -> Just 1
+@@ -1229,7 +1211,7 @@ getAmount rules record currency p1IsVirtual n =
+ 
+     -- assignments to any of these field names with non-empty values
+     assignments = [(f,a') | f <- fieldnames
+-                          , Just v <- [T.strip <$> hledgerFieldValue rules record f]
++                          , Just v <- [T.strip . renderTemplate rules record f <$> hledgerField rules record f]
+                           , not $ T.null v
+                           -- XXX maybe ignore rule-generated values like "", "-", "$", "-$", "$-" ? cf CSV FORMAT -> "amount", "Setting amounts",
+                           , let a = parseAmount rules record currency v
+@@ -1254,7 +1236,518 @@ getAmount rules record currency p1IsVirtual n =
+   in case discardExcessZeros $ discardUnnumbered assignments of
+       []      -> Nothing
+       [(f,a)] -> Just $ negateIfOut f a
+-      fs      -> error' . T.unpack . textChomp . T.unlines $
++      fs      -> error' . T.unpack . textChomp . T.unlines $  -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
++          -- PARTIAL:
+         ["in CSV rules:"
+         ,"While processing " <> showRecord record
+         ,"while calculating amount for posting " <> T.pack (show n)
+@@ -1292,7 +1785,518 @@ getBalance rules record currency n = do
+ -- The whole CSV record is provided for the error message.
+ parseAmount :: CsvRules -> CsvRecord -> Text -> Text -> MixedAmount
+ parseAmount rules record currency s =
+-    either mkerror mixedAmount $
++    either mkerror mixedAmount $  -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
++      -- PARTIAL:
+     runParser (evalStateT (amountp <* eof) journalparsestate) "" $
+     currency <> simplifySign s
+   where
+@@ -1311,7 +2315,7 @@ parseAmount rules record currency s =
+ -- | Show the values assigned to each journal field.
+ showRules rules record = T.unlines $ catMaybes
+   [ (("the "<>fld<>" rule is: ")<>) <$>
+-    hledgerField rules record fld | fld <- journalfieldnames ]
++    getEffectiveAssignment rules record fld | fld <- journalfieldnames ]
+ 
+ -- | Show a (approximate) recreation of the original CSV record.
+ showRecord :: CsvRecord -> Text
+@@ -1488,9 +2492,521 @@ tests_RulesReader = testGroup "RulesReader" [
+         (Right (mkrules $ defrules{rassignments = [("account1","")], rconditionalblocks = [CB{cbMatchers=[RecordMatcher None (toRegex' "foo")],cbAssignments=[("account2","foo")]}]}))
+    ]
+   ,testGroup "conditionalblockp" [
+-    testCase "space after conditional" $
++    testCase "space after conditional" $ -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
++       -- #1120
+       parseWithState' defrules conditionalblockp "if a\n account2 b\n \n" @?=
+         (Right $ CB{cbMatchers=[RecordMatcher None $ toRegexCI' "a"],cbAssignments=[("account2","b")]})
++
+   ],
+ 
+   testGroup "csvfieldreferencep" [
+@@ -1521,48 +3037,32 @@ tests_RulesReader = testGroup "RulesReader" [
+ 
+    ]
+ 
+- ,testGroup "hledgerField" [
++ ,testGroup "getEffectiveAssignment" [
+     let rules = mkrules $ defrules {rcsvfieldindexes=[("csvdate",1)],rassignments=[("date","%csvdate")]}
+ 
+-    in testCase "toplevel" $ hledgerField rules ["a","b"] "date" @?= (Just "%csvdate")
++    in testCase "toplevel" $ getEffectiveAssignment rules ["a","b"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1)], rconditionalblocks=[CB [FieldMatcher None "%csvdate" $ toRegex' "a"] [("date","%csvdate")]]}
+-    in testCase "conditional" $ hledgerField rules ["a","b"] "date" @?= (Just "%csvdate")
++    in testCase "conditional" $ getEffectiveAssignment rules ["a","b"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1)], rconditionalblocks=[CB [FieldMatcher Not "%csvdate" $ toRegex' "a"] [("date","%csvdate")]]}
+-    in testCase "negated-conditional-false" $ hledgerField rules ["a","b"] "date" @?= (Nothing)
++    in testCase "negated-conditional-false" $ getEffectiveAssignment rules ["a","b"] "date" @?= (Nothing)
+   
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1)], rconditionalblocks=[CB [FieldMatcher Not "%csvdate" $ toRegex' "b"] [("date","%csvdate")]]}
+-    in testCase "negated-conditional-true" $ hledgerField rules ["a","b"] "date" @?= (Just "%csvdate")
++    in testCase "negated-conditional-true" $ getEffectiveAssignment rules ["a","b"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1),("description",2)], rconditionalblocks=[CB [FieldMatcher None "%csvdate" $ toRegex' "a", FieldMatcher None "%description" $ toRegex' "b"] [("date","%csvdate")]]}
+-    in testCase "conditional-with-or-a" $ hledgerField rules ["a"] "date" @?= (Just "%csvdate")
++    in testCase "conditional-with-or-a" $ getEffectiveAssignment rules ["a"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1),("description",2)], rconditionalblocks=[CB [FieldMatcher None "%csvdate" $ toRegex' "a", FieldMatcher None "%description" $ toRegex' "b"] [("date","%csvdate")]]}
+-    in testCase "conditional-with-or-b" $ hledgerField rules ["_", "b"] "date" @?= (Just "%csvdate")
++    in testCase "conditional-with-or-b" $ getEffectiveAssignment rules ["_", "b"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1),("description",2)], rconditionalblocks=[CB [FieldMatcher None "%csvdate" $ toRegex' "a", FieldMatcher And "%description" $ toRegex' "b"] [("date","%csvdate")]]}
+-    in testCase "conditional.with-and" $ hledgerField rules ["a", "b"] "date" @?= (Just "%csvdate")
++    in testCase "conditional.with-and" $ getEffectiveAssignment rules ["a", "b"] "date" @?= (Just "%csvdate")
+ 
+    ,let rules = mkrules $ defrules{rcsvfieldindexes=[("csvdate",1),("description",2)], rconditionalblocks=[CB [FieldMatcher None "%csvdate" $ toRegex' "a", FieldMatcher And "%description" $ toRegex' "b", FieldMatcher None "%description" $ toRegex' "c"] [("date","%csvdate")]]}
+-    in testCase "conditional.with-and-or" $ hledgerField rules ["_", "c"] "date" @?= (Just "%csvdate")
++    in testCase "conditional.with-and-or" $ getEffectiveAssignment rules ["_", "c"] "date" @?= (Just "%csvdate")
+ 
+    ]
+ 
+- -- testing match groups (#2158)
+- ,testGroup "hledgerFieldValue" $
+-    let rules = mkrules $ defrules
+-          { rcsvfieldindexes=[ ("date",1), ("description",2) ]
+-          , rassignments=[ ("account2","equity"), ("amount1","1") ]
+-          -- ConditionalBlocks here are in reverse order: mkrules reverses the list
+-          , rconditionalblocks=[ CB { cbMatchers=[FieldMatcher None "%description" (toRegex' "PREFIX (.*) - (.*)")] 
+-                                    , cbAssignments=[("account1","account:\\1:\\2")] }
+-                               , CB { cbMatchers=[FieldMatcher None "%description" (toRegex' "PREFIX (.*)")]
+-                                    , cbAssignments=[("account1","account:\\1"), ("comment1","\\1")] }
+-                               ]
+-          }
+-        record = ["2019-02-01","PREFIX Text 1 - Text 2"]
+-    in [ testCase "scoped match groups forwards" $ hledgerFieldValue rules record "account1" @?= (Just "account:Text 1:Text 2")
+-       , testCase "scoped match groups backwards" $ hledgerFieldValue rules record "comment1" @?= (Just "Text 1 - Text 2")
+-       ]
+  ]
+diff --git a/hledger/test/import/match.rules b/hledger/test/import/match.rules
+index 8596e21c5..db087e2f6 100644
+--- a/hledger/test/import/match.rules
++++ b/hledger/test/import/match.rules
+@@ -1,23 +1,16 @@
+ fields _, date, _, description, account1, amount, _
+-
+-# checking brackets in a field matcher are captured and interpolated into field
+-# assignments (real-life use-case #2)
++# checking brackets in a field matcher are captured...
+ if %account1 liabilities:jon:(.*)
++# ...and interpolated into field assignments (real-life use-case #2)
+     account1 \1
+-
+-# This should match, as should the next block. Both blocks assign to comment1,
+-# so this block should be a no-op. It's here to test the match group numbering
+-# between blocks are not conflated (#2158).
+-if (Zettle)
+-    comment1 ignore
+-
+-# checking brackets in a record matcher are captured, including nesting and the
+-# interpolation token numerical offset is local to this match group; and the
+-# token is interpolated into surrounding text
++# checking brackets in a record matcher are captured, including
++# nesting...
+ if Zettle.*(Robert W. (Bell)).*£
++# ... and the interpolation token numerical offset is local to
++# this match group; and the token is interpolated into surrounding
++# text
+     comment1 Bell=\2.
+-
+-# Match the YYYY-MM of a date field and warp the posting date, useful for
+-# credit cards (real-life use-case #1))
++# Match the YYY-MM of a date field and warp the posting date, useful
++# for credit cards (real-life use-case #1))
+ if %date (....-..)-..
+     comment2 date:\1-01

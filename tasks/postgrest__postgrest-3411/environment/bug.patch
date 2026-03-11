@@ -1,0 +1,490 @@
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index e46d02bd..af1902e8 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -27,13 +27,12 @@ import qualified PostgREST.Config   as Config
+ import Protolude
+ 
+ runAdmin :: AppConfig -> AppState -> Warp.Settings -> IO ()
+-runAdmin conf@AppConfig{configAdminServerPort} appState settings =
++runAdmin conf@AppConfig{configAdminServerPort, configObserver=observer} appState settings =
+   whenJust (AppState.getSocketAdmin appState) $ \adminSocket -> do
+     observer $ AdminStartObs configAdminServerPort
+     void . forkIO $ Warp.runSettingsSocket settings adminSocket adminApp
+   where
+     adminApp = admin appState conf
+-    observer = AppState.getObserver appState
+ 
+ -- | PostgREST admin application
+ admin :: AppState.AppState -> AppConfig -> Wai.Application
+@@ -43,7 +42,7 @@ admin appState appConfig req respond  = do
+   isConnectionUp      <-
+     if configDbChannelEnabled appConfig
+       then AppState.getIsListenerOn appState
+-      else isRight <$> AppState.usePool appState (SQL.sql "SELECT 1")
++      else isRight <$> AppState.usePool appState appConfig (SQL.sql "SELECT 1")
+ 
+   case Wai.pathInfo req of
+     ["ready"] ->
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 06a20556..a10be5e0 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -62,8 +62,7 @@ type Handler = ExceptT Error
+ 
+ run :: AppState -> IO ()
+ run appState = do
+-  let observer = AppState.getObserver appState
+-  conf@AppConfig{..} <- AppState.getConfig appState
++  conf@AppConfig{configObserver=observer, ..} <- AppState.getConfig appState
+ 
+   observer $ AppServerStartObs prettyVersion
+ 
+@@ -98,7 +97,7 @@ postgrest logLevel appState connWorker =
+   traceHeaderMiddleware appState .
+   Cors.middleware appState .
+   Auth.middleware appState .
+-  Logger.middleware logLevel Auth.getRole $
++  Logger.middleware logLevel $
+     -- fromJust can be used, because the auth middleware will **always** add
+     -- some AuthResult to the vault.
+     \req respond -> case fromJust $ Auth.getResult req of
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index cbea46e4..088cc5c8 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -27,7 +27,6 @@ module PostgREST.AppState
+   , reReadConfig
+   , connectionWorker
+   , runListener
+-  , getObserver
+   ) where
+ 
+ import qualified Data.Aeson                 as JSON
+@@ -44,7 +43,6 @@ import qualified Hasql.Transaction.Sessions as SQL
+ import qualified Network.HTTP.Types.Status  as HTTP
+ import qualified Network.Socket             as NS
+ import qualified PostgREST.Error            as Error
+-import qualified PostgREST.Logger           as Logger
+ import           PostgREST.Observation
+ import           PostgREST.Version          (prettyVersion)
+ import           System.TimeIt              (timeItT)
+@@ -59,6 +57,7 @@ import Data.IORef         (IORef, atomicWriteIORef, newIORef,
+ import Data.Time.Clock    (UTCTime, getCurrentTime)
+ 
+ import PostgREST.Config                  (AppConfig (..),
++                                          LogLevel (..),
+                                           addFallbackAppName,
+                                           readAppConfig)
+ import PostgREST.Config.Database         (queryDbSettings,
+@@ -110,26 +109,19 @@ data AppState = AppState
+   , stateSocketREST           :: NS.Socket
+   -- | Network socket for the admin UI
+   , stateSocketAdmin          :: Maybe NS.Socket
+-  -- | Logger state
+-  , stateLogger               :: Logger.LoggerState
+-  -- | Observation handler
+-  , stateObserver             :: ObservationHandler
+   }
+ 
+ type AppSockets = (NS.Socket, Maybe NS.Socket)
+ 
+ init :: AppConfig -> IO AppState
+-init conf@AppConfig{configLogLevel} = do
+-  loggerState <- Logger.init
+-  let observer = Logger.observationLogger loggerState configLogLevel
++init conf = do
+   pool <- initPool conf
+   (sock, adminSock) <- initSockets conf
+-  state' <- initWithPool (sock, adminSock) pool conf loggerState observer
+-  pure state' { stateSocketREST = sock, stateSocketAdmin = adminSock}
+-
+-initWithPool :: AppSockets -> SQL.Pool -> AppConfig -> Logger.LoggerState -> ObservationHandler -> IO AppState
+-initWithPool (sock, adminSock) pool conf loggerState observer = do
++  state' <- initWithPool (sock, adminSock) pool conf
++  pure state' { stateSocketREST = sock, stateSocketAdmin = adminSock }
+ 
++initWithPool :: AppSockets -> SQL.Pool -> AppConfig -> IO AppState
++initWithPool (sock, adminSock) pool conf = do
+   appState <- AppState pool
+     <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
+     <*> newIORef Nothing
+@@ -144,8 +136,6 @@ initWithPool (sock, adminSock) pool conf loggerState observer = do
+     <*> C.newCache Nothing
+     <*> pure sock
+     <*> pure adminSock
+-    <*> pure loggerState
+-    <*> pure observer
+ 
+   debWorker <-
+     let decisecond = 100000 in
+@@ -203,16 +193,17 @@ initPool AppConfig{..} =
+     (toUtf8 $ addFallbackAppName prettyVersion configDbUri)
+ 
+ -- | Run an action with a database connection.
+-usePool :: AppState -> SQL.Session a -> IO (Either SQL.UsageError a)
+-usePool AppState{stateObserver=observer,..} sess = do
++usePool :: AppState -> AppConfig -> SQL.Session a -> IO (Either SQL.UsageError a)
++usePool AppState{..} AppConfig{configLogLevel, configObserver=observer} sess = do
+   res <- SQL.use statePool sess
+ 
+-  whenLeft res (\case
+-    SQL.AcquisitionTimeoutUsageError -> observer $ PoolAcqTimeoutObs SQL.AcquisitionTimeoutUsageError
+-    error
+-      -- TODO We're using the 500 HTTP status for getting all internal db errors but there's no response here. We need a new intermediate type to not rely on the HTTP status.
+-      | Error.status (Error.PgError False error) >= HTTP.status500 -> observer $ QueryErrorCodeHighObs error
+-      | otherwise -> pure ())
++  when (configLogLevel > LogCrit) $ do
++    whenLeft res (\case
++      SQL.AcquisitionTimeoutUsageError -> observer $ PoolAcqTimeoutObs SQL.AcquisitionTimeoutUsageError
++      error
++        -- TODO We're using the 500 HTTP status for getting all internal db errors but there's no response here. We need a new intermediate type to not rely on the HTTP status.
++        | Error.status (Error.PgError False error) >= HTTP.status500 -> observer $ QueryErrorCodeHighObs error
++        | otherwise -> pure ())
+ 
+   return res
+ 
+@@ -290,9 +281,6 @@ getSchemaCacheLoaded = readIORef . stateSchemaCacheLoaded
+ putSchemaCacheLoaded :: AppState -> Bool -> IO ()
+ putSchemaCacheLoaded = atomicWriteIORef . stateSchemaCacheLoaded
+ 
+-getObserver :: AppState -> ObservationHandler
+-getObserver = stateObserver
+-
+ -- | Schema cache status
+ data SCacheStatus
+   = SCLoaded
+@@ -300,12 +288,12 @@ data SCacheStatus
+   | SCFatalFail
+ 
+ -- | Load the SchemaCache by using a connection from the pool.
+-loadSchemaCache :: AppState -> IO SCacheStatus
+-loadSchemaCache appState@AppState{stateObserver=observer} = do
++loadSchemaCache :: AppState -> AppConfig -> IO SCacheStatus
++loadSchemaCache appState AppConfig{configObserver=observer} = do
+   conf@AppConfig{..} <- getConfig appState
+   (resultTime, result) <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    timeItT $ usePool appState (transaction SQL.ReadCommitted SQL.Read $ querySchemaCache conf)
++    timeItT $ usePool appState conf (transaction SQL.ReadCommitted SQL.Read $ querySchemaCache conf)
+   case result of
+     Left e -> do
+       case checkIsFatal e of
+@@ -345,12 +333,12 @@ data ConnectionStatus
+ --     program.
+ --  3. Obtains the sCache. If this fails, it goes back to 1.
+ internalConnectionWorker :: AppState -> IO ()
+-internalConnectionWorker appState@AppState{stateObserver=observer} = work
++internalConnectionWorker appState = work
+   where
+     work = do
+-      AppConfig{..} <- getConfig appState
++      config@AppConfig{configObserver=observer, ..} <- getConfig appState
+       observer DBConnectAttemptObs
+-      connected <- establishConnection appState
++      connected <- establishConnection appState config
+       case connected of
+         FatalConnectionError reason ->
+           -- Fatal error when connecting
+@@ -368,7 +356,7 @@ internalConnectionWorker appState@AppState{stateObserver=observer} = work
+           -- this could be fail because the connection drops, but the loadSchemaCache will pick the error and retry again
+           -- We cannot retry after it fails immediately, because db-pre-config could have user errors. We just log the error and continue.
+           when configDbConfig $ reReadConfig False appState
+-          scStatus <- loadSchemaCache appState
++          scStatus <- loadSchemaCache appState config
+           case scStatus of
+             SCLoaded ->
+               -- do nothing and proceed if the load was successful
+@@ -390,8 +378,8 @@ internalConnectionWorker appState@AppState{stateObserver=observer} = work
+ --
+ -- The connection tries are capped, but if the connection times out no error is
+ -- thrown, just 'False' is returned.
+-establishConnection :: AppState -> IO ConnectionStatus
+-establishConnection appState@AppState{stateObserver=observer} =
++establishConnection :: AppState -> AppConfig -> IO ConnectionStatus
++establishConnection appState config@AppConfig{configObserver=observer} =
+   retrying retrySettings shouldRetry $
+     const $ flushPool appState >> getConnectionStatus
+   where
+@@ -401,7 +389,7 @@ establishConnection appState@AppState{stateObserver=observer} =
+ 
+     getConnectionStatus :: IO ConnectionStatus
+     getConnectionStatus = do
+-      pgVersion <- usePool appState (queryPgVersion False) -- No need to prepare the query here, as the connection might not be established
++      pgVersion <- usePool appState config (queryPgVersion False) -- No need to prepare the query here, as the connection might not be established
+       case pgVersion of
+         Left e -> do
+           observer $ ConnectionPgVersionErrorObs e
+@@ -430,12 +418,12 @@ establishConnection appState@AppState{stateObserver=observer} =
+ 
+ -- | Re-reads the config plus config options from the db
+ reReadConfig :: Bool -> AppState -> IO ()
+-reReadConfig startingUp appState@AppState{stateObserver=observer} = do
+-  AppConfig{..} <- getConfig appState
++reReadConfig startingUp appState = do
++  config@AppConfig{configObserver=observer, ..} <- getConfig appState
+   pgVer <- getPgVersion appState
+   dbSettings <-
+     if configDbConfig then do
+-      qDbSettings <- usePool appState (queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements)
++      qDbSettings <- usePool appState config (queryDbSettings (dumpQi <$> configDbPreConfig) configDbPreparedStatements)
+       case qDbSettings of
+         Left e -> do
+           observer ConfigReadErrorObs
+@@ -451,7 +439,7 @@ reReadConfig startingUp appState@AppState{stateObserver=observer} = do
+       pure mempty
+   (roleSettings, roleIsolationLvl) <-
+     if configDbConfig then do
+-      rSettings <- usePool appState (queryRoleSettings pgVer configDbPreparedStatements)
++      rSettings <- usePool appState config (queryRoleSettings pgVer configDbPreparedStatements)
+       case rSettings of
+         Left e -> do
+           observer $ QueryRoleSettingsErrorObs e
+@@ -459,7 +447,7 @@ reReadConfig startingUp appState@AppState{stateObserver=observer} = do
+         Right x -> pure x
+     else
+       pure mempty
+-  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings roleIsolationLvl >>= \case
++  readAppConfig dbSettings configFilePath (Just configDbUri) roleSettings roleIsolationLvl observer >>= \case
+     Left err   ->
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up
+@@ -480,7 +468,7 @@ runListener conf@AppConfig{configDbChannelEnabled} appState = do
+ -- NOTIFY <db-channel> - with an empty payload - is done, it refills the schema
+ -- cache.  It uses the connectionWorker in case the LISTEN connection dies.
+ listener :: AppState -> AppConfig -> IO ()
+-listener appState@AppState{stateObserver=observer} conf@AppConfig{..} = do
++listener appState conf@AppConfig{configObserver=observer, ..} = do
+   let dbChannel = toS configDbChannel
+ 
+   -- The listener has to wait for a signal from the connectionWorker.
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index bf33509a..68ef441d 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -25,14 +25,17 @@ import PostgREST.Version     (prettyVersion)
+ import qualified PostgREST.App      as App
+ import qualified PostgREST.AppState as AppState
+ import qualified PostgREST.Config   as Config
++import qualified PostgREST.Logger   as Logger
+ 
+ import Protolude hiding (hPutStrLn)
+ 
+ 
+ main :: CLI -> IO ()
+ main CLI{cliCommand, cliPath} = do
++  loggerState <- Logger.init
++
+   conf@AppConfig{..} <-
+-    either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty mempty
++    either panic identity <$> Config.readAppConfig mempty cliPath Nothing mempty mempty (Logger.observationLogger loggerState)
+ 
+   -- Per https://github.com/PostgREST/postgrest/issues/268, we want to
+   -- explicitly close the connections to PostgreSQL on shutdown.
+@@ -53,7 +56,7 @@ dumpSchema appState = do
+   conf@AppConfig{..} <- AppState.getConfig appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+-    AppState.usePool appState
++    AppState.usePool appState conf
+       (transaction SQL.ReadCommitted SQL.Read $ querySchemaCache conf)
+   case result of
+     Left e -> do
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 6d4de526..f8d1f706 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -64,6 +64,8 @@ import PostgREST.Config.Proxy            (Proxy (..),
+ import PostgREST.SchemaCache.Identifiers (QualifiedIdentifier, dumpQi,
+                                           toQi)
+ 
++import PostgREST.Observation
++
+ import Protolude hiding (Proxy, toList)
+ 
+ 
+@@ -112,6 +114,7 @@ data AppConfig = AppConfig
+   , configRoleSettings             :: RoleSettings
+   , configRoleIsoLvl               :: RoleIsolationLvl
+   , configInternalSCSleep          :: Maybe Int32
++  , configObserver                 :: ObservationHandler
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo
+@@ -210,13 +213,13 @@ instance JustIfMaybe a (Maybe a) where
+ 
+ -- | Reads and parses the config and overrides its parameters from env vars,
+ -- files or db settings.
+-readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> RoleIsolationLvl -> IO (Either Text AppConfig)
+-readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
++readAppConfig :: [(Text, Text)] -> Maybe FilePath -> Maybe Text -> RoleSettings -> RoleIsolationLvl -> ObservationHandler -> IO (Either Text AppConfig)
++readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl observer = do
+   env <- readPGRSTEnvironment
+   -- if no filename provided, start with an empty map to read config from environment
+   conf <- maybe (return $ Right M.empty) loadConfig optPath
+ 
+-  case C.runParser (parser optPath env dbSettings roleSettings roleIsolationLvl) =<< mapLeft show conf of
++  case C.runParser (parser optPath env dbSettings roleSettings roleIsolationLvl observer) =<< mapLeft show conf of
+     Left err ->
+       return . Left $ "Error in config " <> err
+     Right parsedConfig ->
+@@ -231,8 +234,8 @@ readAppConfig dbSettings optPath prevDbUri roleSettings roleIsolationLvl = do
+       decodeJWKS <$>
+         (decodeSecret =<< readSecretFile =<< readDbUriFile prevDbUri parsedConfig)
+ 
+-parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> RoleIsolationLvl -> C.Parser C.Config AppConfig
+-parser optPath env dbSettings roleSettings roleIsolationLvl =
++parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> RoleSettings -> RoleIsolationLvl -> ObservationHandler -> C.Parser C.Config AppConfig
++parser optPath env dbSettings roleSettings roleIsolationLvl observer =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+     <*> (fromMaybe False <$> optBool "db-aggregates-enabled")
+@@ -285,6 +288,7 @@ parser optPath env dbSettings roleSettings roleIsolationLvl =
+     <*> pure roleSettings
+     <*> pure roleIsolationLvl
+     <*> optInt "internal-schema-cache-sleep"
++    <*> pure observer
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+index dcee2d0e..b1194003 100644
+--- a/src/PostgREST/Logger.hs
++++ b/src/PostgREST/Logger.hs
+@@ -6,13 +6,11 @@ module PostgREST.Logger
+   ( middleware
+   , observationLogger
+   , init
+-  , LoggerState
+   ) where
+ 
+-import           Control.AutoUpdate    (defaultUpdateSettings,
+-                                        mkAutoUpdate, updateAction)
+-import           Control.Debounce
+-import qualified Data.ByteString.Char8 as BS
++import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
++                           updateAction)
++import Control.Debounce
+ 
+ import Data.Time (ZonedTime, defaultTimeLocale, formatTime,
+                   getZonedTime)
+@@ -26,6 +24,8 @@ import System.IO.Unsafe          (unsafePerformIO)
+ import PostgREST.Config      (LogLevel (..))
+ import PostgREST.Observation
+ 
++import qualified PostgREST.Auth as Auth
++
+ import Protolude
+ 
+ data LoggerState = LoggerState
+@@ -54,32 +54,24 @@ logWithDebounce loggerState action = do
+       putMVar (stateLogDebouncePoolTimeout loggerState) newDebouncer
+       newDebouncer
+ 
+-middleware :: LogLevel -> (Wai.Request -> Maybe BS.ByteString) -> Wai.Middleware
+-middleware logLevel getAuthRole = case logLevel of
++middleware :: LogLevel -> Wai.Middleware
++middleware logLevel = case logLevel of
+   LogInfo  -> requestLogger (const True)
+   LogWarn  -> requestLogger (>= status400)
+   LogError -> requestLogger (>= status500)
+   LogCrit  -> requestLogger (const False)
+   where
+-    requestLogger filterStatus = unsafePerformIO $
+-      Wai.mkRequestLogger Wai.defaultRequestLoggerSettings
+-      { Wai.outputFormat =
+-         Wai.ApacheWithSettings $
+-           Wai.defaultApacheSettings &
+-           Wai.setApacheRequestFilter (\_ res -> filterStatus $ Wai.responseStatus res) &
+-           Wai.setApacheUserGetter getAuthRole
+-      , Wai.autoFlush = True
+-      , Wai.destination = Wai.Handle stdout
++    requestLogger filterStatus = unsafePerformIO $ Wai.mkRequestLogger Wai.defaultRequestLoggerSettings
++      { Wai.outputFormat = Wai.ApacheWithSettings $
++          Wai.defaultApacheSettings
++            & Wai.setApacheRequestFilter (\_ res -> filterStatus $ Wai.responseStatus res)
++            & Wai.setApacheUserGetter Auth.getRole
+       }
+ 
+-observationLogger :: LoggerState -> LogLevel -> ObservationHandler
+-observationLogger loggerState logLevel obs = case obs of
++observationLogger :: LoggerState -> ObservationHandler
++observationLogger loggerState obs = case obs of
+   o@(PoolAcqTimeoutObs _) -> do
+-    when (logLevel >= LogError) $ do
+-      logWithDebounce loggerState $
+-        logWithZTime loggerState $ observationMessage o
+-  o@(QueryErrorCodeHighObs _) -> do
+-    when (logLevel >= LogError) $ do
++    logWithDebounce loggerState $
+       logWithZTime loggerState $ observationMessage o
+   o ->
+     logWithZTime loggerState $ observationMessage o
+diff --git a/src/PostgREST/Query.hs b/src/PostgREST/Query.hs
+index 7332f7b4..7a1b319f 100644
+--- a/src/PostgREST/Query.hs
++++ b/src/PostgREST/Query.hs
+@@ -79,7 +79,7 @@ runQuery _ _ _ _ (NoDb x) _ _ _ = pure $ NoDbResult x
+ runQuery appState config AuthResult{..} apiReq (Db plan) sCache pgVer authenticated = do
+   dbResp <- lift $ do
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction
+-    AppState.usePool appState (transaction isoLvl txMode $ runExceptT dbHandler)
++    AppState.usePool appState config (transaction isoLvl txMode $ runExceptT dbHandler)
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index 044fe0b1..b4ab6389 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -15,7 +15,6 @@ import Protolude                 hiding (toList, toS)
+ import SpecHelper
+ 
+ import qualified PostgREST.AppState as AppState
+-import qualified PostgREST.Logger   as Logger
+ 
+ import qualified Feature.Auth.AsymmetricJwtSpec
+ import qualified Feature.Auth.AudienceJwtSecretSpec
+@@ -69,7 +68,6 @@ import qualified Feature.RpcPreRequestGucsSpec
+ 
+ main :: IO ()
+ main = do
+-  let observer = const $ pure ()
+   pool <- P.acquire 3 10 60 60 $ toUtf8 $ configDbUri testCfg
+ 
+   actualPgVersion <- either (panic . show) id <$> P.use pool (queryPgVersion False)
+@@ -77,12 +75,11 @@ main = do
+   -- cached schema cache so most tests run fast
+   baseSchemaCache <- loadSCache pool testCfg
+   sockets <- AppState.initSockets testCfg
+-  loggerState <- Logger.init
+ 
+   let
+     -- For tests that run with the same refSchemaCache
+     app config = do
+-      appState <- AppState.initWithPool sockets pool config loggerState observer
++      appState <- AppState.initWithPool sockets pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just baseSchemaCache)
+       return ((), postgrest (configLogLevel config) appState (pure ()))
+@@ -90,7 +87,7 @@ main = do
+     -- For tests that run with a different SchemaCache(depends on configSchemas)
+     appDbs config = do
+       customSchemaCache <- loadSCache pool config
+-      appState <- AppState.initWithPool sockets pool config loggerState observer
++      appState <- AppState.initWithPool sockets pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putSchemaCache appState (Just customSchemaCache)
+       return ((), postgrest (configLogLevel config) appState (pure ()))
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 0717ef12..6c73d150 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -141,6 +141,7 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configRoleIsoLvl                = mempty
+   , configInternalSCSleep           = Nothing
+   , configServerTimingEnabled       = True
++  , configObserver                  = const $ pure ()
+   }
+ 
+ testCfg :: AppConfig

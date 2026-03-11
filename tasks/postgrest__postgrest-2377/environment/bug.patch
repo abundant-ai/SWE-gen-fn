@@ -1,0 +1,166 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6607fcba..58961ab3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -57,7 +57,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2341, The search path now correctly identifies schemas with uppercase and special characters in their names (regression) - @laurenceisla
+  - #2364, "404 Not Found" on nested routes and "405 Method Not Allowed" errors no longer start an empty database transaction - @steve-chavez
+  - #2342, Fix inaccurate result count when an inner embed was selected after a normal embed in the query string - @laurenceisla
+- - #2376, OPTIONS requests no longer start an empty database transaction - @steve-chavez
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 1c04c092..7cb46fe6 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -206,14 +206,11 @@ postgrestResponse conf@AppConfig{..} maybeDbStructure jsonDbS pgVer pool AuthRes
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf dbStructure req body
+ 
+-  let ctx apiReq = RequestContext conf dbStructure apiReq pgVer
++  let handleReq apiReq = handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+-  if iAction apiRequest == ActionInfo then
+-    handleInfo (iTarget apiRequest) (ctx apiRequest)
+-  else
+-    runDbHandler pool (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
+-      Middleware.optionalRollback conf apiRequest $
+-        Middleware.runPgLocals conf authClaims authRole (handleRequest . ctx) apiRequest jsonDbS pgVer
++  runDbHandler pool (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
++    Middleware.optionalRollback conf apiRequest $
++      Middleware.runPgLocals conf authClaims authRole handleReq apiRequest jsonDbS pgVer
+ 
+ runDbHandler :: SQL.Pool -> SQL.Mode -> Bool -> Bool -> DbHandler a -> Handler IO a
+ runDbHandler pool mode authenticated prepared handler = do
+@@ -240,6 +237,8 @@ handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+       handleSingleUpsert identifier context
+     (ActionMutate MutationDelete, TargetIdent identifier) ->
+       handleDelete identifier context
++    (ActionInfo, TargetIdent identifier) ->
++      handleInfo identifier context
+     (ActionInvoke invMethod, TargetProc proc _) ->
+       handleInvoke invMethod proc context
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) ->
+@@ -415,8 +414,8 @@ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+       else
+         response HTTP.status204 [contentRangeHeader] mempty)
+ 
+-handleInfo :: Monad m => Target -> RequestContext -> Handler m Wai.Response
+-handleInfo target RequestContext{..} =
++handleInfo :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m Wai.Response
++handleInfo identifier RequestContext{..} =
+   case tbl of
+     Just table ->
+       return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
+@@ -424,9 +423,7 @@ handleInfo target RequestContext{..} =
+       -- TODO is this right? When no tbl is found on the schema cache we disallow OPTIONS?
+       throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+-    tbl = case target of
+-      TargetIdent identifier -> HM.lookup identifier (dbTables ctxDbStructure)
+-      _                      -> Nothing
++    tbl = HM.lookup identifier (dbTables ctxDbStructure)
+     allOrigins = ("Access-Control-Allow-Origin", "*")
+     allowH table =
+       ( HTTP.hAllow
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index d9dd1caa..3fb29df3 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -140,7 +140,7 @@ def dumpconfig(configpath=None, env=None, stdin=None):
+ 
+ 
+ @contextlib.contextmanager
+-def run(configpath=None, stdin=None, env=None, port=None, host=None, no_pool_connection_available=False):
++def run(configpath=None, stdin=None, env=None, port=None, host=None):
+     "Run PostgREST and yield an endpoint that is ready for connections."
+     env = env or {}
+     env["PGRST_DB_POOL"] = "1"
+@@ -190,9 +190,6 @@ def run(configpath=None, stdin=None, env=None, port=None, host=None, no_pool_con
+                 admin=PostgrestSession(adminurl),
+             )
+         finally:
+-            if no_pool_connection_available:
+-                sleep_pool_connection(baseurl, 10)
+-
+             remaining_output = process.stdout.read()
+             if remaining_output:
+                 print(remaining_output.decode())
+@@ -233,17 +230,6 @@ def wait_until_ready(url):
+         raise PostgrestTimedOut()
+ 
+ 
+-def sleep_pool_connection(url, seconds):
+-    "Sleep a pool connection by calling an RPC that uses pg_sleep"
+-    session = requests_unixsocket.Session()
+-
+-    # The try/except is a hack for not waiting for the response,
+-    # taken from https://stackoverflow.com/a/45601591/4692662
+-    try:
+-        session.get(url + f"/rpc/sleep?seconds={seconds}", timeout=0.1)
+-    except requests.exceptions.ReadTimeout:
+-        pass
+-
+ def authheader(token):
+     "Bearer token HTTP authorization header."
+     return {"Authorization": f"Bearer {token}"}
+@@ -960,7 +946,20 @@ def test_log_level(level, has_output, defaultenv):
+ def test_no_pool_connection_required_on_bad_http_logic(defaultenv):
+     "no pool connection should be consumed for failing on invalid http logic"
+ 
+-    with run(env=defaultenv, no_pool_connection_available=True) as postgrest:
++    env = {
++        **defaultenv,
++        "PGRST_DB_POOL": "1",
++    }
++
++    with run(env=env) as postgrest:
++        # First we retain the only pool connection available
++        # The try/except is a hack for not waiting for the response, taken from https://stackoverflow.com/a/45601591/4692662
++        try:
++            postgrest.session.get("/rpc/sleep?seconds=50", timeout=0.1)
++        except requests.exceptions.ReadTimeout:
++            pass
++
++        # Then the following requests should succeed rapidly
+ 
+         # not found nested route shouldn't require opening a connection
+         response = postgrest.session.head("/path/notfound")
+@@ -973,26 +972,20 @@ def test_no_pool_connection_required_on_bad_http_logic(defaultenv):
+         assert response.status_code == 405
+ 
+ 
+-def test_no_pool_connection_required_on_options(defaultenv):
+-    "no pool connection should be consumed for OPTIONS requests"
+-
+-    with run(env=defaultenv, no_pool_connection_available=True) as postgrest:
+-
+-        # OPTIONS on a table shouldn't require opening a connection
+-        response = postgrest.session.options("/projects")
+-        assert response.status_code == 200
+-
+-        # OPTIONS on RPC is not implemented yet, still it shouldn't require opening a connection
+-        response = postgrest.session.options("/rpc/hello")
+-        assert response.status_code == 405
+-
+-
+ def test_no_pool_connection_required_on_bad_jwt_claim(defaultenv):
+     "no pool connection should be consumed for failing on invalid jwt"
+ 
+-    env = {**defaultenv, "PGRST_JWT_SECRET": SECRET}
++    env = {**defaultenv, "PGRST_DB_POOL": "1", "PGRST_JWT_SECRET": SECRET}
++
++    with run(env=env) as postgrest:
++        # First we retain the only pool connection available
++        # The try/except is a hack for not waiting for the response, taken from https://stackoverflow.com/a/45601591/4692662
++        try:
++            postgrest.session.get("/rpc/sleep?seconds=50", timeout=0.1)
++        except requests.exceptions.ReadTimeout:
++            pass
+ 
+-    with run(env=env, no_pool_connection_available=True) as postgrest:
++        # Then the following requests should succeed rapidly
+ 
+         # A JWT with an invalid signature shouldn't open a connection
+         headers = jwtauthheader({"role": "postgrest_test_author"}, "Wrong Secret")

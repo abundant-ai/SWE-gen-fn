@@ -1,0 +1,96 @@
+diff --git a/lib/elixir/src/elixir.erl b/lib/elixir/src/elixir.erl
+index 169cf7c71..352c529dc 100644
+--- a/lib/elixir/src/elixir.erl
++++ b/lib/elixir/src/elixir.erl
+@@ -64,11 +64,6 @@ start(_Type, _Args) ->
+       application:set_env(elixir, ansi_enabled, prim_tty:isatty(stdout) == true)
+   end,
+ 
+-  %% Store the initial dbg_callback value before any runtime modifications.
+-  %% This allows Mix compiler to detect config changes vs runtime changes
+-  %% (e.g., Kino wrapping dbg_callback at runtime should not trigger recompilation).
+-  {ok, InitialDbgCallback} = application:get_env(elixir, dbg_callback),
+-
+   Tokenizer = case code:ensure_loaded('Elixir.String.Tokenizer') of
+     {module, Mod} -> Mod;
+     _ -> elixir_tokenizer
+@@ -95,7 +90,6 @@ start(_Type, _Args) ->
+     {docs, true},
+     {ignore_already_consolidated, false},
+     {ignore_module_conflict, false},
+-    {initial_dbg_callback, InitialDbgCallback},
+     {infer_signatures, [elixir]},
+     {on_undefined_variable, raise},
+     {parser_options, [{columns, true}]},
+diff --git a/lib/mix/lib/mix/compilers/elixir.ex b/lib/mix/lib/mix/compilers/elixir.ex
+index 74e405ee2..8a25b7aa6 100644
+--- a/lib/mix/lib/mix/compilers/elixir.ex
++++ b/lib/mix/lib/mix/compilers/elixir.ex
+@@ -287,13 +287,7 @@ defp local_deps_changed?(deps_config, local_deps) do
+   end
+ 
+   defp deps_config_compile_env_apps(deps_config) do
+-    # Use initial_dbg_callback instead of dbg_callback to ignore runtime modifications.
+-    # Tools like Kino modify dbg_callback at runtime to customize dbg/2 behavior,
+-    # but this should not trigger recompilation since the config hasn't actually changed.
+-    # initial_dbg_callback is set when :elixir app starts, before any runtime modifications.
+-    initial_dbg = :elixir_config.get(:initial_dbg_callback)
+-
+-    if deps_config[:dbg] != initial_dbg do
++    if deps_config[:dbg] != Application.fetch_env!(:elixir, :dbg_callback) do
+       [:elixir]
+     else
+       []
+diff --git a/lib/mix/test/mix/tasks/compile.elixir_test.exs b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+index 2a36f35d3..fdfccdef4 100644
+--- a/lib/mix/test/mix/tasks/compile.elixir_test.exs
++++ b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+@@ -278,11 +278,9 @@ def b, do: :ok
+       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+       assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+ 
+-      # Simulate a config change by updating both dbg_callback and initial_dbg_callback.
+-      # This represents the case where the user actually changed the config file.
++      # Change the dbg_callback at runtime
+       File.touch!("_build/dev/lib/sample/.mix/compile.elixir", @old_time)
+       Application.put_env(:elixir, :dbg_callback, {__MODULE__, :dbg, []})
+-      :elixir_config.put(:initial_dbg_callback, {__MODULE__, :dbg, []})
+ 
+       assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == {:ok, []}
+       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+@@ -291,35 +289,6 @@ def b, do: :ok
+     end)
+   after
+     Application.put_env(:elixir, :dbg_callback, {Macro, :dbg, []})
+-    :elixir_config.put(:initial_dbg_callback, {Macro, :dbg, []})
+-  end
+-
+-  test "does not recompile when dbg_callback is modified at runtime but initial is unchanged" do
+-    in_fixture("no_mixfile", fn ->
+-      Mix.Project.push(MixTest.Case.Sample)
+-
+-      File.write!("lib/a.ex", """
+-      defmodule A do
+-        def a, do: dbg(:ok)
+-      end
+-      """)
+-
+-      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == {:ok, []}
+-      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+-
+-      # Simulate a tool like Kino modifying dbg_callback at runtime.
+-      # Since initial_dbg_callback remains unchanged, this should NOT trigger recompilation.
+-      original_dbg = Application.fetch_env!(:elixir, :dbg_callback)
+-      :elixir_config.put(:initial_dbg_callback, original_dbg)
+-      Application.put_env(:elixir, :dbg_callback, {SomeDebugTool, :dbg, [original_dbg]})
+-
+-      # Should NOT trigger recompilation since initial_dbg_callback is unchanged
+-      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == {:noop, []}
+-      refute_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+-    end)
+-  after
+-    Application.put_env(:elixir, :dbg_callback, {Macro, :dbg, []})
+-    :elixir_config.put(:initial_dbg_callback, {Macro, :dbg, []})
+   end
+ 
+   test "recompiles files when config changes export dependencies" do

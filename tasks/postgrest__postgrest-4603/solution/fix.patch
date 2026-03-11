@@ -1,0 +1,140 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7228e0af..bb9034f0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file. From versio
+ 
+ - Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+ - Add a `HINT` when the LISTEN channel stops working due to a PostgreSQL bug by @laurenceisla in #4581
++- Add string slicing operator for `jwt-role-claim-key` by @taimoorzaeem in #4599
+ 
+ ## [14.3] - 2026-01-03
+ 
+diff --git a/docs/references/auth.rst b/docs/references/auth.rst
+index 4970dd39..30551abe 100644
+--- a/docs/references/auth.rst
++++ b/docs/references/auth.rst
+@@ -234,6 +234,17 @@ The DSL follows the `JSONPath <https://goessner.net/articles/JsonPath/>`_ expres
+ - ``==^`` selects the first array element that ends with the right operand
+ - ``*==`` selects the first array element that contains the right operand
+ 
++The selected role value can also be sliced using the slice operator ``[a:b]``. It is similar to `slice operator in python <https://docs.python.org/3/library/functions.html#slice>`_. Negative index values are also supported. The syntax is as:
++
++- ``[a:b]`` take slice from index ``a`` up to ``b``
++- ``[a:]`` take slice from index ``a`` to end
++- ``[:b]`` take slice from start to index ``b``
++- ``[:]`` select everything, no slicing
++
++.. important::
++
++  Make sure that you are not taking a slice where the start index comes after the end index like ``[11:2]``. The result of this would be empty string and so no role would get selected.
++
+ Usage examples:
+ 
+   .. code:: bash
+@@ -255,6 +266,11 @@ Usage examples:
+     jwt-role-claim-key = ".postgrest.roles[?(@ ==^ \"hor\")]"
+     jwt-role-claim-key = ".postgrest.roles[?(@ *== \"utho\")]"
+ 
++    # {"postgrest":{"wlcg": ["/groupa", "/groupb/"]}}
++    # skip the "/" character using slice operator
++    jwt-role-claim-key = ".postgrest.wlcg[0][1:]"
++    jwt-role-claim-key = ".postgrest.wlcg[1][1:-1]"
++
+ .. note::
+ 
+   The string comparison operators are implemented as a custom extension to the JSPath and does not strictly follow the `RFC 9535 <https://www.rfc-editor.org/rfc/rfc9535.html>`_.
+diff --git a/src/PostgREST/Config/JSPath.hs b/src/PostgREST/Config/JSPath.hs
+index e28e5c36..8116a2d2 100644
+--- a/src/PostgREST/Config/JSPath.hs
++++ b/src/PostgREST/Config/JSPath.hs
+@@ -29,9 +29,10 @@ type JSPath = [JSPathExp]
+ -- NOTE: We only accept one JSPFilter expr (at the end of input)
+ -- | jspath expression
+ data JSPathExp
+-  = JSPKey Text         -- .property or ."property-dash"
+-  | JSPIdx Int          -- [0]
+-  | JSPFilter FilterExp -- [?(@ == "match")]
++  = JSPKey Text                      -- .property or ."property-dash"
++  | JSPIdx Int                       -- [0]
++  | JSPSlice (Maybe Int) (Maybe Int) -- [0:5] or [0:] or [:5] or [:]
++  | JSPFilter FilterExp              -- [?(@ == "match")]
+ 
+ data FilterExp
+   = EqualsCond Text
+@@ -44,6 +45,7 @@ dumpJSPath :: JSPathExp -> Text
+ -- TODO: this needs to be quoted properly for special chars
+ dumpJSPath (JSPKey k) = "." <> show k
+ dumpJSPath (JSPIdx i) = "[" <> show i <> "]"
++dumpJSPath (JSPSlice s e) = "[" <> maybe "" show s <> ":" <> maybe "" show e <> "]"
+ dumpJSPath (JSPFilter cond) = "[?(@" <> expr <> ")]"
+   where
+     expr =
+@@ -59,12 +61,25 @@ walkJSPath :: Maybe JSON.Value -> JSPath -> Maybe JSON.Value
+ walkJSPath x                      []                = x
+ walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (KM.lookup (K.fromText key) o) rest
+ walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
+-walkJSPath (Just (JSON.Array ar)) [JSPFilter jspFilter] = case jspFilter of
+-    EqualsCond txt     -> findFirstMatch (==) txt ar
+-    NotEqualsCond txt  -> findFirstMatch (/=) txt ar
+-    StartsWithCond txt -> findFirstMatch T.isPrefixOf txt ar
+-    EndsWithCond txt   -> findFirstMatch T.isSuffixOf txt ar
+-    ContainsCond txt   -> findFirstMatch T.isInfixOf txt ar
++walkJSPath (Just (JSON.String str)) (JSPSlice start end:rest) =
++  let
++    len = T.length str
++
++    norm :: Maybe Int -> Maybe Int -- Normalize negative indices to positive
++    norm = fmap (\i -> max 0 $ min len $ if i < 0 then len + i else i)
++
++    s = fromMaybe 0 $ norm start -- normalized start index
++    e = fromMaybe len $ norm end -- normalized end index
++    slicedString = if s >= e then T.empty else T.take (e-s) $ T.drop s str
++  in
++    walkJSPath (Just $ JSON.String slicedString) rest
++
++walkJSPath (Just (JSON.Array ar)) (JSPFilter jspFilter:rest) = case jspFilter of
++    EqualsCond txt     -> walkJSPath (findFirstMatch (==) txt ar) rest
++    NotEqualsCond txt  -> walkJSPath (findFirstMatch (/=) txt ar) rest
++    StartsWithCond txt -> walkJSPath (findFirstMatch T.isPrefixOf txt ar) rest
++    EndsWithCond txt   -> walkJSPath (findFirstMatch T.isSuffixOf txt ar) rest
++    ContainsCond txt   -> walkJSPath (findFirstMatch T.isInfixOf txt ar) rest
+   where
+     findFirstMatch matchWith pattern = find (\case
+       JSON.String txt -> pattern `matchWith` txt
+@@ -80,7 +95,7 @@ pJSPath :: P.Parser JSPath
+ pJSPath = P.many1 pJSPathExp <* P.eof
+ 
+ pJSPathExp :: P.Parser JSPathExp
+-pJSPathExp = pJSPKey <|> pJSPFilter <|> pJSPIdx
++pJSPathExp = P.try pJSPKey <|> P.try pJSPFilter <|> P.try pJSPIdx <|> pJSPSlice
+ 
+ pJSPKey :: P.Parser JSPathExp
+ pJSPKey = do
+@@ -95,13 +110,25 @@ pJSPIdx = do
+   P.char ']'
+   return (JSPIdx num) <?> "pJSPIdx: JSPath array index"
+ 
++pJSPSlice :: P.Parser JSPathExp
++pJSPSlice = do
++  P.char '['
++  startSign <- P.optionMaybe $ P.char '-'
++  startIndex <- P.optionMaybe (read <$> P.many1 P.digit)
++  P.char ':'
++  endSign <- P.optionMaybe $ P.char '-'
++  endIndex <- P.optionMaybe (read <$> P.many1 P.digit)
++  P.char ']'
++  let start' = if isJust startSign then ((-1) *) <$> startIndex else startIndex
++      end'   = if isJust endSign   then ((-1) *) <$> endIndex   else endIndex
++  return (JSPSlice start' end') <?> "pJSPSlice: JSPath string slice"
++
+ pJSPFilter :: P.Parser JSPathExp
+ pJSPFilter = do
+   P.try $ P.string "[?("
+   condition <- pFilterConditionParser
+   P.char ')'
+   P.char ']'
+-  P.eof -- this should be the last jspath expression
+   return (JSPFilter condition) <?> "pJSPFilter: JSPath filter exp"
+ 
+ pFilterConditionParser :: P.Parser FilterExp

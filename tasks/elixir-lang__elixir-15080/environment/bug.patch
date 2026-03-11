@@ -1,0 +1,1092 @@
+diff --git a/lib/elixir/lib/kernel.ex b/lib/elixir/lib/kernel.ex
+index 411b63ca2..8f9c79f2d 100644
+--- a/lib/elixir/lib/kernel.ex
++++ b/lib/elixir/lib/kernel.ex
+@@ -2069,20 +2069,15 @@ defmacro left and right do
+   end
+ 
+   defp build_boolean_check(operator, check, true_clause, false_clause) do
+-    bools =
+-      quote do
+-        false -> unquote(false_clause)
+-        true -> unquote(true_clause)
+-      end
+-
+-    error =
+-      quote generated: true do
+-        other -> :erlang.error({:badbool, unquote(operator), other})
+-      end
+-
+     annotate_case(
+       [optimize_boolean: true, type_check: :expr],
+-      {:case, [], [check, [do: bools ++ error]]}
++      quote do
++        case unquote(check) do
++          false -> unquote(false_clause)
++          true -> unquote(true_clause)
++          other -> :erlang.error({:badbool, unquote(operator), other})
++        end
++      end
+     )
+   end
+ 
+diff --git a/lib/elixir/lib/module/types/descr.ex b/lib/elixir/lib/module/types/descr.ex
+index 4176b0af5..67bc011e5 100644
+--- a/lib/elixir/lib/module/types/descr.ex
++++ b/lib/elixir/lib/module/types/descr.ex
+@@ -478,7 +478,6 @@ defp intersection(:dynamic, v1, v2) do
+   Computes the difference between two types.
+   """
+   def difference(left, :term), do: keep_optional(left)
+-  def difference(left, none) when none == @none, do: left
+ 
+   def difference(left, right) do
+     if gradual?(left) or gradual?(right) do
+diff --git a/lib/elixir/lib/module/types/expr.ex b/lib/elixir/lib/module/types/expr.ex
+index 5947c044e..f90025f22 100644
+--- a/lib/elixir/lib/module/types/expr.ex
++++ b/lib/elixir/lib/module/types/expr.ex
+@@ -295,6 +295,7 @@ def of_expr({:cond, _meta, [[{:do, clauses}]]}, expected, expr, stack, original)
+ 
+   def of_expr({:case, meta, [case_expr, [{:do, clauses}]]}, expected, expr, stack, context) do
+     {case_type, context} = of_expr(case_expr, @pending, case_expr, stack, context)
++    info = {:case, meta, case_type, case_expr}
+ 
+     added_meta =
+       if Macro.quoted_literal?(case_expr) do
+@@ -311,7 +312,7 @@ def of_expr({:case, meta, [case_expr, [{:do, clauses}]]}, expected, expr, stack,
+     else
+       clauses
+     end
+-    |> of_case_clauses(case_type, expected, meta, case_expr, expr, stack, context)
++    |> of_clauses([case_type], expected, expr, info, stack, context, none())
+     |> dynamic_unless_static(stack)
+   end
+ 
+@@ -725,63 +726,6 @@ defp of_clauses_fun(clauses, domain, expected, expr, info, stack, original, acc,
+     end)
+   end
+ 
+-  defp of_case_clauses(clauses, domain, expected, case_meta, case_expr, expr, stack, original) do
+-    %{failed: failed?} = original
+-
+-    {result, _previous, context} =
+-      Enum.reduce(clauses, {none(), none(), original}, fn
+-        {:->, meta, [[clause] = head, body]}, {acc, previous, context} ->
+-          {failed?, context} = reset_failed(context, failed?)
+-          {patterns, guards} = extract_head(head)
+-
+-          clause_domain = difference(domain, previous)
+-          info = {:case, case_meta, clause_domain, case_expr, previous}
+-
+-          {trees, precise?, context} =
+-            Pattern.of_head(patterns, guards, [clause_domain], info, meta, stack, context)
+-
+-          # It failed, let's try to detect if it was due a previous or current clause.
+-          # The current clause will be easier to understand, so we prefer that
+-          {[{clause_tree, _, _}], precise?, context} =
+-            if context.failed and previous != none() do
+-              info = {:case, case_meta, domain, case_expr, nil}
+-
+-              case Pattern.of_head(patterns, guards, [domain], info, meta, stack, context) do
+-                {_, _, %{failed: true}} = result -> result
+-                _ -> {trees, precise?, context}
+-              end
+-            else
+-              {trees, precise?, context}
+-            end
+-
+-          {previous, context} =
+-            if context.failed do
+-              {previous, context}
+-            else
+-              clause_type = Pattern.of_pattern_tree(clause_tree, stack, context) |> upper_bound()
+-
+-              cond do
+-                stack.mode != :infer and previous != none() and subtype?(clause_type, previous) ->
+-                  stack = %{stack | meta: meta}
+-                  {previous, Pattern.badpattern_error(clause, 0, info, stack, context)}
+-
+-                precise? ->
+-                  {union(previous, clause_type), context}
+-
+-                true ->
+-                  {previous, context}
+-              end
+-            end
+-
+-          {result, context} = of_expr(body, expected, expr || body, stack, context)
+-
+-          {union(result, acc), previous,
+-           context |> set_failed(failed?) |> Of.reset_vars(original)}
+-      end)
+-
+-    {result, context}
+-  end
+-
+   defp reset_failed(%{failed: true} = context, false), do: {true, %{context | failed: false}}
+   defp reset_failed(context, _), do: {false, context}
+ 
+@@ -829,25 +773,6 @@ defp literal_map_update(descr, key_descr, value_descr) do
+ 
+   ## Warning formatting
+ 
+-  def format_diagnostic({:badclause, {:case, meta, type, expr}, [head], context}) do
+-    {expr, message} =
+-      if meta[:type_check] == :expr do
+-        {expr,
+-         """
+-         the following conditional expression will always evaluate to #{to_quoted_string(type)}:
+-
+-             #{expr_to_string(expr) |> indent(4)}
+-         """}
+-      else
+-        {head, "the following clause has no effect because a previous clause will always match\n"}
+-      end
+-
+-    %{
+-      details: %{typing_traces: collect_traces(expr, context)},
+-      message: message
+-    }
+-  end
+-
+   def format_diagnostic({:badupdate, type, expr, context}) do
+     {:%, _, [module, {:%{}, _, [{:|, _, [map, _]}]}]} = expr
+     traces = collect_traces(map, context)
+diff --git a/lib/elixir/lib/module/types/helpers.ex b/lib/elixir/lib/module/types/helpers.ex
+index 0a2b0f10c..716841da1 100644
+--- a/lib/elixir/lib/module/types/helpers.ex
++++ b/lib/elixir/lib/module/types/helpers.ex
+@@ -143,9 +143,8 @@ def hint, do: :elixir_errors.prefix(:hint)
+   """
+   def collect_traces(expr, %{vars: vars}) do
+     {_, versions} =
+-      Macro.prewalk(expr, %{}, fn node, versions ->
+-        with {var_name, meta, var_context} when is_atom(var_name) and is_atom(var_context) <- node,
+-             false <- String.starts_with?(Atom.to_string(var_name), "_") do
++      Macro.prewalk(expr, %{}, fn
++        {var_name, meta, var_context}, versions when is_atom(var_name) and is_atom(var_context) ->
+           version = meta[:version]
+ 
+           case vars do
+@@ -161,9 +160,9 @@ def collect_traces(expr, %{vars: vars}) do
+             _ ->
+               {:ok, versions}
+           end
+-        else
+-          _ -> {node, versions}
+-        end
++
++        node, versions ->
++          {node, versions}
+       end)
+ 
+     versions
+diff --git a/lib/elixir/lib/module/types/of.ex b/lib/elixir/lib/module/types/of.ex
+index ec077a00f..0e4bd8032 100644
+--- a/lib/elixir/lib/module/types/of.ex
++++ b/lib/elixir/lib/module/types/of.ex
+@@ -86,13 +86,11 @@ def track_var(version, new_deps, new_paths, context) do
+   or if we are doing a guard analysis or occurrence typing.
+   Returns `true` if there was a refinement, `false` otherwise.
+   """
+-  def refine_body_var(var_or_version, type, expr, stack, context, allow_empty? \\ false)
+-
+-  def refine_body_var({_, meta, _}, type, expr, stack, context, allow_empty?) do
+-    refine_body_var(Keyword.fetch!(meta, :version), type, expr, stack, context, allow_empty?)
++  def refine_body_var({_, meta, _}, type, expr, stack, context) do
++    refine_body_var(Keyword.fetch!(meta, :version), type, expr, stack, context)
+   end
+ 
+-  def refine_body_var(version, type, expr, stack, context, allow_empty?)
++  def refine_body_var(version, type, expr, stack, context)
+       when is_integer(version) or is_reference(version) do
+     %{vars: %{^version => %{type: old_type, off_traces: off_traces} = data} = vars} = context
+ 
+@@ -107,15 +105,6 @@ def refine_body_var(version, type, expr, stack, context, allow_empty?)
+ 
+     if gradual?(old_type) and type not in [term(), dynamic()] and not is_map_key(data, :errored) do
+       case compatible_intersection(old_type, type) do
+-        {:error, _} when allow_empty? ->
+-          data = %{
+-            data
+-            | type: none(),
+-              off_traces: new_trace(expr, none(), stack, off_traces)
+-          }
+-
+-          {none(), %{context | vars: %{vars | version => data}}}
+-
+         {:ok, new_type} when new_type != old_type ->
+           data = %{
+             data
+diff --git a/lib/elixir/lib/module/types/pattern.ex b/lib/elixir/lib/module/types/pattern.ex
+index c4823bd68..80f732a38 100644
+--- a/lib/elixir/lib/module/types/pattern.ex
++++ b/lib/elixir/lib/module/types/pattern.ex
+@@ -127,12 +127,12 @@ defp of_changed_var(version, stack, context) do
+   4. Then we propagate all dependencies to refine variables
+ 
+   """
+-  def of_head(patterns, guards, expected, tag, meta, stack, %{vars: vars} = context) do
++  def of_head(patterns, guards, expected, tag, meta, stack, context) do
+     stack = %{stack | meta: meta}
+ 
+     case of_pattern_args(patterns, expected, tag, stack, context) do
+       {trees, pattern_precise?, changed, context} ->
+-        {guard_precise?, context} = of_guards(guards, changed, vars, stack, context)
++        {guard_precise?, context} = of_guards(guards, changed, stack, context)
+         {trees, pattern_precise? and guard_precise?, context}
+ 
+       {trees, context} ->
+@@ -219,7 +219,7 @@ def of_match(pattern, expected_fun, expr, stack, context) do
+   @doc """
+   Handles matches in generators.
+   """
+-  def of_generator(pattern, guards, expected, tag, expr, stack, %{vars: vars} = context) do
++  def of_generator(pattern, guards, expected, tag, expr, stack, context) do
+     context = init_pattern_info(context, [])
+ 
+     {tree, _precise?, context} =
+@@ -230,7 +230,7 @@ def of_generator(pattern, guards, expected, tag, expr, stack, %{vars: vars} = co
+ 
+     case of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context) do
+       {_types, changed, context} ->
+-        {_precise?, context} = of_guards(guards, changed, vars, stack, context)
++        {_precise?, context} = of_guards(guards, changed, stack, context)
+         context
+ 
+       {:error, context} ->
+@@ -311,18 +311,20 @@ defp badvar_error(var, old_type, new_type, stack, context) do
+   end
+ 
+   defp badpattern_error(var, expr, stack, context) do
+-    meta = error_meta(expr, stack)
+     context = Of.error_var(var, context)
+-    error = {:badpattern, meta, expr, nil, :default, context}
+-    error(__MODULE__, error, meta, stack, context)
++    error(__MODULE__, {:badpattern, expr, context}, error_meta(expr, stack), stack, context)
+   end
+ 
+-  @doc """
+-  Marks a badpattern error.
+-  """
+-  def badpattern_error(expr, index, tag, stack, context) do
++  defp badpattern_error(expr, index, tag, stack, context) do
+     meta = error_meta(expr, stack)
+-    error = {:badpattern, meta, expr, index, tag, context}
++
++    error =
++      if index do
++        {:badpattern, meta, expr, index, tag, context}
++      else
++        {:badpattern, expr, context}
++      end
++
+     error(__MODULE__, error, meta, stack, context)
+   end
+ 
+@@ -556,7 +558,7 @@ defp of_pattern({:=, _meta, [_, _]} = match, path, stack, context) do
+     root = %{root: {:var, version}, expr: match}
+ 
+     {precise?, static, dynamic, context} =
+-      Enum.reduce(matches, {precise?, [], [{:var, version}], context}, fn
++      Enum.reduce(matches, {precise?, [], [], context}, fn
+         pattern, {precise?, static, dynamic, context} ->
+           {type, pattern_precise?, context} = of_pattern(pattern, [root], stack, context)
+           precise? = precise? and pattern_precise?
+@@ -569,14 +571,18 @@ defp of_pattern({:=, _meta, [_, _]} = match, path, stack, context) do
+       end)
+ 
+     return =
+-      if static == [] do
+-        {:intersection, dynamic}
+-      else
+-        {:intersection, [Enum.reduce(static, &intersection/2) | dynamic]}
++      cond do
++        dynamic == [] -> Enum.reduce(static, &intersection/2)
++        static == [] -> {:intersection, dynamic}
++        true -> {:intersection, [Enum.reduce(static, &intersection/2) | dynamic]}
+       end
+ 
+-    context = of_var(var, version, [%{root: return, expr: match}], context)
+-    {return, precise?, context}
++    if dynamic == [] do
++      {return, precise?, context}
++    else
++      context = of_var(var, version, [%{root: return, expr: match}], context)
++      {return, precise?, context}
++    end
+   end
+ 
+   # %Struct{...}
+@@ -780,40 +786,18 @@ defp of_list([], suffix, path, stack, context) do
+     of_pattern(suffix, path, stack, context)
+   end
+ 
+-  # [prefix | suffix]
+-  defp of_list([prefix], suffix, path, stack, context) when is_var(prefix) and is_var(suffix) do
+-    {suffix_type, suffix_precise?, context} =
+-      of_pattern(suffix, [:tail | path], stack, context)
+-
+-    context = annotate_list_subpattern(suffix, context)
+-
+-    {prefix_type, prefix_precise?, context} =
+-      of_subpattern(prefix, [:head | path], stack, context)
+-
+-    context = annotate_list_subpattern(prefix, context)
+-
+-    type =
+-      if is_descr(prefix_type) and is_descr(suffix_type) do
+-        non_empty_list(prefix_type, suffix_type)
+-      else
+-        {:non_empty_list, [prefix_type], suffix_type}
+-      end
+-
+-    {type, prefix_precise? and suffix_precise?, context}
+-  end
+-
+   # [prefix1, prefix2, prefix3], [prefix1, prefix2 | suffix]
+   defp of_list(prefix, suffix, path, stack, context) do
+-    {suffix_type, _precise?, context} = of_pattern(suffix, [:tail | path], stack, context)
++    {suffix_type, tail_precise?, context} = of_pattern(suffix, [:tail | path], stack, context)
+ 
+-    {static, dynamic, context} =
+-      Enum.reduce(prefix, {[], [], context}, fn arg, {static, dynamic, context} ->
+-        {type, _precise?, context} = of_subpattern(arg, [:head | path], stack, context)
++    {head_precise?, static, dynamic, context} =
++      Enum.reduce(prefix, {true, [], [], context}, fn arg, {_, static, dynamic, context} ->
++        {type, precise?, context} = of_subpattern(arg, [:head | path], stack, context)
+ 
+         if is_descr(type) do
+-          {[type | static], dynamic, context}
++          {precise?, [type | static], dynamic, context}
+         else
+-          {static, [type | dynamic], context}
++          {precise?, static, [type | dynamic], context}
+         end
+       end)
+ 
+@@ -829,19 +813,11 @@ defp of_list(prefix, suffix, path, stack, context) do
+           {:non_empty_list, [Enum.reduce(static, &union/2) | dynamic], suffix_type}
+       end
+ 
+-    {type, false, context}
+-  end
++    precise? =
++      head_precise? and tail_precise? and is_var(suffix) and
++        match?([head] when is_var(head), prefix)
+ 
+-  defp list_subpattern?(version, context) do
+-    is_map_key(context.subpatterns, {:list, version})
+-  end
+-
+-  defp annotate_list_subpattern({name, meta, _}, context) do
+-    if name != :_ do
+-      put_in(context.subpatterns[{:list, Keyword.fetch!(meta, :version)}], true)
+-    else
+-      context
+-    end
++    {type, precise?, context}
+   end
+ 
+   # These cases don't need to store information because they have no intersection
+@@ -883,47 +859,38 @@ defp of_precise_bitstring?(_), do: false
+   @atom_true atom([true])
+   @atom_false atom([false])
+ 
+-  defp of_guards([], changed, _vars, stack, context) do
++  defp of_guards([], changed, stack, context) do
+     {true, of_changed(changed, stack, context)}
+   end
+ 
+-  defp of_guards(guards, changed, vars, stack, context) do
+-    context =
+-      init_pattern_info(context, %{
+-        allow_empty?: false,
+-        parent_version: nil,
+-        precise?: true,
+-        vars: vars,
+-        changed: Map.from_keys(changed, [])
+-      })
+-
+-    {guard_precise?, context} = of_guards(guards, stack, context)
+-    {%{precise?: precise?, changed: changed}, context} = pop_pattern_info(context)
+-    {precise? and guard_precise?, of_changed(Map.keys(changed), stack, context)}
+-  end
+-
+-  defp of_guards([guard], stack, context) do
++  defp of_guards([guard], changed, stack, context) do
++    context = init_pattern_info(context, {nil, Map.from_keys(changed, [])})
+     {type, context} = of_guard(guard, stack, context)
+-    maybe_badguard(type, guard, stack, context)
++    {precise?, context} = maybe_badguard(type, guard, stack, context)
++    {{_, changed_map}, context} = pop_pattern_info(context)
++    {precise?, of_changed(Map.keys(changed_map), stack, context)}
+   end
+ 
+-  defp of_guards(guards, stack, context) do
++  defp of_guards(guards, changed, stack, context) do
++    context = init_pattern_info(context, {nil, Map.from_keys(changed, [])})
+     expr = Enum.reduce(guards, {:_, [], []}, &{:when, [], [&2, &1]})
+ 
+-    Of.with_conditional_vars(guards, true, expr, stack, context, fn guard, precise?, context ->
+-      {type, context} = of_guard(guard, stack, context)
+-      {guard_precise?, context} = maybe_badguard(type, guard, stack, context)
+-      {guard_precise? and precise?, context}
+-    end)
+-  end
++    {precise?, context} =
++      Of.with_conditional_vars(guards, true, expr, stack, context, fn guard, precise?, context ->
++        {type, context} = of_guard(guard, stack, context)
++        {guard_precise?, context} = maybe_badguard(type, guard, stack, context)
++        {guard_precise? and precise?, context}
++      end)
+ 
+-  defp update_parent_version(parent_version, %{pattern_info: pattern_info} = context) do
+-    {pattern_info.parent_version,
+-     %{context | pattern_info: %{pattern_info | parent_version: parent_version}}}
++    {{_, changed_map}, context} = pop_pattern_info(context)
++    {precise?, of_changed(Map.keys(changed_map), stack, context)}
+   end
+ 
+-  defp enable_conditional_mode(%{pattern_info: pattern_info} = context) do
+-    %{context | pattern_info: %{pattern_info | allow_empty?: true}, conditional_vars: %{}}
++  defp update_parent_version(
++         parent_version,
++         %{pattern_info: {old_version, changed_map}} = context
++       ) do
++    {old_version, %{context | pattern_info: {parent_version, changed_map}}}
+   end
+ 
+   defp maybe_badguard(type, guard, stack, context) do
+@@ -1035,26 +1002,15 @@ def of_guard({_, meta, _} = var, expected, expr, stack, context) when is_var(var
+     # and also when vars change, so we need to deal with all possibilities
+     # for pattern_info.
+     case context.pattern_info do
+-      %{
+-        allow_empty?: allow_empty?,
+-        precise?: precise?,
+-        vars: vars,
+-        parent_version: parent_version,
+-        changed: changed
+-      } = pattern_info ->
+-        precise? =
+-          precise? and not is_map_key(vars, version) and not list_subpattern?(version, context)
+-
+-        changed = Map.put(changed, version, [])
+-        pattern_info = %{pattern_info | precise?: precise?, changed: changed}
+-        context = %{context | pattern_info: pattern_info}
++      {dep_version, changed} when is_map(changed) ->
++        context = %{context | pattern_info: {dep_version, Map.put(changed, version, [])}}
+ 
+         context =
+-          if parent_version != nil,
+-            do: Of.track_var(version, [parent_version], [], context),
++          if dep_version != nil,
++            do: Of.track_var(version, [dep_version], [], context),
+             else: context
+ 
+-        Of.refine_body_var(version, expected, expr, stack, context, allow_empty?)
++        Of.refine_body_var(version, expected, expr, stack, context)
+ 
+       list when is_list(list) ->
+         node = path_node(expected, var, expr, [])
+@@ -1086,14 +1042,12 @@ defp of_compare(_fun, _polarity, _var, other_side, call, stack, context) do
+     of_guard(other_side, term(), call, stack, context)
+   end
+ 
+-  @comp_op [:==, :"/=", :"=:=", :"=/="]
+-
+   defp of_remote(fun, [left, right] = args, call, expected, stack, context)
+-       when fun in @comp_op do
++       when fun in [:==, :"/=", :"=:=", :"=/="] do
+     with false <- Macro.quoted_literal?(left) or Macro.quoted_literal?(right),
+          true <- is_var(left) or is_var(right),
+          {boolean, _maybe_or_always} <- booleaness(expected),
+-         %{pattern_info: %{}} <- context do
++         %{pattern_info: {_, _}} <- context do
+       polarity =
+         case boolean do
+           true -> fun in [:==, :"=:="]
+@@ -1123,34 +1077,13 @@ defp of_remote(fun, _args, call, expected, stack, context)
+     # building nested conditional environments.
+     [left | right] = unpack_op(call, fun, [])
+ 
+-    # In case the right side is a sequence of comparisons with imprecise literals, collapse them.
+-    right =
+-      with {{:., _, [:erlang, comp_op]}, _, [{var_name, _, var_ctx}, literal]}
+-           when comp_op in @comp_op and is_atom(var_name) and is_atom(var_ctx) and
+-                  (is_number(literal) or is_binary(literal)) <- left,
+-           true <-
+-             Enum.all?(right, fn
+-               {{:., _, [:erlang, ^comp_op]}, _, [{^var_name, _, ^var_ctx}, other_literal]}
+-               when is_integer(literal) and is_integer(other_literal)
+-               when is_float(literal) and is_float(other_literal)
+-               when is_binary(literal) and is_binary(other_literal) ->
+-                 true
+-
+-               _ ->
+-                 false
+-             end) do
+-        []
+-      else
+-        _ -> right
+-      end
+-
+     # For example, if the expected type is true for andalso, then it can
+     # only be true if both clauses are executed, so we know the first
+     # argument has to be true and the second has to be expected.
+     if subtype?(expected, both_domain) do
+       of_logical_all([left | right], true, both_domain, abort_domain, stack, context)
+     else
+-      cond_context = enable_conditional_mode(context)
++      cond_context = %{context | conditional_vars: %{}}
+ 
+       # Compute the sure types, which are stored directly in the context
+       {_type, context} = of_guard(left, boolean(), left, stack, context)
+@@ -1171,17 +1104,6 @@ defp of_remote(fun, _args, call, expected, stack, context)
+       {type, vars_conds} =
+         of_logical_cond([left | right], true, expected, abort_domain, stack, cond_context, [])
+ 
+-      # We will be precise if all branches changed the same variable
+-      context =
+-        update_in(context.pattern_info.precise?, fn
+-          false ->
+-            false
+-
+-          true ->
+-            [{_, cond} | tail] = vars_conds
+-            Enum.all?(tail, fn {_, tail_cond} -> cond == tail_cond end)
+-        end)
+-
+       {type, Of.reduce_conditional_vars(vars_conds, call, stack, context)}
+     end
+   end
+@@ -1257,6 +1179,23 @@ def format_diagnostic({:badguard, type, expr, context}) do
+     }
+   end
+ 
++  def format_diagnostic({:badpattern, expr, context}) do
++    traces = collect_traces(expr, context)
++
++    %{
++      details: %{typing_traces: traces},
++      message:
++        IO.iodata_to_binary([
++          """
++          the following pattern will never match:
++
++              #{expr_to_string(expr) |> indent(4)}
++          """,
++          format_traces(traces)
++        ])
++    }
++  end
++
+   def format_diagnostic({:badvar, old_type, new_type, var, context}) do
+     traces = collect_traces(var, context)
+ 
+@@ -1299,7 +1238,7 @@ def format_diagnostic({:badstruct, type, expr, context}) do
+   #
+   # $ typep head_pattern =
+   #     :for_reduce or :with_else or :receive or :try_catch or :fn or :default or
+-  #       {:try_else, type} or {:case, meta, type, expr, previous_type}
++  #       {:try_else, type} or {:case, meta, type, expr}
+   #
+   # $ typep match_pattern =
+   #     :with or :for or {:match, type}
+@@ -1335,49 +1274,29 @@ defp badpattern({:try_else, type}, pattern, _) do
+      """}
+   end
+ 
+-  defp badpattern({:case, meta, type, expr, previous_type}, pattern, _) do
+-    cond do
+-      meta[:type_check] == :expr ->
+-        error_type = if previous_type == none(), do: type, else: previous_type
+-
+-        {expr,
+-         """
+-         the following conditional expression:
+-
+-             #{expr_to_string(expr) |> indent(4)}
+-
+-         will always evaluate to:
+-
+-             #{to_quoted_string(error_type) |> indent(4)}
+-         """}
+-
+-      previous_type == none() ->
+-        {pattern,
+-         """
+-         the following clause will never match:
+-
+-             #{expr_to_string(pattern) |> indent(4)} ->
+-
+-         because it attempts to match on the result of:
+-
+-             #{expr_to_string(expr) |> indent(4)}
++  defp badpattern({:case, meta, type, expr}, pattern, _) do
++    if meta[:type_check] == :expr do
++      {expr,
++       """
++       the following conditional expression will always evaluate to #{to_quoted_string(type)}:
+ 
+-         which has type:
++           #{expr_to_string(expr) |> indent(4)}
++       """}
++    else
++      {pattern,
++       """
++       the following clause will never match:
+ 
+-             #{to_quoted_string(type) |> indent(4)}
+-         """}
++           #{expr_to_string(pattern) |> indent(4)}
+ 
+-      true ->
+-        {pattern,
+-         """
+-         the following clause cannot match because a previous clauses already matched this pattern:
++       because it attempts to match on the result of:
+ 
+-             #{expr_to_string(pattern) |> indent(4)} ->
++           #{expr_to_string(expr) |> indent(4)}
+ 
+-         the following types have already been matched:
++       which has type:
+ 
+-             #{to_quoted_string(previous_type) |> indent(4)}
+-         """}
++           #{to_quoted_string(type) |> indent(4)}
++       """}
+     end
+   end
+ 
+diff --git a/lib/elixir/lib/protocol.ex b/lib/elixir/lib/protocol.ex
+index 4cd2ef30e..654e1cc56 100644
+--- a/lib/elixir/lib/protocol.ex
++++ b/lib/elixir/lib/protocol.ex
+@@ -816,7 +816,6 @@ defmodule unquote(name) do
+         # Set up a clear slate to store defined functions
+         @__functions__ []
+         @fallback_to_any false
+-        @undefined_impl_description ""
+ 
+         # Invoke the user given block
+         _ = unquote(block)
+@@ -928,101 +927,57 @@ def __before_compile__(env) do
+   end
+ 
+   defp after_defprotocol do
+-    prefix =
+-      quote bind_quoted: [built_in: built_in()] do
+-        any_impl_for =
+-          if @fallback_to_any do
+-            __MODULE__.Any
+-          else
+-            nil
+-          end
+-
+-        # Disable Dialyzer checks - before and after consolidation
+-        # the types could be more strict
+-        @dialyzer {:nowarn_function, __protocol__: 1, impl_for: 1, impl_for!: 1}
+-
+-        @doc false
+-        @spec impl_for(term) :: atom | nil
+-        Kernel.def(impl_for(data))
+-
+-        # Define the implementation for structs.
+-        #
+-        # It simply delegates to struct_impl_for which is then
+-        # optimized during protocol consolidation.
+-        Kernel.def impl_for(%struct{}) do
+-          struct_impl_for(struct)
++    quote bind_quoted: [built_in: built_in()] do
++      any_impl_for =
++        if @fallback_to_any do
++          __MODULE__.Any
++        else
++          nil
+         end
+ 
+-        # Define the implementation for built-ins
+-        :lists.foreach(
+-          fn {mod, guard} ->
+-            target = Protocol.__concat__(__MODULE__, mod)
++      # Disable Dialyzer checks - before and after consolidation
++      # the types could be more strict
++      @dialyzer {:nowarn_function, __protocol__: 1, impl_for: 1, impl_for!: 1}
+ 
+-            Kernel.def impl_for(data) when :erlang.unquote(guard)(data) do
+-              case Code.ensure_compiled(unquote(target)) do
+-                {:module, module} -> module
+-                {:error, _} -> unquote(any_impl_for)
+-              end
+-            end
+-          end,
+-          built_in
+-        )
++      @doc false
++      @spec impl_for(term) :: atom | nil
++      Kernel.def(impl_for(data))
++
++      # Define the implementation for structs.
++      #
++      # It simply delegates to struct_impl_for which is then
++      # optimized during protocol consolidation.
++      Kernel.def impl_for(%struct{}) do
++        struct_impl_for(struct)
++      end
+ 
+-        # Define a catch-all impl_for/1 clause to pacify Dialyzer (since
+-        # destructuring opaque types is illegal, Dialyzer will think none of the
+-        # previous clauses matches opaque types, and without this clause, will
+-        # conclude that impl_for can't handle an opaque argument). This is a hack
+-        # since it relies on Dialyzer not being smart enough to conclude that all
+-        # opaque types will get the any_impl_for/0 implementation.
+-        Kernel.def impl_for(_) do
+-          unquote(any_impl_for)
+-        end
++      # Define the implementation for built-ins
++      :lists.foreach(
++        fn {mod, guard} ->
++          target = Protocol.__concat__(__MODULE__, mod)
+ 
+-        # Internal handler for Structs
+-        Kernel.defp struct_impl_for(struct) do
+-          case Code.ensure_compiled(Protocol.__concat__(__MODULE__, struct)) do
+-            {:module, module} -> module
+-            {:error, _} -> unquote(any_impl_for)
++          Kernel.def impl_for(data) when :erlang.unquote(guard)(data) do
++            case Code.ensure_compiled(unquote(target)) do
++              {:module, module} -> module
++              {:error, _} -> unquote(any_impl_for)
++            end
+           end
+-        end
+-
+-        # Inline struct implementation for performance
+-        @compile {:inline, struct_impl_for: 1}
+-
+-        if not Module.defines_type?(__MODULE__, {:t, 0}) do
+-          @typedoc """
+-          All the types that implement this protocol.
+-          """
+-          @type t :: term
+-        end
+-
+-        # Store information as an attribute so it
+-        # can be read without loading the module.
+-        Module.register_attribute(__MODULE__, :__protocol__, persist: true)
+-        @__protocol__ [fallback_to_any: !!@fallback_to_any]
+-
+-        @doc false
+-        @spec __protocol__(:module) :: __MODULE__
+-        @spec __protocol__(:functions) :: [{atom(), arity()}]
+-        @spec __protocol__(:consolidated?) :: boolean()
+-        @spec __protocol__(:impls) :: :not_consolidated | {:consolidated, [module()]}
+-        Kernel.def(__protocol__(:module), do: __MODULE__)
+-        Kernel.def(__protocol__(:functions), do: unquote(:lists.sort(@__functions__)))
+-        Kernel.def(__protocol__(:consolidated?), do: false)
+-        Kernel.def(__protocol__(:impls), do: :not_consolidated)
+-      end
++        end,
++        built_in
++      )
+ 
+-    raise =
+-      quote do
+-        raise(Protocol.UndefinedError,
+-          protocol: __MODULE__,
+-          value: data,
+-          description: @undefined_impl_description
+-        )
++      # Define a catch-all impl_for/1 clause to pacify Dialyzer (since
++      # destructuring opaque types is illegal, Dialyzer will think none of the
++      # previous clauses matches opaque types, and without this clause, will
++      # conclude that impl_for can't handle an opaque argument). This is a hack
++      # since it relies on Dialyzer not being smart enough to conclude that all
++      # opaque types will get the any_impl_for/0 implementation.
++      Kernel.def impl_for(_) do
++        unquote(any_impl_for)
+       end
+ 
+-    quote generated: true do
+-      unquote(prefix)
++      undefined_impl_description =
++        Module.get_attribute(__MODULE__, :undefined_impl_description, "")
+ 
+       @doc false
+       @spec impl_for!(term) :: atom
+@@ -1032,9 +987,47 @@ defp after_defprotocol do
+         end
+       else
+         Kernel.def impl_for!(data) do
+-          impl_for(data) || unquote(raise)
++          impl_for(data) ||
++            raise(Protocol.UndefinedError,
++              protocol: __MODULE__,
++              value: data,
++              description: unquote(undefined_impl_description)
++            )
++        end
++      end
++
++      # Internal handler for Structs
++      Kernel.defp struct_impl_for(struct) do
++        case Code.ensure_compiled(Protocol.__concat__(__MODULE__, struct)) do
++          {:module, module} -> module
++          {:error, _} -> unquote(any_impl_for)
+         end
+       end
++
++      # Inline struct implementation for performance
++      @compile {:inline, struct_impl_for: 1}
++
++      if not Module.defines_type?(__MODULE__, {:t, 0}) do
++        @typedoc """
++        All the types that implement this protocol.
++        """
++        @type t :: term
++      end
++
++      # Store information as an attribute so it
++      # can be read without loading the module.
++      Module.register_attribute(__MODULE__, :__protocol__, persist: true)
++      @__protocol__ [fallback_to_any: !!@fallback_to_any]
++
++      @doc false
++      @spec __protocol__(:module) :: __MODULE__
++      @spec __protocol__(:functions) :: [{atom(), arity()}]
++      @spec __protocol__(:consolidated?) :: boolean()
++      @spec __protocol__(:impls) :: :not_consolidated | {:consolidated, [module()]}
++      Kernel.def(__protocol__(:module), do: __MODULE__)
++      Kernel.def(__protocol__(:functions), do: unquote(:lists.sort(@__functions__)))
++      Kernel.def(__protocol__(:consolidated?), do: false)
++      Kernel.def(__protocol__(:impls), do: :not_consolidated)
+     end
+   end
+ 
+diff --git a/lib/elixir/test/elixir/module/types/expr_test.exs b/lib/elixir/test/elixir/module/types/expr_test.exs
+index eebe910f0..900f0ca20 100644
+--- a/lib/elixir/test/elixir/module/types/expr_test.exs
++++ b/lib/elixir/test/elixir/module/types/expr_test.exs
+@@ -10,7 +10,7 @@ defmodule Module.Types.ExprTest do
+   import Module.Types.Descr
+   defmacro domain_key(arg) when is_atom(arg), do: [arg]
+ 
+-  defmacro generated_foo_call(x) do
++  defmacro generated(x) do
+     quote generated: true do
+       unquote(x).foo()
+     end
+@@ -28,7 +28,7 @@ test "literal" do
+   end
+ 
+   test "generated" do
+-    assert typecheck!([x = 1], generated_foo_call(x)) == dynamic()
++    assert typecheck!([x = 1], generated(x)) == dynamic()
+   end
+ 
+   describe "bitstrings" do
+@@ -1639,85 +1639,6 @@ test "returns unions of all clauses" do
+              ) == dynamic(atom([:ok, :error]))
+     end
+ 
+-    defmacrop generated(op) do
+-      Macro.update_meta(op, &([generated: true] ++ &1))
+-    end
+-
+-    test "ignores always failing guards" do
+-      assert typecheck!(
+-               case System.get_env("foo") do
+-                 x when generated(x == false) or byte_size(x) >= 0 -> :binary
+-                 _ -> nil
+-               end
+-             ) == atom([nil, :binary])
+-
+-      assert typecheck!(
+-               case System.get_env("foo") do
+-                 x when generated(x == false) or x == nil -> nil
+-                 _ -> :binary
+-               end
+-             ) == atom([nil, :binary])
+-    end
+-
+-    test "computes types based on previous branches" do
+-      assert typecheck!(
+-               [condition],
+-               case condition do
+-                 x when is_binary(x) -> {:binary, x}
+-                 x when is_bitstring(x) -> {:bitstring, x}
+-               end
+-             ) ==
+-               dynamic(
+-                 union(
+-                   tuple([atom([:binary]), binary()]),
+-                   tuple([atom([:bitstring]), bitstring_no_binary()])
+-                 )
+-               )
+-
+-      assert typecheck!(
+-               [condition],
+-               case condition do
+-                 x = %{} when x != %{} -> :non_empty_map
+-                 %{} -> :maybe_empty_map
+-               end
+-             ) ==
+-               atom([:non_empty_map, :maybe_empty_map])
+-    end
+-
+-    test "reports error from redundant clauses" do
+-      assert typeerror!(
+-               [x],
+-               case String.to_atom(x) do
+-                 :ok -> 1
+-                 :ok -> 2
+-               end
+-             ) == ~l"""
+-             the following clause cannot match because a previous clauses already matched this pattern:
+-
+-                 :ok ->
+-
+-             the following types have already been matched:
+-
+-                 :ok
+-             """
+-
+-      assert typeerror!(
+-               [a, b],
+-               case {a, b} do
+-                 {x, y} when is_integer(x) and is_integer(y) -> 1
+-                 {x, y} when is_integer(x) and is_integer(y) -> 2
+-               end
+-             ) =~ ~l"""
+-             the following clause cannot match because a previous clauses already matched this pattern:
+-
+-                 {x, y} when is_integer(x) and is_integer(y) ->
+-
+-             the following types have already been matched:
+-
+-                 {integer(), integer()}
+-             """
+-    end
+-
+     test "reports error from clause that will never match" do
+       assert typeerror!(
+                [x],
+@@ -1728,7 +1649,7 @@ test "reports error from clause that will never match" do
+              ) == ~l"""
+              the following clause will never match:
+ 
+-                 :error ->
++                 :error
+ 
+              because it attempts to match on the result of:
+ 
+@@ -1769,23 +1690,9 @@ test "and does not report on literals" do
+ 
+     test "and reports violations" do
+       assert typeerror!([x = 123], x and true) =~ """
+-             the following conditional expression:
++             the following conditional expression will always evaluate to integer():
+ 
+                  x
+-
+-             will always evaluate to:
+-
+-                 integer()
+-             """
+-
+-      assert typeerror!([x = false], x and true) =~ """
+-             the following conditional expression:
+-
+-                 x
+-
+-             will always evaluate to:
+-
+-                 false
+              """
+     end
+   end
+diff --git a/lib/elixir/test/elixir/module/types/pattern_test.exs b/lib/elixir/test/elixir/module/types/pattern_test.exs
+index 6efd49bab..e90fe97d2 100644
+--- a/lib/elixir/test/elixir/module/types/pattern_test.exs
++++ b/lib/elixir/test/elixir/module/types/pattern_test.exs
+@@ -129,15 +129,19 @@ test "reports incompatible types" do
+              """
+ 
+       assert typeerror!([a = b, a = :foo, b = :bar], {a, b}) == ~l"""
+-             the following pattern will never match:
++             incompatible types assigned to "a":
+ 
+-                 a = b
++                 dynamic(:foo) !~ dynamic(:bar)
+ 
+-             where "b" was given the type:
++             where "a" was given the types:
++
++                 # type: dynamic(:foo)
++                 # from: types_test.ex:LINE
++                 a = :foo
+ 
+                  # type: dynamic(:bar)
+                  # from: types_test.ex:LINE
+-                 b = :bar
++                 a = b
+              """
+ 
+       assert typeerror!([{x, _} = {y, _}, x = :foo, y = :bar], {x, y}) == ~l"""
+@@ -851,7 +855,6 @@ test "with non-singleton literals" do
+       assert typecheck!([x], x === "foo", x) == dynamic(binary())
+       assert typecheck!([x], not (x == "foo"), x) == dynamic()
+       assert typecheck!([x], not (x === "foo"), x) == dynamic()
+-      assert typecheck!([x], x in ["foo", "bar", "baz"], x) == dynamic(binary())
+ 
+       assert typecheck!([x], x != "foo", x) == dynamic()
+       assert typecheck!([x], x !== "foo", x) == dynamic()
+@@ -906,9 +909,6 @@ test "with singleton literals" do
+       assert typecheck!([x], x !== [], x) == dynamic(negation(empty_list()))
+       assert typecheck!([x], not (x != []), x) == dynamic(empty_list())
+       assert typecheck!([x], not (x !== []), x) == dynamic(empty_list())
+-
+-      assert typecheck!([x], x != %{}, x) == dynamic(negation(empty_map()))
+-      assert typecheck!([x = %{}], x != %{}, x) == dynamic(difference(open_map(), empty_map()))
+     end
+ 
+     test "with singleton literals and composite types" do
+@@ -1024,7 +1024,7 @@ test "warnings" do
+     end
+   end
+ 
+-  describe "size comparison in guards" do
++  describe "comparison in guards" do
+     test "length equality" do
+       assert typecheck!([x], length(x) != 0, x) == dynamic(non_empty_list(term()))
+       assert typecheck!([x], not (length(x) != 0), x) == dynamic(empty_list())
+@@ -1224,7 +1224,6 @@ test "lists in patterns" do
+       assert precise?([[_ | _]])
+       assert precise?([x, [y | z]])
+ 
+-      refute precise?([[x | y]], is_integer(x))
+       refute precise?([[x | x]])
+       refute precise?([x, [x | y]])
+ 
+@@ -1244,17 +1243,12 @@ test "guards" do
+       assert precise?([x], not (x == :ok))
+       assert precise?([x], x.key != :ok)
+       assert precise?([x], not (x.key != :ok))
+-      assert precise?([x, y], x == :ok and y == :error)
+ 
+       refute precise?([x, y], x == y)
+       refute precise?([x], x == 123)
+       refute precise?([x], x == 123.0)
+-      refute precise?([x], x > 123)
+-      refute precise?([x], x > :ok)
+       refute precise?([x, y], x == hd(y))
+       refute precise?([x], hd(x) == :ok)
+-      refute precise?([x, y], x == :ok and y == 123)
+-      refute precise?([x, y], x == :ok or y == :error)
+     end
+ 
+     test "sized guards" do

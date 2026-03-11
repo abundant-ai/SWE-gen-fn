@@ -1,0 +1,491 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 22f63ad9..3fd49355 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -54,6 +54,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1959, An accidental full table PATCH(without filters) is not possible anymore, it requires filters or a `limit` parameter - @steve-chavez, @laurenceisla
+  - #2317, Increase the `db-pool-timeout` to 1 hour to prevent frequent high connection latency - @steve-chavez
+  - #2341, The search path now correctly identifies schemas with uppercase and special characters in their names (regression) - @laurenceisla
++ - #2364, "404 Not Found" on nested routes and "405 Method Not Allowed" errors no longer start an empty database transaction - @steve-chavez
+ 
+ ### Changed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 9d79664b..7cfb7a55 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -2,7 +2,7 @@ name:               postgrest
+ version:            9.0.1.20220630
+ synopsis:           REST API for any Postgres database
+ description:        Reads the schema of a PostgreSQL database and creates RESTful routes
+-                    for tables, views, and functions, supporting all HTTP verbs that security
++                    for tables, views, and functions, supporting all HTTP methods that security
+                     permits.
+ license:            MIT
+ license-file:       LICENSE
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 7a4dfb98..7cb46fe6 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -54,6 +54,7 @@ import qualified PostgREST.Query.Statements         as Statements
+ import qualified PostgREST.RangeQuery               as RangeQuery
+ import qualified PostgREST.Request.ApiRequest       as ApiRequest
+ import qualified PostgREST.Request.DbRequestBuilder as ReqBuilder
++import qualified PostgREST.Request.Types            as ApiRequestTypes
+ 
+ import PostgREST.AppState                (AppState)
+ import PostgREST.Auth                    (AuthResult (..))
+@@ -242,10 +243,10 @@ handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+       handleInvoke invMethod proc context
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) ->
+       handleOpenApi headersOnly tSchema context
+-    (ActionUnknown verb, _) ->
+-      throwError $ Error.UnsupportedVerb verb
+     _ ->
+-      throwError Error.NotFound
++      -- This is unreachable as the ApiRequest.hs rejects it before
++      -- TODO Refactor the Action/Target types to remove this line
++      throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+ 
+ handleRead :: Bool -> QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleRead headersOnly identifier context@RequestContext{..} = do
+@@ -419,7 +420,8 @@ handleInfo identifier RequestContext{..} =
+     Just table ->
+       return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
+     Nothing ->
+-      throwError Error.NotFound
++      -- TODO is this right? When no tbl is found on the schema cache we disallow OPTIONS?
++      throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+     tbl = HM.lookup identifier (dbTables ctxDbStructure)
+     allOrigins = ("Access-Control-Allow-Origin", "*")
+@@ -610,9 +612,9 @@ contentTypeHeaders RequestContext{..} =
+ -- than `*`
+ binaryField :: Monad m => RequestContext -> ReadRequest -> Handler m (Maybe FieldName)
+ binaryField RequestContext{..} readReq
+-  | returnsScalar (iTarget ctxApiRequest) && iAcceptMediaType ctxApiRequest `elem` rawMediaTypes ctxConfig =
++  | returnsScalar (iTarget ctxApiRequest) && isRawMediaType =
+       return $ Just "pgrst_scalar"
+-  | iAcceptMediaType ctxApiRequest `elem` rawMediaTypes ctxConfig =
++  | isRawMediaType =
+       let
+         fldNames = fstFieldNames readReq
+         fieldName = headMay fldNames
+@@ -623,10 +625,8 @@ binaryField RequestContext{..} readReq
+         throwError $ Error.BinaryFieldError (iAcceptMediaType ctxApiRequest)
+   | otherwise =
+       return Nothing
+-
+-rawMediaTypes :: AppConfig -> [MediaType]
+-rawMediaTypes AppConfig{..} =
+-  (MediaType.decodeMediaType <$> configRawMediaTypes) `union` [MTOctetStream, MTTextPlain, MTTextXML]
++  where
++    isRawMediaType = iAcceptMediaType ctxApiRequest `elem` configRawMediaTypes ctxConfig `union` [MTOctetStream, MTTextPlain, MTTextXML]
+ 
+ profileHeader :: ApiRequest -> Maybe HTTP.Header
+ profileHeader ApiRequest{..} =
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index d6e10a46..f070575e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -57,6 +57,7 @@ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+ import PostgREST.DbStructure.Identifiers (QualifiedIdentifier, dumpQi,
+                                           toQi)
++import PostgREST.MediaType               (MediaType (..), toMime)
+ 
+ import Protolude hiding (Proxy, toList)
+ 
+@@ -88,7 +89,7 @@ data AppConfig = AppConfig
+   , configLogLevel              :: LogLevel
+   , configOpenApiMode           :: OpenAPIMode
+   , configOpenApiServerProxyUri :: Maybe Text
+-  , configRawMediaTypes         :: [BS.ByteString]
++  , configRawMediaTypes         :: [MediaType]
+   , configServerHost            :: Text
+   , configServerPort            :: Int
+   , configServerUnixSocket      :: Maybe FilePath
+@@ -143,7 +144,7 @@ toText conf =
+       ,("log-level",                 q . dumpLogLevel . configLogLevel)
+       ,("openapi-mode",              q . dumpOpenApiMode . configOpenApiMode)
+       ,("openapi-server-proxy-uri",  q . fromMaybe mempty . configOpenApiServerProxyUri)
+-      ,("raw-media-types",           q . T.decodeUtf8 . BS.intercalate "," . configRawMediaTypes)
++      ,("raw-media-types",           q . T.decodeUtf8 . BS.intercalate "," . fmap toMime . configRawMediaTypes)
+       ,("server-host",               q . configServerHost)
+       ,("server-port",                   show . configServerPort)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+@@ -238,7 +239,7 @@ parser optPath env dbSettings =
+     <*> parseLogLevel "log-level"
+     <*> parseOpenAPIMode "openapi-mode"
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+-    <*> (maybe [] (fmap encodeUtf8 . splitOnCommas) <$> optValue "raw-media-types")
++    <*> (maybe [] (fmap (MTOther . encodeUtf8) . splitOnCommas) <$> optValue "raw-media-types")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index d35bec9a..c8f80e26 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -54,13 +54,14 @@ class (JSON.ToJSON a) => PgrstError a where
+   errorResponseFor err = responseLBS (status err) (headers err) $ errorPayload err
+ 
+ instance PgrstError ApiRequestError where
+-  status ActionInappropriate     = HTTP.status405
+   status AmbiguousRelBetween{}   = HTTP.status300
+   status AmbiguousRpc{}          = HTTP.status300
+   status MediaTypeError{}        = HTTP.status415
+   status InvalidBody{}           = HTTP.status400
+   status InvalidFilters          = HTTP.status405
++  status InvalidRpcMethod{}      = HTTP.status405
+   status InvalidRange            = HTTP.status416
++  status NotFound                = HTTP.status404
+   status NoRelBetween{}          = HTTP.status400
+   status NoRpc{}                 = HTTP.status404
+   status NotEmbedded{}           = HTTP.status400
+@@ -68,6 +69,7 @@ instance PgrstError ApiRequestError where
+   status PutRangeNotAllowedError = HTTP.status400
+   status QueryParamError{}       = HTTP.status400
+   status UnacceptableSchema{}    = HTTP.status406
++  status UnsupportedMethod{}     = HTTP.status405
+   status LimitNoOrderError       = HTTP.status400
+ 
+   headers _ = [MediaType.toContentType MTApplicationJSON]
+@@ -78,9 +80,9 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= message,
+     "details" .= details,
+     "hint"    .= JSON.Null]
+-  toJSON ActionInappropriate = JSON.object [
++  toJSON (InvalidRpcMethod method) = JSON.object [
+     "code"    .= ApiRequestErrorCode01,
+-    "message" .= ("Bad Request" :: Text),
++    "message" .= ("Cannot use the " <> T.decodeUtf8 method <> " method on RPC"),
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+   toJSON (InvalidBody errorMessage) = JSON.object [
+@@ -113,6 +115,7 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= ("None of these media types are available: " <> T.intercalate ", " (map T.decodeUtf8 cts)),
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
++  toJSON NotFound = JSON.object []
+   toJSON (NotEmbedded resource) = JSON.object [
+     "code"    .= ApiRequestErrorCode08,
+     "message" .= ("Cannot apply filter because '" <> resource <> "' is not an embedded resource in this request" :: Text),
+@@ -131,6 +134,12 @@ instance JSON.ToJSON ApiRequestError where
+     "details" .= JSON.Null,
+     "hint"    .= JSON.Null]
+ 
++  toJSON (UnsupportedMethod method) = JSON.object [
++    "code"    .= ApiRequestErrorCode17,
++    "message" .= ("Unsupported HTTP method: " <> T.decodeUtf8 method),
++    "details" .= JSON.Null,
++    "hint"    .= JSON.Null]
++
+   toJSON (NoRelBetween parent child schema) = JSON.object [
+     "code"    .= SchemaCacheErrorCode00,
+     "message" .= ("Could not find a relationship between '" <> parent <> "' and '" <> child <> "' in the schema cache" :: Text),
+@@ -311,12 +320,10 @@ data Error
+   | JwtTokenMissing
+   | JwtTokenRequired
+   | NoSchemaCacheError
+-  | NotFound
+   | OffLimitsChangesError Int64 Integer
+   | PgErr PgError
+   | PutMatchingPkError
+   | SingularityError Integer
+-  | UnsupportedVerb Text
+ 
+ instance PgrstError Error where
+   status (ApiRequestError err)   = status err
+@@ -327,12 +334,10 @@ instance PgrstError Error where
+   status JwtTokenMissing         = HTTP.status500
+   status JwtTokenRequired        = HTTP.unauthorized401
+   status NoSchemaCacheError      = HTTP.status503
+-  status NotFound                = HTTP.status404
+   status OffLimitsChangesError{} = HTTP.status400
+   status (PgErr err)             = status err
+   status PutMatchingPkError      = HTTP.status400
+   status SingularityError{}      = HTTP.status406
+-  status UnsupportedVerb{}       = HTTP.status405
+ 
+   headers (ApiRequestError err)  = headers err
+   headers (JwtTokenInvalid m)    = [MediaType.toContentType MTApplicationJSON, invalidTokenHeader m]
+@@ -398,13 +403,6 @@ instance JSON.ToJSON Error where
+     "details" .= T.unwords ["Results contain", show n, "rows,", T.decodeUtf8 (MediaType.toMime MTSingularJSON), "requires 1 row"],
+     "hint"    .= JSON.Null]
+ 
+-  toJSON (UnsupportedVerb verb) = JSON.object [
+-    "code"    .= ApiRequestErrorCode17,
+-    "message" .= ("Unsupported HTTP verb: " <> verb),
+-    "details" .= JSON.Null,
+-    "hint"    .= JSON.Null]
+-
+-  toJSON NotFound = JSON.object []
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+ 
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 5e66cd4e..847f17a1 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -97,23 +97,19 @@ data Action
+   | ActionInvoke InvokeMethod
+   | ActionInfo
+   | ActionInspect {isHead :: Bool}
+-  | ActionUnknown Text
+   deriving Eq
+ -- | The path info that will be mapped to a target (used to handle validations and errors before defining the Target)
+-data Path
++data PathInfo
+   = PathInfo
+-      { pSchema        :: Schema,
+-        pName          :: Text,
+-        pHasRpc        :: Bool,
+-        pIsDefaultSpec :: Bool,
+-        pIsRootSpec    :: Bool
++      { pathName       :: Text
++      , pathIsProc     :: Bool
++      , pathIsDefSpec  :: Bool
++      , pathIsRootSpec :: Bool
+       }
+-  | PathUnknown
+ -- | The target db object of a user action
+ data Target = TargetIdent QualifiedIdentifier
+             | TargetProc{tProc :: ProcDescription, tpIsRootSpec :: Bool}
+             | TargetDefaultSpec{tdsSchema :: Schema} -- The default spec offered at root "/"
+-            | TargetUnknown
+ 
+ -- | RPC query param value `/rpc/func?v=<value>`, used for VARIADIC functions on form-urlencoded POST and GETs
+ -- | It can be fixed `?v=1` or repeated `?v=1&v=2&v=3.
+@@ -155,7 +151,7 @@ targetToJsonRpcParams target params =
+   if it is an action we are able to perform.
+ -}
+ data ApiRequest = ApiRequest {
+-    iAction               :: Action                           -- ^ Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
++    iAction               :: Action                           -- ^ Similar but not identical to HTTP method, e.g. Create/Invoke both POST
+   , iRange                :: HM.HashMap Text NonnegRange      -- ^ Requested range of rows within response
+   , iTopLevelRange        :: NonnegRange                      -- ^ Requested range of rows from the top level
+   , iTarget               :: Target                           -- ^ The target, be it calling a proc or accessing a table
+@@ -178,13 +174,47 @@ data ApiRequest = ApiRequest {
+ 
+ -- | Examines HTTP request and translates it into user intent.
+ userApiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> Either ApiRequestError ApiRequest
+-userApiRequest conf dbStructure req reqBody =
+-  apiRequest conf dbStructure req reqBody =<< first QueryParamError (QueryParams.parse (rawQueryString req))
+-
+-apiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> QueryParams.QueryParams -> Either ApiRequestError ApiRequest
+-apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..}
++userApiRequest conf dbStructure req reqBody = do
++  qPrms <- first QueryParamError $ QueryParams.parse $ rawQueryString req
++  pInfo <- getPathInfo conf $ pathInfo req
++  act <- getAction pInfo $ requestMethod req
++  apiRequest conf dbStructure req reqBody qPrms pInfo act
++
++getPathInfo :: AppConfig -> [Text] -> Either ApiRequestError PathInfo
++getPathInfo AppConfig{configOpenApiMode, configDbRootSpec} path =
++  case path of
++    []             -> case configDbRootSpec of
++                        Just (QualifiedIdentifier _ pathName)     -> Right $ PathInfo pathName True False True
++                        Nothing | configOpenApiMode == OADisabled -> Left NotFound
++                                | otherwise                       -> Right $ PathInfo mempty False True False
++    [table]        -> Right $ PathInfo table False False False
++    ["rpc", pName] -> Right $ PathInfo pName True False False
++    _              -> Left NotFound
++
++getAction :: PathInfo -> ByteString -> Either ApiRequestError Action
++getAction PathInfo{pathIsProc, pathIsDefSpec} method =
++  if pathIsProc && method `notElem` ["HEAD", "GET", "POST"]
++    then Left $ InvalidRpcMethod method
++    else case method of
++      -- The HEAD method is identical to GET except that the server MUST NOT return a message-body in the response
++      -- From https://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html#sec9.4
++      "HEAD"     | pathIsDefSpec -> Right $ ActionInspect{isHead=True}
++                 | pathIsProc    -> Right $ ActionInvoke InvHead
++                 | otherwise     -> Right $ ActionRead{isHead=True}
++      "GET"      | pathIsDefSpec -> Right $ ActionInspect{isHead=False}
++                 | pathIsProc    -> Right $ ActionInvoke InvGet
++                 | otherwise     -> Right $ ActionRead{isHead=False}
++      "POST"     | pathIsProc    -> Right $ ActionInvoke InvPost
++                 | otherwise     -> Right $ ActionMutate MutationCreate
++      "PATCH"                    -> Right $ ActionMutate MutationUpdate
++      "PUT"                      -> Right $ ActionMutate MutationSingleUpsert
++      "DELETE"                   -> Right $ ActionMutate MutationDelete
++      "OPTIONS"                  -> Right ActionInfo
++      _                          -> Left $ UnsupportedMethod method
++
++apiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> QueryParams.QueryParams -> PathInfo -> Action -> Either ApiRequestError ApiRequest
++apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..} path@PathInfo{pathName, pathIsProc, pathIsRootSpec, pathIsDefSpec} action
+   | isJust profile && fromJust profile `notElem` configDbSchemas = Left $ UnacceptableSchema $ toList configDbSchemas
+-  | isTargetingProc && method `notElem` ["HEAD", "GET", "POST"] = Left ActionInappropriate
+   | isInvalidRange = Left InvalidRange
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
+   | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+@@ -217,14 +247,8 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+  where
+   accepts = maybe [MTAny] (map MediaType.decodeMediaType . parseHttpAccept) $ lookupHeader "accept"
+ 
+-  expectParams = isTargetingProc && method /= "POST"
++  expectParams = pathIsProc && method /= "POST"
+ 
+-  isTargetingProc = case path of
+-    PathInfo{pHasRpc, pIsRootSpec} -> pHasRpc || pIsRootSpec
+-    _                              -> False
+-  isTargetingDefaultSpec = case path of
+-    PathInfo{pIsDefaultSpec=True} -> True
+-    _                             -> False
+   contentMediaType = maybe MTApplicationJSON MediaType.decodeMediaType $ lookupHeader "content-type"
+ 
+   columns = case action of
+@@ -243,12 +267,12 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+         (Just RawJSON{}, Just cls)       -> cls
+         _                                -> S.empty
+   payload :: Either ByteString Payload
+-  payload = case (contentMediaType, isTargetingProc) of
++  payload = case (contentMediaType, pathIsProc) of
+     (MTApplicationJSON, _) ->
+       if isJust columns
+         then Right $ RawJSON reqBody
+         else note "All object keys must match" . payloadAttributes reqBody
+-               =<< if LBS.null reqBody && isTargetingProc
++               =<< if LBS.null reqBody && pathIsProc
+                      then Right emptyObject
+                      else first BS.pack $ JSON.eitherDecode reqBody
+     (MTTextCSV, _) -> do
+@@ -262,24 +286,6 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+     (MTOctetStream, True) -> Right $ RawPay reqBody
+     (ct, _) -> Left $ "Content-Type not acceptable: " <> MediaType.toMime ct
+   topLevelRange = fromMaybe allRange $ HM.lookup "limit" ranges -- if no limit is specified, get all the request rows
+-  action =
+-    case method of
+-      -- The HEAD method is identical to GET except that the server MUST NOT return a message-body in the response
+-      -- From https://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html#sec9.4
+-      "HEAD"     | isTargetingDefaultSpec -> ActionInspect{isHead=True}
+-                 | isTargetingProc        -> ActionInvoke InvHead
+-                 | otherwise              -> ActionRead{isHead=True}
+-      "GET"      | isTargetingDefaultSpec -> ActionInspect{isHead=False}
+-                 | isTargetingProc        -> ActionInvoke InvGet
+-                 | otherwise              -> ActionRead{isHead=False}
+-      "POST"    -> if isTargetingProc
+-                    then ActionInvoke InvPost
+-                    else ActionMutate MutationCreate
+-      "PATCH"   -> ActionMutate MutationUpdate
+-      "PUT"     -> ActionMutate MutationSingleUpsert
+-      "DELETE"  -> ActionMutate MutationDelete
+-      "OPTIONS" -> ActionInfo
+-      _         -> ActionUnknown $ T.decodeUtf8 method
+ 
+   defaultSchema = NonEmptyList.head configDbSchemas
+   profile
+@@ -295,19 +301,17 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+     where
+       contentProfile = Just $ maybe defaultSchema T.decodeUtf8 $ lookupHeader "Content-Profile"
+       acceptProfile = Just $ maybe defaultSchema T.decodeUtf8 $ lookupHeader "Accept-Profile"
++
+   schema = fromMaybe defaultSchema profile
+-  target =
+-    let
++
++  target
++    | pathIsProc    = (`TargetProc` pathIsRootSpec) <$> callFindProc schema pathName
++    | pathIsDefSpec = Right $ TargetDefaultSpec schema
++    | otherwise     = Right $ TargetIdent $ QualifiedIdentifier schema pathName
++    where
+       callFindProc procSch procNam = findProc
+         (QualifiedIdentifier procSch procNam) payloadColumns (preferParameters == Just SingleObject) (dbProcs dbStructure)
+         contentMediaType (action == ActionInvoke InvPost)
+-    in
+-    case path of
+-      PathInfo{pSchema, pName, pHasRpc, pIsRootSpec, pIsDefaultSpec}
+-        | pHasRpc || pIsRootSpec -> (`TargetProc` pIsRootSpec) <$> callFindProc pSchema pName
+-        | pIsDefaultSpec         -> Right $ TargetDefaultSpec pSchema
+-        | otherwise              -> Right $ TargetIdent $ QualifiedIdentifier pSchema pName
+-      PathUnknown -> Right TargetUnknown
+ 
+   shouldParsePayload = case (action, contentMediaType) of
+     (ActionMutate MutationCreate, _)       -> True
+@@ -324,15 +328,6 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+     (MTUrlEncoded, ActionInvoke InvPost) -> targetToJsonRpcParams (rightToMaybe target) $ (T.decodeUtf8 *** T.decodeUtf8) <$> parseSimpleQuery (LBS.toStrict reqBody)
+     _ | shouldParsePayload               -> rightToMaybe payload
+       | otherwise                        -> Nothing
+-  path =
+-    case pathInfo req of
+-      []             -> case configDbRootSpec of
+-                          Just (QualifiedIdentifier pSch pName)     -> PathInfo (if pSch == mempty then schema else pSch) pName False False True
+-                          Nothing | configOpenApiMode == OADisabled -> PathUnknown
+-                                  | otherwise                       -> PathInfo schema "" False True False
+-      [table]        -> PathInfo schema table False False False
+-      ["rpc", pName] -> PathInfo schema pName True False False
+-      _              -> PathUnknown
+   method          = requestMethod req
+   hdrs            = requestHeaders req
+   lookupHeader    = flip lookup hdrs
+@@ -409,7 +404,7 @@ payloadAttributes raw json =
+   where
+     emptyPJArray = ProcessedJSON (JSON.encode emptyArray) S.empty
+ 
+-findAcceptMediaType :: AppConfig -> Action -> Path -> [MediaType] -> Either ApiRequestError MediaType
++findAcceptMediaType :: AppConfig -> Action -> PathInfo -> [MediaType] -> Either ApiRequestError MediaType
+ findAcceptMediaType conf action path accepts =
+   case mutuallyAgreeable (requestMediaTypes conf action path) accepts of
+     Just ct ->
+@@ -417,10 +412,10 @@ findAcceptMediaType conf action path accepts =
+     Nothing ->
+       Left . MediaTypeError $ map MediaType.toMime accepts
+ 
+-requestMediaTypes :: AppConfig -> Action -> Path -> [MediaType]
++requestMediaTypes :: AppConfig -> Action -> PathInfo -> [MediaType]
+ requestMediaTypes conf action path =
+   case action of
+-    ActionRead _    -> defaultMediaTypes ++ rawMediaTypes conf
++    ActionRead _    -> defaultMediaTypes ++ rawMediaTypes
+     ActionInvoke _  -> invokeMediaTypes
+     ActionInspect _ -> [MTOpenAPI, MTApplicationJSON]
+     ActionInfo      -> [MTTextCSV]
+@@ -428,14 +423,11 @@ requestMediaTypes conf action path =
+   where
+     invokeMediaTypes =
+       defaultMediaTypes
+-        ++ rawMediaTypes conf
+-        ++ [MTOpenAPI | pIsRootSpec path]
++        ++ rawMediaTypes
++        ++ [MTOpenAPI | pathIsRootSpec path]
+     defaultMediaTypes =
+       [MTApplicationJSON, MTSingularJSON, MTGeoJSON, MTTextCSV]
+-
+-rawMediaTypes :: AppConfig -> [MediaType]
+-rawMediaTypes AppConfig{..} =
+-  (MediaType.decodeMediaType <$> configRawMediaTypes) `union` [MTOctetStream, MTTextPlain, MTTextXML]
++    rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
+ 
+ {-|
+   Search a pg proc by matching name and arguments keys to parameters. Since a function can be overloaded,
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 5b0f5687..cf828793 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -47,14 +47,15 @@ import Protolude
+ 
+ 
+ data ApiRequestError
+-  = ActionInappropriate
+-  | AmbiguousRelBetween Text Text [Relationship]
++  = AmbiguousRelBetween Text Text [Relationship]
+   | AmbiguousRpc [ProcDescription]
+   | MediaTypeError [ByteString]
+   | InvalidBody ByteString
+   | InvalidFilters
+   | InvalidRange
++  | InvalidRpcMethod ByteString
+   | LimitNoOrderError
++  | NotFound
+   | NoRelBetween Text Text Text
+   | NoRpc Text Text [Text] Bool MediaType Bool
+   | NotEmbedded Text
+@@ -62,6 +63,7 @@ data ApiRequestError
+   | PutRangeNotAllowedError
+   | QueryParamError QPError
+   | UnacceptableSchema [Text]
++  | UnsupportedMethod ByteString
+ 
+ data QPError = QPError Text Text
+ 

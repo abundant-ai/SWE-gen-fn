@@ -1,0 +1,153 @@
+diff --git a/Changes b/Changes
+index 017cb2f44e..5ad0eb1122 100644
+--- a/Changes
++++ b/Changes
+@@ -845,9 +845,6 @@ OCaml 5.5.0
+   (Gabriel Scherer and Stefan Muenzel, report by Brandon Stride,
+    review by Florian Angeletti)
+ 
+-- #14626: Handle module-dependent functions in warning 16 (Reported in #14622).
+-  (Alistair O'Brien, review by Gabriel Scherer, report by Kate Deplaix)
+-
+ OCaml 5.4.0 (9 October 2025)
+ ----------------------------
+ 
+diff --git a/testsuite/tests/typing-warnings/warning16.ml b/testsuite/tests/typing-warnings/warning16.ml
+index 73b9598e5c..0e68bfd8c9 100644
+--- a/testsuite/tests/typing-warnings/warning16.ml
++++ b/testsuite/tests/typing-warnings/warning16.ml
+@@ -120,25 +120,3 @@ Line 3, characters 2-9:
+ Error: The value "warn_me" has type "?arg:'a -> unit"
+        but an expression was expected of type "int"
+ |}]
+-
+-(* https://github.com/ocaml/ocaml/issues/14622 *)
+-module type Show = sig
+-  type t
+-
+-  val show : t -> string
+-end
+-
+-type 'a t =
+-  | A :
+-    { x : string option
+-      ; show : 'a -> string
+-      }
+-    -> 'a t
+-
+-let test (type a) ?x (module M : Show with type t = a) =
+-  A { x; show = M.show }
+-[%%expect{|
+-module type Show = sig type t val show : t -> string end
+-type 'a t = A : { x : string option; show : 'a -> string; } -> 'a t
+-val test : ?x:string -> (module M : Show with type t = 'a) -> M.t t = <fun>
+-|}]
+diff --git a/typing/ctype.ml b/typing/ctype.ml
+index e7f65b60a3..9cb454438f 100644
+--- a/typing/ctype.ml
++++ b/typing/ctype.ml
+@@ -6220,14 +6220,6 @@ let rec normalize_type_rec mark ty =
+ let normalize_type ty =
+   with_type_mark (fun mark -> normalize_type_rec mark ty)
+ 
+-type arrow_arg =
+-  | Arg_value of type_expr
+-  | Arg_module of Ident.Unscoped.t * package
+-
+-type arrow_ret =
+-  | Ret_cycle
+-  | Ret_type of type_expr
+-
+ let arrow_spine env ty =
+   let rec arrow_spine_rec ~mark labels ty_fun =
+     let ty = expand_head env ty_fun in
+@@ -6235,14 +6227,9 @@ let arrow_spine env ty =
+     then (
+       match get_desc ty with
+       | Tarrow (label, ty_arg, ty_ret, _commu) ->
+-        arrow_spine_rec ~mark ((label, Arg_value ty_arg) :: labels) ty_ret
+-      | Tfunctor (label, mod_id, package, ty_ret) ->
+-        arrow_spine_rec
+-          ~mark
+-          ((label, Arg_module (mod_id, package)) :: labels)
+-          ty_ret
+-      | _ -> List.rev labels, Ret_type ty)
+-    else List.rev labels, Ret_cycle
++        arrow_spine_rec ~mark ((label, ty_arg) :: labels) ty_ret
++      | _ -> List.rev labels, `Return ty)
++    else List.rev labels, `Cycle
+   in
+   let snap = snapshot () in
+   let result =
+@@ -6256,8 +6243,8 @@ let arrow_labels env ty =
+   let label_tys, ret_ty_or_cycle = arrow_spine env ty in
+   let is_ret_tvar =
+     match ret_ty_or_cycle with
+-    | Ret_cycle -> false
+-    | Ret_type ty -> is_Tvar ty
++    | `Cycle -> false
++    | `Return ty -> is_Tvar ty
+   in
+   List.map fst label_tys, ~is_ret_tvar
+ 
+diff --git a/typing/ctype.mli b/typing/ctype.mli
+index 946b72e913..2814612bf2 100644
+--- a/typing/ctype.mli
++++ b/typing/ctype.mli
+@@ -377,32 +377,17 @@ val filter_method: Env.t -> string -> type_expr -> type_expr
+     indicating that the list of labels isn't necessarily exhaustive. *)
+ val arrow_labels : Env.t -> type_expr -> arg_label list * is_ret_tvar:bool
+ 
+-(** An argument in an arrow spine. *)
+-type arrow_arg =
+-  | Arg_value of type_expr
+-    (** A regular value argument. *)
+-  | Arg_module of Ident.Unscoped.t * package
+-    (** A module dependent parameter. Consisting of a dependent module name
+-        and a package type for the module. *)
+-
+-(** The return type of an arrow. *)
+-type arrow_ret =
+-  | Ret_cycle
+-    (** The arrow is cyclic, its return type is ill-defined. *)
+-  | Ret_type of type_expr
+-    (** A regular return type. *)
+-
+ (** [arrow_spine env ty] expands [ty] as a arrow type in [env] and returns
+     its arrow spine.
+ 
+     If [ty] is [l1:ty1 -> ... -> ln:tyn -> rty], it returns
+-    [([(l1, ty1); ...; (ln, tyn)], Ret_type rty)].
++    [([(l1, ty1); ...; (ln, tyn)], `Return rty)].
+ 
+-    If [ty] is a {e cyclic} arrow type, it returns [([...], Ret_cycle)]. *)
++    If [ty] is a {e cyclic} arrow type, it returns [([...], `Cycle)]. *)
+ val arrow_spine
+   :  Env.t
+   -> type_expr
+-  -> (arg_label * arrow_arg) list * arrow_ret
++  -> (arg_label * type_expr) list * [ `Return of type_expr | `Cycle ]
+ 
+ val occur_in: Env.t -> type_expr -> type_expr -> bool
+ val deep_occur: type_expr -> type_expr -> bool
+diff --git a/typing/typecore.ml b/typing/typecore.ml
+index 6d85957b3e..85c9417003 100644
+--- a/typing/typecore.ml
++++ b/typing/typecore.ml
+@@ -5652,13 +5652,13 @@ and type_function
+            only call this when necessary. *)
+         let label_tys, ret_ty_or_cycle = arrow_spine env ty in
+         let is_spine_only_labels =
+-          List.for_all (fun (label, _arg_ty) -> label <> Nolabel) label_tys
++          List.for_all (fun (label, _ty) -> label <> Nolabel) label_tys
+         in
+         if is_spine_only_labels
+         then (
+           match ret_ty_or_cycle with
+-          | Ret_cycle -> Some `Not_tvar
+-          | Ret_type ty ->
++          | `Cycle -> Some `Not_tvar
++          | `Return ty ->
+               if is_Tvar ty
+               then Some (`Tvar ty)
+               else Some `Not_tvar )

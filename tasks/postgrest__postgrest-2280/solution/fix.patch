@@ -1,0 +1,301 @@
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 5e581941..1767b894 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -100,8 +100,8 @@ queryDbStructure schemas extraSearchPath prepared = do
+     , dbProcs = procs
+     }
+   where
+-    relsToMap = map sort . M.fromListWith (++) . map ((\(x,y) -> (x, [y])) . addKey)
+-    addKey rel = (relTable rel, rel)
++    relsToMap = map sort . M.fromListWith (++) . map ((\(x, fSch, y) -> ((x, fSch), [y])) . addKey)
++    addKey rel = (relTable rel, qiSchema $ relForeignTable rel, rel)
+ 
+ -- | Remove db objects that belong to an internal schema(not exposed through the API) from the DbStructure.
+ removeInternal :: [Schema] -> DbStructure -> DbStructure
+@@ -109,7 +109,7 @@ removeInternal schemas dbStruct =
+   DbStructure {
+       dbTables        = M.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas) $ dbTables dbStruct
+     , dbRelationships = filter (\r -> qiSchema (relForeignTable r) `elem` schemas && not (hasInternalJunction r)) <$>
+-                        M.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas ) (dbRelationships dbStruct)
++                        M.filterWithKey (\(QualifiedIdentifier sch _, _) _ -> sch `elem` schemas ) (dbRelationships dbStruct)
+     , dbProcs         = dbProcs dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+     }
+   where
+@@ -148,6 +148,7 @@ decodeRels =
+     Relationship <$>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+     (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
++    column HD.bool <*>
+     (M2O <$> column HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text))
+ 
+ decodeViewKeyDeps :: HD.Result [ViewKeyDependency]
+@@ -341,18 +342,26 @@ addViewM2ORels keyDeps rels =
+         [ Relationship
+             (keyDepView vwTbl)
+             relForeignTable
++            False
+             (M2O cons $ zipWith (\(_, vCol) (_, fCol)-> (vCol, fCol)) (keyDepCols vwTbl) relColumns)
+         | vwTbl <- viewTableM2Os ]
+         ++
+         [ Relationship
+             relTable
+             (keyDepView tblVw)
++            False
+             (M2O cons $ zipWith (\(tCol, _) (_, vCol) -> (tCol, vCol)) relColumns (keyDepCols tblVw))
+         | tblVw <- tableViewM2Os ]
+         ++
+-        [ Relationship
+-            (keyDepView vwTbl)
+-            (keyDepView tblVw)
++        [
++          let
++            vw1 = keyDepView vwTbl
++            vw2 = keyDepView tblVw
++          in
++          Relationship
++            vw1
++            vw2
++            (vw1 == vw2)
+             (M2O cons $ zipWith (\(_, vcol1) (_, vcol2) -> (vcol1, vcol2)) (keyDepCols vwTbl) (keyDepCols tblVw))
+         | vwTbl <- viewTableM2Os
+         , tblVw <- tableViewM2Os ]
+@@ -360,8 +369,8 @@ addViewM2ORels keyDeps rels =
+ 
+ 
+ addO2MRels :: [Relationship] -> [Relationship]
+-addO2MRels rels = rels ++ [ Relationship ft t (O2M cons (swap <$> cols))
+-                          | Relationship t ft (M2O cons cols) <- rels ]
++addO2MRels rels = rels ++ [ Relationship ft t isSelf (O2M cons (swap <$> cols))
++                          | Relationship t ft isSelf (M2O cons cols) <- rels ]
+ 
+ -- | Adds a m2m relationship if a table has FKs to two other tables and the FK columns are part of the PK columns
+ addM2MRels :: TablesMap -> [Relationship] -> [Relationship]
+@@ -370,10 +379,10 @@ addM2MRels tbls rels = rels ++ catMaybes
+       jtCols = S.fromList $ (fst <$> cols) ++ (fst <$> fcols)
+       pkCols = S.fromList $ maybe mempty tablePKCols $ M.lookup jt1 tbls
+     in if S.isSubsetOf jtCols pkCols
+-      then Just $ Relationship t ft (M2M $ Junction jt1 cons1 cons2 (swap <$> cols) (swap <$> fcols))
++      then Just $ Relationship t ft (t == ft) (M2M $ Junction jt1 cons1 cons2 (swap <$> cols) (swap <$> fcols))
+       else Nothing
+-  | Relationship jt1 t  (M2O cons1 cols)  <- rels
+-  , Relationship jt2 ft (M2O cons2 fcols) <- rels
++  | Relationship jt1 t  _ (M2O cons1 cols)  <- rels
++  , Relationship jt2 ft _ (M2O cons2 fcols) <- rels
+   , jt1 == jt2
+   , cons1 /= cons2]
+ 
+@@ -607,6 +616,7 @@ allM2ORels pgVer =
+            tab.relname AS table_name,
+            ns2.nspname AS foreign_table_schema,
+            other.relname AS foreign_table_name,
++           (ns1.nspname, tab.relname) = (ns2.nspname, other.relname) AS is_self,
+            conname     AS constraint_name,
+            column_info.cols AS columns
+     FROM pg_constraint,
+diff --git a/src/PostgREST/DbStructure/Relationship.hs b/src/PostgREST/DbStructure/Relationship.hs
+index 391cba85..aa8c7ec3 100644
+--- a/src/PostgREST/DbStructure/Relationship.hs
++++ b/src/PostgREST/DbStructure/Relationship.hs
+@@ -5,7 +5,6 @@ module PostgREST.DbStructure.Relationship
+   ( Cardinality(..)
+   , Relationship(..)
+   , Junction(..)
+-  , isSelfReference
+   , RelationshipsMap
+   ) where
+ 
+@@ -13,7 +12,7 @@ import qualified Data.Aeson          as JSON
+ import qualified Data.HashMap.Strict as M
+ 
+ import PostgREST.DbStructure.Identifiers (FieldName,
+-                                          QualifiedIdentifier)
++                                          QualifiedIdentifier, Schema)
+ 
+ import Protolude
+ 
+@@ -22,6 +21,7 @@ import Protolude
+ data Relationship = Relationship
+   { relTable        :: QualifiedIdentifier
+   , relForeignTable :: QualifiedIdentifier
++  , relIsSelf       :: Bool -- ^ Whether is a self relationship
+   , relCardinality  :: Cardinality
+   }
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+@@ -50,7 +50,5 @@ data Junction = Junction
+   }
+   deriving (Eq, Ord, Generic, JSON.ToJSON)
+ 
+-isSelfReference :: Relationship -> Bool
+-isSelfReference r = relTable r == relForeignTable r
+-
+-type RelationshipsMap = M.HashMap QualifiedIdentifier [Relationship]
++-- | Key based on the source table and the foreign table schema
++type RelationshipsMap = M.HashMap (QualifiedIdentifier, Schema)  [Relationship]
+diff --git a/src/PostgREST/OpenAPI.hs b/src/PostgREST/OpenAPI.hs
+index 7a04fb95..0a446adf 100644
+--- a/src/PostgREST/OpenAPI.hs
++++ b/src/PostgREST/OpenAPI.hs
+@@ -100,7 +100,7 @@ makeProperty tbl rels col = (colName col, Inline s)
+         rel = find (\case
+           Relationship{relCardinality=(M2O _ relColumns)} -> [colName col] == (fst <$> relColumns)
+           _                                               -> False
+-          ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier (tableSchema tbl) (tableName tbl)) rels
++          ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier (tableSchema tbl) (tableName tbl), tableSchema tbl) rels
+         fCol = (headMay . (\r -> snd <$> relColumns (relCardinality r)) =<< rel)
+         fTbl = qiName . relForeignTable <$> rel
+         fTblCol = (,) <$> fTbl <*> fCol
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 91373575..818b6120 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -51,8 +51,7 @@ import PostgREST.Request.ApiRequest       (Action (..),
+ import PostgREST.Request.Preferences
+ import PostgREST.Request.Types
+ 
+-import qualified PostgREST.DbStructure.Relationship as Relationship
+-import qualified PostgREST.Request.QueryParams      as QueryParams
++import qualified PostgREST.Request.QueryParams as QueryParams
+ 
+ import Protolude hiding (from)
+ 
+@@ -142,62 +141,75 @@ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, a
+ -- (hint can take table / view values to aid in finding the junction in an m2m relationship)
+ findRel :: Schema -> RelationshipsMap -> NodeName -> NodeName -> Maybe Hint -> Either ApiRequestError Relationship
+ findRel schema allRels origin target hint =
+-  case rel of
++  case rels of
+     []  -> Left $ NoRelBetween origin target schema
+     [r] -> Right r
+-    -- Here we handle a self reference relationship to not cause a breaking
+-    -- change: In a self reference we get two relationships with the same
+-    -- foreign key and relTable/relFtable but with different
+-    -- cardinalities(m2o/o2m) We output the O2M rel, the M2O rel can be
+-    -- obtained by using the origin column as an embed hint.
+-    rs@[rel0, rel1]  -> case (relCardinality rel0, relCardinality rel1, relTable rel0 == relTable rel1 && relForeignTable rel0 == relForeignTable rel1) of
+-      (O2M cons1 _, M2O cons2 _, True) -> if cons1 == cons2 then Right rel0 else Left $ AmbiguousRelBetween origin target rs
+-      (M2O cons1 _, O2M cons2 _, True) -> if cons1 == cons2 then Right rel1 else Left $ AmbiguousRelBetween origin target rs
+-      _                            -> Left $ AmbiguousRelBetween origin target rs
+-    rs -> Left $ AmbiguousRelBetween origin target rs
++    rs  -> Left $ AmbiguousRelBetween origin target rs
+   where
+     matchFKSingleCol hint_ card = case card of
+-      O2M _ cols -> length cols == 1 && hint_ == head (fst <$> cols)
+-      M2O _ cols -> length cols == 1 && hint_ == head (fst <$> cols)
+-      _          -> False
++      O2M _ [(col, _)] -> hint_ == col
++      M2O _ [(col, _)] -> hint_ == col
++      _                -> False
+     matchFKRefSingleCol hint_ card = case card of
+-      O2M _ cols -> length cols == 1 && hint_ == head (snd <$> cols)
+-      M2O _ cols -> length cols == 1 && hint_ == head (snd <$> cols)
+-      _          -> False
++      O2M _ [(_, fCol)] -> hint_ == fCol
++      M2O _ [(_, fCol)] -> hint_ == fCol
++      _                 -> False
+     matchConstraint tar card = case card of
+-      O2M cons _ -> tar == Just cons
+-      M2O cons _ -> tar == Just cons
++      O2M cons _ -> tar == cons
++      M2O cons _ -> tar == cons
+       _          -> False
+     matchJunction hint_ card = case card of
+-      M2M Junction{junTable} -> hint_ == Just (qiName junTable)
++      M2M Junction{junTable} -> hint_ == qiName junTable
+       _                      -> False
+-    rel = filter (
++    -- In a self reference we get two relationships with the same
++    -- foreign key and relTable/relFtable but with different
++    -- cardinalities(M2O/O2M). We use the convention of getting:
++    -- + The O2M by using the table name in the target
++    -- + The M2O by using the column name in the target
++    -- For doing the above we ignore the M2O when using the table name in the target and
++    -- we ignore the O2M when using the column name in the target
++    notM2OSelfRel card isSelf = case card of
++      M2O _ _ -> not isSelf
++      _       -> True
++    notO2MSelfRel card isSelf = case card of
++      O2M _ _ -> not isSelf
++      _       -> True
++    rels = filter (
+       \Relationship{..} ->
+-        -- foreign relationship need to be on the exposed schema
+-        schema == qiSchema relForeignTable &&
+-        (
+-          -- /projects?select=clients(*)
+-          target == qiName relForeignTable  -- clients
+-          ||
+-          -- /projects?select=projects_client_id_fkey(*)
+-          matchConstraint (Just target) relCardinality -- projects_client_id_fkey
+-          ||
+-          -- /projects?select=client_id(*)
+-          matchFKSingleCol (Just target) relCardinality -- client_id
+-        ) && (
+-          isNothing hint || -- hint is optional
+-
+-          -- /projects?select=clients!projects_client_id_fkey(*)
+-          matchConstraint hint relCardinality || -- projects_client_id_fkey
+-
+-          -- /projects?select=clients!client_id(*) or /projects?select=clients!id(*)
+-          matchFKSingleCol hint relCardinality    || -- client_id
+-          matchFKRefSingleCol hint relCardinality || -- id
+-
+-          -- /users?select=tasks!users_tasks(*) many-to-many between users and tasks
+-          matchJunction hint relCardinality -- users_tasks
+-        )
+-      ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier schema origin) allRels
++        case hint of
++          Nothing ->
++              -- /projects?select=clients(*)
++              target == qiName relForeignTable -- clients
++              && notM2OSelfRel relCardinality relIsSelf
++              ||
++              -- /projects?select=projects_client_id_fkey(*)
++              matchConstraint target relCardinality -- projects_client_id_fkey
++              ||
++              -- /projects?select=client_id(*)
++              matchFKSingleCol target relCardinality -- client_id
++              && notO2MSelfRel relCardinality relIsSelf
++          Just hnt ->
++            (
++              -- /projects?select=clients(*)
++              target == qiName relForeignTable && notM2OSelfRel relCardinality relIsSelf -- clients
++              ||
++              -- /projects?select=projects_client_id_fkey(*)
++              matchConstraint target relCardinality -- projects_client_id_fkey
++              ||
++              -- /projects?select=client_id(*)
++              matchFKSingleCol target relCardinality -- client_id
++            ) && (
++              -- /projects?select=clients!projects_client_id_fkey(*)
++              matchConstraint hnt relCardinality || -- projects_client_id_fkey
++
++              -- /projects?select=clients!client_id(*) or /projects?select=clients!id(*)
++              matchFKSingleCol hnt relCardinality    || -- client_id
++              matchFKRefSingleCol hnt relCardinality || -- id
++
++              -- /users?select=tasks!users_tasks(*) many-to-many between users and tasks
++              matchJunction hnt relCardinality -- users_tasks
++            )
++      ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier schema origin, schema) allRels
+ 
+ -- previousAlias is only used for the case of self joins
+ addJoinConditions :: Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
+@@ -211,7 +223,7 @@ addJoinConditions previousAlias (Node node@(query@Select{from=tbl,fromAlias=tblA
+   where
+     newAlias = if depth == 0
+       then tblAlias -- only use the alias on the root node(depth 0) for when the sourceCTEName alias is used for joining
+-      else case Relationship.isSelfReference <$> rel of -- no need to apply the self reference alias on depth 0 only on the next depths
++      else case relIsSelf <$> rel of -- no need to apply the self reference alias on depth 0 only on the next depths
+         Just True -> Just (qiName tbl <> "_" <> show depth)
+         _         -> Nothing
+     augmentQuery r =
+@@ -223,7 +235,7 @@ addJoinConditions previousAlias (Node node@(query@Select{from=tbl,fromAlias=tblA
+ 
+ -- previousAlias and newAlias are used in the case of self joins
+ getJoinConditions :: Maybe Alias -> Maybe Alias -> Relationship -> [JoinCondition]
+-getJoinConditions previousAlias newAlias (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} card) =
++getJoinConditions previousAlias newAlias (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} _ card) =
+   case card of
+     M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
+       (toJoinCondition previousAlias newAlias tN jtn <$> jcols1) ++ (toJoinCondition Nothing Nothing ftN jtn <$> jcols2)

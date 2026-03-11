@@ -1,0 +1,110 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c780b500..19832e62 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,8 @@ A preview of the next release can be installed from
+ - [#1822](https://github.com/babashka/babashka/issues/1822): type should prioritize :type metadata
+ - `ns-name` should work on symbols
+ - `:clojure.core/eval-file` should affect `*file*` during eval
++- [#1179](https://github.com/babashka/babashka/issues/1179): run `:init` in tasks only once
++- [#1823](https://github.com/babashka/babashka/issues/1823): run `:init` in tasks before task specific requires
+ 
+ ## 1.12.200 (2025-04-26)
+ 
+diff --git a/src/babashka/impl/tasks.clj b/src/babashka/impl/tasks.clj
+index 3fe45785..92b0b7a5 100644
+--- a/src/babashka/impl/tasks.clj
++++ b/src/babashka/impl/tasks.clj
+@@ -212,11 +212,14 @@
+ 
+ (def rand-ns (delay (symbol (str "user-" (java.util.UUID/randomUUID)))))
+ 
+-(defn format-task [init extra-paths extra-deps requires prog]
++(defn format-task [init extra-paths extra-deps global-requires requires prog]
+   (format "
+ %s ;; deps
+ 
+-(ns %s %s)
++(ns %s
++;; global requires
++%s)
++
+ (require '[babashka.tasks #_#_:refer [log]])
+ (when-not (resolve 'clojure)
+   ;; we don't use refer so users can override this
+@@ -234,9 +237,17 @@
+ (when-not (resolve 'exec)
+   (intern *ns* 'exec @(var babashka.tasks/exec)))
+ 
++;; init
++(defmacro init []
++  (when-not (resolve '%s/__init?)
++   (intern '%s '__init? true)
++   '%s))
++
++(init)
++;; task requires
+ %s
++;; task
+ %s
+-
+ "
+           (let [deps (cond-> {}
+                        (seq extra-deps) (assoc :deps extra-deps)
+@@ -245,10 +256,18 @@
+               (format "(babashka.deps/add-deps '%s)" (pr-str deps))
+               ""))
+           @rand-ns
+-          (if (seq requires)
+-            (format "(:require %s)" (str/join " " requires))
++          (if (seq global-requires)
++            (format "(:require %s)" (str/join " " global-requires))
+             "")
++          @rand-ns @rand-ns
+           (pr-str init)
++          (if (seq requires)
++            (format "(require %s)"
++                    (str/join "\n"
++                              (map (fn [req]
++                                     (str "'" req))
++                                   requires)))
++            "")
+           prog))
+ 
+ (defn target-order
+@@ -286,7 +305,7 @@
+     (binding [*print-meta* true]
+       (if task
+         (let [m? (map? task)
+-              requires (get tasks :requires)
++              global-requires (get tasks :requires)
+               init (get tasks :init)
+               prog (if (when m? (:depends task))
+                      (let [[targets error]
+@@ -305,7 +324,7 @@
+                                 done []
+                                 extra-paths []
+                                 extra-deps nil
+-                                requires requires]
++                                requires []]
+                            (let [t (first targets)
+                                  targets (next targets)
+                                  task-map (assoc task-map
+@@ -328,14 +347,15 @@
+                                        extra-paths (concat extra-paths (:extra-paths task))
+                                        extra-deps (merge extra-deps (:extra-deps task))
+                                        requires (concat requires (:requires task))]
+-                                   [[(format-task init extra-paths extra-deps requires prog)] nil])
++                                   [[(format-task init extra-paths extra-deps global-requires requires prog)] nil])
+                                  [(binding [*out* *err*]
+                                     (println "No such task:" t)) 1]))))))
+                      [[(format-task
+                         init
+                         (:extra-paths task)
+                         (:extra-deps task)
+-                        (concat requires (:requires task))
++                        global-requires
++                        (:requires task)
+                         (assemble-task-1 (cond-> {:name task-name}
+                                            enter (assoc :enter enter)
+                                            leave (assoc :leave leave)

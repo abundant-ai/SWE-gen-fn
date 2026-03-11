@@ -1,0 +1,418 @@
+diff --git a/lib/phoenix_component/macro_component.ex b/lib/phoenix_component/macro_component.ex
+index 29aecd67..a7cf70ec 100644
+--- a/lib/phoenix_component/macro_component.ex
++++ b/lib/phoenix_component/macro_component.ex
+@@ -120,6 +120,29 @@ defmodule Phoenix.Component.MacroComponent do
+   #   LiveView's end to end tests: a macro component that performs
+   #   [syntax highlighting at compile time](https://github.com/phoenixframework/phoenix_live_view/blob/38851d943f3280c5982d75679291dccb8c442534/test/e2e/support/colocated_live.ex#L4-L35)
+   #   using the [Makeup](https://hexdocs.pm/makeup/Makeup.html) library.
++  #
++  #   ## Directives
++  #
++  #   Macro components may return directives from `transform/2` which can be used to influence
++  #   other elements in the template outside of the macro component at compile-time. For example:
++  #
++  #   ```elixir
++  #   defmodule MyAppWeb.TagRootSampleComponent do
++  #     @behaviour Phoenix.Component.MacroComponent
++  #
++  #     @impl true
++  #     def transform(_ast, _meta) do
++  #       {:ok, "", %{}, [root_tag_attribute: {"phx-sample-one", "test"}, root_tag_attribute: {"phx-sample-two", true}]}
++  #     end
++  #   end
++  #   ```
++  #
++  #   The following directives are currently supported:
++  #
++  #   * `:root_tag_attribute` - A `{name, value}` tuple to apply as an attribute to all root tags during template compilation.
++  #     Requires that a global `:root_tag_attribute` is configured for the application. The attribute name must be a string and the attribute value must be a string or `true`.
++  #     May be provided multiple times to apply multiple attributes.
++  #
+ 
+   @type tag :: binary()
+   @type attribute :: {binary(), Macro.t()}
+@@ -128,9 +151,13 @@ defmodule Phoenix.Component.MacroComponent do
+   @type tag_meta :: %{closing: :self | :void}
+   @type heex_ast :: {tag(), attributes(), children(), tag_meta()} | binary()
+   @type transform_meta :: %{env: Macro.Env.t()}
++  @type directive :: {:root_tag_attribute, {name :: String.t(), value :: String.t() | true}}
++  @type directives :: [directive]
+ 
+   @callback transform(heex_ast :: heex_ast(), meta :: transform_meta()) ::
+-              {:ok, heex_ast()} | {:ok, heex_ast(), data :: term()}
++              {:ok, heex_ast()}
++              | {:ok, heex_ast(), data :: term()}
++              | {:ok, heex_ast(), data :: term(), directives :: directives()}
+ 
+   @doc """
+   Returns the stored data from macro components that returned `{:ok, ast, data}`.
+diff --git a/lib/phoenix_live_view/html_formatter.ex b/lib/phoenix_live_view/html_formatter.ex
+index c7eb34d1..7e3178a5 100644
+--- a/lib/phoenix_live_view/html_formatter.ex
++++ b/lib/phoenix_live_view/html_formatter.ex
+@@ -312,8 +312,8 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+           process_buffer: &process_buffer/1
+         )
+         |> case do
+-          {:ok, nodes} ->
+-            nodes
++          {:ok, result} ->
++            result.nodes
+             |> transform_tree(source, newlines)
+             |> HTMLAlgebra.build(opts)
+             |> Inspect.Algebra.format(line_length)
+diff --git a/lib/phoenix_live_view/tag_engine/compiler.ex b/lib/phoenix_live_view/tag_engine/compiler.ex
+index 3c01706a..1b59b24a 100644
+--- a/lib/phoenix_live_view/tag_engine/compiler.ex
++++ b/lib/phoenix_live_view/tag_engine/compiler.ex
+@@ -1,6 +1,7 @@
+ defmodule Phoenix.LiveView.TagEngine.Compiler do
+   @moduledoc false
+ 
++  alias Phoenix.LiveView.TagEngine.Parser
+   alias Phoenix.LiveView.TagEngine.Tokenizer.ParseError
+ 
+   @doc """
+@@ -15,7 +16,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+   text and expression parts and properly invoking the engine
+   with the correct code for features like components and slots.
+   """
+-  def compile(nodes, opts) do
++  def compile(%Parser{nodes: nodes, directives: directives}, opts) do
+     {engine, opts} = Keyword.pop(opts, :engine, Phoenix.LiveView.Engine)
+     tag_handler = Keyword.fetch!(opts, :tag_handler)
+ 
+@@ -26,8 +27,11 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+       caller: Keyword.fetch!(opts, :caller),
+       source: Keyword.fetch!(opts, :source),
+       tag_handler: tag_handler,
+-      # slots is the only key that is updated when traversing nodes
+-      slots: []
++      root_tag_attribute: Application.get_env(:phoenix_live_view, :root_tag_attribute),
++      root_tag_attributes: Keyword.get_values(directives, :root_tag_attribute),
++      # The following keys are updated when traversing nodes
++      slots: [],
++      local_root?: true
+     }
+ 
+     # Live components require a single, static root tag.
+@@ -328,7 +332,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       substate = handle_tag_and_attrs(name, attrs, ">", to_location(meta), substate, state)
+-      {_child_state, substate} = handle_node(children, substate, state)
++      {_child_state, substate} = handle_node(children, substate, %{state | local_root?: false})
+       substate = state.engine.handle_text(substate, [to_location(close_meta)], "</#{name}>")
+       {state, substate}
+     end)
+@@ -353,7 +357,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+         meta,
+         close_meta,
+         substate,
+-        state
++        %{state | local_root?: true}
+       )
+ 
+     ast =
+@@ -383,7 +387,10 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       {assigns, attr_info, slot_info} =
+-        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, %{
++          state
++          | local_root?: true
++        })
+ 
+       store_component_call({mod, fun}, attr_info, slot_info, line, state)
+       call_meta = [line: line, column: column]
+@@ -420,7 +427,10 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       # Process children in a new nesting
+       {assigns, attr_info, slot_info} =
+-        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, %{
++          state
++          | local_root?: true
++        })
+ 
+       store_component_call({mod, fun}, attr_info, slot_info, line, state)
+       call_meta = [line: line, column: column + mod_size]
+@@ -479,17 +489,41 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+   defp handle_tag_and_attrs(name, attrs, suffix, meta, substate, state) do
+     text =
+-      if debug_attributes?(state.caller) do
+-        "<#{name} data-phx-loc=\"#{meta[:line]}\""
+-      else
+-        "<#{name}"
+-      end
++      "<#{name}"
++      |> maybe_add_phx_loc(state, meta)
++      |> maybe_add_root_tag_attributes(state, meta)
+ 
+     substate = state.engine.handle_text(substate, meta, text)
+     substate = handle_tag_attrs(meta, attrs, substate, state)
+     state.engine.handle_text(substate, meta, suffix)
+   end
+ 
++  defp maybe_add_phx_loc(text, %{caller: caller}, meta) do
++    if debug_attributes?(caller) do
++      "#{text} data-phx-loc=\"#{meta[:line]}\""
++    else
++      text
++    end
++  end
++
++  defp maybe_add_root_tag_attributes(text, %{local_root?: true} = state, _meta) do
++    case state do
++      %{root_tag_attribute: root_tag_attribute} when is_binary(root_tag_attribute) ->
++        attrs =
++          [{root_tag_attribute, true} | state.root_tag_attributes]
++          |> Phoenix.HTML.attributes_escape()
++          |> Phoenix.HTML.safe_to_string()
++
++        # Phoenix.HTML.attributes_escape/1 adds a leading space automatically
++        "#{text}#{attrs}"
++
++      %{root_tag_attribute: _} ->
++        text
++    end
++  end
++
++  defp maybe_add_root_tag_attributes(text, _state, _meta), do: text
++
+   defp handle_tag_attrs(meta, attrs, substate, state) do
+     Enum.reduce(attrs, substate, fn
+       {:root, {:expr, _, _} = expr, _attr_meta}, substate ->
+diff --git a/lib/phoenix_live_view/tag_engine/parser.ex b/lib/phoenix_live_view/tag_engine/parser.ex
+index b36f960a..3c1b85d2 100644
+--- a/lib/phoenix_live_view/tag_engine/parser.ex
++++ b/lib/phoenix_live_view/tag_engine/parser.ex
+@@ -1,6 +1,27 @@
+ defmodule Phoenix.LiveView.TagEngine.Parser do
+   @moduledoc false
+ 
++  defstruct [:nodes, :directives]
++
++  @type t :: %__MODULE__{
++          nodes: list(tag_node()),
++          directives: Phoenix.Component.MacroComponent.directives()
++        }
++
++  @type tag_node() :: text() | comment() | block() | self_close() | expression()
++  @type text() :: {:text, binary(), meta()}
++  @type comment() :: {:eex_comment, binary(), meta()}
++  @type block() :: {:block, atom(), binary(), list(attr()), list(tag_node()), meta(), meta()}
++  @type self_close() :: {:self_close, atom(), binary(), list(attr()), meta()}
++  @type expression() ::
++          {:body_expr, binary(), meta()}
++          | {:eex, binary(), meta()}
++          | {:eex_block, binary(), list(eex_clause()), meta()}
++  @type eex_clause() :: {list(tag_node()), binary(), meta()}
++  @type attr :: {:root | binary(), attr_value(), meta()}
++  @type attr_value :: {:expr, binary(), meta()} | {:string, binary(), meta()}
++  @type meta() :: map()
++
+   alias Phoenix.LiveView.TagEngine.Tokenizer
+   alias Phoenix.Component.MacroComponent
+ 
+@@ -30,7 +51,8 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+       caller: caller,
+       skip_macro_components: skip_macro_components,
+       prune_text_after_slots: prune_text_after_slots,
+-      process_buffer: process_buffer
++      process_buffer: process_buffer,
++      directives: []
+     })
+   catch
+     {:syntax_error, line, column, message} ->
+@@ -233,8 +255,8 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+   #    ], %{line: 0, column: 0, opt: '='}}
+   # ]
+   # ```
+-  defp to_tree([], buffer, [], _state) do
+-    {:ok, Enum.reverse(buffer)}
++  defp to_tree([], buffer, [], state) do
++    {:ok, %__MODULE__{nodes: Enum.reverse(buffer), directives: state.directives}}
+   end
+ 
+   defp to_tree(
+@@ -269,7 +291,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        when parent_type in [:local_component, :remote_component] do
+     meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component(
+         {:self_close, :slot, name, attrs, meta},
+         tokens,
+@@ -331,7 +353,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        when is_tag_open(type) do
+     meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component({:self_close, type, name, attrs, meta}, tokens, buffer, state)
+ 
+     to_tree(tokens, buffer, stack, state)
+@@ -353,7 +375,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        ) do
+     block = Enum.reverse(reversed_buffer)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component(
+         {:block, type, name, attrs, block, open_meta, close_meta},
+         tokens,
+@@ -522,9 +544,19 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+ 
+   defp maybe_process_macro_component(tree_node, tokens, buffer, state)
+        when is_macro_component(tree_node) and not skip_macro_components(state) do
+-    # Remove :type from attrs for the macro component AST
++    caller = state.caller
++
++    if is_nil(caller) do
++      raise ArgumentError, "macro components require a caller environment"
++    end
++
++    Macro.Env.required?(caller, Phoenix.Component) ||
++      raise ArgumentError,
++            "macro components are only supported in modules that `use Phoenix.Component`"
++
+     tree_node =
+       case tree_node do
++        # Remove :type from attrs for the macro component AST
+         {:self_close, :tag, name, attrs, meta} ->
+           {:self_close, :tag, name, List.keydelete(attrs, ":type", 0), meta}
+ 
+@@ -545,21 +577,31 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+           )
+       end
+ 
+-    case process_macro_component(tree_node, state) do
+-      {:text, "", _} ->
+-        {strip_text(tokens), buffer}
++    meta = get_meta(tree_node)
++    module_string = meta.macro_component
++    module = validate_module!(module_string, meta, state)
+ 
+-      new_node ->
+-        {strip_text(tokens), [new_node | buffer]}
++    case process_macro_component(tree_node, module, state) do
++      {_new_node, directives} when directives != [] and buffer != [] ->
++        throw_syntax_error!(
++          "macro component #{inspect(module)} specified directives and therefore must appear at the very beginning of the template",
++          get_meta(tree_node)
++        )
++
++      {{:text, "", _}, directives} ->
++        {strip_text(tokens), buffer, %{state | directives: directives}}
++
++      {new_node, directives} ->
++        {strip_text(tokens), [new_node | buffer], %{state | directives: directives}}
+     end
+   end
+ 
+-  defp maybe_process_macro_component(tree_node, tokens, buffer, _state) do
+-    {tokens, [tree_node | buffer]}
++  defp maybe_process_macro_component(tree_node, tokens, buffer, state) do
++    {tokens, [tree_node | buffer], state}
+   end
+ 
+   # Process a macro component: call transform and convert result back to tree nodes
+-  defp process_macro_component(tree_node, state) do
++  defp process_macro_component(tree_node, module, state) do
+     # Macro components work by converting the tree nodes into a macro AST
+     # (see Phoenix.Component.MacroComponent) and then calling the transform
+     # function on the macro component module, which can return a transformed
+@@ -567,36 +609,29 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+     #
+     # The AST is limited in functionality and we convert it back to the regular
+     # node format afterwards.
+-    caller = state.caller
+-
+-    if is_nil(caller) do
+-      raise ArgumentError, "macro components require a caller environment"
+-    end
+-
+-    Macro.Env.required?(caller, Phoenix.Component) ||
+-      raise ArgumentError,
+-            "macro components are only supported in modules that `use Phoenix.Component`"
+-
+     meta = get_meta(tree_node)
+-    module_string = meta.macro_component
+-    module = validate_module!(module_string, meta, state)
+ 
+-    # Build the macro component AST
+-    case MacroComponent.build_ast(tree_node, caller) do
++    case MacroComponent.build_ast(tree_node, state.caller) do
+       {:ok, macro_ast} ->
+         try do
+           # Call the transform function
+-          case module.transform(macro_ast, %{env: caller}) do
++          case module.transform(macro_ast, %{env: state.caller}) do
+             {:ok, new_ast} ->
+-              MacroComponent.ast_to_tree(new_ast, meta)
++              {MacroComponent.ast_to_tree(new_ast, meta), []}
+ 
+             {:ok, new_ast, data} ->
+-              Module.put_attribute(caller.module, :__macro_components__, {module, data})
+-              MacroComponent.ast_to_tree(new_ast, meta)
++              Module.put_attribute(state.caller.module, :__macro_components__, {module, data})
++              {MacroComponent.ast_to_tree(new_ast, meta), []}
++
++            {:ok, new_ast, data, directives} ->
++              Module.put_attribute(state.caller.module, :__macro_components__, {module, data})
++
++              {MacroComponent.ast_to_tree(new_ast, meta),
++               validate_directives!(module, directives, meta)}
+ 
+             other ->
+               throw_syntax_error!(
+-                "a macro component must return {:ok, ast} or {:ok, ast, data}, got: #{inspect(other)}",
++                "a macro component must return {:ok, ast}, {:ok, ast, data}, or {:ok, ast, data, directives}, got: #{inspect(other)}",
+                 meta
+               )
+           end
+@@ -641,6 +676,39 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+     module
+   end
+ 
++  defp validate_directives!(module, directives, meta) do
++    Enum.each(directives, fn {key, value} ->
++      validate_directive!(module, key, value, meta)
++    end)
++
++    directives
++  end
++
++  defp validate_directive!(_module, :root_tag_attribute, nil, _), do: :ok
++
++  defp validate_directive!(_module, :root_tag_attribute, {name, value}, _meta)
++       when is_binary(name) and (is_binary(value) or value == true) do
++    :ok
++  end
++
++  defp validate_directive!(module, :root_tag_attribute, other, meta) do
++    throw_syntax_error!(
++      """
++      expected {name, value} for :root_tag_attribute directive from macro component #{inspect(module)}, got: #{inspect(other)}
++
++      name must be a compile-time string, and value must be a compile-time string or true
++      """,
++      meta
++    )
++  end
++
++  defp validate_directive!(module, directive, value, meta) do
++    throw_syntax_error!(
++      "unknown directive #{inspect({directive, value})} provided by macro component #{inspect(module)}",
++      meta
++    )
++  end
++
+   defp throw_syntax_error!(message, meta) do
+     throw({:syntax_error, meta.line, meta.column, message})
+   end

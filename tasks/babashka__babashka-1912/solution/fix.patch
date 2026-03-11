@@ -1,0 +1,856 @@
+diff --git a/adr/0001-jline-providers/benchmark.clj b/adr/0001-jline-providers/benchmark.clj
+new file mode 100644
+index 00000000..7072700f
+--- /dev/null
++++ b/adr/0001-jline-providers/benchmark.clj
+@@ -0,0 +1,133 @@
++#!/usr/bin/env bb
++
++;; Benchmark to compare FFM vs Exec provider performance in JLine
++;; Run with: bb jline-bench.clj
++
++(ns jline-bench
++  (:import [org.jline.terminal TerminalBuilder]
++           [org.jline.terminal.spi TerminalProvider TerminalExt SystemStream]
++           [org.jline.utils AttributedString AttributedStringBuilder AttributedStyle Display]))
++
++(def results (atom {}))
++
++(defn bench [provider-name label n f]
++  (let [start (System/nanoTime)
++        _ (dotimes [_ n] (f))
++        elapsed (/ (- (System/nanoTime) start) 1e6)
++        per-op (/ elapsed n)]
++    (swap! results assoc-in [label provider-name] {:total elapsed :per-op per-op :n n})
++    per-op))
++
++(defn test-provider [provider-name]
++  ;; First check if provider is available
++  (let [provider (try
++                   (TerminalProvider/load provider-name)
++                   (catch Exception e
++                     nil))]
++    (when provider
++      ;; Test isSystemStream (TTY detection)
++      (bench provider-name "TTY detection" 100
++             #(.isSystemStream provider SystemStream/Output))
++
++      ;; Create terminal for further tests - force same provider
++      (let [terminal (-> (TerminalBuilder/builder)
++                         (.provider provider-name)
++                         (.system true)
++                         (.build))
++            ^TerminalExt terminal-ext terminal
++            actual-provider (.name (.getProvider terminal-ext))]
++        (swap! results assoc-in ["_provider" provider-name] actual-provider)
++        (try
++          (bench provider-name "getSize" 1000
++                 #(let [size (.getSize terminal)]
++                    (.getColumns size)
++                    (.getRows size)))
++
++          (bench provider-name "getAttributes" 100
++                 #(.getAttributes terminal))
++
++          (bench provider-name "enterRawMode" 50
++                 #(let [saved (.enterRawMode terminal)]
++                    (.setAttributes terminal saved)))
++
++          (let [writer (.writer terminal)]
++            (bench provider-name "write+flush" 500
++                   #(do (.write writer "████████████████████████████████████████████████████████████████████████████████\n")
++                        (.flush writer))))
++
++          (let [display (Display. terminal false)
++                width 40
++                height 20
++                style-green (-> AttributedStyle/DEFAULT (.foreground AttributedStyle/GREEN))
++                build-frame (fn []
++                              (let [lines (java.util.ArrayList.)]
++                                (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
++                                (doseq [y (range height)]
++                                  (let [asb (AttributedStringBuilder.)]
++                                    (.append asb "|")
++                                    (doseq [x (range width)]
++                                      (if (and (= x 10) (= y 10))
++                                        (do (.style asb style-green) (.append asb "██") (.style asb AttributedStyle/DEFAULT))
++                                        (.append asb "  ")))
++                                    (.append asb "|")
++                                    (.add lines (.toAttributedString asb))))
++                                (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
++                                lines))]
++            (.resize display (+ height 2) (+ (* width 2) 2))
++            (bench provider-name "Display.update (full)" 200
++                   #(.update display (build-frame) 0)))
++
++          (let [display (Display. terminal false)
++                width 40
++                height 20
++                lines (let [lines (java.util.ArrayList.)]
++                        (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
++                        (doseq [_ (range height)]
++                          (.add lines (AttributedString. (str "|" (apply str (repeat (* width 2) " ")) "|"))))
++                        (.add lines (AttributedString. (str "+" (apply str (repeat (* width 2) "-")) "+")))
++                        lines)]
++            (.resize display (+ height 2) (+ (* width 2) 2))
++            (.update display lines 0)
++            (bench provider-name "Display.update (diff)" 500
++                   #(.update display lines 0)))
++
++          (finally
++            (.close terminal)))))))
++
++(defn print-results []
++  (println "\nJLine Provider Performance Benchmark")
++  (println "=====================================")
++  (println (str "Platform: " (System/getProperty "os.name")))
++  (println (str "Java: " (System/getProperty "java.version")))
++  (println)
++  (let [exec-actual (get-in @results ["_provider" "exec"])
++        ffm-actual (get-in @results ["_provider" "ffm"])]
++    (println (format "Exec provider: %s" (or exec-actual "N/A")))
++    (println (format "FFM provider:  %s" (or ffm-actual "N/A"))))
++  (println)
++  (println (format "%-25s %12s %12s %12s" "Operation" "Exec (ms)" "FFM (ms)" "Speedup"))
++  (println (apply str (repeat 63 "-")))
++
++  (doseq [label ["TTY detection" "getSize" "getAttributes" "enterRawMode"
++                 "write+flush" "Display.update (full)" "Display.update (diff)"]]
++    (let [exec-data (get-in @results [label "exec"])
++          ffm-data (get-in @results [label "ffm"])]
++      (when (and exec-data ffm-data)
++        (let [exec-ms (:per-op exec-data)
++              ffm-ms (:per-op ffm-data)
++              speedup (/ exec-ms ffm-ms)]
++          (println (format "%-25s %12.4f %12.4f %11.1fx" label exec-ms ffm-ms speedup))))))
++
++  (println))
++
++(defn -main [& _args]
++  ;; Test both providers
++  (test-provider "exec")
++  (test-provider "ffm")
++
++  ;; Clear screen and print results
++  (print "\u001b[2J\u001b[H")
++  (flush)
++  (print-results))
++
++(-main)
+diff --git a/adr/0001-jline-providers/decision.md b/adr/0001-jline-providers/decision.md
+new file mode 100644
+index 00000000..0b1e4aa1
+--- /dev/null
++++ b/adr/0001-jline-providers/decision.md
+@@ -0,0 +1,84 @@
++# ADR 0001: JLine Terminal Provider Strategy
++
++## Status
++
++Accepted
++
++## Context
++
++Babashka includes JLine for terminal/TUI support. JLine supports multiple terminal providers:
++
++- **FFM (Foreign Function Memory)**: Direct native calls via Java's FFM API
++- **Exec**: Shells out to commands like `stty`, `tty`, `test -t`
++- **JNI**: Native library (not used in babashka)
++
++We needed to decide which providers to include and how to handle platform differences.
++
++### Key Findings from Benchmarking
++
++| Operation | Exec (ms) | FFM (ms) | Speedup |
++|-----------|-----------|----------|---------|
++| TTY detection | 1.33 | 0.01 | 94x |
++| getSize | 1.17 | 0.006 | 207x |
++| getAttributes | 1.64 | 0.005 | 304x |
++| enterRawMode | 7.26 | 0.03 | 240x |
++| write+flush | 0.02 | 0.02 | 1.0x |
++| Display.update (full) | 0.54 | 0.54 | 1.0x |
++| Display.update (diff) | 0.03 | 0.03 | 1.0x |
++
++Key insight: **Display.update performance is identical** because JLine's Display class caches terminal size/attributes and doesn't shell out during rendering. The expensive exec operations only happen at startup and on resize.
++
++You can verify these results yourself by running `bb benchmark.clj` (included in this directory).
++
++### Platform Constraints
++
++- **Linux musl (static builds)**: FFM fails because it tries to `dlopen("libc.so.6")` which doesn't exist on musl. Only exec works.
++- **Windows native (cmd.exe, PowerShell)**: Exec requires `stty`/`tty` commands which don't exist. FFM calls Windows Console APIs directly.
++- **Windows Git Bash/MSYS/Cygwin**: Exec works (has `stty.exe` etc.)
++- **macOS, Linux glibc**: Both FFM and exec work.
++
++## Decision
++
++Include both FFM and Exec providers with the following strategy:
++
++1. **FFM as primary provider** on platforms where it works:
++   - macOS
++   - Linux with glibc
++   - Windows (native console support)
++
++2. **Exec as fallback** on platforms where FFM doesn't work:
++   - Linux musl static builds
++
++3. **TTY detection** via `babashka.terminal/tty?`:
++   - Tries FFM first, falls back to exec (same strategy as terminal creation)
++   - Returns true if fd is available for terminal use
++   - Returns false if not a TTY OR if stream is already in use by active terminal
++   - This semantic is intentional: it answers "can I create a terminal on this?" not just "is this a TTY device?"
++
++## Consequences
++
++### Positive
++
++- Cross-platform TUI support everywhere
++- Native Windows console support (no Git Bash requirement)
++- Optimal performance on macOS/Linux glibc/Windows via FFM
++- Static Linux builds still work via exec fallback
++- Practical TUI performance is identical due to Display caching
++
++### Negative
++
++- Slightly larger binary (includes both providers)
++- Startup ~10ms slower on musl static builds (exec raw mode setup)
++- Resize handling ~2ms slower on musl (exec size query)
++
++### Neutral
++
++- JLine is well-architected: Display layer insulates apps from provider differences
++- Exec fallback is solid - `stty` is POSIX standard, available everywhere on Unix
++
++## Notes
++
++- `stty` and `test` are part of POSIX and coreutils, available on all Unix systems including Alpine/musl
++- The ~10ms startup difference is imperceptible to users
++- For 60fps TUI apps, both providers leave 95%+ of frame budget for app logic
++
+diff --git a/adr/0001-jline-providers/research.bb b/adr/0001-jline-providers/research.bb
+new file mode 100755
+index 00000000..e2d690dd
+--- /dev/null
++++ b/adr/0001-jline-providers/research.bb
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bb
++
++;; Research script for TTY detection on different platforms
++;; Uses only public .spi classes (no .impl)
++
++(import '[org.jline.terminal TerminalBuilder]
++        '[org.jline.terminal.spi TerminalProvider SystemStream TerminalExt])
++
++(println "=== TTY Detection Research ===\n")
++
++(println "--- Available Providers ---")
++(let [providers (.getProviders (TerminalBuilder/builder) nil (IllegalStateException.))]
++  (println "Providers found:" (mapv #(.name %) providers))
++  (println "First (preferred):" (some-> (first providers) .name)))
++
++(println "\n--- Testing TerminalProvider/load ---")
++(doseq [provider-name ["ffm" "exec"]]
++  (println (str "Loading '" provider-name "':"))
++  (try
++    (let [p (TerminalProvider/load provider-name)]
++      (println "  Loaded:" (.name p))
++      (println "  isSystemStream stdin:" (.isSystemStream p SystemStream/Input))
++      (println "  isSystemStream stdout:" (.isSystemStream p SystemStream/Output))
++      (println "  isSystemStream stderr:" (.isSystemStream p SystemStream/Error)))
++    (catch Throwable e
++      (println "  FAILED:" (class e) (ex-message e)))))
++
++(println "\n--- Testing TerminalBuilder ---")
++(try
++  (let [t (-> (TerminalBuilder/builder)
++              (.system true)
++              (.build))
++        ^TerminalExt te t]
++    (println "Terminal class:" (.getClass t))
++    (println "Terminal type:" (.getType t))
++    (println "Terminal name:" (.getName t))
++    (println "Provider:" (.name (.getProvider te)))
++    (.close t))
++  (catch Throwable e
++    (println "TerminalBuilder FAILED:" (class e) (ex-message e))))
++
++(println "\n--- Testing babashka.terminal/tty? ---")
++(require '[babashka.terminal :as terminal])
++(println "tty? :stdin ->" (terminal/tty? :stdin))
++(println "tty? :stdout ->" (terminal/tty? :stdout))
++(println "tty? :stderr ->" (terminal/tty? :stderr))
++
++(println "\n=== Done ===")
+diff --git a/adr/0001-jline-providers/snake.clj b/adr/0001-jline-providers/snake.clj
+new file mode 100755
+index 00000000..90a5ec75
+--- /dev/null
++++ b/adr/0001-jline-providers/snake.clj
+@@ -0,0 +1,223 @@
++#!/usr/bin/env bb
++
++(ns snake
++  "Snake game TUI using JLine terminal library"
++  (:import [org.jline.terminal TerminalBuilder]
++           [org.jline.utils AttributedString AttributedStringBuilder AttributedStyle Display InfoCmp$Capability]))
++
++(defn grid-size [terminal]
++  (let [term-size (.getSize terminal)
++        cols (.getColumns term-size)
++        rows (.getRows term-size)]
++    ;; Leave room for borders and status lines
++    [(max 10 (quot (- cols 2) 2))   ; width (each cell is 2 chars)
++     (max 10 (- rows 6))]))          ; height
++
++(defonce state
++  (atom {:snake [[5 5] [4 5] [3 5]] ; initial snake body
++         :dir [1 0] ; moving right
++         :food [10 5] ; initial food
++         :alive? true
++         :score 0}))
++
++(defn random-food [snake [width height]]
++  (let [food [(rand-int width) (rand-int height)]]
++    (if (some #(= food %) snake)
++      (recur snake [width height])
++      food)))
++
++(defn move-snake [terminal]
++  (let [[width height] (grid-size terminal)]
++    (swap! state
++      (fn [{:keys [snake dir food alive?] :as st}]
++        (if (not alive?)
++          st
++          (let [head [(+ (first (first snake)) (first dir))
++                      (+ (second (first snake)) (second dir))]
++                ate? (= head food)
++                new-snake (vec (cons head (if ate? snake (butlast snake))))
++                [x y] head
++                hit-wall? (or (< x 0) (< y 0) (>= x width) (>= y height))
++                hit-self? (some #(= head %) (rest new-snake))]
++            (cond
++              hit-wall? (assoc st :alive? false)
++              hit-self? (assoc st :alive? false)
++              ate? (-> st
++                       (assoc :snake new-snake)
++                       (assoc :food (random-food new-snake [width height]))
++                       (update :score inc))
++              :else (assoc st :snake new-snake))))))))
++
++(defn handle-key [key]
++  (swap! state update :dir
++    (fn [dir]
++      (case key
++        (:up \k) (if (= dir [0 1]) dir [0 -1])
++        (:down \j) (if (= dir [0 -1]) dir [0 1])
++        (:left \h) (if (= dir [1 0]) dir [-1 0])
++        (:right \l) (if (= dir [-1 0]) dir [1 0])
++        dir))))
++
++(defn clear-screen [terminal]
++  (.puts terminal InfoCmp$Capability/clear_screen (object-array 0))
++  (.flush terminal))
++
++(def ^:private style-green-bright (-> AttributedStyle/DEFAULT (.foreground AttributedStyle/GREEN) (.bold)))
++(def ^:private style-green (.foreground AttributedStyle/DEFAULT AttributedStyle/GREEN))
++(def ^:private style-red (.foreground AttributedStyle/DEFAULT AttributedStyle/RED))
++(def ^:private style-default AttributedStyle/DEFAULT)
++
++(defn- build-row-line [snake food width y]
++  "Build an AttributedString for a single game row"
++  (let [asb (AttributedStringBuilder.)]
++    (.style asb style-default)
++    (.append asb "|")
++    (doseq [x (range width)]
++      (let [pos [x y]
++            is-head (= pos (first snake))
++            is-body (and (not is-head) (some #(= pos %) snake))
++            is-food (= pos food)]
++        (cond
++          is-head (do (.style asb style-green-bright) (.append asb "██"))
++          is-body (do (.style asb style-green) (.append asb "██"))
++          is-food (do (.style asb style-red) (.append asb "██"))
++          :else (do (.style asb style-default) (.append asb "  ")))))
++    (.style asb style-default)
++    (.append asb "|")
++    (.toAttributedString asb)))
++
++(defn- build-display-lines [terminal]
++  "Build all lines for the display as AttributedStrings"
++  (let [{:keys [snake food alive? score]} @state
++        term-size (.getSize terminal)
++        cols (.getColumns term-size)
++        rows (.getRows term-size)
++        [width height] (grid-size terminal)
++        border-line (str "+" (apply str (repeat (* width 2) "-")) "+")
++        lines (java.util.ArrayList.)]
++    ;; Top border
++    (.add lines (AttributedString. border-line))
++    ;; Grid rows
++    (doseq [y (range height)]
++      (.add lines (build-row-line snake food width y)))
++    ;; Bottom border
++    (.add lines (AttributedString. border-line))
++    ;; Empty line
++    (.add lines (AttributedString. ""))
++    ;; Score line
++    (.add lines (AttributedString. (str "Score: " score "  |  Terminal: " cols "x" rows "  |  Grid: " width "x" height)))
++    ;; Controls line
++    (.add lines (AttributedString. "Controls: Arrow keys or hjkl | q to quit"))
++    ;; Game over message
++    (when (not alive?)
++      (.add lines (AttributedString. ""))
++      (.add lines (AttributedString. "*** GAME OVER! Press 'r' to restart or 'q' to quit ***")))
++    lines))
++
++(defn render [display terminal]
++  (let [term-size (.getSize terminal)
++        cols (.getColumns term-size)
++        rows (.getRows term-size)]
++    (.resize display rows cols)
++    (.update display (build-display-lines terminal) 0)))
++
++(defn restart-game [terminal]
++  (let [[width height] (grid-size terminal)
++        start-y (quot height 2)]
++    (reset! state {:snake [[5 start-y] [4 start-y] [3 start-y]]
++                   :dir [1 0]
++                   :food [(quot width 2) start-y]
++                   :alive? true
++                   :score 0})))
++
++(defn read-key [reader]
++  (let [c (.read reader 1)]
++    (when (pos? c)
++      (cond
++        ;; ESC sequences
++        (= c 27)
++        (let [c2 (.read reader 50)]
++          (when (pos? c2)
++            (case c2
++              ;; ESC [ A/B/C/D (Unix/ANSI)
++              91 (let [c3 (.read reader 50)]
++                   (case c3
++                     65 :up
++                     66 :down
++                     67 :right
++                     68 :left
++                     nil))
++              ;; ESC O A/B/C/D (Application mode / Windows)
++              79 (let [c3 (.read reader 50)]
++                   (case c3
++                     65 :up
++                     66 :down
++                     67 :right
++                     68 :left
++                     nil))
++              nil)))
++        ;; Regular character
++        :else (char c)))))
++
++(defn -main [& _args]
++  (let [terminal (-> (TerminalBuilder/builder)
++                     (.system true)
++                     (.build))
++        reader (.reader terminal)
++        display (Display. terminal false)
++        term-size (.getSize terminal)]
++    (println "Terminal size:" (.getColumns term-size) "x" (.getRows term-size))
++    (println "Terminal type:" (.getType terminal))
++    (println "Press any key to start...")
++    (.read reader)
++    (try
++      ;; Enter raw mode for unbuffered input
++      (.enterRawMode terminal)
++      (clear-screen terminal)
++      (render display terminal)
++
++      ;; Game loop
++      (loop [last-move (System/currentTimeMillis)
++             running true]
++        (when running
++          (let [now (System/currentTimeMillis)
++                elapsed (- now last-move)
++                {:keys [alive?]} @state
++                key (read-key reader)]
++
++            ;; Handle input
++            (cond
++              ;; Quit
++              (= key \q)
++              (clear-screen terminal)
++
++              ;; Restart when dead
++              (and (not alive?) (= key \r))
++              (do (restart-game terminal)
++                  (clear-screen terminal)
++                  (render display terminal)
++                  (recur now true))
++
++              ;; Direction change
++              key
++              (do (handle-key key)
++                  (recur last-move true))
++
++              ;; Move snake on timer
++              (and alive? (>= elapsed 150))
++              (do (move-snake terminal)
++                  (render display terminal)
++                  (recur now true))
++
++              ;; Keep looping
++              :else
++              (do (Thread/sleep 10)
++                  (recur last-move true))))))
++
++      (finally
++        (.close terminal)))))
++
++#_(when (= *file* (System/getProperty "babashka.file"))
++  (-main))
++
++(-main)
+diff --git a/adr/0002-linux-static-default/decision.md b/adr/0002-linux-static-default/decision.md
+new file mode 100644
+index 00000000..7e4f653c
+--- /dev/null
++++ b/adr/0002-linux-static-default/decision.md
+@@ -0,0 +1,56 @@
++# ADR 0002: Linux Static Binary as Default
++
++## Status
++
++Accepted
++
++## Context
++
++Babashka provides multiple Linux builds:
++
++- **x86_64 static binary**: Compiled against musl, no external dependencies
++- **x86_64 dynamic binary**: Compiled against glibc, requires compatible system glibc
++- **aarch64 "mostly static" binary**: Statically linked but with external glibc
++
++The static binary has been the default for x86_64 Linux installations (via install script, brew, etc.) for years. This ensures babashka works on virtually every x86_64 Linux system regardless of the glibc version installed.
++
++Note: On aarch64, the "mostly static" build uses glibc, so FFM works there. The musl limitation only affects the fully static x86_64 build.
++
++When adding JLine for TUI support, we discovered that JLine's optimal provider (FFM - Foreign Function Memory) doesn't work on musl static builds because it tries to `dlopen("libc.so.6")` which doesn't exist. This raised the question: should we change the default to dynamic builds?
++
++## Decision
++
++**Keep static binary as the default for Linux.**
++
++### Rationale
++
++1. **JLine's fallback works well**: The exec provider (which shells out to `stty`, `test -t`, etc.) works on musl and performs almost equally well for practical TUI use cases. JLine's Display class caches terminal state, so the expensive shell-out operations only happen at startup and on resize - not during rendering. See [ADR 0001](../0001-jline-providers/decision.md) for benchmark details.
++
++2. **Universal compatibility is valuable**: The static binary works on any Linux without worrying about glibc version mismatches. This is especially important for a scripting tool that users expect to "just work."
++
++3. **No breaking change**: Users and tooling have relied on static being the default for years. Changing this would require coordination and could cause issues.
++
++4. **Dynamic is still available**: Users who want FFM performance can install the dynamic build with a flag.
++
++## Consequences
++
++### Positive
++
++- Babashka continues to work on all Linux systems
++- No change required for existing users or installation tooling
++- TUI features work via exec provider fallback
++- Users can opt-in to dynamic build if needed
++
++### Negative
++
++- Static builds have slightly slower JLine startup (~10ms for raw mode setup)
++- Resize handling is slower (~2ms per resize event)
++
++### Neutral
++
++- These performance differences are imperceptible in practice
++- TUI rendering performance is identical (Display caches internally)
++
++## Summary
++
++Adding JLine doesn't change the Linux distribution strategy. Static binary remains the default with full TUI support via the exec provider. Users get more features (TUIs, improved REPL) without any downsides.
+diff --git a/project.clj b/project.clj
+index 9bf3da2c..b0038e95 100644
+--- a/project.clj
++++ b/project.clj
+@@ -21,7 +21,7 @@
+                    :windows (complement (some-fn :skip-windows :flaky))
+                    :non-flaky (complement :flaky)
+                    :flaky :flaky}
+-  :jvm-opts ["--enable-preview"]
++  :jvm-opts ["--enable-preview" "--enable-native-access=ALL-UNNAMED"]
+   :dependencies [[org.clojure/clojure "1.12.3"]
+                  [borkdude/edamame "1.5.37"]
+                  [org.clojure/tools.cli "1.0.214"]
+@@ -44,6 +44,12 @@
+                  [org.jline/jline-terminal "3.30.6"
+                   :exclusions [;; this saves 1mb of native-image size
+                                org.jline/jline-native]]
++                 #_[org.jline/jansi "3.30.6"
++                  :exclusions [;; this saves 1mb of native-image size
++                               org.jline/jline-native]]
++                 #_[org.jline/jansi-core "3.30.6"
++                  :exclusions [;; this saves 1mb of native-image size
++                               org.jline/jline-native]]
+                  [org.jline/jline-reader "3.30.6"]]
+   :plugins       [[org.kipz/lein-meta-bom "0.1.1"]]
+   :metabom {:jar-name "metabom.jar"}
+diff --git a/resources/META-INF/babashka/deps.edn b/resources/META-INF/babashka/deps.edn
+index fc01a476..24730c9a 100644
+--- a/resources/META-INF/babashka/deps.edn
++++ b/resources/META-INF/babashka/deps.edn
+@@ -60,7 +60,8 @@
+                                                org.jline/jline-native]}
+         org.jline/jline-reader {:mvn/version "3.30.6"}}
+  :aliases {:babashka/dev
+-           {:main-opts ["-m" "babashka.main"]}
++           {:main-opts ["-m" "babashka.main"]
++            :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+            :profile
+            {:extra-deps
+             {com.clojure-goes-fast/clj-async-profiler {:mvn/version "0.5.0"}}
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index 618f1ee0..17e4204f 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -641,7 +641,10 @@
+           ;; jline
+           org.jline.terminal.Terminal
+           org.jline.terminal.TerminalBuilder
++          org.jline.terminal.Attributes
+           org.jline.utils.AttributedString
++          org.jline.utils.AttributedStringBuilder
++          org.jline.utils.AttributedStyle
+           org.jline.utils.InfoCmp$Capability
+           org.jline.utils.NonBlockingReader
+           org.jline.utils.Display
+@@ -651,8 +654,11 @@
+           org.jline.reader.LineReaderBuilder
+           org.jline.reader.EndOfFileException
+           org.jline.reader.UserInterruptException
+-          org.jline.terminal.impl.ffm.FfmTerminalProvider
++          org.jline.keymap.KeyMap
+           org.jline.terminal.Terminal$SignalHandler
++          org.jline.terminal.spi.TerminalProvider
++          org.jline.terminal.spi.TerminalExt ;; cast Terminal to this and then .getProvider
++          org.jline.terminal.spi.SystemStream
+           ;; end jline
+           ]
+     :constructors [clojure.lang.Delay
+@@ -886,6 +892,8 @@
+                                    ;; jline: check before Closeable since NonBlockingReader extends Closeable
+                                    (instance? org.jline.utils.NonBlockingReader v)
+                                    org.jline.utils.NonBlockingReader
++                                   (instance? org.jline.terminal.spi.TerminalProvider v)
++                                   org.jline.terminal.spi.TerminalProvider
+                                    (instance? java.io.Closeable v)
+                                    java.io.Closeable
+                                    (instance? java.util.Collection v)
+diff --git a/src/babashka/impl/repl.clj b/src/babashka/impl/repl.clj
+index 13f9f69a..ac093175 100644
+--- a/src/babashka/impl/repl.clj
++++ b/src/babashka/impl/repl.clj
+@@ -1,9 +1,11 @@
+ (ns babashka.impl.repl
+   {:no-doc true}
+   (:require
++   [babashka.fs :as fs]
+    [babashka.impl.clojure.core :as core-extras]
+    [babashka.impl.clojure.main :as m]
+    [babashka.impl.common :as common]
++   [babashka.terminal :as terminal]
+    [clojure.java.io :as io]
+    [clojure.string :as str]
+    [clojure.tools.reader.reader-types :as r]
+@@ -11,7 +13,11 @@
+    [sci.impl.interpreter :refer [eval-form]]
+    [sci.impl.io :as sio]
+    [sci.impl.parser :as parser]
+-   [sci.impl.utils :as utils]))
++   [sci.impl.utils :as utils])
++  (:import
++   [org.jline.reader LineReaderBuilder EndOfFileException UserInterruptException]
++   [org.jline.terminal TerminalBuilder]))
++
+ 
+ (set! *warn-on-reflection* true)
+ 
+@@ -74,7 +80,7 @@
+                       (sio/println "Babashka"
+                                    (str "v" (str/trim (slurp (io/resource "BABASHKA_VERSION" common/jvm-loader))))
+                                    "REPL.")
+-                      (sio/println "Use :repl/quit or :repl/exit to quit the REPL.")
++                      (sio/println "Use CTRL+D or :repl/exit to quit the REPL.")
+                       (sio/println "Clojure rocks, Bash reaches.")
+                       (sio/println))
+                     (eval-form sci-ctx `(apply require (quote ~m/repl-requires)))))
+@@ -96,10 +102,135 @@
+         :print (or print sio/prn)
+         :caught (or caught repl-caught))))))
+ 
++(defn- create-line-reader
++  "Creates a JLine LineReader for interactive input with persistent history."
++  ^org.jline.reader.LineReader []
++  (let [terminal (-> (TerminalBuilder/builder)
++                     (.system true)
++                     (.build))
++        history-file (fs/path (fs/home) ".bb_repl_history")]
++    (-> (LineReaderBuilder/builder)
++        (.terminal terminal)
++        (.variable org.jline.reader.LineReader/HISTORY_FILE history-file)
++        (.build))))
++
++(defn- read-remaining
++  "Read remaining characters from a reader into a string."
++  [reader]
++  (let [sb (StringBuilder.)]
++    (loop []
++      (let [c (r/read-char reader)]
++        (if (nil? c)
++          (str sb)
++          (do (.append sb c)
++              (recur)))))))
++
++;; Sentinel value for interrupted input - skip eval and print
++(def ^:private interrupted (Object.))
++
++(defn- jline-read
++  "Read function for m/repl that uses JLine for input.
++   Buffers lines until a complete form is available.
++   Implements Node-style Ctrl+C behavior: first Ctrl+C on empty prompt shows warning,
++   second Ctrl+C exits."
++  [sci-ctx ^org.jline.reader.LineReader line-reader input-buffer ctrl-c-pending _request-prompt request-exit]
++  (let [has-prior-input (atom (not (str/blank? @input-buffer)))]
++    (try
++      (loop [input @input-buffer
++             first-line? (str/blank? @input-buffer)]
++        (let [reader (r/source-logging-push-back-reader input)
++              parse-result
++              (try
++                (when-not (str/blank? input)
++                  ;; Skip leading whitespace
++                  (loop []
++                    (let [c (r/read-char reader)]
++                      (cond
++                        (nil? c) nil
++                        (Character/isWhitespace ^Character c) (recur)
++                        :else (do (r/unread reader c)
++                                  (let [form (parser/parse-next sci-ctx reader)
++                                        remaining (read-remaining reader)]
++                                    (reset! input-buffer remaining)
++                                    (reset! ctrl-c-pending false)
++                                    [:form form]))))))
++                (catch Exception e
++                  (let [msg (ex-message e)]
++                    (if (and msg (str/includes? msg "EOF"))
++                      [:incomplete]
++                      (do
++                        (reset! input-buffer "")
++                        (throw e))))))]
++          (case (first parse-result)
++            ;; Got a complete form
++            :form
++            (let [form (second parse-result)]
++              (if (or (identical? :repl/quit form)
++                      (identical? :repl/exit form))
++                request-exit
++                form))
++
++            ;; Need more input (nil or :incomplete)
++            (let [prompt (if first-line?
++                           (str (utils/current-ns-name) "=> ")
++                           "   ")
++                  line (.readLine line-reader prompt)
++                  new-input (str input (when-not (str/blank? input) "\n") line)]
++              (reset! has-prior-input true)
++              (reset! ctrl-c-pending false)
++              (recur new-input false)))))
++      (catch EndOfFileException _
++        request-exit)
++      (catch UserInterruptException e
++        (let [partial-line (.getPartialLine e)
++              had-input? (or @has-prior-input (not (str/blank? partial-line)))]
++          (reset! input-buffer "")
++          (if (and (not had-input?) @ctrl-c-pending)
++            ;; Second Ctrl+C on empty prompt - exit
++            request-exit
++            (do
++              (when (not had-input?)
++                ;; First Ctrl+C on empty prompt - show warning
++                (reset! ctrl-c-pending true)
++                (sio/println "(To exit, press Ctrl+C again or Ctrl+D or type :repl/exit)"))
++              interrupted)))))))
++
++(defn repl-with-line-reader
++  "REPL using a JLine LineReader for interactive input.
++   Exposed for testing with mock LineReaders."
++  [sci-ctx line-reader opts]
++  (let [input-buffer (atom "")
++        ctrl-c-pending (atom false)]
++    (repl sci-ctx
++          (merge opts
++                 {:need-prompt (constantly false)  ;; JLine handles prompting
++                  :prompt (constantly nil)         ;; No-op, JLine handles prompting
++                  :read (fn [request-prompt request-exit]
++                          (jline-read sci-ctx line-reader input-buffer ctrl-c-pending request-prompt request-exit))
++                  :eval (fn [form]
++                          (if (identical? form interrupted)
++                            interrupted
++                            (sci/with-bindings {sci/file "<repl>"
++                                                sci/*1 *1
++                                                sci/*2 *2
++                                                sci/*3 *3
++                                                sci/*e *e}
++                              (eval-form sci-ctx form))))
++                  :print (fn [val]
++                           (when-not (identical? val interrupted)
++                             (sio/prn val)))}))))
++
++(defn- repl-with-jline
++  "REPL using JLine for interactive line editing and history."
++  [sci-ctx opts]
++  (repl-with-line-reader sci-ctx (create-line-reader) opts))
++
+ (defn start-repl!
+   ([sci-ctx] (start-repl! sci-ctx nil))
+   ([sci-ctx opts]
+-   (repl sci-ctx opts)))
++   (if (terminal/tty? :stdin)
++     (repl-with-jline sci-ctx opts)
++     (repl sci-ctx opts))))
+ 
+ ;;;; Scratch
+ 
+diff --git a/src/babashka/terminal.clj b/src/babashka/terminal.clj
+index c3c3d84f..b199bcaf 100644
+--- a/src/babashka/terminal.clj
++++ b/src/babashka/terminal.clj
+@@ -1,13 +1,15 @@
+ (ns babashka.terminal
+-  ;; MB: relying on Jline's internals here, but we can always implement this
+-  ;; ourselves if this changes using Java's FFM stuff.
+-  (:import [org.jline.terminal.spi SystemStream]
+-           [org.jline.terminal.impl.ffm FfmTerminalProvider]))
++  (:import [org.jline.terminal TerminalBuilder]
++           [org.jline.terminal.spi SystemStream TerminalProvider]))
+ 
+ (set! *warn-on-reflection* true)
+ 
++;; Get first available provider in default order: FFM, JNI, Exec
++(def ^:private provider
++  (delay (first (.getProviders (TerminalBuilder/builder) nil (IllegalStateException.)))))
++
+ (defn- system-stream? [^SystemStream stream]
+-  (.isSystemStream (FfmTerminalProvider.) stream))
++  (.isSystemStream ^TerminalProvider @provider stream))
+ 
+ (defn tty?
+   "Returns true if the given file descriptor is associated with a terminal.
+@@ -18,4 +20,3 @@
+     :stdout (system-stream? SystemStream/Output)
+     :stderr (system-stream? SystemStream/Error)
+     (throw (IllegalArgumentException. (str "Invalid file descriptor: " fd ". Expected :stdin, :stdout, or :stderr.")))))
+-

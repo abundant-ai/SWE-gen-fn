@@ -1,0 +1,11 @@
+When running on Elixir 1.18, applications may configure Ecto-related JSON encoding to use the built-in `JSON` module instead of `Jason`. This currently fails because Ecto expects JSON libraries to provide an `encode/1` function returning `{:ok, iodata} | {:error, reason}`, but `JSON` provides `encode!/1` (raising on error) and does not match the expected API. As a result, switching the configured JSON library from `Jason` to `JSON` causes runtime failures such as undefined function errors (e.g., `encode/1 is not defined`) or mismatched behavior around error reporting.
+
+Ecto should support flipping between `Jason` and `JSON` without requiring downstream adapters or applications to special-case Elixir versions. In particular:
+
+- Calling `Jason.encode!/1` and `JSON.encode!/1` on Ecto-related values should work consistently, including encoding `Decimal` values (for example, encoding `Decimal.new("1.0")` should produce the JSON string `"1.0"`).
+
+- Encoding Ecto structs must continue to fail fast and with clear runtime errors for unsupported internal fields. Specifically, attempting to encode an association that is not loaded (e.g. an Ecto association struct/value representing “not loaded”) must raise a `RuntimeError` whose message indicates that the association cannot be encoded and includes both the association name and the struct being encoded (for example, it should match a pattern like: `cannot encode association :comments from <YourSchema> to JSON`).
+
+- Attempting to encode Ecto metadata (the `:__meta__` field) must also raise a `RuntimeError` with a message indicating metadata from `:__meta__` cannot be encoded for the given schema to JSON (for example, matching: `cannot encode metadata from the :__meta__ field for <YourSchema> to JSON`).
+
+Overall, `JSON` must be usable as a drop-in replacement for `Jason` in Ecto’s JSON handling on Elixir 1.18, preserving the existing error semantics for Ecto associations/metadata while providing a compatible encoding API (including non-bang behavior that returns `{:ok, encoded} | {:error, reason}` where Ecto expects it).

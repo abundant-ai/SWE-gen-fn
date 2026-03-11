@@ -1,0 +1,80 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7eb3ea52..0dfef74b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -27,6 +27,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2176, Errors raised with `SQLSTATE` now include the message and the code in the response body - @laurenceisla
+  - #2236, Support POSIX regular expression operators for row filtering - @enote-kane
+  - #2202, Allow returning XML from RPCs - @fjf2002
++ - #2269, Allow `limit=0` in the request query to return an empty array - @gautam1168, @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/RangeQuery.hs b/src/PostgREST/RangeQuery.hs
+index 4d92b130..bbe7b3df 100644
+--- a/src/PostgREST/RangeQuery.hs
++++ b/src/PostgREST/RangeQuery.hs
+@@ -10,6 +10,8 @@ module PostgREST.RangeQuery (
+ , restrictRange
+ , rangeGeq
+ , allRange
++, limitZeroRange
++, hasLimitZero
+ , NonnegRange
+ , rangeStatusHeader
+ , contentRangeH
+@@ -74,6 +76,15 @@ rangeLeq :: Integer -> NonnegRange
+ rangeLeq n =
+   Range BoundaryBelowAll (BoundaryAbove n)
+ 
++-- Special case to allow limit 0 queries
++-- https://github.com/PostgREST/postgrest/issues/1121
++-- 0 <= x <= -1
++limitZeroRange :: Range Integer
++limitZeroRange = Range (BoundaryBelow 0) (BoundaryAbove (-1))
++
++hasLimitZero :: Range Integer -> Bool
++hasLimitZero r = rangeUpper r == rangeUpper limitZeroRange
++
+ rangeStatusHeader :: NonnegRange -> Int64 -> Maybe Int64 -> (Status, Header)
+ rangeStatusHeader topLevelRange queryTotal tableTotal =
+   let lower = rangeOffset topLevelRange
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index e7a1d2b0..76294137 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -50,6 +50,8 @@ import PostgREST.DbStructure.Identifiers (FieldName,
+ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+                                           ProcParam (..), ProcsMap)
+ import PostgREST.RangeQuery              (NonnegRange, allRange,
++                                          hasLimitZero,
++                                          limitZeroRange,
+                                           rangeRequested)
+ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferParameters (..),
+@@ -180,7 +182,7 @@ apiRequest :: AppConfig -> DbStructure -> Request -> RequestBody -> QueryParams.
+ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..}
+   | isJust profile && fromJust profile `notElem` configDbSchemas = Left $ UnacceptableSchema $ toList configDbSchemas
+   | isTargetingProc && method `notElem` ["HEAD", "GET", "POST"] = Left ActionInappropriate
+-  | topLevelRange == emptyRange = Left InvalidRange
++  | isInvalidRange = Left InvalidRange
+   | shouldParsePayload && isLeft payload = either (Left . InvalidBody) witness payload
+   | not expectParams && not (L.null qsParams) = Left $ ParseRequestError "Unexpected param or filter missing operator" ("Failed to parse " <> show qsParams)
+   | otherwise = do
+@@ -330,8 +332,14 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+   lookupHeader    = flip lookup hdrs
+   Preferences.Preferences{..} = Preferences.fromHeaders hdrs
+   headerRange = rangeRequested hdrs
+-
+-  ranges = M.insert "limit" (rangeIntersection headerRange (fromMaybe allRange (M.lookup "limit" qsRanges))) qsRanges
++  limitRange = fromMaybe allRange (M.lookup "limit" qsRanges)
++  headerAndLimitRange = rangeIntersection headerRange limitRange
++
++  -- Bypass all the ranges and send only the limit zero range (0 <= x <= -1) if
++  -- limit=0 is present in the query params (not allowed for the Range header)
++  ranges = M.insert "limit" (if hasLimitZero limitRange then limitZeroRange else headerAndLimitRange) qsRanges
++  -- The only emptyRange allowed is the limit zero range
++  isInvalidRange = topLevelRange == emptyRange && not (hasLimitZero limitRange)
+ 
+ {-|
+   Find the best match from a list of content types accepted by the

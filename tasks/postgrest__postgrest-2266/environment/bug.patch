@@ -1,0 +1,473 @@
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 7404fcb6..66b1ed98 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -51,8 +51,7 @@ import PostgREST.DbStructure.Proc         (PgType (..),
+                                            ProcsMap, RetType (..))
+ import PostgREST.DbStructure.Relationship (Cardinality (..),
+                                            Junction (..),
+-                                           Relationship (..),
+-                                           RelationshipsMap)
++                                           Relationship (..))
+ import PostgREST.DbStructure.Table        (Column (..), Table (..),
+                                            TablesMap)
+ 
+@@ -61,7 +60,7 @@ import Protolude
+ 
+ data DbStructure = DbStructure
+   { dbTables        :: TablesMap
+-  , dbRelationships :: RelationshipsMap
++  , dbRelationships :: [Relationship]
+   , dbProcs         :: ProcsMap
+   }
+   deriving (Generic, JSON.ToJSON)
+@@ -96,24 +95,22 @@ queryDbStructure schemas extraSearchPath prepared = do
+   procs   <- SQL.statement schemas $ allProcs pgVer prepared
+ 
+   let tabsWViewsPks = addViewPrimaryKeys tabs keyDeps
+-      rels          = relsToMap $ addO2MRels $ addM2MRels tabsWViewsPks $ addViewM2ORels keyDeps m2oRels
++      rels          = addO2MRels $ addM2MRels tabsWViewsPks $ addViewM2ORels keyDeps m2oRels
+ 
+   return $ removeInternal schemas $ DbStructure {
+       dbTables = tabsWViewsPks
+     , dbRelationships = rels
+     , dbProcs = procs
+     }
+-  where
+-    relsToMap = map sort . M.fromListWith (++) . map ((\(x,y) -> (x, [y])) . addKey)
+-    addKey rel = (relTable rel, rel)
+ 
+ -- | Remove db objects that belong to an internal schema(not exposed through the API) from the DbStructure.
+ removeInternal :: [Schema] -> DbStructure -> DbStructure
+ removeInternal schemas dbStruct =
+   DbStructure {
+       dbTables        = M.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas) $ dbTables dbStruct
+-    , dbRelationships = filter (\r -> qiSchema (relForeignTable r) `elem` schemas && not (hasInternalJunction r)) <$>
+-                        M.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas ) (dbRelationships dbStruct)
++    , dbRelationships = filter (\x -> qiSchema (relTable x) `elem` schemas &&
++                                      qiSchema (relForeignTable x) `elem` schemas &&
++                                      not (hasInternalJunction x)) $ dbRelationships dbStruct
+     , dbProcs         = dbProcs dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+     }
+   where
+@@ -146,13 +143,20 @@ decodeTables =
+ 
+ decodeRels :: HD.Result [Relationship]
+ decodeRels =
+- HD.rowList relRow
++  map relFromRow <$> HD.rowList relRow
+  where
+-  relRow =
+-    Relationship <$>
+-    (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    (QualifiedIdentifier <$> column HD.text <*> column HD.text) <*>
+-    (M2O <$> column HD.text <*> compositeArrayColumn ((,) <$> compositeField HD.text <*> compositeField HD.text))
++  relRow = (,,,,,)
++    <$> column HD.text <*> column HD.text
++    <*> column HD.text <*> column HD.text
++    <*> column HD.text
++    <*> compositeArrayColumn
++        ((,)
++        <$> compositeField HD.text
++        <*> compositeField HD.text)
++
++relFromRow :: (Text, Text, Text, Text, Text, [(Text, Text)]) -> Relationship
++relFromRow (rs, rt, frs, frt, cn, cs) =
++  Relationship (QualifiedIdentifier rs rt) (QualifiedIdentifier frs frt) (M2O cn cs)
+ 
+ decodeViewKeyDeps :: HD.Result [ViewKeyDependency]
+ decodeViewKeyDeps =
+diff --git a/src/PostgREST/DbStructure/Relationship.hs b/src/PostgREST/DbStructure/Relationship.hs
+index 391cba85..4f0fcc09 100644
+--- a/src/PostgREST/DbStructure/Relationship.hs
++++ b/src/PostgREST/DbStructure/Relationship.hs
+@@ -6,11 +6,9 @@ module PostgREST.DbStructure.Relationship
+   , Relationship(..)
+   , Junction(..)
+   , isSelfReference
+-  , RelationshipsMap
+   ) where
+ 
+-import qualified Data.Aeson          as JSON
+-import qualified Data.HashMap.Strict as M
++import qualified Data.Aeson as JSON
+ 
+ import PostgREST.DbStructure.Identifiers (FieldName,
+                                           QualifiedIdentifier)
+@@ -24,7 +22,7 @@ data Relationship = Relationship
+   , relForeignTable :: QualifiedIdentifier
+   , relCardinality  :: Cardinality
+   }
+-  deriving (Eq, Ord, Generic, JSON.ToJSON)
++  deriving (Eq, Generic, JSON.ToJSON)
+ 
+ -- | The relationship cardinality
+ -- | https://en.wikipedia.org/wiki/Cardinality_(data_modeling)
+@@ -36,7 +34,7 @@ data Cardinality
+   -- ^ many-to-one
+   | M2M Junction
+   -- ^ many-to-many
+-  deriving (Eq, Ord, Generic, JSON.ToJSON)
++  deriving (Eq, Generic, JSON.ToJSON)
+ 
+ type FKConstraint = Text
+ 
+@@ -48,9 +46,7 @@ data Junction = Junction
+   , junColumns1    :: [(FieldName, FieldName)]
+   , junColumns2    :: [(FieldName, FieldName)]
+   }
+-  deriving (Eq, Ord, Generic, JSON.ToJSON)
++  deriving (Eq, Generic, JSON.ToJSON)
+ 
+ isSelfReference :: Relationship -> Bool
+ isSelfReference r = relTable r == relForeignTable r
+-
+-type RelationshipsMap = M.HashMap QualifiedIdentifier [Relationship]
+diff --git a/src/PostgREST/OpenAPI.hs b/src/PostgREST/OpenAPI.hs
+index 7a04fb95..2ade86b6 100644
+--- a/src/PostgREST/OpenAPI.hs
++++ b/src/PostgREST/OpenAPI.hs
+@@ -31,8 +31,7 @@ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+                                            ProcParam (..))
+ import PostgREST.DbStructure.Relationship (Cardinality (..),
+-                                           Relationship (..),
+-                                           RelationshipsMap)
++                                           Relationship (..))
+ import PostgREST.DbStructure.Table        (Column (..), Table (..),
+                                            TablesMap)
+ import PostgREST.Version                  (docsVersion, prettyVersion)
+@@ -80,7 +79,7 @@ parseDefault colType colDefault =
+   where
+     wrapInQuotations text = "\"" <> text <> "\""
+ 
+-makeTableDef :: RelationshipsMap -> Table -> (Text, Schema)
++makeTableDef :: [Relationship] -> Table -> (Text, Schema)
+ makeTableDef rels t =
+   let tn = tableName t in
+       (tn, (mempty :: Schema)
+@@ -89,7 +88,7 @@ makeTableDef rels t =
+         & properties .~ fromList (makeProperty t rels <$> tableColumns t)
+         & required .~ fmap colName (filter (not . colNullable) $ tableColumns t))
+ 
+-makeProperty :: Table -> RelationshipsMap -> Column -> (Text, Referenced Schema)
++makeProperty :: Table -> [Relationship] -> Column -> (Text, Referenced Schema)
+ makeProperty tbl rels col = (colName col, Inline s)
+   where
+     e = if null $ colEnum col then Nothing else JSON.decode $ JSON.encode $ colEnum col
+@@ -100,7 +99,7 @@ makeProperty tbl rels col = (colName col, Inline s)
+         rel = find (\case
+           Relationship{relCardinality=(M2O _ relColumns)} -> [colName col] == (fst <$> relColumns)
+           _                                               -> False
+-          ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier (tableSchema tbl) (tableName tbl)) rels
++          ) rels
+         fCol = (headMay . (\r -> snd <$> relColumns (relCardinality r)) =<< rel)
+         fTbl = qiName . relForeignTable <$> rel
+         fTblCol = (,) <$> fTbl <*> fCol
+@@ -321,7 +320,7 @@ escapeHostName "*6" = "0.0.0.0"
+ escapeHostName "!6" = "0.0.0.0"
+ escapeHostName h    = h
+ 
+-postgrestSpec :: RelationshipsMap -> [ProcDescription] -> [Table] -> (Text, Text, Integer, Text) -> Maybe Text -> Swagger
++postgrestSpec :: [Relationship] -> [ProcDescription] -> [Table] -> (Text, Text, Integer, Text) -> Maybe Text -> Swagger
+ postgrestSpec rels pds ti (s, h, p, b) sd = (mempty :: Swagger)
+   & basePath ?~ T.unpack b
+   & schemes ?~ [s']
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 761d22ca..3353fb4f 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -219,19 +219,17 @@ requestToCallProcQuery (FunctionCall qi params args returnsScalar multipleCall r
+ -- See https://github.com/PostgREST/postgrest/issues/2009#issuecomment-977473031
+ -- Only for the nodes that have an INNER JOIN linked to the root level.
+ readRequestToCountQuery :: ReadRequest -> SQL.Snippet
+-readRequestToCountQuery (Node (Select{from=mainQi, fromAlias=tblAlias, implicitJoins=implJoins, where_=logicForest, joinConditions=joinConditions_}, _) forest) =
+-  "SELECT 1 FROM " <> SQL.sql (BS.intercalate ", " (tabl : implJs)) <>
++readRequestToCountQuery (Node (Select{from=qi, implicitJoins=implJoins, where_=logicForest, joinConditions=joinConditions_}, _) forest) =
++  "SELECT 1 FROM " <> SQL.sql (BS.intercalate ", " (fromQi qi:(fromQi <$> implJoins))) <>
+   (if null logicForest && null joinConditions_ && null subQueries
+     then mempty
+     else " WHERE " ) <>
+   intercalateSnippet " AND " (
+-    map (pgFmtLogicTree mainQi) logicForest ++
++    map (pgFmtLogicTree qi) logicForest ++
+     map pgFmtJoinCondition joinConditions_ ++
+     subQueries
+   )
+   where
+-    tabl = fromQi mainQi <> maybe mempty (\a -> " AS " <> pgFmtIdent a) tblAlias
+-    implJs = fromQi <$> implJoins
+     subQueries = foldr existsSubquery [] forest
+     existsSubquery :: ReadRequest -> [SQL.Snippet] -> [SQL.Snippet]
+     existsSubquery readReq@(Node (_, (_, _, _, _, joinType, _)) _) rest =
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 679ff55e..57f6056c 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -6,6 +6,8 @@ This module constructs single SQL statements that can be parametrized and prepar
+ 
+ - It consumes the SqlQuery types generated by the QueryBuilder module.
+ - It generates the body format and some headers of the final HTTP response.
++
++TODO: Currently, createReadStatement is not using prepared statements. See https://github.com/PostgREST/postgrest/issues/718.
+ -}
+ module PostgREST.Query.Statements
+   ( createWriteStatement
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 3e5c00d4..a33da37e 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -36,8 +36,7 @@ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+                                            procReturnsScalar)
+ import PostgREST.DbStructure.Relationship (Cardinality (..),
+                                            Junction (..),
+-                                           Relationship (..),
+-                                           RelationshipsMap)
++                                           Relationship (..))
+ import PostgREST.Error                    (Error (..))
+ import PostgREST.Query.SqlFragment        (sourceCTEName)
+ import PostgREST.RangeQuery               (NonnegRange, allRange,
+@@ -59,34 +58,49 @@ import Protolude hiding (from)
+ -- | Builds the ReadRequest tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+-readRequest :: Schema -> TableName -> Maybe Integer -> RelationshipsMap -> ApiRequest -> Either Error ReadRequest
++readRequest :: Schema -> TableName -> Maybe Integer -> [Relationship] -> ApiRequest -> Either Error ReadRequest
+ readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange maxRows (iAction apiRequest) =<<
+-  augmentRequestWithJoin schema allRels =<<
++  augmentRequestWithJoin schema rootRels =<<
+   addLogicTrees apiRequest =<<
+   addRanges apiRequest =<<
+   addOrders apiRequest =<<
+-  addFilters apiRequest (initReadRequest rootName rootAlias qsSelect)
++  addFilters apiRequest (initReadRequest rootName qsSelect)
+   where
+     QueryParams.QueryParams{..} = iQueryParams apiRequest
+-    (rootName, rootAlias) = case iAction apiRequest of
+-      ActionRead _ -> (QualifiedIdentifier schema rootTableName, Nothing)
+-      -- the CTE we use for non-read cases has a sourceCTEName(see Statements.hs) as the WITH name so we use the table name as an alias so findRel can find the right relationship
+-      _ -> (QualifiedIdentifier mempty $ decodeUtf8 sourceCTEName, Just rootTableName)
++    (rootName, rootRels) = rootWithRels schema rootTableName allRels (iAction apiRequest)
++
++-- Get the root table name with its relationships according to the Action type.
++-- This is done because of the shape of the final SQL Query. The mutation cases
++-- are wrapped in a WITH {sourceCTEName}(see Statements.hs).  So we need a FROM
++-- {sourceCTEName} instead of FROM {tableName}.
++rootWithRels :: Schema -> TableName -> [Relationship] -> Action -> (QualifiedIdentifier, [Relationship])
++rootWithRels schema rootTableName allRels action = case action of
++  ActionRead _ -> (QualifiedIdentifier schema rootTableName, allRels) -- normal read case
++  _            -> (QualifiedIdentifier mempty _sourceCTEName, mapMaybe toSourceRel allRels ++ allRels) -- mutation cases and calling proc
++  where
++    _sourceCTEName = decodeUtf8 sourceCTEName
++    -- To enable embedding in the sourceCTEName cases we need to replace the
++    -- foreign key tableName in the Relationship with {sourceCTEName}. This way
++    -- findRel can find relationships with sourceCTEName.
++    toSourceRel :: Relationship -> Maybe Relationship
++    toSourceRel r@Relationship{relTable=t}
++      | rootTableName == qiName t = Just $ r {relTable=t {qiName=_sourceCTEName}}
++      | otherwise                    = Nothing
+ 
+ -- Build the initial tree with a Depth attribute so when a self join occurs we
+ -- can differentiate the parent and child tables by having an alias like
+ -- "table_depth", this is related to
+ -- http://github.com/PostgREST/postgrest/issues/987.
+-initReadRequest :: QualifiedIdentifier -> Maybe Alias -> [Tree SelectItem] -> ReadRequest
+-initReadRequest rootQi rootAlias =
++initReadRequest :: QualifiedIdentifier -> [Tree SelectItem] -> ReadRequest
++initReadRequest rootQi =
+   foldr (treeEntry rootDepth) initial
+   where
+     rootDepth = 0
+     rootSchema = qiSchema rootQi
+     rootName = qiName rootQi
+-    initial = Node (Select [] rootQi rootAlias [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
++    initial = Node (Select [] rootQi Nothing [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
+     treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
+     treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node (q, i) rForest) =
+       let nxtDepth = succ depth in
+@@ -106,21 +120,18 @@ treeRestrictRange maxRows _ request = pure $ nodeRestrictRange maxRows <$> reque
+     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
+     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+ 
+-augmentRequestWithJoin :: Schema -> RelationshipsMap -> ReadRequest -> Either ApiRequestError ReadRequest
++augmentRequestWithJoin :: Schema -> [Relationship] -> ReadRequest -> Either ApiRequestError ReadRequest
+ augmentRequestWithJoin schema allRels request =
+   addRels schema allRels Nothing request
+   >>= addJoinConditions Nothing
+ 
+-addRels :: Schema -> RelationshipsMap -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
++addRels :: Schema -> [Relationship] -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
+   case parentNode of
+-    Just (Node (Select{from=parentNodeQi, fromAlias=aliasQi}, _) _) ->
++    Just (Node (Select{from=parentNodeQi}, _) _) ->
+       let newFrom r = if qiName tbl == nodeName then relForeignTable r else tbl
+           newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType, depth))) <$> rel
+-          origin = if depth == 1 -- Only on depth 1 we check if the parent(depth 0) has an alias so the sourceCTEName alias can be found as a relationship
+-            then fromMaybe (qiName parentNodeQi) aliasQi
+-            else qiName parentNodeQi
+-          rel = findRel schema allRels origin nodeName hint
++          rel = findRel schema allRels (qiName parentNodeQi) nodeName hint
+       in
+       Node <$> newReadNode <*> (updateForest . hush $ Node <$> newReadNode <*> pure forest)
+     _ ->
+@@ -140,7 +151,7 @@ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, a
+ -- target = table / view / constraint / column-from-origin
+ -- hint   = table / view / constraint / column-from-origin / column-from-target
+ -- (hint can take table / view values to aid in finding the junction in an m2m relationship)
+-findRel :: Schema -> RelationshipsMap -> NodeName -> NodeName -> Maybe Hint -> Either ApiRequestError Relationship
++findRel :: Schema -> [Relationship] -> NodeName -> NodeName -> Maybe Hint -> Either ApiRequestError Relationship
+ findRel schema allRels origin target hint =
+   case rel of
+     []  -> Left $ NoRelBetween origin target schema
+@@ -173,17 +184,23 @@ findRel schema allRels origin target hint =
+       _                      -> False
+     rel = filter (
+       \Relationship{..} ->
+-        -- foreign relationship need to be on the exposed schema
+-        schema == qiSchema relForeignTable &&
++        -- Both relationship ends need to be on the exposed schema
++        schema == qiSchema relTable && schema == qiSchema relForeignTable &&
+         (
+           -- /projects?select=clients(*)
+-          target == qiName relForeignTable  -- clients
+-          ||
++          origin == qiName relTable  &&  -- projects
++          target == qiName relForeignTable ||  -- clients
++
+           -- /projects?select=projects_client_id_fkey(*)
+-          matchConstraint (Just target) relCardinality -- projects_client_id_fkey
+-          ||
++          (
++            origin == qiName relTable &&              -- projects
++            matchConstraint (Just target) relCardinality -- projects_client_id_fkey
++          ) ||
+           -- /projects?select=client_id(*)
+-          matchFKSingleCol (Just target) relCardinality -- client_id
++          (
++            origin == qiName relTable &&                  -- projects
++            matchFKSingleCol (Just target) relCardinality -- client_id
++          )
+         ) && (
+           isNothing hint || -- hint is optional
+ 
+@@ -197,11 +214,11 @@ findRel schema allRels origin target hint =
+           -- /users?select=tasks!users_tasks(*) many-to-many between users and tasks
+           matchJunction hint relCardinality -- users_tasks
+         )
+-      ) $ fromMaybe mempty $ M.lookup (QualifiedIdentifier schema origin) allRels
++      ) allRels
+ 
+ -- previousAlias is only used for the case of self joins
+ addJoinConditions :: Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
+-addJoinConditions previousAlias (Node node@(query@Select{from=tbl,fromAlias=tblAlias}, nodeProps@(_, rel, _, _, _, depth)) forest) =
++addJoinConditions previousAlias (Node node@(query@Select{from=tbl}, nodeProps@(_, rel, _, _, _, depth)) forest) =
+   case rel of
+     Just r@Relationship{relCardinality=M2M Junction{junTable}} ->
+       let rq = augmentQuery r in
+@@ -209,11 +226,11 @@ addJoinConditions previousAlias (Node node@(query@Select{from=tbl,fromAlias=tblA
+     Just r -> Node (augmentQuery r, nodeProps) <$> updatedForest
+     Nothing -> Node node <$> updatedForest
+   where
+-    newAlias = if depth == 0
+-      then tblAlias -- only use the alias on the root node(depth 0) for when the sourceCTEName alias is used for joining
+-      else case Relationship.isSelfReference <$> rel of -- no need to apply the self reference alias on depth 0 only on the next depths
+-        Just True -> Just (qiName tbl <> "_" <> show depth)
+-        _         -> Nothing
++    newAlias = case Relationship.isSelfReference <$> rel of
++      Just True
++        | depth /= 0 -> Just (qiName tbl <> "_" <> show depth) -- root node doesn't get aliased
++        | otherwise  -> Nothing
++      _              -> Nothing
+     augmentQuery r =
+       foldr
+         (\jc rq@Select{joinConditions=jcs} -> rq{joinConditions=jc:jcs})
+@@ -226,18 +243,25 @@ getJoinConditions :: Maybe Alias -> Maybe Alias -> Relationship -> [JoinConditio
+ getJoinConditions previousAlias newAlias (Relationship QualifiedIdentifier{qiSchema=tSchema, qiName=tN} QualifiedIdentifier{qiName=ftN} card) =
+   case card of
+     M2M (Junction QualifiedIdentifier{qiName=jtn} _ _ jcols1 jcols2) ->
+-      (toJoinCondition previousAlias newAlias tN jtn <$> jcols1) ++ (toJoinCondition Nothing Nothing ftN jtn <$> jcols2)
++      (toJoinCondition tN jtn <$> jcols1) ++ (toJoinCondition ftN jtn <$> jcols2)
+     O2M _ cols ->
+-      toJoinCondition previousAlias newAlias tN ftN <$> cols
++      toJoinCondition tN ftN <$> cols
+     M2O _ cols ->
+-      toJoinCondition previousAlias newAlias tN ftN <$> cols
++      toJoinCondition tN ftN <$> cols
+   where
+-    toJoinCondition :: Maybe Alias -> Maybe Alias -> Text -> Text -> (FieldName, FieldName) -> JoinCondition
+-    toJoinCondition prAl newAl tb ftb (c, fc) =
+-      let qi1 = QualifiedIdentifier tSchema tb
+-          qi2 = QualifiedIdentifier tSchema ftb in
+-        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) prAl, c)
+-                      (maybe qi2 (QualifiedIdentifier mempty) newAl, fc)
++    toJoinCondition :: Text -> Text -> (FieldName, FieldName) -> JoinCondition
++    toJoinCondition tb ftb (c, fc) =
++      let qi1 = removeSourceCTESchema tSchema tb
++          qi2 = removeSourceCTESchema tSchema ftb in
++        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) previousAlias, c)
++                      (maybe qi2 (QualifiedIdentifier mempty) newAlias, fc)
++
++    -- On mutation and calling proc cases we wrap the target table in a WITH
++    -- {sourceCTEName} if this happens remove the schema `FROM
++    -- "schema"."{sourceCTEName}"` and use only the `FROM "{sourceCTEName}"`.
++    -- If the schema remains the FROM would be invalid.
++    removeSourceCTESchema :: Schema -> TableName -> QualifiedIdentifier
++    removeSourceCTESchema schema tbl = QualifiedIdentifier (if tbl == decodeUtf8 sourceCTEName then mempty else schema) tbl
+ 
+ addFilters :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+ addFilters ApiRequest{..} rReq =
+diff --git a/test/spec/Feature/OpenApi/RootSpec.hs b/test/spec/Feature/OpenApi/RootSpec.hs
+index e5b8d3f9..e894f54d 100644
+--- a/test/spec/Feature/OpenApi/RootSpec.hs
++++ b/test/spec/Feature/OpenApi/RootSpec.hs
+@@ -27,6 +27,6 @@ spec =
+       request methodGet "/"
+         [("Accept", "application/json")] "" `shouldRespondWith`
+         [json| {
+-          "qiSchema":"test","qiName":"bars"
++          "qiSchema":"test","qiName":"has_fk"
+           } |]
+         { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+index a1c13242..57553831 100644
+--- a/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
++++ b/test/spec/Feature/Query/EmbedDisambiguationSpec.hs
+@@ -99,17 +99,17 @@ spec =
+             {
+               "details": [
+                 {
+-                    "cardinality": "one-to-many",
+-                    "relationship": "departments_head_id_fkey using agents(id) and departments(head_id)",
++                    "cardinality": "many-to-one",
++                    "relationship": "agents_department_id_fkey using agents(department_id) and departments(id)",
+                     "embedding": "agents with departments"
+                 },
+                 {
+-                    "cardinality": "many-to-one",
+-                    "relationship": "agents_department_id_fkey using agents(department_id) and departments(id)",
++                    "cardinality": "one-to-many",
++                    "relationship": "departments_head_id_fkey using agents(id) and departments(head_id)",
+                     "embedding": "agents with departments"
+                 }
+               ],
+-              "hint": "Try changing 'departments' to one of the following: 'departments!departments_head_id_fkey', 'departments!agents_department_id_fkey'. Find the desired relationship in the 'details' key.",
++              "hint": "Try changing 'departments' to one of the following: 'departments!agents_department_id_fkey', 'departments!departments_head_id_fkey'. Find the desired relationship in the 'details' key.",
+               "message": "Could not embed because more than one relationship was found for 'agents' and 'departments'",
+               "code": "PGRST201"
+             }
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 26e86ac2..83c0dabd 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -1843,7 +1843,7 @@ case accept
+   when 'application/openapi+json' then
+     return openapi;
+   when 'application/json' then
+-    return (current_setting('request.spec', true)::json)->'dbRelationships'->0->0;
++    return (current_setting('request.spec', true)::json)->'dbRelationships'->0->'relTable';
+   else
+     return openapi;
+   end case;

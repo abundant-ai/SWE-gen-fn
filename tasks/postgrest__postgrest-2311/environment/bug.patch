@@ -1,0 +1,595 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6663b94b..795dd3c1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -28,7 +28,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2269, Allow `limit=0` in the request query to return an empty array - @gautam1168, @laurenceisla
+  - #2268, Allow returning XML from single-column queries - @fjf2002
+  - #2300, RPC POST for function w/single unnamed XML param #2300 - @fjf2002
+- - #1959, Bulk update with PATCH - @steve-chavez
+ 
+ ### Fixed
+ 
+@@ -46,7 +45,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2277, #2238, #1643, Prevent views from breaking one-to-many/many-to-one embeds when using column or FK as target - @steve-chavez
+     + When using a column or FK as target for embedding(`/tbl?select=*,col-or-fk(*)`), only tables are now detected and views are not.
+     + You can still use a column or an inferred FK on a view to embed a table(`/view?select=*,col-or-fk(*)`)
+- - #1959, An accidental full table PATCH(without filters) is not possible anymore, it requires filters or a `limit` parameter - @steve-chavez, @laurenceisla
+  - #2317, Increase the `db-pool-timeout` to 1 hour to prevent frequent high connection latency - @steve-chavez
+ 
+ ### Changed
+@@ -63,8 +61,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2277, Views now are not detected when embedding using the column or FK as target (`/view?select=*,column(*)`) - @steve-chavez
+    + This embedding form was easily made ambiguous whenever a new view was added.
+    + For migrating, clients must be updated to the embedding form of `/view?select=*,other_view!column(*)`.
+- - #1959, A full table PATCH(without filters) is now restricted, it requires a `limit` parameter - @steve-chavez
+-   + A `PATCH /tbl` will now result in 0 rows updated, unless `PATCH /tbl?limit=10&order=<pkcol>` is done
+ 
+ ## [9.0.1] - 2022-06-03
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index a3f79e90..b4555f5b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -347,12 +347,8 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+       response HTTP.status201 headers mempty
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@RequestContext{..} = do
+-  let
+-    ApiRequest{..} = ctxApiRequest
+-    pkCols = maybe mempty tablePKCols $ HM.lookup identifier $ dbTables ctxDbStructure
+-
+-  WriteQueryResult{..} <- writeQuery MutationUpdate identifier False pkCols context
++handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
++  WriteQueryResult{..} <- writeQuery MutationUpdate identifier False mempty context
+ 
+   let
+     response = gucResponse resGucStatus resGucHeaders
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index 0c794cf7..440ea74d 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -107,8 +107,7 @@ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returning
+   where
+     cols = BS.intercalate ", " $ pgFmtIdent <$> S.toList iCols
+ 
+--- An update without a limit is always filtered with a WHERE
+-mutateRequestToQuery (Update mainQi uCols body logicForest pkFlts range ordts returnings)
++mutateRequestToQuery (Update mainQi uCols body logicForest range ordts returnings)
+   | S.null uCols =
+     -- if there are no columns we cannot do UPDATE table SET {empty}, it'd be invalid syntax
+     -- selecting an empty resultset from mainQi gives us the column names to prevent errors when using &select=
+@@ -116,21 +115,17 @@ mutateRequestToQuery (Update mainQi uCols body logicForest pkFlts range ordts re
+     SQL.sql $ "SELECT " <> emptyBodyReturnedColumns <> " FROM " <> fromQi mainQi <> " WHERE false"
+ 
+   | range == allRange =
+-    let whereLogic | null logicForest = if null pkFlts then "FALSE" else pgrstUpdateBodyF
+-                   | otherwise        = logicForestF in
+     "WITH " <> normalizedBody body <> " " <>
+     "UPDATE " <> mainTbl <> " SET " <> SQL.sql nonRangeCols <> " " <>
+-    "FROM (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " )) pgrst_update_body " <>
+-    "WHERE " <> whereLogic <> " " <>
++    "FROM (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " )) _ " <>
++    whereLogic <> " " <>
+     SQL.sql (returningF mainQi returnings)
+ 
+   | otherwise =
+-    let whereLogic | null logicForest = mempty
+-                   | otherwise        = " WHERE " <> logicForestF in
+     "WITH " <> normalizedBody body <> ", " <>
+     "pgrst_update_body AS (SELECT * FROM json_populate_recordset (null::" <> mainTbl <> " , " <> SQL.sql selectBody <> " ) LIMIT 1), " <>
+     "pgrst_affected_rows AS (" <>
+-      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <> " " <>
++      "SELECT " <> SQL.sql rangeIdF <> " FROM " <> mainTbl <>
+       whereLogic <> " " <>
+       orderF mainQi ordts <> " " <>
+       limitOffsetF range <>
+@@ -141,11 +136,10 @@ mutateRequestToQuery (Update mainQi uCols body logicForest pkFlts range ordts re
+     SQL.sql (returningF mainQi returnings)
+ 
+   where
++    whereLogic = if null logicForest then mempty else " WHERE " <> intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+     mainTbl = SQL.sql (fromQi mainQi)
+-    logicForestF = intercalateSnippet " AND " (pgFmtLogicTree mainQi <$> logicForest)
+-    pgrstUpdateBodyF = SQL.sql (BS.intercalate " AND " $ (\x -> pgFmtColumn mainQi x <> " = " <> pgFmtColumn (QualifiedIdentifier mempty "pgrst_update_body") x) <$> pkFlts)
+     emptyBodyReturnedColumns = if null returnings then "NULL" else BS.intercalate ", " (pgFmtColumn (QualifiedIdentifier mempty $ qiName mainQi) <$> returnings)
+-    nonRangeCols = BS.intercalate ", " (pgFmtIdent <> const " = pgrst_update_body." <> pgFmtIdent <$> S.toList uCols)
++    nonRangeCols = BS.intercalate ", " (pgFmtIdent <> const " = _." <> pgFmtIdent <$> S.toList uCols)
+     rangeCols = BS.intercalate ", " ((\col -> pgFmtIdent col <> " = (SELECT " <> pgFmtIdent col <> " FROM pgrst_update_body) ") <$> S.toList uCols)
+     (whereRangeIdF, rangeIdF) = mutRangeF mainQi (fst . otTerm <$> ordts)
+ 
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 2ac728c8..537b7490 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -316,14 +316,14 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+   case mutation of
+     MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+-    MutationUpdate -> Right $ Update qi iColumns body combinedLogic pkCols iTopLevelRange rootOrder returnings
++    MutationUpdate -> Right $ Update qi iColumns body combinedLogic iTopLevelRange rootOrder returnings
+     MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+            not (null (S.fromList pkCols)) &&
+            all (\case
+               Filter _ (OpExpr False (Op OpEqual _)) -> True
+-              _                                      -> False) qsFiltersRoot
++              _                                      -> False) filters
+           then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
+         else
+           Left InvalidFilters
+@@ -336,9 +336,11 @@ mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiR
+       if iPreferRepresentation == None
+         then []
+         else returningCols readReq pkCols
++    -- update/delete filters can be only on the root table
++    filters = map snd qsFiltersRoot
+     logic = map snd qsLogic
+     rootOrder = maybe [] snd $ find (\(x, _) -> null x) qsOrder
+-    combinedLogic = foldr addFilterToLogicForest logic qsFiltersRoot
++    combinedLogic = foldr addFilterToLogicForest logic filters
+     body = payRaw <$> iPayload -- the body is assumed to be json at this stage(ApiRequest validates)
+ 
+ callRequest :: ProcDescription -> ApiRequest -> ReadRequest -> CallRequest
+diff --git a/src/PostgREST/Request/QueryParams.hs b/src/PostgREST/Request/QueryParams.hs
+index d7cb2ed1..4ebb5d9a 100644
+--- a/src/PostgREST/Request/QueryParams.hs
++++ b/src/PostgREST/Request/QueryParams.hs
+@@ -90,8 +90,8 @@ data QueryParams =
+     -- ^ &select parameter used to shape the response
+     , qsFilters        :: [(EmbedPath, Filter)]
+     -- ^ Filters on the result from e.g. &id=e.10
+-    , qsFiltersRoot    :: [Filter]
+-    -- ^ Subset of the filters that apply on the root table. These are used on UPDATE/DELETE.
++    , qsFiltersRoot    :: [(EmbedPath, Filter)]
++    -- ^ Subset of the filters that apply on the root table
+     , qsFiltersNotRoot :: [(EmbedPath, Filter)]
+     -- ^ Subset of the filters that do not apply on the root table
+     , qsFilterFields   :: S.Set FieldName
+@@ -133,7 +133,7 @@ parse qs =
+     <*> pRequestColumns columns
+     <*> pRequestSelect select
+     <*> pRequestFilter `traverse` filters
+-    <*> (fmap snd <$> (pRequestFilter `traverse` filtersRoot))
++    <*> pRequestFilter `traverse` filtersRoot
+     <*> pRequestFilter `traverse` filtersNotRoot
+     <*> pure (S.fromList (fst <$> filters))
+     <*> sequenceA (pRequestOnConflict <$> onConflict)
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 315e9aea..2dda4738 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -137,7 +137,6 @@ data MutateQuery
+       , updCols   :: S.Set FieldName
+       , updBody   :: Maybe LBS.ByteString
+       , where_    :: [LogicTree]
+-      , pkFilters :: [FieldName]
+       , mutRange  :: NonnegRange
+       , mutOrder  :: [OrderTerm]
+       , returning :: [FieldName]
+diff --git a/test/spec/Feature/Query/DeleteSpec.hs b/test/spec/Feature/Query/DeleteSpec.hs
+index 24741cfd..3ed807a2 100644
+--- a/test/spec/Feature/Query/DeleteSpec.hs
++++ b/test/spec/Feature/Query/DeleteSpec.hs
+@@ -143,7 +143,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodPost "/rpc/reset_items_tables"
++        request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+           [json| {"tbl_name": "limited_delete_items"} |]
+           `shouldRespondWith` ""
+@@ -175,7 +175,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodPost "/rpc/reset_items_tables"
++        request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+           [json| {"tbl_name": "limited_delete_items"} |]
+           `shouldRespondWith` ""
+@@ -233,7 +233,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodPost "/rpc/reset_items_tables"
++        request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+           [json| {"tbl_name": "limited_delete_items_view"} |]
+           `shouldRespondWith` ""
+@@ -265,7 +265,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodPost "/rpc/reset_items_tables"
++        request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+           [json| {"tbl_name": "limited_delete_items_cpk_view"} |]
+           `shouldRespondWith` ""
+@@ -297,7 +297,7 @@ spec =
+             , { "id": 3, "name": "item-3" }
+             ]|]
+ 
+-        request methodPost "/rpc/reset_items_tables"
++        request methodPost "/rpc/reset_limited_items"
+           [("Prefer", "tx=commit")]
+           [json| {"tbl_name": "limited_delete_items_no_pk"} |]
+           `shouldRespondWith` ""
+diff --git a/test/spec/Feature/Query/QueryLimitedSpec.hs b/test/spec/Feature/Query/QueryLimitedSpec.hs
+index 46f5e38e..addca790 100644
+--- a/test/spec/Feature/Query/QueryLimitedSpec.hs
++++ b/test/spec/Feature/Query/QueryLimitedSpec.hs
+@@ -93,13 +93,16 @@ spec =
+               { "id": 8, "name": "HaikuOS" } ]|]
+             { matchStatus  = 201 }
+ 
+-      it "doesn't affect updates(2 rows would be modified if it did)" $
++      it "doesn't affect updates" $
+         request methodPatch "/employees?select=first_name,last_name,occupation"
+             [("Prefer", "return=representation")]
+             [json| [{"occupation": "Barista"}] |]
+           `shouldRespondWith`
+-            [json|[]|]
+-            { matchStatus  = 404 }
++            [json|[
++                { "first_name": "Frances M.", "last_name": "Roe", "occupation": "Barista" },
++                { "first_name": "Daniel B.", "last_name": "Lyon", "occupation": "Barista" },
++                { "first_name": "Edwin S.", "last_name": "Smith", "occupation": "Barista" } ]|]
++            { matchStatus  = 200 }
+ 
+       it "doesn't affect deletions" $
+         request methodDelete "/employees?select=first_name,last_name"
+diff --git a/test/spec/Feature/Query/SingularSpec.hs b/test/spec/Feature/Query/SingularSpec.hs
+index 878fcde5..5f212246 100644
+--- a/test/spec/Feature/Query/SingularSpec.hs
++++ b/test/spec/Feature/Query/SingularSpec.hs
+@@ -65,7 +65,7 @@ spec =
+             }
+ 
+       it "raises an error for multiple rows" $ do
+-        request methodPatch "/addresses?limit=4&order=id"
++        request methodPatch "/addresses"
+             [("Prefer", "tx=commit"), singular]
+             [json| { address: "zzz" } |]
+           `shouldRespondWith`
+@@ -81,7 +81,7 @@ spec =
+             [json|[{"id":1,"address":"address 1"}]|]
+ 
+       it "raises an error for multiple rows with return=rep" $ do
+-        request methodPatch "/addresses?limit=4&order=id"
++        request methodPatch "/addresses"
+             [("Prefer", "tx=commit"), ("Prefer", "return=representation"), singular]
+             [json| { address: "zzz" } |]
+           `shouldRespondWith`
+diff --git a/test/spec/Feature/Query/UpdateSpec.hs b/test/spec/Feature/Query/UpdateSpec.hs
+index 32a327e4..088e7a77 100644
+--- a/test/spec/Feature/Query/UpdateSpec.hs
++++ b/test/spec/Feature/Query/UpdateSpec.hs
+@@ -388,17 +388,6 @@ spec = do
+           }
+ 
+   context "limited update" $ do
+-    it "does not work when no limit query or filter is given" $
+-      request methodPatch "/limited_update_items"
+-          [("Prefer", "tx=commit"), ("Prefer", "count=exact")]
+-          [json| {"name": "updated-item"} |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 404
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "*/0" ]
+-          }
+-
+     it "works with the limit query param" $ do
+       get "/limited_update_items"
+         `shouldRespondWith`
+@@ -409,13 +398,12 @@ spec = do
+           ]|]
+ 
+       request methodPatch "/limited_update_items?order=id&limit=2"
+-          [("Prefer", "tx=commit"), ("Prefer", "count=exact")]
++          [("Prefer", "tx=commit")]
+           [json| {"name": "updated-item"} |]
+         `shouldRespondWith`
+           ""
+           { matchStatus  = 204
+           , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "0-1/2"
+                            , "Preference-Applied" <:> "tx=commit" ]
+           }
+ 
+@@ -427,7 +415,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items"} |]
+         `shouldRespondWith` ""
+@@ -460,7 +448,7 @@ spec = do
+           , { "id": 3, "name": "updated-item" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items"} |]
+         `shouldRespondWith` ""
+@@ -493,7 +481,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items"} |]
+         `shouldRespondWith` ""
+@@ -552,7 +540,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items_view"} |]
+         `shouldRespondWith` ""
+@@ -585,7 +573,7 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items_cpk_view"} |]
+         `shouldRespondWith` ""
+@@ -619,186 +607,8 @@ spec = do
+           , { "id": 3, "name": "item-3" }
+           ]|]
+ 
+-      request methodPost "/rpc/reset_items_tables"
++      request methodPost "/rpc/reset_limited_items"
+         [("Prefer", "tx=commit")]
+         [json| {"tbl_name": "limited_update_items_no_pk"} |]
+         `shouldRespondWith` ""
+         { matchStatus  = 204 }
+-
+-  context "bulk updates" $ do
+-    it "can update tables with simple pk" $ do
+-      get "/bulk_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          , { "id": 3, "name": "item-3", "observation": null }
+-          ]|]
+-
+-      request methodPatch "/bulk_update_items"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "id": 1, "name": "item-1 - 1st", "observation": "Lost item" }
+-          , { "id": 3, "name": "item-3 - 3rd", "observation": null }
+-          ]|]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "0-1/*"
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/bulk_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1 - 1st", "observation": "Lost item" }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          , { "id": 3, "name": "item-3 - 3rd", "observation": null }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_items_tables"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "bulk_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "can update tables with composite pk" $ do
+-      get "/bulk_update_items_cpk"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          , { "id": 3, "name": "item-3", "observation": null }
+-          ]|]
+-
+-      request methodPatch "/bulk_update_items_cpk"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": "Lost item" }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          ]|]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "0-1/*"
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/bulk_update_items_cpk?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": "Lost item" }
+-          , { "id": 2, "name": "item-2", "observation": null  }
+-          , { "id": 3, "name": "item-3", "observation": null  }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_items_tables"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "bulk_update_items_cpk"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "updates with filters taking only the first item in the json array body" $ do
+-      get "/bulk_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          , { "id": 3, "name": "item-3", "observation": null }
+-          ]|]
+-
+-      request methodPatch "/bulk_update_items?id=eq.2"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "id": 4, "name": "item-4", "observation": "Damaged item" }
+-          , { "id": 3, "name": "item-3 - 3rd", "observation": null }
+-          ]|]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "0-0/*"
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/bulk_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 3, "name": "item-3", "observation": null }
+-          , { "id": 4, "name": "item-4", "observation": "Damaged item" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_items_tables"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "bulk_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "updates with limit and offset taking only the first item in the json array body" $ do
+-      get "/bulk_update_items"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 2, "name": "item-2", "observation": null }
+-          , { "id": 3, "name": "item-3", "observation": null }
+-          ]|]
+-
+-      request methodPatch "/bulk_update_items?limit=2&offset=1&order=id"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "name": "item-4", "observation": "Damaged item" }
+-          , { "name": "item-3 - 3rd", "observation": null }
+-          ]|]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus  = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "Content-Range" <:> "0-1/*"
+-                           , "Preference-Applied" <:> "tx=commit" ]
+-          }
+-
+-      get "/bulk_update_items?order=id"
+-        `shouldRespondWith`
+-          [json|[
+-            { "id": 1, "name": "item-1", "observation": null }
+-          , { "id": 2, "name": "item-4", "observation": "Damaged item" }
+-          , { "id": 3, "name": "item-4", "observation": "Damaged item" }
+-          ]|]
+-
+-      request methodPost "/rpc/reset_items_tables"
+-        [("Prefer", "tx=commit")]
+-        [json| {"tbl_name": "bulk_update_items"} |]
+-        `shouldRespondWith` ""
+-        { matchStatus  = 204 }
+-
+-    it "rejects a json array that isn't exclusively composed of objects" $
+-      request methodPatch "/bulk_update_items"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "id": 1, "name": "Item 1" }
+-          , 2
+-          , "Item 2"
+-          , { "id": 3, "name": "Item 3" }
+-          ]|]
+-        `shouldRespondWith`
+-          [json| {"message":"All object keys must match","code":"PGRST102","hint":null,"details":null} |]
+-          { matchStatus  = 400
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+-
+-    it "rejects a json array that has objects with different keys" $
+-      request methodPatch "/bulk_update_items"
+-          [("Prefer", "tx=commit")]
+-          [json|[
+-            { "id": 1, "name": "Item 1" }
+-          , { "id": 2 }
+-          , { "id": 3, "name": "Item 3" }
+-          ]|]
+-        `shouldRespondWith`
+-          [json| {"message":"All object keys must match","code":"PGRST102","hint":null,"details":null} |]
+-          { matchStatus  = 400
+-          , matchHeaders = [matchContentTypeJson]
+-          }
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index 68f48e3d..f5cc0e6b 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -778,9 +778,3 @@ INSERT INTO private.internal_job (id, parent_id) VALUES (2, 1);
+ 
+ TRUNCATE TABLE test.test CASCADE;
+ INSERT INTO test.test (id, parent_id) VALUES (1, null), (2, 1);
+-
+-TRUNCATE TABLE test.bulk_update_items CASCADE;
+-INSERT INTO test.bulk_update_items (id, name, observation) VALUES (1, 'item-1', NULL), (2, 'item-2', NULL), (3, 'item-3', NULL);
+-
+-TRUNCATE TABLE test.bulk_update_items_cpk CASCADE;
+-INSERT INTO test.bulk_update_items_cpk (id, name, observation) VALUES (1, 'item-1', NULL), (2, 'item-2', NULL), (3, 'item-3', NULL);
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index 152b1ea0..d87ec523 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -186,8 +186,6 @@ GRANT ALL ON TABLE
+     , series_popularity
+     , test
+     , view_test
+-    , bulk_update_items
+-    , bulk_update_items_cpk
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index e3ef0e22..f616cc03 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2528,7 +2528,7 @@ select *, 'static'::text as static from limited_delete_items;
+ create view limited_delete_items_cpk_view as
+ select * from limited_delete_items_cpk;
+ 
+-create function reset_items_tables(tbl_name text default '') returns void as $_$ begin
++create function reset_limited_items(tbl_name text default '') returns void as $_$ begin
+   execute format(
+   $$
+     delete from %I;
+@@ -2634,18 +2634,3 @@ CREATE TABLE test.test (
+ 
+ CREATE OR REPLACE VIEW test.view_test AS
+   SELECT id FROM test.test;
+-
+--- Tables to test bulk updates
+-
+-CREATE TABLE test.bulk_update_items (
+-  id INT PRIMARY KEY,
+-  name TEXT,
+-  observation TEXT
+-);
+-
+-CREATE TABLE test.bulk_update_items_cpk (
+-  id INT,
+-  name TEXT,
+-  observation TEXT,
+-  PRIMARY KEY (id, name)
+-);

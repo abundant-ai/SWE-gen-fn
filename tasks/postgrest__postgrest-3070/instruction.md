@@ -1,0 +1,5 @@
+The Server-Timing header currently reports a timing metric labeled "render" for the final phase of handling a request. This label is misleading (it suggests HTML rendering), because the server is only finalizing the HTTP response (status and headers) at that stage. The metric name should be changed from "render" to "response" everywhere it is produced.
+
+When clients make requests (GET/POST/PATCH/PUT/DELETE and RPC calls), the Server-Timing header should include timing entries for the phases "jwt", "parse", "plan", "transaction", and "response". The "render" entry should no longer appear.
+
+For example, after a successful request, clients should be able to find a Server-Timing entry named "response" (with a duration value), and should not see any entry named "render". This must hold across different response types (e.g., JSON responses, empty 204 responses, and HEAD requests) so that the Server-Timing header is consistent regardless of method and status code.

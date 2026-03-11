@@ -1,0 +1,631 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 8a82d4b5..a7b3174e 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -313,9 +313,7 @@ handleCreate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+   let
+     ApiRequest{..} = ctxApiRequest
+-    pkCols = if iPreferRepresentation /= None || isJust iPreferResolution
+-      then maybe mempty tablePKCols $ M.lookup identifier $ dbTables ctxDbStructure
+-      else mempty
++    pkCols = maybe mempty tablePKCols $ M.lookup identifier $ dbTables ctxDbStructure
+ 
+   WriteQueryResult{..} <- writeQuery MutationCreate identifier True pkCols context
+ 
+@@ -372,13 +370,11 @@ handleUpdate identifier context@(RequestContext _ ctxDbStructure ApiRequest{..}
+       response status [contentRangeHeader] mempty
+ 
+ handleSingleUpsert :: QualifiedIdentifier -> RequestContext-> DbHandler Wai.Response
+-handleSingleUpsert identifier context@(RequestContext _ ctxDbStructure ApiRequest{..} _) = do
++handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   when (iTopLevelRange /= RangeQuery.allRange) $
+     throwError Error.PutRangeNotAllowedError
+ 
+-  let pkCols = maybe mempty tablePKCols $ M.lookup identifier $ dbTables ctxDbStructure
+-
+-  WriteQueryResult{..} <- writeQuery MutationSingleUpsert identifier False pkCols context
++  WriteQueryResult{..} <- writeQuery MutationSingleUpsert identifier False mempty context
+ 
+   let response = gucResponse resGucStatus resGucHeaders
+ 
+@@ -420,13 +416,12 @@ handleDelete identifier context@(RequestContext _ ctxDbStructure ApiRequest{..}
+ 
+ handleInfo :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m Wai.Response
+ handleInfo identifier RequestContext{..} =
+-  case tbl of
++  case M.lookup identifier $ dbTables ctxDbStructure of
+     Just table ->
+       return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
+     Nothing ->
+       throwError Error.NotFound
+   where
+-    tbl = M.lookup identifier (dbTables ctxDbStructure)
+     allOrigins = ("Access-Control-Allow-Origin", "*")
+     allowH table =
+       ( HTTP.hAllow
+@@ -438,7 +433,7 @@ handleInfo identifier RequestContext{..} =
+           ++ ["DELETE" | tableDeletable table]
+       )
+     hasPK =
+-      not $ null $ maybe mempty tablePKCols tbl
++      not $ null $ maybe mempty tablePKCols $ M.lookup identifier (dbTables ctxDbStructure)
+ 
+ handleInvoke :: InvokeMethod -> ProcDescription -> RequestContext -> DbHandler Wai.Response
+ handleInvoke invMethod proc context@RequestContext{..} = do
+@@ -490,7 +485,7 @@ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure
+     lift $ case configOpenApiMode of
+       OAFollowPriv ->
+         OpenAPI.encode conf dbStructure
+-           <$> SQL.statement [tSchema] (DbStructure.accessibleTables ctxPgVersion configDbPreparedStatements)
++           <$> SQL.statement tSchema (DbStructure.accessibleTables ctxPgVersion configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.accessibleProcs ctxPgVersion configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+       OAIgnorePriv ->
+@@ -542,7 +537,7 @@ writeQuery mutation identifier@QualifiedIdentifier{..} isInsert pkCols context@R
+   mutateReq <-
+     liftEither $
+       ReqBuilder.mutateRequest mutation qiSchema qiName ctxApiRequest
+-        pkCols
++        (maybe mempty tablePKCols $ M.lookup identifier $ dbTables ctxDbStructure)
+         readReq
+ 
+   (_, queryTotal, fields, body, gucHeaders, gucStatus) <-
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 91787ac9..09f80f49 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -25,6 +25,7 @@ module PostgREST.DbStructure
+   , accessibleProcs
+   , findIfView
+   , schemaDescription
++  , tableCols
+   ) where
+ 
+ import qualified Data.Aeson          as JSON
+@@ -42,7 +43,7 @@ import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+                                            pgVersion110)
+ import PostgREST.DbStructure.Identifiers  (FieldName,
+                                            QualifiedIdentifier (..),
+-                                           Schema)
++                                           Schema, TableName)
+ import PostgREST.DbStructure.Proc         (PgType (..),
+                                            ProcDescription (..),
+                                            ProcParam (..),
+@@ -59,11 +60,16 @@ import Protolude
+ 
+ data DbStructure = DbStructure
+   { dbTables        :: TablesMap
++  , dbColumns       :: [Column]
+   , dbRelationships :: [Relationship]
+   , dbProcs         :: ProcsMap
+   }
+   deriving (Generic, JSON.ToJSON)
+ 
++-- TODO Table could hold references to all its Columns
++tableCols :: DbStructure -> Schema -> TableName -> [Column]
++tableCols dbs tSchema tName = filter (\Column{colTable=Table{tableSchema=s, tableName=t}} -> s==tSchema && t==tName) $ dbColumns dbs
++
+ findIfView :: QualifiedIdentifier -> TablesMap -> Bool
+ findIfView identifier tbls = maybe False tableIsView $ M.lookup identifier tbls
+ 
+@@ -88,7 +94,8 @@ queryDbStructure :: [Schema] -> [Schema] -> Bool -> SQL.Transaction DbStructure
+ queryDbStructure schemas extraSearchPath prepared = do
+   SQL.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+   pgVer   <- SQL.statement mempty pgVersionStatement
+-  tabs    <- SQL.statement schemas $ allTables pgVer prepared
++  tabs    <- SQL.statement mempty $ allTables pgVer prepared
++  cols    <- SQL.statement schemas $ allColumns tabs prepared
+   keyDeps <- SQL.statement (schemas, extraSearchPath) $ allViewsKeyDependencies prepared
+   m2oRels <- SQL.statement mempty $ allM2ORels pgVer prepared
+   procs   <- SQL.statement schemas $ allProcs pgVer prepared
+@@ -98,6 +105,7 @@ queryDbStructure schemas extraSearchPath prepared = do
+ 
+   return $ removeInternal schemas $ DbStructure {
+       dbTables = tabsWViewsPks
++    , dbColumns = cols
+     , dbRelationships = rels
+     , dbProcs = procs
+     }
+@@ -107,6 +115,7 @@ removeInternal :: [Schema] -> DbStructure -> DbStructure
+ removeInternal schemas dbStruct =
+   DbStructure {
+       dbTables        = M.filterWithKey (\(QualifiedIdentifier sch _) _ -> sch `elem` schemas) $ dbTables dbStruct
++    , dbColumns       = filter (\x -> tableSchema (colTable x) `elem` schemas) (dbColumns dbStruct)
+     , dbRelationships = filter (\x -> qiSchema (relTable x) `elem` schemas &&
+                                       qiSchema (relForeignTable x) `elem` schemas &&
+                                       not (hasInternalJunction x)) $ dbRelationships dbStruct
+@@ -121,24 +130,30 @@ decodeTables :: HD.Result TablesMap
+ decodeTables =
+  M.fromList . map (\tbl@Table{tableSchema, tableName} -> (QualifiedIdentifier tableSchema tableName, tbl)) <$> HD.rowList tblRow
+  where
+-  tblRow = Table
+-    <$> column HD.text
+-    <*> column HD.text
+-    <*> nullableColumn HD.text
+-    <*> column HD.bool
+-    <*> column HD.bool
+-    <*> column HD.bool
+-    <*> column HD.bool
+-    <*> arrayColumn HD.text
+-    <*> compositeArrayColumn
+-        (Column
+-        <$> compositeField HD.text
+-        <*> nullableCompositeField HD.text
+-        <*> compositeField HD.bool
+-        <*> compositeField HD.text
+-        <*> nullableCompositeField HD.int4
+-        <*> nullableCompositeField HD.text
+-        <*> compositeFieldArray HD.text)
++  tblRow = Table <$> column HD.text
++                 <*> column HD.text
++                 <*> nullableColumn HD.text
++                 <*> column HD.bool
++                 <*> column HD.bool
++                 <*> column HD.bool
++                 <*> column HD.bool
++                 <*> arrayColumn HD.text
++
++decodeColumns :: TablesMap -> HD.Result [Column]
++decodeColumns tables =
++  mapMaybe (columnFromRow tables) <$> HD.rowList colRow
++ where
++  colRow =
++    (,,,,,,,,)
++      <$> column HD.text
++      <*> column HD.text
++      <*> column HD.text
++      <*> nullableColumn HD.text
++      <*> column HD.bool
++      <*> column HD.text
++      <*> nullableColumn HD.int4
++      <*> nullableColumn HD.text
++      <*> arrayColumn HD.text
+ 
+ decodeRels :: HD.Result [Relationship]
+ decodeRels =
+@@ -315,9 +330,9 @@ schemaDescription =
+       where
+         n.nspname = $1 |]
+ 
+-accessibleTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
++accessibleTables :: PgVersion -> Bool -> SQL.Statement Schema TablesMap
+ accessibleTables pgVer =
+-  SQL.Statement sql (arrayParam HE.text) decodeTables
++  SQL.Statement sql (param HE.text) decodeTables
+  where
+   sql = tablesSqlQuery False pgVer
+ 
+@@ -388,9 +403,9 @@ addViewPrimaryKeys tabs keyDeps =
+       maybe [] (\(ViewKeyDependency _ _ _ _ pkCols) -> snd <$> pkCols) $
+       find (\(ViewKeyDependency _ viewQi _ dep _) -> dep == PKDep && viewQi == QualifiedIdentifier sch vw) keyDeps
+ 
+-allTables :: PgVersion -> Bool -> SQL.Statement [Schema] TablesMap
++allTables :: PgVersion -> Bool -> SQL.Statement () TablesMap
+ allTables pgVer =
+-  SQL.Statement sql (arrayParam HE.text) decodeTables
++  SQL.Statement sql HE.noParams decodeTables
+   where
+     sql = tablesSqlQuery True pgVer
+ 
+@@ -402,80 +417,6 @@ tablesSqlQuery getAll pgVer =
+   -- (pg_has_role(ss.relowner, 'USAGE'::text) OR has_column_privilege(ss.roid, a.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'::text));
+   [q|
+   WITH
+-  columns AS (
+-      SELECT
+-          nc.nspname::name AS table_schema,
+-          c.relname::name AS table_name,
+-          a.attname::name AS column_name,
+-          d.description AS description,
+-          pg_get_expr(ad.adbin, ad.adrelid)::text AS column_default,
+-          not (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
+-              CASE
+-                  WHEN t.typtype = 'd' THEN
+-                  CASE
+-                      WHEN bt.typelem <> 0::oid AND bt.typlen = (-1) THEN 'ARRAY'::text
+-                      WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
+-                      ELSE format_type(a.atttypid, a.atttypmod)
+-                  END
+-                  ELSE
+-                  CASE
+-                      WHEN t.typelem <> 0::oid AND t.typlen = (-1) THEN 'ARRAY'::text
+-                      WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
+-                      ELSE format_type(a.atttypid, a.atttypmod)
+-                  END
+-              END::text AS data_type,
+-          information_schema._pg_char_max_length(
+-              information_schema._pg_truetypid(a.*, t.*),
+-              information_schema._pg_truetypmod(a.*, t.*)
+-          )::integer AS character_maximum_length,
+-          COALESCE(bt.typname, t.typname)::name AS udt_name,
+-          a.attnum::integer AS position
+-      FROM pg_attribute a
+-          LEFT JOIN pg_description AS d
+-              ON d.objoid = a.attrelid and d.objsubid = a.attnum
+-          LEFT JOIN pg_attrdef ad
+-              ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+-          JOIN (pg_class c JOIN pg_namespace nc ON c.relnamespace = nc.oid)
+-              ON a.attrelid = c.oid
+-          JOIN (pg_type t JOIN pg_namespace nt ON t.typnamespace = nt.oid)
+-              ON a.atttypid = t.oid
+-          LEFT JOIN (pg_type bt JOIN pg_namespace nbt ON bt.typnamespace = nbt.oid)
+-              ON t.typtype = 'd' AND t.typbasetype = bt.oid
+-          LEFT JOIN (pg_collation co JOIN pg_namespace nco ON co.collnamespace = nco.oid)
+-              ON a.attcollation = co.oid AND (nco.nspname <> 'pg_catalog'::name OR co.collname <> 'default'::name)
+-      WHERE
+-          NOT pg_is_other_temp_schema(nc.oid)
+-          AND a.attnum > 0
+-          AND NOT a.attisdropped
+-          AND c.relkind in ('r', 'v', 'f', 'm', 'p')
+-          AND nc.nspname = ANY($1)
+-  ),
+-  columns_agg AS (
+-    SELECT DISTINCT
+-        info.table_schema AS table_schema,
+-        info.table_name AS table_name,
+-        array_agg(row(
+-          info.column_name,
+-          info.description,
+-          info.is_nullable::boolean,
+-          info.data_type,
+-          info.character_maximum_length,
+-          info.column_default,
+-          coalesce(enum_info.vals, '{}')) order by info.position) as columns
+-    FROM columns info
+-    LEFT OUTER JOIN (
+-        SELECT
+-            n.nspname AS s,
+-            t.typname AS n,
+-            array_agg(e.enumlabel ORDER BY e.enumsortorder) AS vals
+-        FROM pg_type t
+-        JOIN pg_enum e ON t.oid = e.enumtypid
+-        JOIN pg_namespace n ON n.oid = t.typnamespace
+-        GROUP BY s,n
+-    ) AS enum_info ON info.udt_name = enum_info.n
+-    WHERE info.table_schema NOT IN ('pg_catalog', 'information_schema')
+-    GROUP BY info.table_schema, info.table_name
+-  ),
+   tbl_constraints AS (
+       SELECT
+           c.conname::name AS constraint_name,
+@@ -577,13 +518,11 @@ tablesSqlQuery getAll pgVer =
+         AND (pg_relation_is_updatable(c.oid::regclass, TRUE) & 16) = 16
+       )
+     ) AS deletable,
+-    coalesce(tpks.pk_cols, '{}') as pk_cols,
+-    coalesce(cols_agg.columns, '{}') as columns
++    coalesce(tpks.pk_cols, '{}') as pk_cols
+   FROM pg_class c
+   JOIN pg_namespace n ON n.oid = c.relnamespace
+   LEFT JOIN pg_description d on d.objoid = c.oid and d.objsubid = 0
+   LEFT JOIN tbl_pk_cols tpks ON n.nspname = tpks.table_schema AND c.relname = tpks.table_name
+-  LEFT JOIN columns_agg cols_agg ON n.nspname = cols_agg.table_schema AND c.relname = cols_agg.table_name
+   WHERE c.relkind IN ('v','r','m','f','p')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema') |] <>
+   relIsPartition <>
+@@ -591,7 +530,7 @@ tablesSqlQuery getAll pgVer =
+   "ORDER BY table_schema, table_name"
+   where
+     fltTables = if getAll then mempty else [q|
+-      AND n.nspname = ANY($1)
++      AND n.nspname = $1
+       AND (
+         pg_has_role(c.relowner, 'USAGE')
+         or has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+@@ -599,6 +538,97 @@ tablesSqlQuery getAll pgVer =
+       )|]
+     relIsPartition = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+ 
++allColumns :: TablesMap -> Bool -> SQL.Statement [Schema] [Column]
++allColumns tabs =
++ SQL.Statement sql (arrayParam HE.text) (decodeColumns tabs)
++ where
++  -- CTE based on information_schema.columns changed: remove the owner filter
++  sql = [q|
++    WITH
++    columns AS (
++        SELECT
++            nc.nspname::name AS table_schema,
++            c.relname::name AS table_name,
++            a.attname::name AS column_name,
++            d.description AS description,
++            pg_get_expr(ad.adbin, ad.adrelid)::text AS column_default,
++            not (a.attnotnull OR t.typtype = 'd' AND t.typnotnull) AS is_nullable,
++                CASE
++                    WHEN t.typtype = 'd' THEN
++                    CASE
++                        WHEN bt.typelem <> 0::oid AND bt.typlen = (-1) THEN 'ARRAY'::text
++                        WHEN nbt.nspname = 'pg_catalog'::name THEN format_type(t.typbasetype, NULL::integer)
++                        ELSE format_type(a.atttypid, a.atttypmod)
++                    END
++                    ELSE
++                    CASE
++                        WHEN t.typelem <> 0::oid AND t.typlen = (-1) THEN 'ARRAY'::text
++                        WHEN nt.nspname = 'pg_catalog'::name THEN format_type(a.atttypid, NULL::integer)
++                        ELSE format_type(a.atttypid, a.atttypmod)
++                    END
++                END::text AS data_type,
++            information_schema._pg_char_max_length(
++                information_schema._pg_truetypid(a.*, t.*),
++                information_schema._pg_truetypmod(a.*, t.*)
++            )::integer AS character_maximum_length,
++            COALESCE(bt.typname, t.typname)::name AS udt_name,
++            a.attnum::integer AS position
++        FROM pg_attribute a
++            LEFT JOIN pg_description AS d
++                ON d.objoid = a.attrelid and d.objsubid = a.attnum
++            LEFT JOIN pg_attrdef ad
++                ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
++            JOIN (pg_class c JOIN pg_namespace nc ON c.relnamespace = nc.oid)
++                ON a.attrelid = c.oid
++            JOIN (pg_type t JOIN pg_namespace nt ON t.typnamespace = nt.oid)
++                ON a.atttypid = t.oid
++            LEFT JOIN (pg_type bt JOIN pg_namespace nbt ON bt.typnamespace = nbt.oid)
++                ON t.typtype = 'd' AND t.typbasetype = bt.oid
++            LEFT JOIN (pg_collation co JOIN pg_namespace nco ON co.collnamespace = nco.oid)
++                ON a.attcollation = co.oid AND (nco.nspname <> 'pg_catalog'::name OR co.collname <> 'default'::name)
++        WHERE
++            NOT pg_is_other_temp_schema(nc.oid)
++            AND a.attnum > 0
++            AND NOT a.attisdropped
++            AND c.relkind in ('r', 'v', 'f', 'm', 'p')
++            AND nc.nspname = ANY($1)
++    )
++    SELECT DISTINCT
++        info.table_schema AS schema,
++        info.table_name AS table_name,
++        info.column_name AS name,
++        info.description AS description,
++        info.is_nullable::boolean AS nullable,
++        info.data_type AS col_type,
++        info.character_maximum_length AS max_len,
++        info.column_default AS default_value,
++        coalesce(enum_info.vals, '{}') AS enum,
++        info.position
++    FROM columns info
++    LEFT OUTER JOIN (
++        SELECT
++            n.nspname AS s,
++            t.typname AS n,
++            array_agg(e.enumlabel ORDER BY e.enumsortorder) AS vals
++        FROM pg_type t
++        JOIN pg_enum e ON t.oid = e.enumtypid
++        JOIN pg_namespace n ON n.oid = t.typnamespace
++        GROUP BY s,n
++    ) AS enum_info ON (info.udt_name = enum_info.n)
++    WHERE info.table_schema NOT IN ('pg_catalog', 'information_schema')
++    ORDER BY schema, position;
++    |]
++
++columnFromRow :: TablesMap ->
++                 (Text,        Text,        Text,
++                  Maybe Text,  Bool,        Text,
++                  Maybe Int32, Maybe Text,  [Text])
++                 -> Maybe Column
++columnFromRow tabs (s, t, n, desc, nul, typ, l, d, e) = buildColumn <$> table
++  where
++    buildColumn tbl = Column tbl n desc nul typ l d e
++    table = M.lookup (QualifiedIdentifier s t) tabs
++
+ allM2ORels :: PgVersion -> Bool -> SQL.Statement () [Relationship]
+ allM2ORels pgVer =
+   SQL.Statement sql HE.noParams decodeRels
+@@ -804,12 +834,6 @@ compositeArrayColumn = arrayColumn . HD.composite
+ compositeField :: HD.Value a -> HD.Composite a
+ compositeField = HD.field . HD.nonNullable
+ 
+-nullableCompositeField :: HD.Value a -> HD.Composite (Maybe a)
+-nullableCompositeField = HD.field . HD.nullable
+-
+-compositeFieldArray :: HD.Value a -> HD.Composite [a]
+-compositeFieldArray = HD.field . HD.nonNullable . HD.listArray . HD.nonNullable
+-
+ column :: HD.Value a -> HD.Row a
+ column = HD.column . HD.nonNullable
+ 
+diff --git a/src/PostgREST/DbStructure/Table.hs b/src/PostgREST/DbStructure/Table.hs
+index ed2302a9..0fdc7c7d 100644
+--- a/src/PostgREST/DbStructure/Table.hs
++++ b/src/PostgREST/DbStructure/Table.hs
+@@ -28,7 +28,6 @@ data Table = Table
+   , tableUpdatable   :: Bool
+   , tableDeletable   :: Bool
+   , tablePKCols      :: [FieldName]
+-  , tableColumns     :: [Column]
+   }
+   deriving (Show, Ord, Generic, JSON.ToJSON)
+ 
+@@ -36,7 +35,8 @@ instance Eq Table where
+   Table{tableSchema=s1,tableName=n1} == Table{tableSchema=s2,tableName=n2} = s1 == s2 && n1 == n2
+ 
+ data Column = Column
+-  { colName        :: FieldName
++  { colTable       :: Table
++  , colName        :: FieldName
+   , colDescription :: Maybe Text
+   , colNullable    :: Bool
+   , colType        :: Text
+@@ -44,6 +44,9 @@ data Column = Column
+   , colDefault     :: Maybe Text
+   , colEnum        :: [Text]
+   }
+-  deriving (Eq, Show, Ord, Generic, JSON.ToJSON)
++  deriving (Ord, Generic, JSON.ToJSON)
++
++instance Eq Column where
++  Column{colTable=t1,colName=n1} == Column{colTable=t2,colName=n2} = t1 == t2 && n1 == n2
+ 
+ type TablesMap = M.HashMap QualifiedIdentifier Table
+diff --git a/src/PostgREST/OpenAPI.hs b/src/PostgREST/OpenAPI.hs
+index 2ade86b6..76aa3a6d 100644
+--- a/src/PostgREST/OpenAPI.hs
++++ b/src/PostgREST/OpenAPI.hs
+@@ -26,7 +26,8 @@ import Data.Swagger
+ 
+ import PostgREST.Config                   (AppConfig (..), Proxy (..),
+                                            isMalformedProxyUri, toURI)
+-import PostgREST.DbStructure              (DbStructure (..))
++import PostgREST.DbStructure              (DbStructure (..),
++                                           tableCols)
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..))
+ import PostgREST.DbStructure.Proc         (ProcDescription (..),
+                                            ProcParam (..))
+@@ -46,7 +47,7 @@ encode conf dbStructure tables procs schemaDescription =
+     postgrestSpec
+       (dbRelationships dbStructure)
+       (concat $ M.elems procs)
+-      (snd <$> M.toList tables)
++      (openApiTableInfo dbStructure <$> (snd <$> M.toList tables))
+       (proxyUri conf)
+       schemaDescription
+ 
+@@ -79,17 +80,17 @@ parseDefault colType colDefault =
+   where
+     wrapInQuotations text = "\"" <> text <> "\""
+ 
+-makeTableDef :: [Relationship] -> Table -> (Text, Schema)
+-makeTableDef rels t =
++makeTableDef :: [Relationship] -> (Table, [Column]) -> (Text, Schema)
++makeTableDef rels (t, cs) =
+   let tn = tableName t in
+       (tn, (mempty :: Schema)
+         & description .~ tableDescription t
+         & type_ ?~ SwaggerObject
+-        & properties .~ fromList (makeProperty t rels <$> tableColumns t)
+-        & required .~ fmap colName (filter (not . colNullable) $ tableColumns t))
++        & properties .~ fromList (fmap (makeProperty rels) cs)
++        & required .~ fmap colName (filter (not . colNullable) cs))
+ 
+-makeProperty :: Table -> [Relationship] -> Column -> (Text, Referenced Schema)
+-makeProperty tbl rels col = (colName col, Inline s)
++makeProperty :: [Relationship] -> Column -> (Text, Referenced Schema)
++makeProperty rels col = (colName col, Inline s)
+   where
+     e = if null $ colEnum col then Nothing else JSON.decode $ JSON.encode $ colEnum col
+     fk :: Maybe Text
+@@ -106,7 +107,7 @@ makeProperty tbl rels col = (colName col, Inline s)
+       in
+         (\(a, b) -> T.intercalate "" ["This is a Foreign Key to `", a, ".", b, "`.<fk table='", a, "' column='", b, "'/>"]) <$> fTblCol
+     pk :: Bool
+-    pk = colName col `elem` tablePKCols tbl
++    pk = colName col `elem` tablePKCols (colTable col)
+     n = catMaybes
+       [ Just "Note:"
+       , if pk then Just "This is a Primary Key.<pk/>" else Nothing
+@@ -161,7 +162,7 @@ makeProcParam pd =
+   , Ref $ Reference "preferParams"
+   ]
+ 
+-makeParamDefs :: [Table] -> [(Text, Param)]
++makeParamDefs :: [(Table, [Column])] -> [(Text, Param)]
+ makeParamDefs ti =
+   [ ("preferParams", makePreferParam ["params=single-object"])
+   , ("preferReturn", makePreferParam ["return=representation", "return=minimal", "return=none"])
+@@ -217,8 +218,8 @@ makeParamDefs ti =
+         & in_ .~ ParamQuery
+         & type_ ?~ SwaggerString))
+   ]
+-  <> concat [ makeObjectBody (tableName t) : makeRowFilters (tableName t) (tableColumns t)
+-            | t <- ti
++  <> concat [ makeObjectBody (tableName t) : makeRowFilters (tableName t) cs
++            | (t, cs) <- ti
+             ]
+ 
+ makeObjectBody :: Text -> (Text, Param)
+@@ -243,8 +244,8 @@ makeRowFilter tn c =
+ makeRowFilters :: Text -> [Column] -> [(Text, Param)]
+ makeRowFilters tn = fmap (makeRowFilter tn)
+ 
+-makePathItem :: Table -> (FilePath, PathItem)
+-makePathItem t = ("/" ++ T.unpack tn, p $ tableInsertable t || tableUpdatable t || tableDeletable t)
++makePathItem :: (Table, [Column]) -> (FilePath, PathItem)
++makePathItem (t, cs) = ("/" ++ T.unpack tn, p $ tableInsertable t || tableUpdatable t || tableDeletable t)
+   where
+     -- Use first line of table description as summary; rest as description (if present)
+     -- We strip leading newlines from description so that users can include a blank line between summary and description
+@@ -278,7 +279,7 @@ makePathItem t = ("/" ++ T.unpack tn, p $ tableInsertable t || tableUpdatable t
+     p False = pr
+     p True  = pw
+     tn = tableName t
+-    rs = [ T.intercalate "." ["rowFilter", tn, colName c ] | c <- tableColumns t ]
++    rs = [ T.intercalate "." ["rowFilter", tn, colName c ] | c <- cs ]
+     ref = Ref . Reference
+ 
+ makeProcPathItem :: ProcDescription -> (FilePath, PathItem)
+@@ -308,7 +309,7 @@ makeRootPathItem = ("/", p)
+     pr = (mempty :: PathItem) & get ?~ getOp
+     p = pr
+ 
+-makePathItems :: [ProcDescription] -> [Table] -> InsOrdHashMap FilePath PathItem
++makePathItems :: [ProcDescription] -> [(Table, [Column])] -> InsOrdHashMap FilePath PathItem
+ makePathItems pds ti = fromList $ makeRootPathItem :
+   fmap makePathItem ti ++ fmap makeProcPathItem pds
+ 
+@@ -320,7 +321,7 @@ escapeHostName "*6" = "0.0.0.0"
+ escapeHostName "!6" = "0.0.0.0"
+ escapeHostName h    = h
+ 
+-postgrestSpec :: [Relationship] -> [ProcDescription] -> [Table] -> (Text, Text, Integer, Text) -> Maybe Text -> Swagger
++postgrestSpec :: [Relationship] -> [ProcDescription] -> [(Table, [Column])] -> (Text, Text, Integer, Text) -> Maybe Text -> Swagger
+ postgrestSpec rels pds ti (s, h, p, b) sd = (mempty :: Swagger)
+   & basePath ?~ T.unpack b
+   & schemes ?~ [s']
+@@ -378,3 +379,9 @@ proxyUri AppConfig{..} =
+       (proxyScheme, proxyHost, proxyPort, proxyPath)
+     Nothing ->
+       ("http", configServerHost, toInteger configServerPort, "/")
++
++openApiTableInfo :: DbStructure -> Table -> (Table, [Column])
++openApiTableInfo dbStructure table =
++  ( table
++  , tableCols dbStructure (tableSchema table) (tableName table)
++  )
+diff --git a/test/memory/memory-tests.sh b/test/memory/memory-tests.sh
+index 032ef978..1ecbd2e4 100755
+--- a/test/memory/memory-tests.sh
++++ b/test/memory/memory-tests.sh
+@@ -102,21 +102,21 @@ postJsonArrayTest(){
+ 
+ echo "Running memory usage tests.."
+ 
+-jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "15M"
+-jsonKeyTest "1M" "POST" "/leak?columns=blob" "15M"
+-jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "15M"
++jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "13M"
++jsonKeyTest "1M" "POST" "/leak?columns=blob" "13M"
++jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "13M"
+ 
+-jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "43M"
+-jsonKeyTest "10M" "POST" "/leak?columns=blob" "43M"
+-jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "43M"
++jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "41M"
++jsonKeyTest "10M" "POST" "/leak?columns=blob" "41M"
++jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "41M"
+ 
+ jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "171M"
+ jsonKeyTest "50M" "POST" "/leak?columns=blob" "171M"
+ jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "171M"
+ 
+-postJsonArrayTest "1000" "/perf_articles?columns=id,body" "13M"
+-postJsonArrayTest "10000" "/perf_articles?columns=id,body" "13M"
+-postJsonArrayTest "100000" "/perf_articles?columns=id,body" "23M"
++postJsonArrayTest "1000" "/perf_articles?columns=id,body" "11M"
++postJsonArrayTest "10000" "/perf_articles?columns=id,body" "11M"
++postJsonArrayTest "100000" "/perf_articles?columns=id,body" "21M"
+ 
+ trap - int term exit
+ 
+diff --git a/test/spec/Feature/OpenApi/OpenApiSpec.hs b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+index 50d14ea4..1fb06bcf 100644
+--- a/test/spec/Feature/OpenApi/OpenApiSpec.hs
++++ b/test/spec/Feature/OpenApi/OpenApiSpec.hs
+@@ -523,7 +523,7 @@ spec actualPgVersion = describe "OpenAPI" $ do
+ 
+         types `shouldBe` Just [aesonQQ|
+             {
+-              "format": "enum_menagerie_type",
++              "format": "test.enum_menagerie_type",
+               "type": "string",
+               "enum": [
+                 "foo",

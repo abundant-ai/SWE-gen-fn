@@ -1,0 +1,12 @@
+Running `mix phx.gen.live` multiple times for different resources that share the same context produces incorrect PubSub helper functions in the generated context.
+
+When a project uses authenticated LiveView generation (scoped by a `%Scope{}`), the first run of `mix phx.gen.live` for a resource adds a resource-specific subscribe function (for example `subscribe_cats/1`) plus a private `broadcast/2` helper that broadcasts to that resource’s topic (for example `"user:#{key}:cats"`).
+
+If `mix phx.gen.live` is run again with the same context but a different resource (for example generating `Dog` after `Cat` in the `Animals` context), the generator adds the new `subscribe_dogs/1` function, but it does not create a new broadcast helper for dogs and it does not update the existing broadcast helper. As a result:
+
+- The context still contains only a single `broadcast/2` that always broadcasts to the first-generated resource topic (e.g. cats), so dog operations incorrectly broadcast dog events on the cats topic.
+- If the developer has renamed the original `broadcast/2` (for example to `broadcast_cats/2`) to make room for multiple resources, the second generator run does not recreate `broadcast/2`, but the newly generated functions (for example `create_dog/2`) still call `broadcast(scope, {:created, dog})`. This causes a compile-time error because `broadcast/2` no longer exists.
+
+The generator needs to avoid producing a single ambiguous `broadcast/2` that cannot support more than one resource within the same context. Each resource generated into a scoped context must have consistent subscribe and broadcast helpers that work even when multiple resources are added over time.
+
+Expected behavior: for each resource, the generator should create and use separate helper functions, such as `subscribe_cats/1` and `broadcast_cats/2`, `subscribe_dogs/1` and `broadcast_dogs/2`, and ensure the generated CRUD functions call the correct resource-specific broadcast helper (e.g. `broadcast_dogs(scope, {:created, dog})`). Generating a second resource into the same context must not overwrite or incorrectly reuse broadcast logic from the first resource, and it must not generate code that calls a missing `broadcast/2` function.

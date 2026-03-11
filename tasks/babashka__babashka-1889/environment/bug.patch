@@ -1,0 +1,240 @@
+diff --git a/deps.edn b/deps.edn
+index 8afb0b1d..8b12a29f 100644
+--- a/deps.edn
++++ b/deps.edn
+@@ -20,7 +20,7 @@
+          "impl-java/src"],
+  :deps {org.clojure/clojure {:mvn/version "1.12.3"},
+         org.babashka/sci {:local/root "sci"}
+-        org.babashka/babashka.impl.java {:mvn/version "0.1.11"}
++        org.babashka/babashka.impl.java {:mvn/version "0.1.10"}
+         org.babashka/sci.impl.types {:mvn/version "0.0.2"}
+         babashka/babashka.curl {:local/root "babashka.curl"}
+         babashka/fs {:local/root "fs"}
+diff --git a/impl-java/build.clj b/impl-java/build.clj
+index 2053bdcd..7c6bb295 100644
+--- a/impl-java/build.clj
++++ b/impl-java/build.clj
+@@ -3,7 +3,7 @@
+             [clojure.tools.build.api :as b]))
+ 
+ (def lib 'org.babashka/babashka.impl.java)
+-(def version "0.1.11")
++(def version "0.1.10")
+ (def class-dir "target/classes")
+ (def basis (b/create-basis {:project "deps.edn"}))
+ (def jar-file (format "target/%s-%s.jar" (name lib) version))
+diff --git a/impl-java/build/reify2.clj b/impl-java/build/reify2.clj
+index 932e2e62..4dcc9f35 100644
+--- a/impl-java/build/reify2.clj
++++ b/impl-java/build/reify2.clj
+@@ -14,80 +14,56 @@
+ (defn return [desc]
+   (case (last desc)
+     :void [:return]
+-    (:boolean :int :byte :short) [:ireturn]
+-    :long [:lreturn]
+-    :float [:freturn]
+-    :double [:dreturn]
++    (:boolean :int) [:ireturn]
+     [:areturn]))
+ 
+-(defn slots [desc]
+-  (->> (butlast desc)
+-       (map #(case % (:long :double) 2 1))
+-       (reductions + 1)))
+-
+-(defn loads [desc slots cast?]
++(defn loads [desc cast?]
+   (let [desc (butlast desc)]
+     (vec
+      (mapcat (fn [i e]
+-               (if-let [[xload boxed]
+-                        (case e
+-                          :boolean [:iload Boolean]
+-                          :int [:iload Integer]
+-                          :byte [:iload Byte]
+-                          :short [:iload Short]
+-                          :long [:lload Long]
+-                          :float [:fload Float]
+-                          :double [:dload Double]
+-                          nil)]
+-                 [[xload i]
+-                  (when cast? [:invokestatic boxed "valueOf" [e boxed]])]
++               (case e
++                 :boolean [[:iload i]
++                            (when cast? [:invokestatic Boolean "valueOf" [:boolean Boolean]])]
++                 :int [[:iload i]
++                       (when cast? [:invokestatic Integer "valueOf" [:int Integer]])]
+                  [[:aload i]]))
+-             slots
++             (range 1 (inc (count desc)))
+              desc))))
+ 
+ (defn emit-method [class meth desc default]
+-  (let [slots (slots desc)
+-        method-slot (last slots)]
++  (let [args (dec (count desc))]
+     [[[:aload 0]
+       [:getfield :this "_methods" java.util.Map]
+       [:getstatic :this (str "_sym_" meth) clojure.lang.Symbol]
+       [:invokeinterface java.util.Map "get" [Object Object]]
+       [:checkcast clojure.lang.IFn]
+-      [:astore method-slot]
+-      [:aload method-slot]
++      [:astore (inc args)]
++      [:aload (inc args)]
+       [:ifnull :fallback]
+-      [:aload method-slot]
++      [:aload (inc args)]
+       ;; load this, always the first argument of IFn
+       [:aload 0]]
+      ;; load remaining args
+-     (loads desc slots true)
++     (loads desc true)
+      [[:invokeinterface clojure.lang.IFn "invoke" (vec (repeat (inc (count desc)) Object))]
+       (let [ret-type* (last desc)
+             ret-type (if (class? ret-type*)
+                        (.getName ^Class ret-type*)
+                        ret-type*)]
+-        (if-let [[tvalue boxed]
+-                 (case ret-type
+-                   :int ["intValue" Integer]
+-                   :boolean ["booleanValue" Boolean]
+-                   :byte ["byteValue" Byte]
+-                   :short ["shortValue" Short]
+-                   :long ["longValue" Long]
+-                   :float ["floatValue" Float]
+-                   :double ["doubleValue" Double]
+-                   nil)]
+-          [[:checkcast boxed]
+-           [:invokevirtual boxed tvalue]]
+-          (case ret-type
+-            :void [:pop]
+-            "java.lang.Object" nil
+-            (when (class? ret-type*)
+-              [[:checkcast ret-type*]]))))
++        (case ret-type
++          :void [:pop]
++          :boolean [[:checkcast Boolean]
++                    [:invokevirtual Boolean "booleanValue"]]
++          :int [[:checkcast Integer]
++                [:invokevirtual Integer "intValue"]]
++          "java.lang.Object" nil
++          (when (class? ret-type*)
++            [[:checkcast ret-type*]])))
+       (return desc)
+       [:mark :fallback]]
+      (if default
+        [[[:aload 0]]
+-        (loads desc slots false)
++        (loads desc false)
+         [[:invokespecial class meth desc true]
+          (return desc)]]
+        [[:new java.lang.UnsupportedOperationException]
+@@ -172,7 +148,8 @@
+                     (for [{:keys [name desc default]} methods]
+                       {:flags #{:public}, :name name
+                        :desc desc
+-                       :emit (emit-method interface name desc default)}))}))
++                       :emit (emit-method interface name desc default)}
++                      ))}))
+ 
+ (set! *warn-on-reflection* true)
+ 
+@@ -181,11 +158,6 @@
+     Void/TYPE :void
+     Boolean/TYPE :boolean
+     Integer/TYPE :int
+-    Byte/TYPE :byte
+-    Short/TYPE :short
+-    Long/TYPE :long
+-    Float/TYPE :float
+-    Double/TYPE :double
+     type))
+ 
+ (defn class->methods [^Class clazz]
+@@ -210,20 +182,7 @@
+ 
+ (def reified (babashka.impl.clojure.lang.IFn. {'invoke (fn [& _args] :yep)} {} {}))
+ 
+-(defn gen-reified [i]
+-  (insn/write (doto (insn/visit (interface-data i (class->methods i)))
+-                insn/define) "target/classes"))
+-
+ (defn gen-classes [_]
+-  (run! gen-reified interfaces))
+-
+-(comment
+-  (definterface IHaveManyPrimitives
+-    (^void example [^byte b ^short s ^int i ^long l ^boolean z ^float f ^double d])
+-    (^int example2 [^long x])
+-    (^boolean example3 []))
+-  (def impl
+-    (insn/load-type
+-     (clojure.lang.DynamicClassLoader.)
+-     (gen-reified IHaveManyPrimitives)))
+-  )
+\ No newline at end of file
++  (doseq [i interfaces]
++    (insn/write (doto (insn/visit (interface-data i (class->methods i)))
++                  insn/define) "target/classes")))
+diff --git a/impl-java/src/babashka/impl/reify2/interfaces.clj b/impl-java/src/babashka/impl/reify2/interfaces.clj
+index b956a062..47e48377 100644
+--- a/impl-java/src/babashka/impl/reify2/interfaces.clj
++++ b/impl-java/src/babashka/impl/reify2/interfaces.clj
+@@ -35,5 +35,4 @@
+                  sun.misc.SignalHandler
+                  java.util.concurrent.ThreadFactory
+                  java.lang.Thread$UncaughtExceptionHandler
+-                 java.util.concurrent.Callable
+-                 java.time.temporal.TemporalField])
++                 java.util.concurrent.Callable])
+diff --git a/project.clj b/project.clj
+index 2d0f654a..87101665 100644
+--- a/project.clj
++++ b/project.clj
+@@ -29,7 +29,7 @@
+                  [nrepl/bencode "1.2.0"]
+                  [borkdude/sci.impl.reflector "0.0.5"]
+                  [org.babashka/sci.impl.types "0.0.2"]
+-                 [org.babashka/babashka.impl.java "0.1.11"]
++                 [org.babashka/babashka.impl.java "0.1.10"]
+                  [org.clojure/core.async "1.8.741"]
+                  [org.clojure/test.check "1.1.1"]
+                  [com.github.clj-easy/graal-build-time "0.1.0"]
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index e4e773a0..8d34c277 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -492,7 +492,6 @@
+                 java.time.temporal.TemporalAdjusters
+                 java.time.temporal.TemporalAmount
+                 java.time.temporal.TemporalField
+-                java.time.temporal.ValueRange
+                 java.time.temporal.WeekFields
+                 ~(symbol "[Ljava.time.temporal.TemporalField;")
+                 java.time.format.TextStyle
+diff --git a/test/babashka/reify_test.clj b/test/babashka/reify_test.clj
+index 040c988b..66edc83d 100644
+--- a/test/babashka/reify_test.clj
++++ b/test/babashka/reify_test.clj
+@@ -186,18 +186,3 @@
+   (let [path (.toPath (java.io.File. dir-path))]
+     (java.nio.file.Files/newDirectoryStream path glob-pattern)))
+ (pos? (count (seq (get-dir-stream \".\" (reify java.nio.file.DirectoryStream$Filter (accept [_ path] (.isDirectory (.toFile path))))))))"))))
+-
+-(deftest reify-temporal-field-test
+-  (let [s (bb nil "(def field
+-  (reify
+-    java.time.temporal.TemporalField
+-    (rangeRefinedBy [_ _temporal]
+-      (java.time.temporal.ValueRange/of 0 999))
+-    (getFrom [_ _temporal] 1337)
+-    (adjustInto [_ temporal value] temporal)))
+-  (prn (pr-str (.rangeRefinedBy field nil)
+-          (.getFrom field nil)
+-          (.adjustInto field (java.time.Instant/now) 1)))")]
+-    (is (str/includes? s "0 - 999"))
+-    (is (str/includes? s "1337"))
+-    (is (str/includes? s "java.time.Instant"))))

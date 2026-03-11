@@ -27,7 +27,7 @@ Run with Codex:
 export OPENAI_API_KEY=<YOUR-KEY> 
 harbor run --dataset swe-gen-fun \
    --agent codex \
-   --model openai/gpt-5.2-codex \
+   --model openai/gpt-5.3-codex \
    --n-concurrent 4
 ```
 

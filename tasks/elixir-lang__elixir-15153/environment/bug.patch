@@ -1,0 +1,1171 @@
+diff --git a/lib/elixir/lib/module/types.ex b/lib/elixir/lib/module/types.ex
+index 64f999072..586a9584a 100644
+--- a/lib/elixir/lib/module/types.ex
++++ b/lib/elixir/lib/module/types.ex
+@@ -452,7 +452,7 @@ def context() do
+       subpatterns: %{},
+       # Variables that are specific to the current environment/conditional
+       conditional_vars: nil,
+-      # Track metadata specific to patterns and guards
++      # Track metadata specific to matches and guards
+       pattern_info: nil,
+       # If type checking has found an error/failure
+       failed: false,
+diff --git a/lib/elixir/lib/module/types/apply.ex b/lib/elixir/lib/module/types/apply.ex
+index 07354ee02..1e8d154da 100644
+--- a/lib/elixir/lib/module/types/apply.ex
++++ b/lib/elixir/lib/module/types/apply.ex
+@@ -1486,9 +1486,9 @@ defp filter_domain({_, domain, clauses}, expected, _arity) when expected in @ter
+     domain(domain, clauses)
+   end
+ 
+-  defp filter_domain({_type, domain, clauses}, expected, _arity) do
++  defp filter_domain({_type, domain, clauses}, expected, arity) do
+     case filter_domain(clauses, expected, [], true) do
+-      :none -> domain(domain, clauses)
++      :none -> List.duplicate(term(), arity)
+       :all -> domain(domain, clauses)
+       args -> Enum.zip_with(args, fn types -> Enum.reduce(types, &union/2) end)
+     end
+diff --git a/lib/elixir/lib/module/types/descr.ex b/lib/elixir/lib/module/types/descr.ex
+index 1011037a0..43e9446e9 100644
+--- a/lib/elixir/lib/module/types/descr.ex
++++ b/lib/elixir/lib/module/types/descr.ex
+@@ -2258,20 +2258,15 @@ defp list_difference(bdd_leaf(list1, last1) = bdd1, bdd_leaf(list2, last2) = bdd
+         do: :bdd_bot,
+         else: bdd_leaf(list1, difference(last1, last2))
+     else
+-      bdd_difference(bdd1, bdd2, &list_leaf_compare/2)
++      bdd_difference(bdd1, bdd2, &list_leaf_disjoint?/2)
+     end
+   end
+ 
+   defp list_difference(bdd1, bdd2),
+-    do: bdd_difference(bdd1, bdd2, &list_leaf_compare/2)
++    do: bdd_difference(bdd1, bdd2, &list_leaf_disjoint?/2)
+ 
+-  defp list_leaf_compare(bdd_leaf(list1, last1), bdd_leaf(list2, last2)) do
+-    if disjoint?(list1, list2) or disjoint?(last1, last2) do
+-      :disjoint
+-    else
+-      :none
+-    end
+-  end
++  defp list_leaf_disjoint?(bdd_leaf(list1, last1), bdd_leaf(list2, last2)),
++    do: disjoint?(list1, list2) or disjoint?(last1, last2)
+ 
+   defp list_empty?(@non_empty_list_top), do: false
+ 
+@@ -2974,13 +2969,13 @@ defp map_difference(bdd_leaf(tag, fields) = map1, bdd_leaf(neg_tag, neg_fields)
+         end
+ 
+       _ when is_atom(tag) and is_atom(neg_tag) ->
+-        case map_difference_strategy(fields, neg_fields, tag, neg_tag) do
++        case map_difference_strategy(fields, neg_fields, tag, neg_tag, :all_equal) do
++          :all_equal when tag == neg_tag or neg_tag == :open ->
++            :bdd_bot
++
+           :disjoint ->
+             bdd_leaf(tag, fields)
+ 
+-          :left_subtype_of_right ->
+-            :bdd_bot
+-
+           {:one_key_difference, key, v1, v2} ->
+             t_diff = difference(fields_get(fields, key, v1), v2)
+ 
+@@ -2990,28 +2985,38 @@ defp map_difference(bdd_leaf(tag, fields) = map1, bdd_leaf(neg_tag, neg_fields)
+               bdd_leaf(tag, fields_store(key, t_diff, fields))
+             end
+ 
++          :left_subtype_of_right ->
++            :bdd_bot
++
+           _ ->
+             bdd_difference(map1, map2)
+         end
+ 
+       _ ->
+-        bdd_difference(map1, map2, &map_leaf_compare/2)
++        bdd_difference(map1, map2, &map_leaf_disjoint?/2)
+     end
+   end
+ 
+   defp map_difference(bdd_leaf(:open, []), bdd2),
+     do: bdd_negation(bdd2)
+ 
+-  defp map_difference(bdd1, bdd2) do
+-    bdd_difference(bdd1, bdd2, &map_leaf_compare/2)
++  defp map_difference(bdd1, bdd2),
++    do: bdd_difference(bdd1, bdd2, &map_leaf_disjoint?/2)
++
++  defp map_leaf_disjoint?(bdd_leaf(_tag1, fields1), bdd_leaf(_tag2, fields2)) do
++    disjoint_structs?(fields1, fields2)
+   end
+ 
+-  defp map_leaf_compare(bdd_leaf(tag, fields), bdd_leaf(neg_tag, neg_fields)) do
+-    case map_difference_strategy(fields, neg_fields, tag, neg_tag) do
+-      :disjoint -> :disjoint
+-      :left_subtype_of_right -> :subtype
+-      {:one_key_difference, _, v1, v2} -> if subtype?(v1, v2), do: :subtype, else: :none
+-      _ -> :none
++  defp disjoint_structs?(fields1, fields2) do
++    case {fields_find(:__struct__, fields1), fields_find(:__struct__, fields2)} do
++      {{:ok, %{atom: atom} = d1}, {:ok, d2}} when map_size(d1) == 1 ->
++        disjoint_atom_descr?(atom, d2)
++
++      {{:ok, d1}, {:ok, %{atom: atom} = d2}} when map_size(d2) == 1 ->
++        disjoint_atom_descr?(atom, d1)
++
++      _ ->
++        false
+     end
+   end
+ 
+@@ -4356,7 +4361,10 @@ defp maybe_eliminate_map_negations(tag, fields, negs) do
+       if empty_intersection? do
+         {acc_fields, acc_negs}
+       else
+-        case map_difference_strategy(acc_fields, neg_fields, tag, neg_tag) do
++        case map_difference_strategy(acc_fields, neg_fields, tag, neg_tag, :all_equal) do
++          :all_equal when tag == neg_tag or neg_tag == :open ->
++            {acc_fields, acc_negs}
++
+           {:one_key_difference, key, v1, v2} ->
+             {fields_store(key, difference(v1, v2), acc_fields), acc_negs}
+ 
+@@ -4370,27 +4378,13 @@ defp maybe_eliminate_map_negations(tag, fields, negs) do
+     end)
+   end
+ 
+-  defp map_difference_strategy(fields1, fields2, tag1, tag2) do
+-    if is_atom(tag1) and is_atom(tag2) do
+-      status = if tag1 == tag2 or tag2 == :open, do: :all_equal, else: :none
+-      map_difference_strategy(fields1, fields2, tag1, tag2, status)
+-    else
+-      :none
+-    end
+-  end
+-
+-  defp map_difference_strategy([{k1, value} | t1], [{k2, _} | _] = l2, tag1, tag2, status)
++  defp map_difference_strategy([{k1, _} | t1], [{k2, _} | _] = l2, tag1, tag2, status)
+        when k1 < k2 do
+     # Left side has a key the right side does not have,
+     # left can only be a subtype if the right side is open.
+-    # If the right side is closed and the key is not optional, they are disjoint.
+     case status do
+-      _ when tag2 == :closed ->
+-        if not is_optional_static(value) do
+-          :disjoint
+-        else
+-          map_difference_strategy(t1, l2, tag1, tag2, :none)
+-        end
++      _ when tag2 != :open ->
++        :none
+ 
+       :all_equal ->
+         map_difference_strategy(t1, l2, tag1, tag2, :left_subtype_of_right)
+@@ -4408,15 +4402,11 @@ defp map_difference_strategy([{k1, value} | t1], [{k2, _} | _] = l2, tag1, tag2,
+     end
+   end
+ 
+-  defp map_difference_strategy([{k1, _} | _] = l1, [{k2, value} | t2], tag1, tag2, _status)
++  defp map_difference_strategy([{k1, _} | _], [{k2, value} | _], tag1, _tag2, _status)
+        when k1 > k2 do
+     # Right side has a key the left side does not have,
+     # if left-side is closed, they are disjoint.
+-    if tag1 == :closed and not is_optional_static(value) do
+-      :disjoint
+-    else
+-      map_difference_strategy(l1, t2, tag1, tag2, :none)
+-    end
++    if tag1 == :closed and not is_optional_static(value), do: :disjoint, else: :none
+   end
+ 
+   defp map_difference_strategy([{_, v} | t1], [{_, v} | t2], tag1, tag2, status) do
+@@ -4440,19 +4430,20 @@ defp map_difference_strategy([{k1, v1} | t1], [{_, v2} | t2], tag1, tag2, status
+             :none
+           end
+ 
++        # all_equal or left_subtype_of_right
+         _ ->
+-          if status in [:all_equal, :left_subtype_of_right] and subtype?(v1, v2),
++          if subtype?(v1, v2),
+             do: map_difference_strategy(t1, t2, tag1, tag2, :left_subtype_of_right),
+-            else: map_difference_strategy(t1, t2, tag1, tag2, :none)
++            else: :none
+       end
+     end
+   end
+ 
+   defp map_difference_strategy([], [], _tag1, _tag2, status) do
+-    if status == :all_equal, do: :left_subtype_of_right, else: status
++    status
+   end
+ 
+-  defp map_difference_strategy(l1, l2, tag1, tag2, status) do
++  defp map_difference_strategy(_l1, l2, tag1, tag2, status) do
+     cond do
+       tag2 == :open and l2 == [] ->
+         case status do
+@@ -4464,17 +4455,11 @@ defp map_difference_strategy(l1, l2, tag1, tag2, status) do
+ 
+           :left_subtype_of_right ->
+             :left_subtype_of_right
+-
+-          :none ->
+-            :none
+         end
+ 
+       tag1 == :closed and l2 != [] and Enum.all?(l2, fn {_, v} -> not is_optional_static(v) end) ->
+         :disjoint
+ 
+-      tag2 == :closed and l1 != [] and Enum.all?(l1, fn {_, v} -> not is_optional_static(v) end) ->
+-        :disjoint
+-
+       true ->
+         :none
+     end
+@@ -4831,15 +4816,11 @@ defp tuple_difference(bdd_leaf(:open, []), bdd2),
+     do: bdd_negation(bdd2)
+ 
+   defp tuple_difference(bdd1, bdd2),
+-    do: bdd_difference(bdd1, bdd2, &tuple_leaf_compare?/2)
++    do: bdd_difference(bdd1, bdd2, &tuple_leaf_disjoint?/2)
+ 
+-  defp tuple_leaf_compare?(bdd_leaf(tag1, elements1), bdd_leaf(tag2, elements2)) do
+-    if mismatched_tuple_sizes?(tag1, elements1, tag2, elements2) or
+-         disjoint_tagged_tuples?(elements1, elements2) do
+-      :disjoint
+-    else
+-      :none
+-    end
++  defp tuple_leaf_disjoint?(bdd_leaf(tag1, elements1), bdd_leaf(tag2, elements2)) do
++    mismatched_tuple_sizes?(tag1, elements1, tag2, elements2) or
++      disjoint_tagged_tuples?(elements1, elements2)
+   end
+ 
+   # A very cheap check for tagged tuples
+@@ -5612,87 +5593,65 @@ defp bdd_difference_union(:bdd_bot, _u1, _u2),
+   defp bdd_difference_union(i, u1, u2),
+     do: bdd_difference(i, bdd_union(u1, u2))
+ 
+-  ## Optimize differences
+-
+-  # For the right-side being a leaf, we have:
++  # Optimize differences
+   #
+-  #     ((a1 and C1) or U1 or (not a1 and D1)) and not a2
++  # ## When D2 == :bottom
+   #
+-  # If disjoint?(a1, a2), we end up with:
++  # We can rewrite the BDD format:
+   #
+-  #     (a1 and C1) or (U1 and not d2) or (not a1 and D1 and not a2)
++  # B1 and not B2
++  # ((a1 and C1) or B1_no_C1) and not B2
++  # ((a1 and C1) and not B2) or (B1_no_C1 and not B2)
++  # (a1 and C1 and not ((a2 and C2) or U2)) or (B1_no_C1 and not B2)
++  # (a1 and C1 and not (a2 and C2) and not U2) or (B1_no_C1 and not B2)
++  # (a1 and C1 and not U2) or (B1_no_C1 and not B2)
++  # (a1 and C1 and not U2) or (U1 and not B2) or (not a1 and D1 and not B2)
+   #
+-  # If subtype?(a1, a2), we end up with:
++  # The last line is equivalent to the BDD:
++  # {a1, C1 and not U2, U1 and not B2, D1 and not B2}
+   #
+-  #     (U1 and not d2) or (D1 and not a2)
+-  defp bdd_difference({a1, c1, u1, d1} = bdd1, bdd_leaf(_, _) = bdd2, leaf_compare)
+-       when is_tuple(bdd2) do
+-    case leaf_compare.(a1, bdd2) do
+-      :disjoint ->
+-        bdd_union(
+-          bdd_difference(u1, bdd2, leaf_compare),
+-          bdd_difference({a1, :bdd_bot, :bdd_bot, d1}, bdd2)
+-        )
+-        |> bdd_union({a1, c1, :bdd_bot, :bdd_bot})
++  # ## When D2 != :bottom
++  #
++  # We could rewrite it to use the same optimization as bdd_leaf_intersection.
++  # However, given differences of negations are not common and because
++  # bdd_leaf_intersection can be expensive for open maps, we skip this step for now.
++  #
++  # (B1) and not (B2)
++  # (B1) and not (B2_no_D2 or (not a2 and D2))
++  # (B1) and (not B2_no_D2 and (a2 or not D2))
++  # (B1) and (a2 or not D2) and not B2_no_D2
++  # ((B1 and a2) or (B1 and not D2)) and not B2_no_D2
+ 
+-      :subtype ->
+-        bdd_union(bdd_difference(u1, bdd2, leaf_compare), bdd_difference(d1, bdd2, leaf_compare))
++  defp bdd_difference(bdd1, {_, _, _, d} = bdd2, _leaf_disjoint) when d != :bdd_bot do
++    bdd_difference(bdd1, bdd2)
++  end
+ 
+-      :none when a1 < bdd2 ->
+-        {a1, bdd_difference(c1, bdd2, leaf_compare), bdd_difference(u1, bdd2, leaf_compare),
+-         bdd_difference(d1, bdd2, leaf_compare)}
+-        |> case do
+-          {_, :bdd_bot, u, :bdd_bot} -> u
+-          other -> other
+-        end
++  defp bdd_difference(bdd_leaf(_, _) = bdd1, bdd2, leaf_disjoint)
++       when is_tuple(bdd2) do
++    {leaf, _, u, :bdd_bot} = bdd_expand(bdd2)
+ 
+-      :none ->
+-        bdd_difference(bdd1, bdd2)
++    case leaf_disjoint.(bdd1, leaf) do
++      true when u == :bdd_bot -> bdd1
++      true -> bdd_difference(bdd1, u, leaf_disjoint)
++      false -> bdd_difference(bdd1, bdd2)
+     end
+   end
+ 
+-  # For the left-side being a leaf, we have:
+-  #
+-  #     a1 and not ((a2 and C2) or U2 or (not a2 and D2))
+-  #     a1 and not (a2 and C2) and not U2 and (a2 or not D2)
+-  #
+-  # If disjoint?(a1, a2):
+-  #
+-  #     a1 and not (a2 and C2) = a1            (a2 and C2 is subset of a2, disjoint from a1)
+-  #     a1 and (a2 or not D2) = a1 and not D2  (a1 and a2 = bottom)
+-  #
+-  # Result: a1 and not D2 and not U2
+-  #
+-  # If subtype?(a1, a2):
+-  #
+-  #     a1 and not (a2 and C2) = a1 and not C2 (a1 and not a2 = bottom)
+-  #     a1 and (a2 or not D2) = a1             (a1 and a2 = a1)
+-  #
+-  # Result: a1 and not C2 and not U2
+-  defp bdd_difference(bdd_leaf(_, _) = bdd1, bdd2, leaf_compare) when is_tuple(bdd2) do
+-    {a2, c2, u2, d2} = bdd_expand(bdd2)
+-
+-    case leaf_compare.(bdd1, a2) do
+-      :disjoint ->
+-        bdd1 |> bdd_difference(u2, leaf_compare) |> bdd_difference(d2, leaf_compare)
+-
+-      :subtype ->
+-        bdd1 |> bdd_difference(u2, leaf_compare) |> bdd_difference(c2, leaf_compare)
++  defp bdd_difference({a1, c1, u1, d1} = bdd1, bdd2, leaf_disjoint)
++       when is_tuple(bdd2) do
++    {a2, _c2, u2, :bdd_bot} = bdd_expand(bdd2)
+ 
+-      :none when a2 < bdd1 ->
+-        {a2, bdd_difference(bdd1, bdd_union(c2, u2), leaf_compare), :bdd_bot,
+-         bdd_difference(bdd1, bdd_union(d2, u2), leaf_compare)}
+-        |> case do
+-          {_, :bdd_bot, u, :bdd_bot} -> u
+-          other -> other
+-        end
++    case leaf_disjoint.(a1, a2) do
++      true ->
++        {a1, bdd_difference(c1, u2, leaf_disjoint), bdd_difference(u1, bdd2, leaf_disjoint),
++         bdd_difference(d1, bdd2, leaf_disjoint)}
+ 
+-      :none ->
++      false ->
+         bdd_difference(bdd1, bdd2)
+     end
+   end
+ 
+-  defp bdd_difference(bdd1, bdd2, _leaf_compare) do
++  defp bdd_difference(bdd1, bdd2, _leaf_disjoint) do
+     bdd_difference(bdd1, bdd2)
+   end
+ 
+diff --git a/lib/elixir/lib/module/types/of.ex b/lib/elixir/lib/module/types/of.ex
+index 9b9610bfb..ba795ee20 100644
+--- a/lib/elixir/lib/module/types/of.ex
++++ b/lib/elixir/lib/module/types/of.ex
+@@ -86,14 +86,13 @@ def track_var(version, new_deps, new_paths, context) do
+   or if we are doing a guard analysis or occurrence typing.
+   Returns `true` if there was a refinement, `false` otherwise.
+   """
+-  @skip_refinement_for [term(), dynamic()]
+-  def refine_body_var(var_or_version, type, expr, stack, context)
++  def refine_body_var(var_or_version, type, expr, stack, context, allow_empty? \\ false)
+ 
+-  def refine_body_var({_, meta, _}, type, expr, stack, context) do
+-    refine_body_var(Keyword.fetch!(meta, :version), type, expr, stack, context)
++  def refine_body_var({_, meta, _}, type, expr, stack, context, allow_empty?) do
++    refine_body_var(Keyword.fetch!(meta, :version), type, expr, stack, context, allow_empty?)
+   end
+ 
+-  def refine_body_var(version, type, expr, stack, context)
++  def refine_body_var(version, type, expr, stack, context, allow_empty?)
+       when is_integer(version) or is_reference(version) do
+     %{vars: %{^version => %{type: old_type, off_traces: off_traces} = data} = vars} = context
+ 
+@@ -106,50 +105,31 @@ def refine_body_var(version, type, expr, stack, context)
+           context
+       end
+ 
+-    case context do
+-      _ when type in @skip_refinement_for or is_map_key(data, :errored) ->
+-        {old_type, context}
++    if gradual?(old_type) and type not in [term(), dynamic()] and not is_map_key(data, :errored) do
++      case compatible_intersection(old_type, type) do
++        {:error, _} when allow_empty? ->
++          data = %{
++            data
++            | type: none(),
++              off_traces: new_trace(expr, none(), stack, off_traces)
++          }
+ 
+-      %{pattern_info: %{guard_context: guard_context}} ->
+-        new_type = intersection(old_type, type)
++          {none(), %{context | vars: %{vars | version => data}}}
+ 
+-        case empty?(new_type) do
+-          true when guard_context == :orelse ->
+-            data = %{
+-              data
+-              | type: none(),
+-                off_traces: new_trace(expr, none(), stack, off_traces)
+-            }
++        {:ok, new_type} when new_type != old_type ->
++          data = %{
++            data
++            | type: new_type,
++              off_traces: new_trace(expr, new_type, stack, off_traces)
++          }
+ 
+-            {none(), %{context | vars: %{vars | version => data}}}
++          {new_type, %{context | vars: %{vars | version => data}}}
+ 
+-          false when new_type != old_type ->
+-            data = %{
+-              data
+-              | type: new_type,
+-                off_traces: new_trace(expr, new_type, stack, off_traces)
+-            }
+-
+-            {new_type, %{context | vars: %{vars | version => data}}}
+-
+-          _ ->
+-            {old_type, context}
+-        end
+-
+-      _ ->
+-        case gradual?(old_type) and compatible_intersection(old_type, type) do
+-          {:ok, new_type} when new_type != old_type ->
+-            data = %{
+-              data
+-              | type: new_type,
+-                off_traces: new_trace(expr, new_type, stack, off_traces)
+-            }
+-
+-            {new_type, %{context | vars: %{vars | version => data}}}
+-
+-          _ ->
+-            {old_type, context}
+-        end
++        _ ->
++          {old_type, context}
++      end
++    else
++      {old_type, context}
+     end
+   end
+ 
+diff --git a/lib/elixir/lib/module/types/pattern.ex b/lib/elixir/lib/module/types/pattern.ex
+index 4bf82e0c7..cb37cd15b 100644
+--- a/lib/elixir/lib/module/types/pattern.ex
++++ b/lib/elixir/lib/module/types/pattern.ex
+@@ -194,7 +194,7 @@ defp of_changed_var(version, stack, context) do
+   def of_head(patterns, guards, expected, previous, tag, meta, stack, original) do
+     stack = %{stack | meta: meta}
+ 
+-    {trees, precise?, args_types, context} =
++    {trees, precise?, context} =
+       of_precise_head(patterns, guards, expected, previous, tag, stack, original)
+ 
+     if context.failed and not empty_previous?(previous) and
+@@ -202,10 +202,17 @@ def of_head(patterns, guards, expected, previous, tag, meta, stack, original) do
+       # If it failed, let's try to break it down to a better error message.
+       # First we check if it fails without previous, if it doesn't, check if it is redundant.
+       case of_precise_head(patterns, guards, expected, init_previous(), tag, stack, original) do
+-        {other_trees, _, _, %{failed: true} = other_context} ->
++        {other_trees, _, %{failed: true} = other_context} ->
+           {other_trees, previous, other_context}
+ 
+-        {other_trees, _, args_types, other_context} ->
++        {other_trees, _, other_context} ->
++          args_types =
++            Enum.map(other_trees, fn {tree, _, _} ->
++              tree
++              |> of_pattern_tree(stack, other_context)
++              |> upper_bound()
++            end)
++
+           if previous_subtype?(args_types, previous) do
+             warning = {:redundant, tag, expected, args_types, previous, other_context}
+             {other_trees, previous, warn(__MODULE__, warning, meta, stack, other_context)}
+@@ -214,6 +221,13 @@ def of_head(patterns, guards, expected, previous, tag, meta, stack, original) do
+           end
+       end
+     else
++      args_types =
++        Enum.map(trees, fn {tree, _, _} ->
++          tree
++          |> of_pattern_tree(stack, context)
++          |> upper_bound()
++        end)
++
+       cond do
+         previous_subtype?(args_types, previous) ->
+           warning = {:redundant, tag, expected, args_types, previous, context}
+@@ -228,53 +242,19 @@ def of_head(patterns, guards, expected, previous, tag, meta, stack, original) do
+     end
+   end
+ 
+-  defp of_precise_head([], guards, _expected, _previous, _tag, stack, context) do
+-    %{vars: vars} = context
+-    {guard_precise?, changed, context} = of_guards(guards, vars, stack, context)
+-    {[], guard_precise?, [], of_changed(Map.keys(changed), stack, context)}
+-  end
+-
+   defp of_precise_head(patterns, guards, expected, previous, tag, stack, context) do
+     %{vars: vars} = context
+-    context = init_pattern_info(context, [])
+-
+-    {trees, pattern_precise?, context} =
+-      of_pattern_args_zip(patterns, expected, 0, [], true, stack, context)
+ 
+-    {pattern_info, context} = pop_pattern_info(context)
+-    {guard_precise?, changed, context} = of_guards(guards, vars, stack, context)
++    case of_pattern_args(patterns, expected, previous, tag, stack, context) do
++      {trees, pattern_precise?, changed, context} ->
++        {guard_precise?, context} = of_guards(guards, changed, vars, stack, context)
++        {trees, pattern_precise? and guard_precise?, context}
+ 
+-    with {:ok, types} <-
+-           of_pattern_intersect(trees, 0, [], pattern_info, tag, stack, context),
+-         # We compute the args types before we do the intersection with previous clauses
+-         args_types =
+-           (with [_ | _] <- previous,
+-                 {:ok, _types, context} <-
+-                   of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
+-              trees_to_args_types(trees, stack, context)
+-            else
+-              _ -> nil
+-            end),
+-         {:ok, types} <-
+-           of_pattern_previous(types, previous, trees, pattern_info, tag, stack, context),
+-         {:ok, _types, context} <-
+-           of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
+-      {trees, pattern_precise? and guard_precise?,
+-       args_types || trees_to_args_types(trees, stack, context), context}
+-    else
+-      {:error, context} ->
+-        {trees, false, trees_to_args_types(trees, stack, context), context}
++      {trees, context} ->
++        {trees, false, context}
+     end
+   end
+ 
+-  defp trees_to_args_types(trees, stack, context) do
+-    Enum.map(trees, fn {tree, _, _} ->
+-      tree
+-      |> of_pattern_tree(stack, context)
+-      |> upper_bound()
+-    end)
+-  end
+-
+   @doc """
+   Computes the domain from the pattern tree and expected types.
+ 
+@@ -292,6 +272,30 @@ def of_domain([], _stack, _context) do
+     []
+   end
+ 
++  defp of_pattern_args([], [], _previous, _tag, _stack, context) do
++    {[], true, [], context}
++  end
++
++  defp of_pattern_args(patterns, expected, previous, tag, stack, context) do
++    context = init_pattern_info(context, [])
++
++    {trees, precise?, context} =
++      of_pattern_args_zip(patterns, expected, 0, [], true, stack, context)
++
++    {pattern_info, context} = pop_pattern_info(context)
++
++    with {:ok, types} <-
++           of_pattern_intersect(trees, 0, [], pattern_info, tag, stack, context),
++         {:ok, types} <-
++           of_pattern_previous(types, previous, trees, pattern_info, tag, stack, context),
++         {_types, changed, context} <-
++           of_pattern_refine(types, pattern_info, tag, stack, context) do
++      {trees, precise?, changed, context}
++    else
++      {:error, context} -> {trees, context}
++    end
++  end
++
+   defp of_pattern_args_zip(
+          [pattern | tail],
+          [expected | types],
+@@ -329,9 +333,9 @@ def of_match(pattern, expected_fun, expr, stack, context) do
+ 
+     with {:ok, types} <-
+            of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context),
+-         {:ok, [type], context} <-
+-           of_pattern_refine(types, %{}, pattern_info, tag, stack, context) do
+-      {type, context}
++         {[type], changed, context} <-
++           of_pattern_refine(types, pattern_info, tag, stack, context) do
++      {type, of_changed(changed, stack, context)}
+     else
+       {:error, context} -> {expected, context}
+     end
+@@ -348,15 +352,15 @@ def of_generator(pattern, guards, expected, tag, expr, stack, %{vars: vars} = co
+ 
+     {pattern_info, context} = pop_pattern_info(context)
+     args = [{tree, expected, pattern}]
+-    {_precise?, changed, context} = of_guards(guards, vars, stack, context)
+ 
+-    with {:ok, types} <-
+-           of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context),
+-         {:ok, _types, context} <-
+-           of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
++    with {:ok, types} <- of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context),
++         {_types, changed, context} <-
++           of_pattern_refine(types, pattern_info, tag, stack, context) do
++      {_precise?, context} = of_guards(guards, changed, vars, stack, context)
+       context
+     else
+-      {:error, context} -> context
++      {:error, context} ->
++        context
+     end
+   end
+ 
+@@ -378,10 +382,10 @@ defp of_pattern_intersect([], _index, acc, _pattern_info, _tag, _stack, _context
+     {:ok, Enum.reverse(acc)}
+   end
+ 
+-  defp of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
++  defp of_pattern_refine(types, pattern_info, tag, stack, context) do
+     pattern_info
+     |> Enum.reverse()
+-    |> Enum.reduce({changed, context}, fn {version, _pinned, node}, {changed, context} ->
++    |> Enum.reduce({[], context}, fn {version, _pinned, node}, {changed, context} ->
+       %{var: var, expr: expr, root: root, path: path} = node
+ 
+       {actual, index} =
+@@ -409,13 +413,13 @@ defp of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
+             throw(badpattern_error(expr, index, tag, stack, context))
+         end
+ 
+-      {Map.put(changed, version, true), context}
++      {[version | changed], context}
+     end)
+   catch
+     context -> {:error, error_vars(pattern_info, context)}
+   else
+     {changed, context} ->
+-      {:ok, types, of_changed(Map.keys(changed), stack, context)}
++      {types, changed, context}
+   end
+ 
+   defp error_vars(pattern_info, context) do
+@@ -515,11 +519,13 @@ defp of_pattern_var([:tail | rest], type, context) do
+     end
+   end
+ 
+-  # Receives the pattern tree and the context and returns a concrete type.
+-  defp of_pattern_tree(descr, _stack, _context) when is_descr(descr),
++  @doc """
++  Receives the pattern tree and the context and returns a concrete type.
++  """
++  def of_pattern_tree(descr, _stack, _context) when is_descr(descr),
+     do: descr
+ 
+-  defp of_pattern_tree({:guard, name, polarity, guard, expr}, stack, context) do
++  def of_pattern_tree({:guard, name, polarity, guard, expr}, stack, context) do
+     {type, _context} = of_guard(guard, term(), expr, stack, context)
+ 
+     # This logic mirrors the code in `Apply.compare`
+@@ -535,25 +541,25 @@ defp of_pattern_tree({:guard, name, polarity, guard, expr}, stack, context) do
+     end
+   end
+ 
+-  defp of_pattern_tree({:tuple, entries}, stack, context) do
++  def of_pattern_tree({:tuple, entries}, stack, context) do
+     tuple(Enum.map(entries, &of_pattern_tree(&1, stack, context)))
+   end
+ 
+-  defp of_pattern_tree({:open_map, static, dynamic}, stack, context) do
++  def of_pattern_tree({:open_map, static, dynamic}, stack, context) do
+     dynamic =
+       Enum.map(dynamic, fn {key, value} -> {key, of_pattern_tree(value, stack, context)} end)
+ 
+     open_map(static ++ dynamic)
+   end
+ 
+-  defp of_pattern_tree({:closed_map, static, dynamic}, stack, context) do
++  def of_pattern_tree({:closed_map, static, dynamic}, stack, context) do
+     dynamic =
+       Enum.map(dynamic, fn {key, value} -> {key, of_pattern_tree(value, stack, context)} end)
+ 
+     closed_map(static ++ dynamic)
+   end
+ 
+-  defp of_pattern_tree({:non_empty_list, [head | tail], suffix}, stack, context) do
++  def of_pattern_tree({:non_empty_list, [head | tail], suffix}, stack, context) do
+     tail
+     |> Enum.reduce(
+       of_pattern_tree(head, stack, context),
+@@ -562,20 +568,20 @@ defp of_pattern_tree({:non_empty_list, [head | tail], suffix}, stack, context) d
+     |> non_empty_list(of_pattern_tree(suffix, stack, context))
+   end
+ 
+-  defp of_pattern_tree({:intersection, entries}, stack, context) do
++  def of_pattern_tree({:intersection, entries}, stack, context) do
+     entries
+     |> Enum.map(&of_pattern_tree(&1, stack, context))
+     |> Enum.reduce(&intersection/2)
+   end
+ 
+-  defp of_pattern_tree({:var, version}, _stack, context) do
++  def of_pattern_tree({:var, version}, _stack, context) do
+     case context do
+       %{vars: %{^version => %{type: type}}} -> type
+       _ -> term()
+     end
+   end
+ 
+-  defp of_pattern_tree(:key, _stack, _context) do
++  def of_pattern_tree(:key, _stack, _context) do
+     term()
+   end
+ 
+@@ -1019,22 +1025,22 @@ defp of_precise_bitstring?(_), do: false
+   @atom_true atom([true])
+   @atom_false atom([false])
+ 
+-  defp of_guards([], _vars, _stack, context) do
+-    {true, %{}, context}
++  defp of_guards([], changed, _vars, stack, context) do
++    {true, of_changed(changed, stack, context)}
+   end
+ 
+-  defp of_guards(guards, vars, stack, context) do
++  defp of_guards(guards, changed, vars, stack, context) do
+     context =
+       init_pattern_info(context, %{
+-        guard_context: :andalso,
++        allow_empty?: false,
+         parent_version: nil,
+         vars: vars,
+-        changed: %{}
++        changed: Map.from_keys(changed, [])
+       })
+ 
+     {precise?, context} = of_guards(guards, stack, context)
+     {%{vars: vars, changed: changed}, context} = pop_pattern_info(context)
+-    {is_map(vars) and precise?, changed, context}
++    {is_map(vars) and precise?, of_changed(Map.keys(changed), stack, context)}
+   end
+ 
+   defp of_guards([guard], stack, context) do
+@@ -1066,7 +1072,7 @@ defp update_parent_version(parent_version, %{pattern_info: pattern_info} = conte
+   end
+ 
+   defp enable_conditional_mode(%{pattern_info: pattern_info} = context) do
+-    %{context | pattern_info: %{pattern_info | guard_context: :orelse}, conditional_vars: %{}}
++    %{context | pattern_info: %{pattern_info | allow_empty?: true}, conditional_vars: %{}}
+   end
+ 
+   defp maybe_badguard(type, guard, stack, context) do
+@@ -1184,7 +1190,8 @@ def of_guard({_, meta, _} = var, expected, expr, stack, context) when is_var(var
+     # and also when vars change, so we need to deal with all possibilities
+     # for pattern_info.
+     case context.pattern_info do
+-      %{vars: vars, parent_version: parent_version, changed: changed} = pattern_info ->
++      %{allow_empty?: allow_empty?, vars: vars, parent_version: parent_version, changed: changed} =
++          pattern_info ->
+         vars =
+           is_map(vars) and not is_map_key(vars, version) and
+             not list_subpattern?(version, context) and vars
+@@ -1198,7 +1205,7 @@ def of_guard({_, meta, _} = var, expected, expr, stack, context) when is_var(var
+             do: Of.track_var(version, [parent_version], [], context),
+             else: context
+ 
+-        Of.refine_body_var(version, expected, expr, stack, context)
++        Of.refine_body_var(version, expected, expr, stack, context, allow_empty?)
+ 
+       list when is_list(list) ->
+         node = path_node(expected, var, expr, [])
+@@ -1471,44 +1478,66 @@ def format_diagnostic({:redundant, {info, args}, expected, _types, previous, con
+     traces = collect_traces(args, context)
+ 
+     message =
+-      with {_op, meta, expr, type} <- info,
+-           true <- previous_subtype?(expected, previous) do
+-        if match?({:case, :||}, meta[:type_check]) do
++      with {:case, meta, expr, type} <- info,
++           {:case, :||} <- meta[:type_check] do
++        if subtype?(type, atom([false, nil])) do
+           """
+-          the right-hand side of || will always execute:
++          the following conditional expression will never succeed:
+ 
+               #{expr_to_string(expr) |> indent(4)}
+ 
+-          because the left-hand side always evaluates to:
++          because it evaluates to:
+ 
+               #{to_quoted_string(type) |> indent(4)}
+           """
+         else
+-          """
+-          the following clause cannot match because the previous clauses already matched all possible values:
+-
+-              #{args_to_string(args) |> indent(4)} ->
++          additional =
++            with {:case, meta, [_, _]} <- expr,
++                 {:case, :||} <- meta[:type_check] do
++              "(shown as ... below) "
++            else
++              _ -> ""
++            end
+ 
+-          it attempts to match on the result of:
++          """
++          the right-hand side of || #{additional}will never be executed:
+ 
+-              #{expr_to_string(expr) |> indent(4)}
++              #{expr_to_string({:||, [], [expr, {:..., [], []}]}) |> indent(4)}
+ 
+-          which has the already matched type:
++          because the left-hand side always evaluates to:
+ 
+               #{to_quoted_string(type) |> indent(4)}
+           """
+         end
+       else
+         _ ->
+-          """
+-          the following clause is redundant:
++          with {_op, _meta, expr, type} <- info,
++               true <- previous_subtype?(expected, previous) do
++            """
++            the following clause cannot match because the previous clauses already matched all possible values:
+ 
+-              #{args_to_string(args) |> indent(4)} ->
++                #{args_to_string(args) |> indent(4)} ->
+ 
+-          previous clauses have already matched on the following types:
++            it attempts to match on the result of:
+ 
+-              #{previous_to_string(previous)}
+-          """
++                #{expr_to_string(expr) |> indent(4)}
++
++            which has the already matched type:
++
++                #{to_quoted_string(type) |> indent(4)}
++            """
++          else
++            _ ->
++              """
++              the following clause is redundant:
++
++                  #{args_to_string(args) |> indent(4)} ->
++
++              previous clauses have already matched on the following types:
++
++                  #{previous_to_string(previous)}
++              """
++          end
+       end
+ 
+     %{
+@@ -1587,59 +1616,37 @@ defp badpattern({{:def, _kind, _fun, types}, args, _guards}, index) when is_inte
+ 
+   defp badpattern({{op, meta, expr, type}, args}, _index) when op in [:case, :try_else] do
+     with {:case, op} <- meta[:type_check] do
+-      message =
+-        cond do
+-          op == :|| ->
+-            additional =
+-              with {:case, meta, [_, _]} <- expr,
+-                   {:case, :||} <- meta[:type_check] do
+-                "(shown as ... below) "
+-              else
+-                _ -> ""
+-              end
+-
+-            """
+-            the right-hand side of || #{additional}will never be executed:
+-
+-                #{expr_to_string({:||, [], [expr, {:..., [], []}]}) |> indent(4)}
+-
+-            because the left-hand side always evaluates to:
+-
+-                #{to_quoted_string(type) |> indent(4)}
+-            """
+-
+-          op in [:and, :or] ->
+-            {first_message, second_message} =
+-              case booleaness(type) do
+-                {true, _} -> {" will always succeed", "because it evaluates to"}
+-                {false, _} -> {" will never succeed", "because it evaluates to"}
+-                :none -> {" will always fail", "because it evaluates to"}
+-                _ -> {"", "will always evaluate to"}
+-              end
+-
+-            """
+-            the following conditional expression#{first_message}:
+-
+-                #{expr_to_string(expr) |> indent(4)}
++      if op in [:and, :or] do
++        {first_message, second_message} =
++          case booleaness(type) do
++            {true, _} -> {" will always succeed", "because it evaluates to"}
++            {false, _} -> {" will never succeed", "because it evaluates to"}
++            :none -> {" will always fail", "because it evaluates to"}
++            _ -> {"", "will always evaluate to"}
++          end
+ 
+-            #{second_message}:
++        {expr,
++         """
++         the following conditional expression#{first_message}:
+ 
+-                #{to_quoted_string(type) |> indent(4)}
+-            """
++             #{expr_to_string(expr) |> indent(4)}
+ 
+-          true ->
+-            """
+-            the following conditional expression:
++         #{second_message}:
+ 
+-                #{expr_to_string(expr) |> indent(4)}
++             #{to_quoted_string(type) |> indent(4)}
++         """}
++      else
++        {expr,
++         """
++         the following conditional expression:
+ 
+-            will always evaluate to:
++             #{expr_to_string(expr) |> indent(4)}
+ 
+-                #{to_quoted_string(type) |> indent(4)}
+-            """
+-        end
++         will always evaluate to:
+ 
+-      {expr, message}
++             #{to_quoted_string(type) |> indent(4)}
++         """}
++      end
+     else
+       _ ->
+         {args,
+diff --git a/lib/elixir/test/elixir/module/types/expr_test.exs b/lib/elixir/test/elixir/module/types/expr_test.exs
+index 0fcbcad7b..a5d7a829f 100644
+--- a/lib/elixir/test/elixir/module/types/expr_test.exs
++++ b/lib/elixir/test/elixir/module/types/expr_test.exs
+@@ -1974,7 +1974,7 @@ test "or reports violations" do
+     end
+ 
+     test "|| reports violations" do
+-      assert typeerror!([x = 123], x || true) =~ """
++      assert typewarn!([x = 123], x || true) |> elem(1) =~ """
+              the right-hand side of || will never be executed:
+ 
+                  x || ...
+@@ -1985,7 +1985,7 @@ test "|| reports violations" do
+ 
+              """
+ 
+-      assert typeerror!([x = 123], System.get_env("foo") || x || true) =~ """
++      assert typewarn!([x = 123], System.get_env("foo") || x || true) |> elem(1) =~ """
+              the right-hand side of || (shown as ... below) will never be executed:
+ 
+                  System.get_env("foo") || x || ...
+@@ -1997,11 +1997,11 @@ test "|| reports violations" do
+              """
+ 
+       assert typewarn!([x = false], x || true) |> elem(1) =~ """
+-             the right-hand side of || will always execute:
++             the following conditional expression will never succeed:
+ 
+                  x
+ 
+-             because the left-hand side always evaluates to:
++             because it evaluates to:
+ 
+                  dynamic(false)
+              """
+diff --git a/lib/elixir/test/elixir/module/types/pattern_test.exs b/lib/elixir/test/elixir/module/types/pattern_test.exs
+index 79063f032..2a73eebf8 100644
+--- a/lib/elixir/test/elixir/module/types/pattern_test.exs
++++ b/lib/elixir/test/elixir/module/types/pattern_test.exs
+@@ -171,7 +171,7 @@ test "reports incompatible types" do
+ 
+              where "y" was given the type:
+ 
+-                 # type: atom()
++                 # type: dynamic(atom())
+                  # from: types_test.ex:LINE
+                  is_atom(y)
+              """
+@@ -631,9 +631,9 @@ test "not" do
+ 
+              where "x" was given the type:
+ 
+-                 # type: list(term())
++                 # type: dynamic()
+                  # from: types_test.ex:LINE
+-                 length(x)
++                 x
+              """
+     end
+ 
+@@ -678,17 +678,22 @@ test "map.field" do
+       assert typecheck!([x = %{foo: :bar}], not x.bar, x) ==
+                dynamic(open_map(foo: atom([:bar]), bar: atom([false])))
+ 
+-      assert typeerror!([x = %Point{}], x.foo_bar, :ok) == ~l"""
+-             the following pattern will never match:
++      assert typeerror!([x = %Point{}], x.foo_bar, :ok) ==
++               ~l"""
++               unknown key .foo_bar in expression:
+ 
+-                 x = %Point{}
++                   x.foo_bar
+ 
+-             where "x" was given the type:
++               the given type does not have the given key:
+ 
+-                 # type: %{..., foo_bar: true}
+-                 # from: types_test.ex:LINE
+-                 x.foo_bar
+-             """
++                   dynamic(%Point{x: term(), y: term(), z: term()})
++
++               where "x" was given the type:
++
++                   # type: dynamic(%Point{})
++                   # from: types_test.ex:LINE-1
++                   x = %Point{}
++               """
+     end
+ 
+     test "when checks" do
+@@ -749,7 +754,7 @@ test "conditional checks (andalso/orelse)" do
+ 
+              where "x" was given the type:
+ 
+-                 # type: atom() or binary()
++                 # type: dynamic(atom() or binary())
+                  # from: types_test.ex:LINE
+                  is_binary(x) or is_atom(x)
+              """
+@@ -802,7 +807,7 @@ test "conditional checks (and/or)" do
+ 
+                where "x" was given the type:
+ 
+-                   # type: atom() or binary()
++                   # type: dynamic(atom() or binary())
+                    # from: types_test.ex:LINE-1
+                    :erlang.or(is_binary(x), is_atom(x))
+                """
+@@ -841,17 +846,21 @@ test "domain checks" do
+                dynamic(tuple([list(term()), term()]))
+     end
+ 
+-    test "incompatible pattern and guards" do
++    test "errors in guards" do
+       assert typeerror!([x = {}], is_integer(x), x) == ~l"""
+-             the following pattern will never match:
++             this guard will never succeed:
+ 
+-                 x = {}
++                 is_integer(x)
++
++             because it returns type:
++
++                 false
+ 
+              where "x" was given the type:
+ 
+-                 # type: integer()
++                 # type: dynamic({})
+                  # from: types_test.ex:LINE
+-                 is_integer(x)
++                 x = {}
+              """
+     end
+   end
+@@ -1005,39 +1014,43 @@ test "with expressions" do
+ 
+     test "warnings" do
+       assert typeerror!([x = {}], x == 0, x) =~ ~l"""
+-             the following pattern will never match:
++             comparison between distinct types found:
+ 
+-                 x = {}
++                 x == 0
+ 
+-             where "x" was given the type:
++             given types:
+ 
+-                 # type: float() or integer()
+-                 # from: types_test.ex:LINE
+-                 x == 0
++                 dynamic({}) == integer()
+              """
+ 
+-      assert typeerror!([x = {}], x == :foo, x) =~ ~l"""
+-             the following pattern will never match:
++      assert typeerror!([x = {}], x != 0, x) =~ ~l"""
++             comparison between distinct types found:
+ 
+-                 x = {}
++                 x != 0
+ 
+-             where "x" was given the type:
++             given types:
++
++                 dynamic({}) != integer()
++             """
++
++      assert typeerror!([x = {}], x == :foo, x) =~ ~l"""
++             comparison between distinct types found:
+ 
+-                 # type: :foo
+-                 # from: types_test.ex:LINE
+                  x == :foo
++
++             given types:
++
++                 dynamic({}) == :foo
+              """
+ 
+       assert typeerror!([x = {}], not (x != :foo), x) =~ ~l"""
+-             the following pattern will never match:
++             comparison between distinct types found:
+ 
+-                 x = {}
++                 x != :foo
+ 
+-             where "x" was given the type:
++             given types:
+ 
+-                 # type: :foo
+-                 # from: types_test.ex:LINE
+-                 x != :foo
++                 dynamic({}) != :foo
+              """
+ 
+       # We cannot warn in this case because the inference itself will lead to disjoint types

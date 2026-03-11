@@ -1,0 +1,5 @@
+Soft-delete workflows that rely on `allow_stale: true` break when the operation involves associations. When a repo operation (such as `Repo.update/2`, `Repo.delete/2`, or similar write operations that cascade through associations via changesets) is invoked with the option `allow_stale: true`, the option is applied to the top-level struct but is not propagated to associated structs processed as part of the same operation.
+
+As a result, attempting to soft-delete or otherwise update an entity with associated data can raise a stale/optimistic-lock style error for the associated records even though the caller explicitly opted into allowing stale data for the operation.
+
+The repo operations must consistently honor `allow_stale: true` not only for the root schema struct but also when handling associations (for example, `belongs_to`/`has_many` relationships) that are inserted/updated/deleted as part of the same call. After the fix, calling repo write operations with `allow_stale: true` should allow the operation to complete without stale errors even when associated records are involved and require writes.

@@ -1,0 +1,9 @@
+When using tools that modify the `dbg_callback` configuration at runtime (for example, to customize `dbg/2` output), starting a development server with code reloading enabled can trigger unnecessary recompilation even though the project’s compile-time configuration has not changed.
+
+Reproduction scenario: compile a project normally, then at runtime change the `:elixir` application’s `:dbg_callback` setting (without changing the project files or persistent compile-time configuration), and then trigger a recompilation check such as what happens on server start with code reloader enabled. The compiler incorrectly treats the runtime-updated `dbg_callback` as a configuration change and recompiles modules.
+
+Expected behavior: recompilation should only occur if the compile-time `dbg_callback` configuration (the value that was in effect when the `:elixir` application started / when compilation decisions are made) has changed. Runtime changes to `dbg_callback` should not force recompilation, because `dbg/2` is a compile-time macro and already-compiled code is not affected by later runtime callback changes.
+
+Actual behavior: changing `dbg_callback` at runtime is detected as a configuration change and causes recompilation on subsequent compilation checks.
+
+Implement a fix so the recompilation decision compares against a stable, initial value captured when the `:elixir` application starts (for example, an `initial_dbg_callback` value) rather than the mutable runtime `dbg_callback`. After the change, updating `dbg_callback` at runtime must not cause recompilation unless the initial (compile-time relevant) callback configuration actually differs.

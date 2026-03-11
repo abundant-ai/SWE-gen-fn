@@ -1,0 +1,112 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 51be06f6..16d965a9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -63,7 +63,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2364, "404 Not Found" on nested routes and "405 Method Not Allowed" errors no longer start an empty database transaction - @steve-chavez
+  - #2342, Fix inaccurate result count when an inner embed was selected after a normal embed in the query string - @laurenceisla
+  - #2376, OPTIONS requests no longer start an empty database transaction - @steve-chavez
+- - #2395, Allow using columns with dollar sign($) without double quoting in filters and `select` - @steve-chavez
+ 
+ ### Changed
+ 
+@@ -71,6 +70,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Previously, those RPCs would return "null" as a body with Content-Type: application/json.
+  - #2156, `limit/offset` now limits the affected rows on UPDATE/DELETE  - @steve-chavez
+    + Previously, `limit/offset` only limited the returned rows but not the actual updated rows
++ - #2156, using PATCH/DELETE with `limit/offset` throws an error on views - @steve-chavez
+  - #2155, `max-rows` is no longer applied on POST/PATCH/PUT/DELETE returned rows - @steve-chavez
+    + This was misleading because the affected rows were not really affected by `max-rows`, only the returned rows were limited
+  - #2070, Restrict generated many-to-many relationships - @steve-chavez
+diff --git a/src/PostgREST/Request/QueryParams.hs b/src/PostgREST/Request/QueryParams.hs
+index 9dc661ff..f985b398 100644
+--- a/src/PostgREST/Request/QueryParams.hs
++++ b/src/PostgREST/Request/QueryParams.hs
+@@ -314,7 +314,7 @@ pStar = string "*" $> "*"
+ pFieldName :: Parser Text
+ pFieldName =
+   pQuotedValue <|>
+-  T.intercalate "-" . map toS <$> (many1 pIdentifierChar `sepBy1` dash) <?>
++  T.intercalate "-" . map toS <$> (many1 (letter <|> digit <|> oneOf "_ ") `sepBy1` dash) <?>
+   "field name (* or [a..z0..9_])"
+   where
+     isDash :: GenParser Char st ()
+@@ -396,7 +396,7 @@ pFieldSelect = lexeme $
+     do
+       alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+       fld <- pField
+-      cast' <- optionMaybe (string "::" *> many pIdentifierChar)
++      cast' <- optionMaybe (string "::" *> many (letter <|> digit <|> oneOf "_"))
+       return (fld, toS <$> cast', alias, Nothing, Nothing)
+   )
+   <|> do
+@@ -426,7 +426,7 @@ pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)
+     pFts = do
+       opStr <- try (P.many (noneOf ".("))
+       op <- parseMaybe ("unknown fts operator " <> opStr) . ftsOperator $ toS opStr
+-      lang <- optionMaybe $ try (between (char '(') (char ')') $ many pIdentifierChar)
++      lang <- optionMaybe $ try (between (char '(') (char ')') (many (letter <|> digit <|> oneOf "_")))
+       pDelimiter >> Fts op (toS <$> lang) <$> pSVal
+ 
+     parseMaybe :: [Char] -> Maybe a -> Parser a
+@@ -509,9 +509,6 @@ pLogicPath = do
+ pColumns :: Parser [FieldName]
+ pColumns = pFieldName `sepBy1` lexeme (char ',')
+ 
+-pIdentifierChar :: Parser Char
+-pIdentifierChar = letter <|> digit <|> oneOf "_ $"
+-
+ mapError :: Either ParseError a -> Either QPError a
+ mapError = mapLeft translateError
+   where
+diff --git a/test/spec/Feature/Query/QuerySpec.hs b/test/spec/Feature/Query/QuerySpec.hs
+index 8a959a62..9fe205b1 100644
+--- a/test/spec/Feature/Query/QuerySpec.hs
++++ b/test/spec/Feature/Query/QuerySpec.hs
+@@ -1002,11 +1002,6 @@ spec actualPgVersion = do
+         [json|[{":arr->ow::cast":" arrow-1 ","(inside,parens)":" parens-1 ","a.dotted.column":" dotted-1 ","  col  w  space  ":" space-1"}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    it "will select and filter a column that has dollars in(without double quoting)" $
+-      get "/do$llar$s?select=a$num$&a$num$=eq.100" `shouldRespondWith`
+-        [json|[{"a$num$":100}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+   context "binary output" $ do
+     it "can query if a single column is selected" $
+       request methodGet "/images_base64?select=img&name=eq.A.png" (acceptHdrs "application/octet-stream") ""
+diff --git a/test/spec/fixtures/data.sql b/test/spec/fixtures/data.sql
+index ef2d0bd7..3e36c858 100644
+--- a/test/spec/fixtures/data.sql
++++ b/test/spec/fixtures/data.sql
+@@ -800,6 +800,3 @@ INSERT INTO shop_bles(id, name, coords, shop_id, range_area) VALUES(2, 'Beacon-2
+ 
+ TRUNCATE TABLE "SPECIAL ""@/\#~_-".names CASCADE;
+ INSERT INTO "SPECIAL ""@/\#~_-".names (id, name) VALUES (1, 'John'), (2, 'Mary');
+-
+-TRUNCATE TABLE do$llar$s CASCADE;
+-INSERT INTO do$llar$s (a$num$) VALUES (100), (200), (300);
+diff --git a/test/spec/fixtures/privileges.sql b/test/spec/fixtures/privileges.sql
+index ca6d1e52..21e8ccab 100644
+--- a/test/spec/fixtures/privileges.sql
++++ b/test/spec/fixtures/privileges.sql
+@@ -194,7 +194,6 @@ GRANT ALL ON TABLE
+     , shops
+     , shop_bles
+     , "SPECIAL ""@/\#~_-".names
+-    , do$llar$s
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index 70068b87..71e26a75 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2685,7 +2685,3 @@ $$ LANGUAGE sql;
+ CREATE FUNCTION test.special_extended_schema(val text) RETURNS text AS $$
+   SELECT get_val_special(val);
+ $$ LANGUAGE sql;
+-
+-CREATE TABLE do$llar$s (
+-  a$num$ numeric
+-);

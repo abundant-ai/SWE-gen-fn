@@ -1,0 +1,327 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c08fb1ef..16d965a9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -38,9 +38,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2378, Support http OPTIONS method on RPC and root path - @steve-chavez
+  - #2354, Allow getting the EXPLAIN plan of a request by using the `Accept: application/vnd.pgrst.plan` header - @steve-chavez
+    + Only allowed if the `db-plan-enabled` config is set to true
+-   + Can generate the plan for different media types using the `for` parameter: `Accept: application/vnd.pgrst.plan; for="application/vnd.pgrst.object"`
+-   + Different options for the plan can be used with the `options` parameter: `Accept: application/vnd.pgrst.plan; options=analyze|verbose|settings|buffers|wal`
+-   + The plan can be obtained in text or json by using different media type suffixes: `Accept: application/vnd.pgrst.plan+text` and `Accept: application/vnd.pgrst.plan+json`.
++   + Limited to generating the plan of a json representation(`application/json`) but can be extended later to allow other representations.
++   + The plan can be obtained in text(`Accept: application/vnd.pgrst.plan+text`) and json(`Accept: application/vnd.pgrst.plan+json` or `Accept: application/vnd.pgrst.plan`) format.
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index c5322100..c1343084 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -73,8 +73,7 @@ import PostgREST.Error                   (Error)
+ import PostgREST.GucHeader               (GucHeader,
+                                           addHeadersIfNotIncluded,
+                                           unwrapGucHeader)
+-import PostgREST.MediaType               (MTPlanAttrs (..),
+-                                          MediaType (..))
++import PostgREST.MediaType               (MediaType (..))
+ import PostgREST.Query.Statements        (ResultSet (..))
+ import PostgREST.Request.ApiRequest      (Action (..),
+                                           ApiRequest (..),
+@@ -648,17 +647,11 @@ binaryField RequestContext{..} readReq
+       if length fldNames == 1 && fieldName /= Just "*" then
+         return fieldName
+       else
+-        throwError $ Error.BinaryFieldError mediaType
++        throwError $ Error.BinaryFieldError (iAcceptMediaType ctxApiRequest)
+   | otherwise =
+       return Nothing
+   where
+-    mediaType = iAcceptMediaType ctxApiRequest
+-    isRawMediaType = mediaType `elem` configRawMediaTypes ctxConfig `union` [MTOctetStream, MTTextPlain, MTTextXML] || isRawPlan mediaType
+-    isRawPlan mt = case mt of
+-      MTPlan (MTPlanAttrs (Just MTOctetStream) _ _) -> True
+-      MTPlan (MTPlanAttrs (Just MTTextPlain) _ _)   -> True
+-      MTPlan (MTPlanAttrs (Just MTTextXML) _ _)     -> True
+-      _                                             -> False
++    isRawMediaType = iAcceptMediaType ctxApiRequest `elem` configRawMediaTypes ctxConfig `union` [MTOctetStream, MTTextPlain, MTTextXML]
+ 
+ profileHeader :: ApiRequest -> Maybe HTTP.Header
+ profileHeader ApiRequest{..} =
+diff --git a/src/PostgREST/MediaType.hs b/src/PostgREST/MediaType.hs
+index e2a3af64..5c034714 100644
+--- a/src/PostgREST/MediaType.hs
++++ b/src/PostgREST/MediaType.hs
+@@ -8,12 +8,10 @@ module PostgREST.MediaType
+   , toContentType
+   , toMime
+   , decodeMediaType
+-  , getMediaType
+   ) where
+ 
+ import qualified Data.ByteString          as BS
+ import qualified Data.ByteString.Internal as BS (c2w)
+-import           Data.Maybe               (fromJust)
+ 
+ import Network.HTTP.Types.Header (Header, hContentType)
+ 
+@@ -35,7 +33,7 @@ data MediaType
+   | MTPlan MTPlanAttrs
+   deriving Eq
+ 
+-data MTPlanAttrs = MTPlanAttrs (Maybe MediaType) MTPlanFormat [MTPlanOption]
++data MTPlanAttrs = MTPlanAttrs MTPlanFormat [MTPlanOption]
+ instance Eq MTPlanAttrs where
+   MTPlanAttrs {} == MTPlanAttrs {} = True -- we don't care about the attributes when comparing two MTPlan media types
+ 
+@@ -67,10 +65,8 @@ toMime MTUrlEncoded      = "application/x-www-form-urlencoded"
+ toMime MTOctetStream     = "application/octet-stream"
+ toMime MTAny             = "*/*"
+ toMime (MTOther ct)      = ct
+-toMime (MTPlan (MTPlanAttrs mt fmt opts)) =
+-  "application/vnd.pgrst.plan+" <> toMimePlanFormat fmt <>
+-  (if isNothing mt then mempty else "; for=\"" <> toMime (fromJust mt) <> "\"") <>
+-  (if null opts then mempty else "; options=" <> BS.intercalate "|" (toMimePlanOption <$> opts))
++toMime (MTPlan (MTPlanAttrs fmt opts)) = "application/vnd.pgrst.plan+" <> toMimePlanFormat fmt <>
++                            if null opts then mempty else "; options=" <> BS.intercalate "|" (toMimePlanOption <$> opts)
+ 
+ toMimePlanOption :: MTPlanOption -> ByteString
+ toMimePlanOption PlanAnalyze  = "analyze"
+@@ -105,20 +101,11 @@ decodeMediaType mt =
+     _                                      -> MTAny
+   where
+     getPlan fmt rest =
+-     let
+-       opts         = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
+-       inOpts str   = str `elem` opts
+-       mtFor        = decodeMediaType . dropAround (== BS.c2w '"') <$> (BS.stripPrefix "for=" =<< find (BS.isPrefixOf "for=") rest)
+-       dropAround p = BS.dropWhile p . BS.dropWhileEnd p in
+-     MTPlan $ MTPlanAttrs mtFor fmt $
++     let opts = BS.split (BS.c2w '|') $ fromMaybe mempty (BS.stripPrefix "options=" =<< find (BS.isPrefixOf "options=") rest)
++         inOpts str = str `elem` opts in
++     MTPlan $ MTPlanAttrs fmt $
+       [PlanAnalyze  | inOpts "analyze" ] ++
+       [PlanVerbose  | inOpts "verbose" ] ++
+       [PlanSettings | inOpts "settings"] ++
+       [PlanBuffers  | inOpts "buffers" ] ++
+       [PlanWAL      | inOpts "wal"     ]
+-
+-getMediaType :: MediaType -> MediaType
+-getMediaType mt = case mt of
+-  MTPlan (MTPlanAttrs (Just mType) _ _) -> mType
+-  MTPlan (MTPlanAttrs Nothing _ _)      -> MTApplicationJSON
+-  other                                 -> other
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index d8ba389f..368ab327 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -35,8 +35,7 @@ import PostgREST.GucHeader (GucHeader)
+ import PostgREST.DbStructure.Identifiers (FieldName)
+ import PostgREST.MediaType               (MTPlanAttrs (..),
+                                           MTPlanFormat (..),
+-                                          MediaType (..),
+-                                          getMediaType)
++                                          MediaType (..))
+ import PostgREST.Query.SqlFragment
+ import PostgREST.Request.Preferences
+ 
+@@ -64,8 +63,8 @@ data ResultSet
+ 
+ prepareWrite :: SQL.Snippet -> SQL.Snippet -> Bool -> MediaType ->
+                 PreferRepresentation -> [Text] -> Bool -> SQL.Statement () ResultSet
+-prepareWrite selectQuery mutateQuery isInsert mt rep pKeys =
+-  SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
++prepareWrite selectQuery mutateQuery isInsert mediaType rep pKeys =
++  SQL.dynamicallyParameterized (mtSnippet mediaType snippet) decodeIt
+  where
+   snippet =
+     "WITH " <> SQL.sql sourceCTEName <> " AS (" <> mutateQuery <> ") " <>
+@@ -90,11 +89,11 @@ prepareWrite selectQuery mutateQuery isInsert mt rep pKeys =
+       else noLocationF
+ 
+   bodyF
+-    | rep /= Full                       = "''"
+-    | getMediaType mt == MTTextCSV      = asCsvF
+-    | getMediaType mt == MTGeoJSON      = asGeoJsonF
+-    | getMediaType mt == MTSingularJSON = asJsonSingleF False
+-    | otherwise                         = asJsonF False
++    | rep /= Full                 = "''"
++    | mediaType == MTTextCSV      = asCsvF
++    | mediaType == MTGeoJSON      = asGeoJsonF
++    | mediaType == MTSingularJSON = asJsonSingleF False
++    | otherwise                   = asJsonF False
+ 
+   selectF
+     -- prevent using any of the column names in ?select= when no response is returned from the CTE
+@@ -102,13 +101,13 @@ prepareWrite selectQuery mutateQuery isInsert mt rep pKeys =
+     | otherwise   = selectQuery
+ 
+   decodeIt :: HD.Result ResultSet
+-  decodeIt = case mt of
++  decodeIt = case mediaType of
+     MTPlan{} -> planRow
+     _        -> fromMaybe (RSStandard Nothing 0 mempty mempty (Right []) (Right Nothing)) <$> HD.rowMaybe (standardRow False)
+ 
+ prepareRead :: SQL.Snippet -> SQL.Snippet -> Bool -> MediaType -> Maybe FieldName -> Bool -> SQL.Statement () ResultSet
+-prepareRead selectQuery countQuery countTotal mt binaryField =
+-  SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
++prepareRead selectQuery countQuery countTotal mediaType binaryField =
++  SQL.dynamicallyParameterized (mtSnippet mediaType snippet) decodeIt
+  where
+   snippet =
+     "WITH " <>
+@@ -125,23 +124,23 @@ prepareRead selectQuery countQuery countTotal mt binaryField =
+   (countCTEF, countResultF) = countF countQuery countTotal
+ 
+   bodyF
+-    | getMediaType mt == MTTextCSV                       = asCsvF
+-    | getMediaType mt == MTSingularJSON                  = asJsonSingleF False
+-    | getMediaType mt == MTGeoJSON                       = asGeoJsonF
+-    | isJust binaryField && getMediaType mt == MTTextXML = asXmlF $ fromJust binaryField
+-    | isJust binaryField                                 = asBinaryF $ fromJust binaryField
+-    | otherwise                                          = asJsonF False
++    | mediaType == MTTextCSV                       = asCsvF
++    | mediaType == MTSingularJSON                  = asJsonSingleF False
++    | mediaType == MTGeoJSON                       = asGeoJsonF
++    | isJust binaryField && mediaType == MTTextXML = asXmlF $ fromJust binaryField
++    | isJust binaryField                           = asBinaryF $ fromJust binaryField
++    | otherwise                                    = asJsonF False
+ 
+   decodeIt :: HD.Result ResultSet
+-  decodeIt = case mt of
++  decodeIt = case mediaType of
+     MTPlan{} -> planRow
+     _        -> HD.singleRow $ standardRow True
+ 
+ prepareCall :: Bool -> Bool -> SQL.Snippet -> SQL.Snippet -> SQL.Snippet -> Bool ->
+                MediaType -> Bool -> Maybe FieldName -> Bool ->
+                SQL.Statement () ResultSet
+-prepareCall returnsScalar returnsSingle callProcQuery selectQuery countQuery countTotal mt multObjects binaryField =
+-  SQL.dynamicallyParameterized (mtSnippet mt snippet) decodeIt
++prepareCall returnsScalar returnsSingle callProcQuery selectQuery countQuery countTotal mediaType multObjects binaryField =
++  SQL.dynamicallyParameterized (mtSnippet mediaType snippet) decodeIt
+   where
+     snippet =
+       "WITH " <> SQL.sql sourceCTEName <> " AS (" <> callProcQuery <> ") " <>
+@@ -158,16 +157,16 @@ prepareCall returnsScalar returnsSingle callProcQuery selectQuery countQuery cou
+     (countCTEF, countResultF) = countF countQuery countTotal
+ 
+     bodyF
+-     | getMediaType mt == MTSingularJSON                  = asJsonSingleF returnsScalar
+-     | getMediaType mt == MTTextCSV                       = asCsvF
+-     | getMediaType mt == MTGeoJSON                       = asGeoJsonF
+-     | isJust binaryField && getMediaType mt == MTTextXML = asXmlF $ fromJust binaryField
+-     | isJust binaryField                                 = asBinaryF $ fromJust binaryField
+-     | returnsSingle && not multObjects                   = asJsonSingleF returnsScalar
+-     | otherwise                                          = asJsonF returnsScalar
++     | mediaType == MTSingularJSON                  = asJsonSingleF returnsScalar
++     | mediaType == MTTextCSV                       = asCsvF
++     | mediaType == MTGeoJSON                       = asGeoJsonF
++     | isJust binaryField && mediaType == MTTextXML = asXmlF $ fromJust binaryField
++     | isJust binaryField                           = asBinaryF $ fromJust binaryField
++     | returnsSingle && not multObjects             = asJsonSingleF returnsScalar
++     | otherwise                                    = asJsonF returnsScalar
+ 
+     decodeIt :: HD.Result ResultSet
+-    decodeIt = case mt of
++    decodeIt = case mediaType of
+       MTPlan{} -> planRow
+       _        -> fromMaybe (RSStandard (Just 0) 0 mempty mempty (Right []) (Right Nothing)) <$> HD.rowMaybe (standardRow True)
+ 
+@@ -195,8 +194,8 @@ standardRow noLocation =
+ 
+ mtSnippet :: MediaType -> SQL.Snippet -> SQL.Snippet
+ mtSnippet mediaType snippet = case mediaType of
+-  MTPlan (MTPlanAttrs _ fmt opts) -> explainF fmt opts snippet
+-  _                               -> snippet
++  MTPlan (MTPlanAttrs fmt opts) -> explainF fmt opts snippet
++  _                             -> snippet
+ 
+ -- | We use rowList because when doing EXPLAIN (FORMAT TEXT), the result comes as many rows. FORMAT JSON comes as one.
+ planRow :: HD.Result ResultSet
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index f067cf74..62fda6e2 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -429,7 +429,7 @@ requestMediaTypes conf action path =
+         ++ [MTOpenAPI | pathIsRootSpec path]
+     defaultMediaTypes =
+       [MTApplicationJSON, MTSingularJSON, MTGeoJSON, MTTextCSV] ++
+-      [MTPlan $ MTPlanAttrs Nothing PlanJSON mempty | configDbPlanEnabled conf]
++      [MTPlan $ MTPlanAttrs PlanJSON mempty | configDbPlanEnabled conf]
+     rawMediaTypes = configRawMediaTypes conf `union` [MTOctetStream, MTTextPlain, MTTextXML]
+ 
+ {-|
+diff --git a/test/spec/Feature/Query/PlanSpec.hs b/test/spec/Feature/Query/PlanSpec.hs
+index ac17739c..bec5d890 100644
+--- a/test/spec/Feature/Query/PlanSpec.hs
++++ b/test/spec/Feature/Query/PlanSpec.hs
+@@ -125,32 +125,6 @@ spec actualPgVersion = do
+         resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; options=verbose; charset=utf-8")
+         cols `shouldBe` Just [aesonQQ| ["projects.id", "projects.name", "projects.client_id"] |]
+ 
+-    it "outputs the plan for application/json " $ do
+-      r <- request methodGet "/projects" (acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/json\"; options=verbose") ""
+-
+-      let aggCol  = simpleBody r ^? nth 0 . key "Plan" . key "Output" . nth 2
+-          resHeaders = simpleHeaders r
+-
+-      liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/json\"; options=verbose; charset=utf-8")
+-        aggCol `shouldBe`
+-          if actualPgVersion >= pgVersion120
+-            then Just [aesonQQ| "(COALESCE(json_agg(ROW(projects.id, projects.name, projects.client_id)), '[]'::json))::character varying" |]
+-            else Just [aesonQQ| "(COALESCE(json_agg(ROW(pgrst_source.id, pgrst_source.name, pgrst_source.client_id)), '[]'::json))::character varying" |]
+-
+-    it "outputs the plan for application/vnd.pgrst.object " $ do
+-      r <- request methodGet "/projects_view" (acceptHdrs "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object\"; options=verbose") ""
+-
+-      let aggCol  = simpleBody r ^? nth 0 . key "Plan" . key "Output" . nth 2
+-          resHeaders = simpleHeaders r
+-
+-      liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object+json\"; options=verbose; charset=utf-8")
+-        aggCol `shouldBe`
+-          if actualPgVersion >= pgVersion120
+-            then Just [aesonQQ| "COALESCE(((json_agg(ROW(projects.id, projects.name, projects.client_id)) -> 0))::text, 'null'::text)" |]
+-            else Just [aesonQQ| "COALESCE(((json_agg(ROW(pgrst_source.id, pgrst_source.name, pgrst_source.client_id)) -> 0))::text, 'null'::text)" |]
+-
+   describe "writes plans" $ do
+     it "outputs the total cost for an insert" $ do
+       r <- request methodPost "/projects"
+@@ -214,17 +188,6 @@ spec actualPgVersion = do
+             then Just [aesonQQ|1.3|]
+             else Just [aesonQQ|1.35|]
+ 
+-    it "outputs the plan for application/vnd.pgrst.object" $ do
+-      r <- request methodDelete "/projects?id=eq.6"
+-        [("Prefer", "return=representation"), ("Accept", "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object\"; options=verbose")] ""
+-
+-      let aggCol  = simpleBody r ^? nth 0 . key "Plan" . key "Output" . nth 3
+-          resHeaders = simpleHeaders r
+-
+-      liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object+json\"; options=verbose; charset=utf-8")
+-        aggCol `shouldBe` Just [aesonQQ| "COALESCE(((json_agg(ROW(projects.id, projects.name, projects.client_id)) -> 0))::text, 'null'::text)" |]
+-
+   describe "function plan" $ do
+     it "outputs the total cost for a function call" $ do
+       r <- request methodGet "/rpc/getallprojects?id=in.(1,2,3)"
+@@ -239,17 +202,6 @@ spec actualPgVersion = do
+         resStatus `shouldBe` Status { statusCode = 200, statusMessage="OK" }
+         totalCost `shouldBe` Just [aesonQQ|68.57|]
+ 
+-    it "outputs the plan for text/xml" $ do
+-      r <- request methodGet "/rpc/return_scalar_xml"
+-        (acceptHdrs "application/vnd.pgrst.plan+json; for=\"text/xml\"; options=verbose") ""
+-
+-      let aggCol  = simpleBody r ^? nth 0 . key "Plan" . key "Output" . nth 2
+-          resHeaders = simpleHeaders r
+-
+-      liftIO $ do
+-        resHeaders `shouldSatisfy` elem ("Content-Type", "application/vnd.pgrst.plan+json; for=\"text/xml\"; options=verbose; charset=utf-8")
+-        aggCol `shouldBe` Just [aesonQQ| "COALESCE(xmlagg(return_scalar_xml.pgrst_scalar), ''::xml)" |]
+-
+   describe "text format" $
+     it "outputs the total cost for a function call" $ do
+       r <- request methodGet "/projects?id=in.(1,2,3)"

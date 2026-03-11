@@ -1,0 +1,400 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a57171ab..61870fd6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@ A preview of the next release can be installed from
+ 
+ ## Unreleased
+ 
++- Support `(source inc)` and `(source babashka.fs/exists?)` for built-in vars [#1935](https://github.com/babashka/babashka/issues/1935)
+ - Support `BABASHKA_REPL_HISTORY` env var for configurable REPL history location [#1930](https://github.com/babashka/babashka/issues/1930)
+ - Fix `deftype` and `defrecord` inside non-top-level forms (e.g. `let`, `testing`) [#1936](https://github.com/babashka/babashka/issues/1936)
+ - Support rebel-readline as external REPL provider
+diff --git a/deps.edn b/deps.edn
+index add1b368..4cdd8c48 100644
+--- a/deps.edn
++++ b/deps.edn
+@@ -18,7 +18,7 @@
+          "deps.clj/src" "deps.clj/resources"
+          "resources" "sci/resources"
+          "impl-java/src"],
+- :deps {org.clojure/clojure {:mvn/version "1.12.3"},
++ :deps {org.clojure/clojure {:mvn/version "1.12.4"},
+         org.babashka/sci {:local/root "sci"}
+         org.babashka/babashka.impl.java {:mvn/version "0.1.17"}
+         org.babashka/sci.impl.types {:mvn/version "0.0.3"}
+diff --git a/doc/adr/0008-source-for-built-in-vars/decision.md b/doc/adr/0008-source-for-built-in-vars/decision.md
+new file mode 100644
+index 00000000..5d20055e
+--- /dev/null
++++ b/doc/adr/0008-source-for-built-in-vars/decision.md
+@@ -0,0 +1,73 @@
++# ADR 0008: Source for built-in vars
++
++## Status
++
++Accepted
++
++## Context
++
++`(source inc)` and other built-in vars return "Source not found" because SCI's
++`copy-var` / `copy-core-var` did not preserve `:file` and `:line` metadata from
++the original Clojure vars. Issue: https://github.com/babashka/babashka/issues/1935
++
++## Approach
++
++### 1. Preserve `:file`, `:line` and `:column` in SCI
++
++- Internal `var-meta` in `sci.impl.copy-vars` now includes `:file`, `:line` and
++  `:column` from the original var metadata (gated behind `elide-vars`).
++- Public `sci.core/copy-var` and `copy-var*` also preserve these fields.
++- `sci.core/copy-ns` default metadata now includes `:file`, `:line` and
++  `:column` (alongside `:arglists`, `:doc`, `:macro`, etc.).
++
++### 2. Split `clojure-core` map to avoid "Method code too large"
++
++Adding `:file`/`:line`/`:column` to every var increases the bytecode size of the
++`clojure-core` namespace map in `sci.impl.namespaces`. This was already at the
++JVM 64KB method limit.
++
++Split into two maps merged together, each wrapped in `avoid-method-too-large`:
++
++```clojure
++(def clojure-core
++  (merge
++   (avoid-method-too-large
++    {:obj clojure-core-ns
++     ;; ... first half (A-J) ...
++     })
++   (avoid-method-too-large
++    {;; ... second half (K-Z) ...
++     })))
++```
++
++### 3. Deduplicate built-in entries in stacktraces
++
++Built-in vars now appear twice in stacktraces: once from the SCI call-site
++(`:sci/built-in true`, no file info) and once from the var metadata (with
++`:file`/`:line`). `format-stacktrace` deduplicates by replacing a `<built-in>`
++entry with the following file-location entry when they refer to the same var.
++
++### 4. Look up source from Maven jars via isolated classloader
++
++`source-fn` in `babashka.impl.clojure.repl` finds source files through:
++
++1. Local file on disk (user code with file paths)
++2. bb's runtime URLClassLoader (user-added classpath via `-cp` or `bb.edn`)
++3. An isolated URLClassLoader (created lazily via `delay`) that resolves
++   bb's built-in library jars from `~/.m2/repository` using
++   `print-deps/deps-classpath`
++
++The isolated classloader uses `nil` parent to avoid polluting bb's runtime
++classpath — source jars are only used for reading text, not loading code. This
++prevents issues like `(require 'clojure.core :reload)` triggering reflection
++errors in native image.
++
++## Binary size
++
++Baseline (master, macOS arm64): 71,098,992 bytes (68M)
++
++With changes (split + :file/:line/:column metadata): 71,098,992 bytes (68M) — zero increase
++
++Verified by building both with and without the metadata changes: identical size.
++String literals are interned (most vars share "clojure/core.clj") and per-var
++line numbers (ints) have negligible impact.
+diff --git a/project.clj b/project.clj
+index 664b6bfc..131742c8 100644
+--- a/project.clj
++++ b/project.clj
+@@ -22,7 +22,7 @@
+                    :non-flaky (complement :flaky)
+                    :flaky :flaky}
+   :jvm-opts ["--enable-preview" "--enable-native-access=ALL-UNNAMED"]
+-  :dependencies [[org.clojure/clojure "1.12.3"]
++  :dependencies [[org.clojure/clojure "1.12.4"]
+                  [borkdude/edamame "1.5.37"]
+                  [org.clojure/tools.cli "1.0.214"]
+                  [cheshire "6.1.0"]
+diff --git a/resources/META-INF/babashka/deps.edn b/resources/META-INF/babashka/deps.edn
+index add1b368..4cdd8c48 100644
+--- a/resources/META-INF/babashka/deps.edn
++++ b/resources/META-INF/babashka/deps.edn
+@@ -18,7 +18,7 @@
+          "deps.clj/src" "deps.clj/resources"
+          "resources" "sci/resources"
+          "impl-java/src"],
+- :deps {org.clojure/clojure {:mvn/version "1.12.3"},
++ :deps {org.clojure/clojure {:mvn/version "1.12.4"},
+         org.babashka/sci {:local/root "sci"}
+         org.babashka/babashka.impl.java {:mvn/version "0.1.17"}
+         org.babashka/sci.impl.types {:mvn/version "0.0.3"}
+diff --git a/sci b/sci
+index 407aa71d..4b2510ee 160000
+--- a/sci
++++ b/sci
+@@ -1 +1 @@
+-Subproject commit 407aa71dd0e6e20de68494b4b0d365d7df2a3fd1
++Subproject commit 4b2510ee2973ced351cb02f22531a71f2a6ef864
+diff --git a/src/babashka/impl/clojure/repl.clj b/src/babashka/impl/clojure/repl.clj
+new file mode 100644
+index 00000000..961e29d8
+--- /dev/null
++++ b/src/babashka/impl/clojure/repl.clj
+@@ -0,0 +1,125 @@
++(ns babashka.impl.clojure.repl
++  {:no-doc true}
++  (:require [babashka.fs :as fs]
++            [babashka.impl.classpath :as cp]
++            [babashka.impl.common :as common]
++            [babashka.impl.print-deps :as print-deps]
++            [clojure.string :as str]
++            [sci.core :as sci]))
++
++(set! *warn-on-reflection* true)
++
++(def crns (sci/create-ns 'clojure.repl nil))
++
++(def special-doc-var
++  (sci/new-var
++   'special-doc
++   (let [m '{. {:url "java_interop#dot"
++                :forms [(.instanceMember instance args*)
++                        (.instanceMember Classname args*)
++                        (Classname/staticMethod args*)
++                        Classname/staticField]
++                :doc "The instance member form works for both fields and methods.
++  They all expand into calls to the dot operator at macroexpansion time."}
++             def {:forms [(def symbol doc-string? init?)]
++                  :doc "Creates and interns a global var with the name
++  of symbol in the current namespace (*ns*) or locates such a var if
++  it already exists.  If init is supplied, it is evaluated, and the
++  root binding of the var is set to the resulting value.  If init is
++  not supplied, the root binding of the var is unaffected."}
++             do {:forms [(do exprs*)]
++                 :doc "Evaluates the expressions in order and returns the value of
++  the last. If no expressions are supplied, returns nil."}
++             if {:forms [(if test then else?)]
++                 :doc "Evaluates test. If not the singular values nil or false,
++  evaluates and yields then, otherwise, evaluates and yields else. If
++  else is not supplied it defaults to nil."}
++             monitor-enter {:forms [(monitor-enter x)]
++                            :doc "Synchronization primitive that should be avoided
++  in user code. Use the 'locking' macro."}
++             monitor-exit {:forms [(monitor-exit x)]
++                           :doc "Synchronization primitive that should be avoided
++  in user code. Use the 'locking' macro."}
++             new {:forms [(Classname. args*) (new Classname args*)]
++                  :url "java_interop#new"
++                  :doc "The args, if any, are evaluated from left to right, and
++  passed to the constructor of the class named by Classname. The
++  constructed object is returned."}
++             quote {:forms [(quote form)]
++                    :doc "Yields the unevaluated form."}
++             recur {:forms [(recur exprs*)]
++                    :doc "Evaluates the exprs in order, then, in parallel, rebinds
++  the bindings of the recursion point to the values of the exprs.
++  Execution then jumps back to the recursion point, a loop or fn method."}
++             set! {:forms [(set! var-symbol expr)
++                           (set! (. instance-expr instanceFieldName-symbol) expr)
++                           (set! (. Classname-symbol staticFieldName-symbol) expr)]
++                   :url "vars#set"
++                   :doc "Used to set thread-local-bound vars, Java object instance
++fields, and Java class static fields."}
++             throw {:forms [(throw expr)]
++                    :doc "The expr is evaluated and thrown, therefore it should
++  yield an instance of some derivee of Throwable."}
++             try {:forms [(try expr* catch-clause* finally-clause?)]
++                  :doc "catch-clause => (catch classname name expr*)
++  finally-clause => (finally expr*)
++
++  Catches and handles Java exceptions."}
++             var {:forms [(var symbol)]
++                  :doc "The symbol must resolve to a var, and the Var object
++itself (not its value) is returned. The reader macro #'x expands to (var x)."}}]
++     (fn [name-symbol]
++       (when-let [doc (m name-symbol)]
++         (assoc doc :name name-symbol :special-form true))))
++   {:ns crns :private true}))
++
++(def set-break-handler-var
++  (sci/new-var
++   'set-break-handler!
++   (fn
++     ([] nil)
++     ([f]
++      (sun.misc.Signal/handle
++        (sun.misc.Signal. "INT")
++        (proxy [sun.misc.SignalHandler] []
++          (handle [signal]
++            (f (str "-- caught signal " signal)))))))
++   {:ns crns
++    :doc "Register INT signal handler.  After calling this, Ctrl-C will cause\n  the given function f to be called with a single argument, the signal.\n  Uses thread-stopper if no function given."
++    :arglists '([] [f])}))
++
++(def source-fn-var
++  (let [source-loader (delay
++                        (try
++                          (let [cp (print-deps/deps-classpath)
++                                urls (into-array java.net.URL
++                                                 (map #(-> (fs/file %) .toURI .toURL)
++                                                      (str/split cp (re-pattern (System/getProperty "path.separator")))))]
++                            (java.net.URLClassLoader. urls nil))
++                          (catch Exception _ nil)))
++        find-source (fn [^String file]
++                      (or (when (fs/exists? file) (slurp file))
++                          (when-let [res (.findResource ^babashka.impl.URLClassLoader @cp/the-url-loader file)]
++                            (slurp res))
++                          (when-let [loader @source-loader]
++                            (when-let [res (.getResource ^java.net.URLClassLoader loader file)]
++                              (slurp res)))))]
++    (sci/new-var
++     'source-fn
++     (fn [x]
++       (when-let [v (sci/resolve (common/ctx) x)]
++         (let [{:keys [file line]} (meta v)]
++           (when (and file line)
++             (when-let [source (find-source file)]
++               (let [lines (str/split source #"\n")
++                     line (dec ^long line)
++                     start (str/join "\n" (drop line lines))
++                     reader (sci/source-reader start)
++                     res (sci/parse-next+string (common/ctx) reader)]
++                 (second res)))))))
++     {:ns crns})))
++
++(def repl-namespace
++  {'special-doc special-doc-var
++   'set-break-handler! set-break-handler-var
++   'source-fn source-fn-var})
+diff --git a/src/babashka/impl/print_deps.clj b/src/babashka/impl/print_deps.clj
+index da9cc5e7..0eabc7ae 100644
+--- a/src/babashka/impl/print_deps.clj
++++ b/src/babashka/impl/print_deps.clj
+@@ -8,7 +8,7 @@
+    [clojure.string :as str]
+    [sci.core :as sci]))
+ 
+-(defn print-deps [deps-format]
++(defn- deps-map []
+   (let [deps (-> (io/resource "META-INF/babashka/deps.edn" common/jvm-loader)
+                  slurp
+                  edn/read-string)
+@@ -35,9 +35,15 @@
+         deps {:deps deps}
+         deps (cond-> deps
+                (seq paths) (assoc :paths paths))]
+-    (case deps-format
+-      ("deps" nil) (binding [*print-namespace-maps* false]
+-                     (pp/pprint deps))
+-      ("classpath") (let [cp (str/trim (sci/with-out-str
+-                                         (deps/clojure ["-Spath" "-Sdeps" deps] {:out :string})))]
+-                      (println cp)))))
++    deps))
++
++(defn deps-classpath []
++  (let [deps (deps-map)]
++    (str/trim (sci/with-out-str
++                (deps/clojure ["-Spath" "-Sdeps" deps] {:out :string})))))
++
++(defn print-deps [deps-format]
++  (case deps-format
++    ("deps" nil) (binding [*print-namespace-maps* false]
++                   (pp/pprint (deps-map)))
++    ("classpath") (println (deps-classpath))))
+diff --git a/src/babashka/main.clj b/src/babashka/main.clj
+index 6d9370fc..46811726 100644
+--- a/src/babashka/main.clj
++++ b/src/babashka/main.clj
+@@ -21,6 +21,7 @@
+    [babashka.impl.clojure.java.process :refer [cjp-namespace]]
+    [babashka.impl.clojure.java.shell :refer [shell-namespace]]
+    [babashka.impl.clojure.main :as clojure-main :refer [demunge]]
++   [babashka.impl.clojure.repl :refer [repl-namespace]]
+    [babashka.impl.clojure.math :refer [math-namespace]]
+    [babashka.impl.clojure.reflect :refer [reflect-namespace]]
+    [babashka.impl.clojure.stacktrace :refer [stacktrace-namespace]]
+@@ -390,83 +391,7 @@ Use bb run --help to show this help output.
+        'clojure.instant instant/instant-namespace
+        'clojure.stacktrace stacktrace-namespace
+        'clojure.zip zip-namespace
+-       'clojure.repl
+-       (let [crns (sci/create-ns 'clojure.repl)]
+-         {'special-doc
+-          (sci/new-var
+-           'special-doc
+-           (let [m '{. {:url "java_interop#dot"
+-                        :forms [(.instanceMember instance args*)
+-                                (.instanceMember Classname args*)
+-                                (Classname/staticMethod args*)
+-                                Classname/staticField]
+-                        :doc "The instance member form works for both fields and methods.
+-  They all expand into calls to the dot operator at macroexpansion time."}
+-                     def {:forms [(def symbol doc-string? init?)]
+-                          :doc "Creates and interns a global var with the name
+-  of symbol in the current namespace (*ns*) or locates such a var if
+-  it already exists.  If init is supplied, it is evaluated, and the
+-  root binding of the var is set to the resulting value.  If init is
+-  not supplied, the root binding of the var is unaffected."}
+-                     do {:forms [(do exprs*)]
+-                         :doc "Evaluates the expressions in order and returns the value of
+-  the last. If no expressions are supplied, returns nil."}
+-                     if {:forms [(if test then else?)]
+-                         :doc "Evaluates test. If not the singular values nil or false,
+-  evaluates and yields then, otherwise, evaluates and yields else. If
+-  else is not supplied it defaults to nil."}
+-                     monitor-enter {:forms [(monitor-enter x)]
+-                                    :doc "Synchronization primitive that should be avoided
+-  in user code. Use the 'locking' macro."}
+-                     monitor-exit {:forms [(monitor-exit x)]
+-                                   :doc "Synchronization primitive that should be avoided
+-  in user code. Use the 'locking' macro."}
+-                     new {:forms [(Classname. args*) (new Classname args*)]
+-                          :url "java_interop#new"
+-                          :doc "The args, if any, are evaluated from left to right, and
+-  passed to the constructor of the class named by Classname. The
+-  constructed object is returned."}
+-                     quote {:forms [(quote form)]
+-                            :doc "Yields the unevaluated form."}
+-                     recur {:forms [(recur exprs*)]
+-                            :doc "Evaluates the exprs in order, then, in parallel, rebinds
+-  the bindings of the recursion point to the values of the exprs.
+-  Execution then jumps back to the recursion point, a loop or fn method."}
+-                     set! {:forms [(set! var-symbol expr)
+-                                   (set! (. instance-expr instanceFieldName-symbol) expr)
+-                                   (set! (. Classname-symbol staticFieldName-symbol) expr)]
+-                           :url "vars#set"
+-                           :doc "Used to set thread-local-bound vars, Java object instance
+-fields, and Java class static fields."}
+-                     throw {:forms [(throw expr)]
+-                            :doc "The expr is evaluated and thrown, therefore it should
+-  yield an instance of some derivee of Throwable."}
+-                     try {:forms [(try expr* catch-clause* finally-clause?)]
+-                          :doc "catch-clause => (catch classname name expr*)
+-  finally-clause => (finally expr*)
+-
+-  Catches and handles Java exceptions."}
+-                     var {:forms [(var symbol)]
+-                          :doc "The symbol must resolve to a var, and the Var object
+-itself (not its value) is returned. The reader macro #'x expands to (var x)."}}]
+-             (fn [name-symbol]
+-               (when-let [doc (m name-symbol)]
+-                 (assoc doc :name name-symbol :special-form true))))
+-           {:ns crns :private true})
+-          'set-break-handler!
+-          (sci/new-var
+-           'set-break-handler!
+-           (fn
+-             ([] nil)
+-             ([f]
+-              (sun.misc.Signal/handle
+-                (sun.misc.Signal. "INT")
+-                (proxy [sun.misc.SignalHandler] []
+-                  (handle [signal]
+-                    (f (str "-- caught signal " signal)))))))
+-           {:ns crns
+-            :doc "Register INT signal handler.  After calling this, Ctrl-C will cause\n  the given function f to be called with a single argument, the signal.\n  Uses thread-stopper if no function given."
+-            :arglists '([] [f])})})
++       'clojure.repl repl-namespace
+        'clojure.main {:obj clojure-main-ns
+                       'demunge (sci/copy-var demunge clojure-main-ns)
+                       'repl-requires (sci/copy-var clojure-main/repl-requires clojure-main-ns)

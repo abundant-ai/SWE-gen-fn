@@ -1,0 +1,178 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fab71eb1..6607fcba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,7 +35,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Resource embedding works and the embedded rows will go into the `properties` key
+    + In case of multiple geometries in the same table, you can choose which one will go into the `geometry` key with the usual `?select` query parameter.
+  - #1082, Add security definitions to the OpenAPI output - @laurenceisla
+- - #2378, Support http OPTIONS method on RPC and root path - @steve-chavez
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 2f2e3d1b..1c04c092 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -417,26 +417,28 @@ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+ 
+ handleInfo :: Monad m => Target -> RequestContext -> Handler m Wai.Response
+ handleInfo target RequestContext{..} =
+-  case target of
+-    TargetIdent identifier ->
+-      case HM.lookup identifier (dbTables ctxDbStructure) of
+-        Just tbl -> infoResponse $ allowH tbl
+-        Nothing  -> throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+-    TargetProc pd _
+-      | pdVolatility pd == Volatile -> infoResponse "OPTIONS,POST"
+-      | otherwise                   -> infoResponse "OPTIONS,GET,HEAD,POST"
+-    TargetDefaultSpec _             -> infoResponse "OPTIONS,GET,HEAD"
++  case tbl of
++    Just table ->
++      return $ Wai.responseLBS HTTP.status200 [allOrigins, allowH table] mempty
++    Nothing ->
++      -- TODO is this right? When no tbl is found on the schema cache we disallow OPTIONS?
++      throwError $ Error.ApiRequestError ApiRequestTypes.NotFound
+   where
+-    infoResponse allowHeader = return $ Wai.responseLBS HTTP.status200 [allOrigins, (HTTP.hAllow, allowHeader)] mempty
++    tbl = case target of
++      TargetIdent identifier -> HM.lookup identifier (dbTables ctxDbStructure)
++      _                      -> Nothing
+     allOrigins = ("Access-Control-Allow-Origin", "*")
+     allowH table =
+-      let hasPK = not . null $ tablePKCols table in
+-      BS.intercalate "," $
+-          ["OPTIONS,GET,HEAD"] ++
+-          ["POST" | tableInsertable table] ++
+-          ["PUT" | tableInsertable table && tableUpdatable table && hasPK] ++
+-          ["PATCH" | tableUpdatable table] ++
+-          ["DELETE" | tableDeletable table]
++      ( HTTP.hAllow
++      , BS.intercalate "," $
++          ["OPTIONS,GET,HEAD"]
++          ++ ["POST" | tableInsertable table]
++          ++ ["PUT" | tableInsertable table && tableUpdatable table && hasPK]
++          ++ ["PATCH" | tableUpdatable table]
++          ++ ["DELETE" | tableDeletable table]
++      )
++    hasPK =
++      not $ null $ maybe mempty tablePKCols tbl
+ 
+ handleInvoke :: InvokeMethod -> ProcDescription -> RequestContext -> DbHandler Wai.Response
+ handleInvoke invMethod proc context@RequestContext{..} = do
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 9114d407..847f17a1 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -193,7 +193,7 @@ getPathInfo AppConfig{configOpenApiMode, configDbRootSpec} path =
+ 
+ getAction :: PathInfo -> ByteString -> Either ApiRequestError Action
+ getAction PathInfo{pathIsProc, pathIsDefSpec} method =
+-  if pathIsProc && method `notElem` ["HEAD", "GET", "POST", "OPTIONS"]
++  if pathIsProc && method `notElem` ["HEAD", "GET", "POST"]
+     then Left $ InvalidRpcMethod method
+     else case method of
+       -- The HEAD method is identical to GET except that the server MUST NOT return a message-body in the response
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index fbab0ec6..d9dd1caa 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -140,14 +140,7 @@ def dumpconfig(configpath=None, env=None, stdin=None):
+ 
+ 
+ @contextlib.contextmanager
+-def run(
+-    configpath=None,
+-    stdin=None,
+-    env=None,
+-    port=None,
+-    host=None,
+-    no_pool_connection_available=False,
+-):
++def run(configpath=None, stdin=None, env=None, port=None, host=None, no_pool_connection_available=False):
+     "Run PostgREST and yield an endpoint that is ready for connections."
+     env = env or {}
+     env["PGRST_DB_POOL"] = "1"
+@@ -251,7 +244,6 @@ def sleep_pool_connection(url, seconds):
+     except requests.exceptions.ReadTimeout:
+         pass
+ 
+-
+ def authheader(token):
+     "Bearer token HTTP authorization header."
+     return {"Authorization": f"Bearer {token}"}
+@@ -990,13 +982,9 @@ def test_no_pool_connection_required_on_options(defaultenv):
+         response = postgrest.session.options("/projects")
+         assert response.status_code == 200
+ 
+-        # OPTIONS on RPC shouldn't require opening a connection
++        # OPTIONS on RPC is not implemented yet, still it shouldn't require opening a connection
+         response = postgrest.session.options("/rpc/hello")
+-        assert response.status_code == 200
+-
+-        # OPTIONS on root shouldn't require opening a connection
+-        response = postgrest.session.options("/")
+-        assert response.status_code == 200
++        assert response.status_code == 405
+ 
+ 
+ def test_no_pool_connection_required_on_bad_jwt_claim(defaultenv):
+diff --git a/test/spec/Feature/OptionsSpec.hs b/test/spec/Feature/OptionsSpec.hs
+index ed5188a4..1dd2fea3 100644
+--- a/test/spec/Feature/OptionsSpec.hs
++++ b/test/spec/Feature/OptionsSpec.hs
+@@ -22,9 +22,6 @@ spec actualPgVersion = describe "Allow header" $ do
+         simpleHeaders r `shouldSatisfy`
+           matchHeader "Allow" "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+ 
+-    it "fails with 404 for an unknown table" $
+-      request methodOptions "/unknown" [] "" `shouldRespondWith` 404
+-
+   when (actualPgVersion >= pgVersion100) $
+     context "a partitioned table" $ do
+       it "includes read/write methods for writeable partitioned tables" $ do
+@@ -88,29 +85,3 @@ spec actualPgVersion = describe "Allow header" $ do
+         liftIO $
+           simpleHeaders r `shouldSatisfy`
+             matchHeader "Allow" "OPTIONS,GET,HEAD,DELETE"
+-
+-  context "a function" $ do
+-    it "includes the POST method for a volatile function" $ do
+-      r <- request methodOptions "/rpc/reset_items_tables" [] ""
+-      liftIO $
+-        simpleHeaders r `shouldSatisfy`
+-          matchHeader "Allow" "OPTIONS,POST"
+-
+-    it "includes the GET/HEAD/POST method for a stable function" $ do
+-      r <- request methodOptions "/rpc/getallusers" [] ""
+-      liftIO $
+-        simpleHeaders r `shouldSatisfy`
+-          matchHeader "Allow" "OPTIONS,GET,HEAD,POST"
+-
+-    it "includes the GET/HEAD/POST method for a immutable function" $ do
+-      r <- request methodOptions "/rpc/jwt_test" [] ""
+-      liftIO $
+-        simpleHeaders r `shouldSatisfy`
+-          matchHeader "Allow" "OPTIONS,GET,HEAD,POST"
+-
+-  context "root endpoint" $ do
+-    it "includes the GET/HEAD method " $ do
+-      r <- request methodOptions "/" [] ""
+-      liftIO $
+-        simpleHeaders r `shouldSatisfy`
+-          matchHeader "Allow" "OPTIONS,GET,HEAD"
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index eb558d17..c73157c4 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -541,6 +541,10 @@ spec actualPgVersion =
+       it "PATCH fails" $
+         request methodPatch "/rpc/sayhello" [] ""
+           `shouldRespondWith` 405
++      it "OPTIONS fails" $
++        -- TODO: should return info about the function
++        request methodOptions "/rpc/sayhello" [] ""
++          `shouldRespondWith` 405
+ 
+     it "executes the proc exactly once per request" $ do
+       -- callcounter is persistent even with rollback, because it uses a sequence

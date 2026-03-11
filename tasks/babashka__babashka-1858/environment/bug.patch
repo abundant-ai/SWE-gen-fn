@@ -1,0 +1,374 @@
+diff --git a/src/babashka/impl/clojure/core.clj b/src/babashka/impl/clojure/core.clj
+index 7574e338..386f3a04 100644
+--- a/src/babashka/impl/clojure/core.clj
++++ b/src/babashka/impl/clojure/core.clj
+@@ -89,7 +89,7 @@
+   the agent will be set to the value of:
+   (apply action-fn state-of-agent args)"
+   [^clojure.lang.Agent a f & args]
+-  (apply send-via @common/solo-executor a f args))
++  (apply send-via clojure.lang.Agent/soloExecutor a f args))
+ 
+ ;;;; End agents
+ 
+diff --git a/src/babashka/impl/common.clj b/src/babashka/impl/common.clj
+index 32de0601..18fee865 100644
+--- a/src/babashka/impl/common.clj
++++ b/src/babashka/impl/common.clj
+@@ -12,4 +12,3 @@
+ (def debug (volatile! false))
+ (def version (str/trim (slurp (io/resource "BABASHKA_VERSION"))))
+ (def jvm-loader (.getContextClassLoader (Thread/currentThread)))
+-(def solo-executor (volatile! nil))
+diff --git a/src/babashka/main.clj b/src/babashka/main.clj
+index acafaec6..869fe5ed 100644
+--- a/src/babashka/main.clj
++++ b/src/babashka/main.clj
+@@ -168,7 +168,6 @@ Global opts:
+   --config <file>   Replace bb.edn with file. Defaults to bb.edn adjacent to invoked file or bb.edn in current dir. Relative paths are resolved relative to bb.edn.
+   --deps-root <dir> Treat dir as root of relative paths in config.
+   --prn             Print result via clojure.core/prn
+-  --force-exit      Force exiting even when non-daemon threads are still running
+   -Sforce           Force recalculation of the classpath (don't use the cache)
+   -Sdeps            Deps data to use as the last deps file to be merged
+   -f, --file <path> Run file
+@@ -731,8 +730,6 @@ Use bb run --help to show this help output.
+         (recur (nnext options) (assoc opts-map :deps-root (second options)))
+         ("--prn")
+         (recur (next options) (assoc opts-map :prn true))
+-        ("--force-exit")
+-        (recur (next options) (assoc opts-map :force-exit true))
+         ("-f" "--file")
+         (recur (nnext options) (assoc opts-map :file (second options)))
+         ("-jar" "--jar")
+@@ -843,23 +840,6 @@ Use bb run --help to show this help output.
+             (sci/eval-form ctx (list 'clojure.core/var-set core/data-readers (list 'quote (assoc @core/data-readers t the-var))))
+             the-var)))))
+ 
+-(defn- set-daemon-agent-executor
+-  "Set Clojure's send-off agent executor (also affects futures). This is almost
+-  an exact rewrite of the Clojure's executor, but the Threads are created as
+-  daemons."
+-  []
+-  (let [thread-counter (atom 0)
+-        thread-factory (reify java.util.concurrent.ThreadFactory
+-                         (newThread [_ runnable]
+-                           (let [name (format "CLI-agent-send-off-pool-%d"
+-                                              (first (swap-vals! thread-counter inc)))]
+-                             (doto (Thread. runnable)
+-                               (.setDaemon true) ;; DIFFERENT
+-                               (.setName name)))))
+-        executor (java.util.concurrent.Executors/newCachedThreadPool thread-factory)]
+-    (set-agent-send-off-executor! executor)
+-    (vreset! common/solo-executor executor)))
+-
+ (defn exec [cli-opts]
+   (with-bindings {#'*unrestricted* true
+                   clojure.lang.Compiler/LOADER @cp/the-url-loader}
+@@ -871,19 +851,18 @@ Use bb run --help to show this help output.
+                   sci/print-length @sci/print-length
+                   ;; when adding vars here, also add them to repl.clj and nrepl_server.clj
+                   ]
+-      (let [{:keys [shell-in edn-in shell-out edn-out
+-                    file command-line-args
+-                    expressions stream? init
+-                    repl socket-repl nrepl
+-                    debug classpath force?
+-                    main uberscript
+-                    jar uberjar clojure
+-                    doc run list-tasks
+-                    print-deps prepare
+-                    force-exit]
+-             exec-fn :exec
+-             print-result? :prn}
++      (let [{:keys [:shell-in :edn-in :shell-out :edn-out
++                    :file :command-line-args
++                    :expressions :stream? :init
++                    :repl :socket-repl :nrepl
++                    :debug :classpath :force?
++                    :main :uberscript
++                    :jar :uberjar :clojure
++                    :doc :run :list-tasks
++                    :print-deps :prepare]
++             exec-fn :exec}
+             cli-opts
++            print-result? (:prn cli-opts)
+             _ (when debug (vreset! common/debug true))
+             _ (do ;; set properties
+                 (when main (System/setProperty "babashka.main" main))
+@@ -1142,19 +1121,16 @@ Use bb run --help to show this help output.
+                         (uberjar/run (assoc uber-params
+                                             :classpath cp-with-bb-edn)))))
+                   (uberjar/run uber-params))))))
+-        {:exit exit-code
+-         :force-exit force-exit}))))
++        exit-code))))
+ 
+ (defn exec-without-deps [cli-opts]
+   (let [{version-opt :version
+-         :keys [help describe?
+-                force-exit]} cli-opts]
++         :keys [help describe?]} cli-opts]
+     (cond
+       version-opt (print-version)
+       help        (print-help)
+-      describe?   (print-describe))
+-    {:exit 0
+-     :force-exit force-exit}))
++      describe?   (print-describe)))
++  0)
+ 
+ (defn satisfies-min-version? [min-version]
+   (let [[major-current minor-current patch-current] version-data
+@@ -1204,7 +1180,6 @@ Use bb run --help to show this help output.
+     (some #(contains? opts %) fast-path-opts)))
+ 
+ (defn main [& args]
+-  (set-daemon-agent-executor)
+   (let [bin-jar (binary-invoked-as-jar)
+         args (if bin-jar
+                (list* "--jar" bin-jar "--" args)
+@@ -1264,6 +1239,26 @@ Use bb run --help to show this help output.
+       (exec-without-deps opts)
+       (exec opts))))
+ 
++(def musl?
++  "Captured at compile time, to know if we are running inside a
++  statically compiled executable with musl."
++  (and (= "true" (System/getenv "BABASHKA_STATIC"))
++       (= "true" (System/getenv "BABASHKA_MUSL"))))
++
++(defmacro run [args]
++  (if musl?
++    ;; When running in musl-compiled static executable we lift execution of bb
++    ;; inside a thread, so we have a larger than default stack size, set by an
++    ;; argument to the linker. See https://github.com/oracle/graal/issues/3398
++    `(let [v# (volatile! nil)
++           f# (fn []
++                (vreset! v# (apply main ~args)))]
++       (doto (Thread. nil f# "main")
++         (.start)
++         (.join))
++       @v#)
++    `(apply main ~args)))
++
+ (defn -main
+   [& args]
+   (handle-pipe!)
+@@ -1275,15 +1270,11 @@ Use bb run --help to show this help output.
+       (dotimes [i n]
+         (if (< i last-iteration)
+           (with-out-str (apply main args))
+-          (do (apply main args)
++          (do (run args)
+               (binding [*out* *err*]
+                 (println "ran" n "times"))))))
+-    (let [{:keys [exit force-exit]} (apply main args)]
+-      ;; only necessary for linux musl, but for compat, we do it everywhere:
+-      (shutdown-agents)
+-      (when (or (not (zero? exit))
+-                force-exit)
+-        (System/exit exit)))))
++    (let [exit-code (run args)]
++      (System/exit exit-code))))
+ 
+ (sci/alter-var-root main-var (constantly -main))
+ ;;;; Scratch
+diff --git a/test/babashka/interop_test.clj b/test/babashka/interop_test.clj
+index e7a41a37..ae804fca 100644
+--- a/test/babashka/interop_test.clj
++++ b/test/babashka/interop_test.clj
+@@ -205,19 +205,19 @@
+ 
+ (deftest posix-file-attributes
+   (when-not test-utils/windows?
+-    (is (true?
++    (is (= 'java.util.HashSet
+            (bb nil
+                '(do
+                   (import
+                    [java.nio.file Files LinkOption Path]
+                    [java.nio.file.attribute PosixFileAttributes])
+-                  (->> (Files/readAttributes (Path/of "test-resources/posix-file-attributes.txt"
+-                                                      (into-array String []))
+-                                             PosixFileAttributes
+-                                             ^"[Ljava.nio.file.LinkOption;"
+-                                             (into-array LinkOption []))
+-                       .permissions
+-                       (instance? java.util.Set))))))))
++                  (-> (Files/readAttributes (Path/of "test-resources/posix-file-attributes.txt"
++                                                     (into-array String []))
++                                            PosixFileAttributes
++                                            ^"[Ljava.nio.file.LinkOption;"
++                                            (into-array LinkOption []))
++                      .permissions
++                      type)))))))
+ 
+ (deftest extended-attributes
+   (is (true?
+@@ -251,13 +251,11 @@
+ 
+ (deftest cached-thread-pool
+   (is (= 3 (bb nil "(import '(java.util.concurrent Executors ExecutorService))
+-                    (let [executor (Executors/newCachedThreadPool)
+-                          fut (.submit ^ExecutorService executor ^Callable (fn [] 3))]
+-                      (try (.get fut) (finally (.shutdown executor))))")))
++                    (let [fut (.submit ^ExecutorService (Executors/newCachedThreadPool) ^Callable (fn [] 3))]
++                      (.get fut))")))
+   (is (nil? (bb nil "(import '(java.util.concurrent Executors ExecutorService))
+-                     (let [executor (Executors/newCachedThreadPool)
+-                           fut (.submit ^ExecutorService executor ^Runnable (fn [] 3))]
+-                       (try (.get fut) (finally (.shutdown executor))))"))))
++                     (let [fut (.submit ^ExecutorService (Executors/newCachedThreadPool) ^Runnable (fn [] 3))]
++                       (.get fut))"))))
+ 
+ (deftest break-iterator-test
+   (is (= 1 (bb nil "(ns dude
+@@ -308,45 +306,3 @@
+ (def s \"cafe\u0301\")
+ 
+ (assert (> (count s) (count (normalize s))))"))
+-
+-(deftest non-daemon-thread-test
+-  (when test-utils/native?
+-    (is (< 500 (bb nil "(import '(java.time Instant Duration))
+-
+-(defn jvm-uptime-seconds []
+-  (let [start (-> (java.lang.ProcessHandle/current)
+-                  .info
+-                  .startInstant
+-                  .get)
+-        now   (Instant/now)]
+-    (.toMillis (Duration/between start now))))
+-
+-(.start (doto (Thread. (fn [] (Thread/sleep 500)
+-                         (println (jvm-uptime-seconds))))
+-          (.setDaemon false)))")))
+-    (is (nil? (bb nil "--force-exit" "(import '(java.time Instant Duration))
+-
+-(defn jvm-uptime-seconds []
+-  (let [start (-> (java.lang.ProcessHandle/current)
+-                  .info
+-                  .startInstant
+-                  .get)
+-        now   (Instant/now)]
+-    (.toMillis (Duration/between start now))))
+-
+-(.start (doto (Thread. (fn [] (Thread/sleep 500)
+-                         (println (jvm-uptime-seconds))))
+-          (.setDaemon false)))")))
+-    (is (nil? (bb nil "(import '(java.time Instant Duration))
+-(defn jvm-uptime-seconds []
+-  (let [start (-> (java.lang.ProcessHandle/current)
+-                  .info
+-                  .startInstant
+-                  .get)
+-        now   (Instant/now)]
+-    (.toMillis (Duration/between start now))))
+-
+-(.start (doto (Thread. (fn [] (Thread/sleep 500)
+-                         (println (jvm-uptime-seconds))))
+-;; DIFFERENT
+-(.setDaemon true)))")))))
+diff --git a/test/babashka/java_net_http_test.clj b/test/babashka/java_net_http_test.clj
+index 6a52ed03..dfa8b94f 100644
+--- a/test/babashka/java_net_http_test.clj
++++ b/test/babashka/java_net_http_test.clj
+@@ -163,17 +163,14 @@
+                 (java.util.concurrent Executors)))
+ 
+              (let [uri (URI. "https://www.postman-echo.com/get")
+-                   executor (Executors/newSingleThreadExecutor)
+                    req (-> (HttpRequest/newBuilder uri)
+                            (.GET)
+                            (.build))
+                    client (-> (HttpClient/newBuilder)
+-                              (.executor executor)
++                              (.executor (Executors/newSingleThreadExecutor))
+                               (.build))
+                    res (.send client req (HttpResponse$BodyHandlers/discarding))]
+-               (let [status (.statusCode res)]
+-                 (.shutdown executor)
+-                 status)))))))
++               (.statusCode res)))))))
+ 
+ (deftest ^:flaky proxy-test
+   (is (= true
+diff --git a/test/babashka/main_test.clj b/test/babashka/main_test.clj
+index ef0ad1e2..53683a20 100644
+--- a/test/babashka/main_test.clj
++++ b/test/babashka/main_test.clj
+@@ -798,7 +798,7 @@ true")))
+                               (map str ["doc" "with-precision"]))
+                        "precision"))
+     (is (str/blank? (with-out-str (main/main "doc" "non-existing"))))
+-    (is (= 1 (:exit (main/main "doc" "non-existing"))))))
++    (is (= 1 (main/main "doc" "non-existing")))))
+ 
+ (deftest ^:skip-windows process-handler-info-test
+   (when test-utils/native?
+diff --git a/test/babashka/test_utils.clj b/test/babashka/test_utils.clj
+index d55e9aa2..b2b440eb 100644
+--- a/test/babashka/test_utils.clj
++++ b/test/babashka/test_utils.clj
+@@ -66,22 +66,22 @@
+       (vars/bindRoot sci/out os)
+       (vars/bindRoot sci/err es)
+       (sci/with-bindings bindings-map
+-        (let [res (:exit (binding [*out* os
+-                                   *err* es]
+-                           (if (string? input-or-opts)
+-                             (with-in-str input-or-opts (apply main/main args))
+-                             (apply main/main args))))]
+-          (if (zero? res)
+-            (do
+-              (let [err (str es)]
+-                (when-not (str/blank? err)
+-                  (println err))) ;; flush stderr
+-              (normalize (str os)))
+-            (do
+-              (println (str os))
+-              (throw (ex-info (str es)
+-                              {:stdout (str os)
+-                               :stderr (str es)}))))))
++          (let [res (binding [*out* os
++                              *err* es]
++                      (if (string? input-or-opts)
++                        (with-in-str input-or-opts (apply main/main args))
++                        (apply main/main args)))]
++            (if (zero? res)
++              (do
++                (let [err (str es)]
++                  (when-not (str/blank? err)
++                    (println err))) ;; flush stderr
++                (normalize (str os)))
++              (do
++                (println (str os))
++                (throw (ex-info (str es)
++                                {:stdout (str os)
++                                 :stderr (str es)}))))))
+       (finally
+         (when (string? input-or-opts) (vars/bindRoot sci/in *in*))
+         (vars/bindRoot sci/out *out*)
+@@ -89,7 +89,7 @@
+ 
+ (defn bb-native [input & args]
+   (let [args (cond-> args *bb-edn-path*
+-                     (->> (list* "--config" *bb-edn-path* "--deps-root" ".")))
++               (->> (list* "--config" *bb-edn-path* "--deps-root" ".")))
+         res (p/process (into ["./bb"] args)
+                        {:in input
+                         :out :string
+@@ -98,11 +98,7 @@
+         exit (:exit res)
+         error? (pos? exit)]
+     (if error? (throw (ex-info (or (:err res) "") {}))
+-        (do
+-          (let [err (:err res)]
+-            (when-not (str/blank? err)
+-              (println err)))
+-          (normalize (:out res))))))
++               (normalize (:out res)))))
+ 
+ (def bb
+   (case (System/getenv "BABASHKA_TEST_ENV")

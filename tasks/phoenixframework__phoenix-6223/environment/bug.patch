@@ -1,0 +1,340 @@
+diff --git a/lib/phoenix/channel/server.ex b/lib/phoenix/channel/server.ex
+index 9e159e55e..b5b4906d6 100644
+--- a/lib/phoenix/channel/server.ex
++++ b/lib/phoenix/channel/server.ex
+@@ -295,9 +295,6 @@ defmodule Phoenix.Channel.Server do
+     Process.put(:"$initial_call", {channel, :join, 3})
+     Process.put(:"$callers", [pid])
+ 
+-    # TODO: replace with Process.put_label/2 when we require Elixir 1.17
+-    Process.put(:"$process_label", {Phoenix.Channel, channel, topic})
+-
+     socket = %{
+       socket
+       | channel_pid: self(),
+diff --git a/lib/phoenix/debug.ex b/lib/phoenix/debug.ex
+deleted file mode 100644
+index 4f86ae697..000000000
+--- a/lib/phoenix/debug.ex
++++ /dev/null
+@@ -1,168 +0,0 @@
+-defmodule Phoenix.Debug do
+-  @moduledoc """
+-  Functions for runtime introspection and debugging of Phoenix applications.
+-
+-  This module provides utilities for inspecting and debugging Phoenix applications.
+-  At the moment, it only includes functions related to `Phoenix.Socket` and `Phoenix.Channel`
+-  processes.
+-
+-  It allows you to:
+-
+-    * List all currently connected `Phoenix.Socket` transport processes.
+-    * List all channels for a given `Phoenix.Socket` process.
+-    * Get the socket of a channel process.
+-    * Check if a process is a `Phoenix.Socket` or `Phoenix.Channel`.
+-
+-  """
+-
+-  @doc """
+-  Returns a list of all currently connected `Phoenix.Socket` transport processes.
+-
+-  Note that custom sockets implementing the `Phoenix.Socket.Transport` behaviour
+-  are not listed.
+-
+-  Each process corresponds to one connection that can have multiple channels.
+-
+-  For example, when using Phoenix LiveView, the browser establishes a socket
+-  connection when initially navigating to the page, and each live navigation
+-  retains the same socket connection. Nested LiveViews also share the same
+-  connection, each being a different channel. See `Phoenix.Debug.channels/1`.
+-
+-  ## Examples
+-
+-      iex> Phoenix.Debug.list_sockets()
+-      [%{pid: #PID<0.123.0>, module: Phoenix.LiveView.Socket, id: nil}]
+-
+-  """
+-  def list_sockets do
+-    for pid <- Process.list(), dict = socket_process_dict(pid), not is_nil(dict) do
+-      {Phoenix.Socket, mod, id} = keyfind(dict, :"$process_label")
+-      %{pid: pid, module: mod, id: id}
+-    end
+-  end
+-
+-  defp keyfind(list, key) do
+-    case List.keyfind(list, key, 0) do
+-      {^key, value} -> value
+-      _ -> nil
+-    end
+-  end
+-
+-  defp socket_process_dict(pid) do
+-    # Phoenix.Socket sets the "$process_label" to {Phoenix.Socket, handler_module, id}
+-    with info when is_list(info) <- Process.info(pid, [:dictionary]),
+-         dictionary when not is_nil(dictionary) <- keyfind(info, :dictionary),
+-         label when not is_nil(label) <- keyfind(dictionary, :"$process_label"),
+-         {Phoenix.Socket, mod, id} when is_atom(mod) and (is_binary(id) or is_nil(id)) <- label do
+-      dictionary
+-    else
+-      _ -> nil
+-    end
+-  end
+-
+-  @doc """
+-  Returns true if the given pid is a `Phoenix.Socket` transport process.
+-
+-  It returns `false` for custom sockets implementing the `Phoenix.Socket.Transport` behaviour.
+-
+-  ## Examples
+-
+-      iex> Phoenix.Debug.list_sockets() |> Enum.at(0) |> Map.fetch!(:pid) |> socket_process?()
+-      true
+-
+-      iex> socket_process?(pid(0,456,0))
+-      false
+-
+-  """
+-  def socket_process?(pid) do
+-    not is_nil(socket_process_dict(pid))
+-  end
+-
+-  @doc """
+-  Checks if the given pid is a `Phoenix.Channel` process.
+-
+-  Note: this function returns false for [custom channels](https://hexdocs.pm/phoenix/Phoenix.Socket.html#module-custom-channels).
+-  """
+-  def channel_process?(pid) do
+-    # Phoenix.Channel sets the "$process_label" to {Phoenix.Socket, handler_module, id}
+-    with info when is_list(info) <- Process.info(pid, [:dictionary]),
+-         dictionary when not is_nil(dictionary) <- keyfind(info, :dictionary),
+-         label when not is_nil(label) <- keyfind(dictionary, :"$process_label"),
+-         {Phoenix.Channel, mod, topic} when is_atom(mod) and is_binary(topic) <- label do
+-      true
+-    else
+-      _ -> false
+-    end
+-  end
+-
+-  @doc """
+-  Returns a list of all currently connected channels for the given `Phoenix.Socket` pid.
+-
+-  Each channel is represented as a map with the following keys:
+-
+-    - `:pid` - the pid of the channel process
+-    - `:status` - the status of the channel
+-    - `:topic` - the topic of the channel
+-
+-  Note that this list also contains [custom channels](https://hexdocs.pm/phoenix/Phoenix.Socket.html#module-custom-channels)
+-  like LiveViews. You can check if a channel is a custom channel by using the `channel?/1`
+-  function, which returns `false` for custom channels.
+-
+-  ## Examples
+-
+-      iex> pid = Phoenix.Debug.list_sockets() |> Enum.at(0) |> Map.fetch!(:pid)
+-      iex> Phoenix.Debug.list_channels(pid)
+-      {:ok,
+-       [
+-         %{pid: #PID<0.1702.0>, status: :joined, topic: "lv:phx-GDp9a9UZPiTxcgnE"},
+-         %{pid: #PID<0.1727.0>, status: :joined, topic: "lv:sidebar"}
+-       ]}
+-
+-      iex> Phoenix.Debug.list_channels(pid(0,456,0))
+-      {:error, :not_alive}
+-
+-  """
+-  def list_channels(socket_pid) do
+-    ref = make_ref()
+-
+-    if Process.alive?(socket_pid) and socket_process?(socket_pid) do
+-      send(socket_pid, {:debug_channels, ref, self()})
+-
+-      receive do
+-        {:debug_channels, ^ref, channels} ->
+-          {:ok, channels}
+-      after
+-        5_000 -> {:error, :timeout}
+-      end
+-    else
+-      {:error, :not_alive}
+-    end
+-  end
+-
+-  @doc """
+-  Returns the socket of the channel process.
+-
+-  Note: this only works for channels defined with `use Phoenix.Channel`.
+-  For LiveViews, use the functions defined in `Phoenix.LiveView.Debug` instead.
+-
+-  ## Examples
+-
+-      iex> pid = Phoenix.Debug.list_sockets() |> Enum.at(0) |> Map.fetch!(:pid)
+-      iex> {:ok, channels} = Phoenix.Debug.list_channels(pid)
+-      iex> channels |> Enum.at(0) |> Map.fetch!(:pid) |> socket()
+-      {:ok, %Phoenix.Socket{...}}
+-
+-      iex> socket(pid(0,456,0))
+-      {:error, :not_alive_or_not_a_channel}
+-
+-  """
+-  def socket(channel_pid) do
+-    if channel_process?(channel_pid) do
+-      {:ok, Phoenix.Channel.Server.socket(channel_pid)}
+-    else
+-      {:error, :not_alive_or_not_a_channel}
+-    end
+-  catch
+-    :exit, _ -> {:error, :not_alive_or_not_a_channel}
+-  end
+-end
+diff --git a/lib/phoenix/socket.ex b/lib/phoenix/socket.ex
+index 25ada6161..00c4885c6 100644
+--- a/lib/phoenix/socket.ex
++++ b/lib/phoenix/socket.ex
+@@ -520,13 +520,7 @@ defmodule Phoenix.Socket do
+   defp result(:error), do: :error
+   defp result({:error, _}), do: :error
+ 
+-  defp set_label(socket) do
+-    # TODO: replace with Process.put_label/2 when we require Elixir 1.17
+-    Process.put(:"$process_label", {Phoenix.Socket, socket.handler, socket.id})
+-  end
+-
+   def __init__({state, %{id: id, endpoint: endpoint} = socket}) do
+-    set_label(socket)
+     _ = id && endpoint.subscribe(id)
+     {:ok, {state, %{socket | transport_pid: self()}}}
+   end
+@@ -569,16 +563,6 @@ defmodule Phoenix.Socket do
+     {:ok, state}
+   end
+ 
+-  def __info__({:debug_channels, ref, reply_to}, {state, socket}) do
+-    channels =
+-      Enum.map(state.channels, fn {topic, {pid, _monitor_ref, status}} ->
+-        %{topic: topic, pid: pid, status: status}
+-      end)
+-
+-    send(reply_to, {:debug_channels, ref, channels})
+-    {:ok, {state, socket}}
+-  end
+-
+   def __info__(_, state) do
+     {:ok, state}
+   end
+@@ -641,8 +625,6 @@ defmodule Phoenix.Socket do
+             {:ok, {state, socket}}
+ 
+           id when is_binary(id) ->
+-            # update the process label
+-            set_label(socket)
+             {:ok, {state, %{socket | id: id}}}
+ 
+           invalid ->
+diff --git a/test/phoenix/debug_test.exs b/test/phoenix/debug_test.exs
+deleted file mode 100644
+index b8bc76951..000000000
+--- a/test/phoenix/debug_test.exs
++++ /dev/null
+@@ -1,102 +0,0 @@
+-defmodule Phoenix.DebugTest do
+-  use ExUnit.Case, async: true
+-
+-  alias Phoenix.Debug
+-
+-  # we cannot easily test the Phoenix.Debug functions with the regular
+-  # Phoenix.ChannelTest functions, because they use the test process
+-  # itself as the transport process
+-  defmodule FakeSocket do
+-    use GenServer
+-
+-    def init(channel_pid) do
+-      Process.put(:"$process_label", {Phoenix.Socket, __MODULE__, nil})
+-      {:ok, channel_pid}
+-    end
+-
+-    def handle_info({:debug_channels, ref, reply_to}, state) do
+-      send(
+-        reply_to,
+-        {:debug_channels, ref, [%{pid: state, status: :joined, topic: "room:lobby"}]}
+-      )
+-
+-      {:noreply, state}
+-    end
+-  end
+-
+-  defmodule FakeChannel do
+-    use GenServer
+-
+-    def init(state) do
+-      Process.put(:"$process_label", {Phoenix.Channel, __MODULE__.Channel, "room:lobby"})
+-      {:ok, state}
+-    end
+-
+-    def handle_call(:socket, _from, state) do
+-      {:reply, %Phoenix.Socket{}, state}
+-    end
+-  end
+-
+-  setup do
+-    {:ok, channel_pid} = GenServer.start_link(FakeChannel, nil)
+-    {:ok, socket_pid} = GenServer.start_link(FakeSocket, channel_pid)
+-
+-    %{socket_pid: socket_pid, channel_pid: channel_pid}
+-  end
+-
+-  describe "list_sockets/0" do
+-    test "returns a list of all currently connected channel socket processes", %{
+-      socket_pid: socket_pid
+-    } do
+-      sockets = Debug.list_sockets()
+-      assert is_list(sockets)
+-      assert Enum.any?(sockets, fn s -> s.pid == socket_pid end)
+-      assert Enum.find(sockets, fn s -> s.module == __MODULE__.FakeSocket end)
+-    end
+-  end
+-
+-  describe "socket_process?/1" do
+-    test "returns true if the given pid is a channel socket process", %{socket_pid: socket_pid} do
+-      assert Debug.socket_process?(socket_pid)
+-    end
+-
+-    test "returns false for a non-socket process" do
+-      refute Debug.socket_process?(self())
+-    end
+-  end
+-
+-  describe "channel_process?/1" do
+-    test "returns true if the given pid is a channel process", %{channel_pid: channel_pid} do
+-      assert Debug.channel_process?(channel_pid)
+-    end
+-
+-    test "returns false for a non-channel process" do
+-      refute Debug.channel_process?(self())
+-    end
+-  end
+-
+-  describe "list_channels/1" do
+-    test "returns a list of all channels for a given socket pid", %{
+-      socket_pid: socket_pid,
+-      channel_pid: channel_pid
+-    } do
+-      {:ok, channels} = Debug.list_channels(socket_pid)
+-      assert is_list(channels)
+-      assert Enum.any?(channels, fn ch -> ch.pid == channel_pid and ch.topic == "room:lobby" end)
+-    end
+-
+-    test "returns error for non-socket pid" do
+-      assert {:error, :not_alive} = Debug.list_channels(self())
+-    end
+-  end
+-
+-  describe "socket/1" do
+-    test "returns the socket struct for a channel process", %{channel_pid: channel_pid} do
+-      assert {:ok, %Phoenix.Socket{}} = Debug.socket(channel_pid)
+-    end
+-
+-    test "returns error for non-channel process" do
+-      assert {:error, :not_alive_or_not_a_channel} = Debug.socket(self())
+-    end
+-  end
+-end

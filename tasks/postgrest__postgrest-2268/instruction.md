@@ -1,0 +1,7 @@
+PostgREST currently supports returning different representations (based on content negotiation), but XML responses fail or are not produced correctly when the requested resource/query returns a single column (for example, selecting only one field from a table or view). Requests that should be able to return XML (via the Accept header or equivalent content-negotiation mechanism) do not return valid XML for these single-column result sets, even though multi-column results can be rendered.
+
+When a client requests a single-column projection (e.g. a request like `GET /<resource>?select=<one_column>`), and the client negotiates an XML response (e.g. `Accept: application/xml`), PostgREST should return a well-formed XML document representing the result rows, not an error and not a fallback to another media type.
+
+The XML rendering/content-negotiation logic needs to be updated so that single-column query results are handled as a first-class case, producing a valid XML response consistent with how multi-column row results are represented. This should work both for empty results and for one-or-more-row results, and should not change the behavior for JSON or other existing media types.
+
+In particular, ensure that selecting a single column does not break XML generation (for example due to assumptions that a row always contains multiple fields or that the row can always be encoded as an object with multiple keys). The resulting response must have the correct XML `Content-Type` and must be parseable as XML.
