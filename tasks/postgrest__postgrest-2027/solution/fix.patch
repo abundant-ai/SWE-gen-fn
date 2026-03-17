@@ -1,0 +1,173 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 27893bf0..8c7cbc56 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ - #1075, Allow filtering top-level resource based on embedded resources filters - @steve-chavez, @Iced-Sun
+    + This is enabled by adding `!inner` to the embedded resource, e.g. `/projects?select=*,clients!inner(*)&clients.id=eq.12`
+    + This behavior can be enabled by default with the `db-embed-default-join='inner'` config option, which saves the need for specifying `!inner` on every request. In this case, you can go back to the previous behavior per request by specifying `!left`  on the embedded resource, e.g `/projects?select=*,clients!left(*)&clients.id=eq.12`
++- #1988, Allow specifying `unknown` for the `is` operator - @steve-chavez
+ 
+ ### Fixed
+ 
+@@ -585,4 +586,4 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Fixed
+ - Make filter position match docs, e.g. `?order=col.asc` rather
+-  than `?order=asc.col`.
+\ No newline at end of file
++  than `?order=asc.col`.
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index f0174419..9bbc1ff0 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -61,7 +61,8 @@ import PostgREST.Request.Types           (Alias, Field, Filter (..),
+                                           Operation (..),
+                                           OrderDirection (..),
+                                           OrderNulls (..),
+-                                          OrderTerm (..), SelectItem)
++                                          OrderTerm (..), SelectItem,
++                                          TrileanVal (..))
+ 
+ import Protolude hiding (cast)
+ 
+@@ -133,19 +134,14 @@ singleParameter body typ =
+ selectBody :: SqlFragment
+ selectBody = "(SELECT val FROM pgrst_body)"
+ 
+-pgFmtLit :: Text -> SqlFragment
+-pgFmtLit x =
+- let trimmed = trimNullChars x
+-     escaped = "'" <> T.replace "'" "''" trimmed <> "'"
+-     slashed = T.replace "\\" "\\\\" escaped in
+- encodeUtf8 $ if "\\" `T.isInfixOf` escaped
+-   then "E" <> slashed
+-   else slashed
+-
+ -- Here we build the pg array literal, e.g '{"Hebdon, John","Other","Another"}', manually.
+ -- This is necessary to pass an "unknown" array and let pg infer the type.
+-pgFmtArrayLit :: [Text] -> Text
+-pgFmtArrayLit vals =
++-- There are backslashes here, but since this value is parametrized and is not a string constant
++-- https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS
++-- we don't need to use the E'string' form for C-style escapes
++-- https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-STRINGS-ESCAPE
++pgBuildArrayLiteral :: [Text] -> Text
++pgBuildArrayLiteral vals =
+  let trimmed = trimNullChars
+      slashed = T.replace "\\" "\\\\" . trimmed
+      escaped x = "\"" <> T.replace "\"" "\\\"" (slashed x) <> "\"" in
+@@ -234,15 +230,24 @@ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper
+    Op op val  -> pgFmtFieldOp op <> " " <> case op of
+      "like"  -> unknownLiteral (T.map star val)
+      "ilike" -> unknownLiteral (T.map star val)
+-     "is"    -> isAllowed val
+      _       -> unknownLiteral val
+ 
++   -- IS cannot be prepared. `PREPARE boolplan AS SELECT * FROM projects where id IS $1` will give a syntax error.
++   -- The above can be fixed by using `PREPARE boolplan AS SELECT * FROM projects where id IS NOT DISTINCT FROM $1;`
++   -- However that would not accept the TRUE/FALSE/NULL/UNKNOWN keywords. See: https://stackoverflow.com/questions/6133525/proper-way-to-set-preparedstatement-parameter-to-null-under-postgres.
++   -- This is why `IS` operands are whitelisted at the Parsers.hs level
++   Is triVal -> pgFmtField table fld <> " IS " <> case triVal of
++     TriTrue    -> "TRUE"
++     TriFalse   -> "FALSE"
++     TriNull    -> "NULL"
++     TriUnknown -> "UNKNOWN"
++
+    -- We don't use "IN", we use "= ANY". IN has the following disadvantages:
+    -- + No way to use an empty value on IN: "col IN ()" is invalid syntax. With ANY we can do "= ANY('{}')"
+    -- + Can invalidate prepared statements: multiple parameters on an IN($1, $2, $3) will lead to using different prepared statements and not take advantage of caching.
+    In vals -> pgFmtField table fld <> " " <> case vals of
+       [""] -> "= ANY('{}') "
+-      _    -> "= ANY (" <> unknownLiteral (pgFmtArrayLit vals) <> ") "
++      _    -> "= ANY (" <> unknownLiteral (pgBuildArrayLiteral vals) <> ") "
+ 
+    Fts op lang val ->
+      pgFmtFieldOp op <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
+@@ -252,13 +257,6 @@ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper
+    sqlOperator o = SQL.sql $ M.lookupDefault "=" o operators
+    notOp = if hasNot then "NOT" else mempty
+    star c = if c == '*' then '%' else c
+-   -- IS cannot be prepared. `PREPARE boolplan AS SELECT * FROM projects where id IS $1` will give a syntax error.
+-   -- The above can be fixed by using `PREPARE boolplan AS SELECT * FROM projects where id IS NOT DISTINCT FROM $1;`
+-   -- However that would not accept the TRUE/FALSE/NULL keywords. See: https://stackoverflow.com/questions/6133525/proper-way-to-set-preparedstatement-parameter-to-null-under-postgres.
+-   isAllowed :: Text -> SQL.Snippet
+-   isAllowed v = SQL.sql $ maybe
+-     (pgFmtLit v <> "::unknown") encodeUtf8
+-     (find ((==) . T.toLower $ v) ["null","true","false"])
+ 
+ pgFmtJoinCondition :: JoinCondition -> SQL.Snippet
+ pgFmtJoinCondition (JoinCondition (qi1, col1) (qi2, col2)) =
+@@ -329,10 +327,10 @@ responseStatusF pgVer =
+     then currentSettingF "response.status"
+     else "null"
+ 
+-currentSettingF :: Text -> SqlFragment
++currentSettingF :: SqlFragment -> SqlFragment
+ currentSettingF setting =
+   -- nullif is used because of https://gist.github.com/steve-chavez/8d7033ea5655096903f3b52f8ed09a15
+-  "nullif(current_setting(" <> pgFmtLit setting <> ", true), '')"
++  "nullif(current_setting('" <> setting <> "', true), '')"
+ 
+ -- Hasql Snippet utilities
+ unknownEncoder :: ByteString -> SQL.Snippet
+diff --git a/src/PostgREST/Request/Parsers.hs b/src/PostgREST/Request/Parsers.hs
+index cd78e639..4a8db797 100644
+--- a/src/PostgREST/Request/Parsers.hs
++++ b/src/PostgREST/Request/Parsers.hs
+@@ -195,15 +195,22 @@ pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)
+     pOperation =
+           Op . toS <$> foldl1 (<|>) (try . ((<* pDelimiter) . string) . toS <$> M.keys ops) <*> pSVal
+       <|> In <$> (try (string "in" *> pDelimiter) *> pListVal)
++      <|> Is <$> (try (string "is" *> pDelimiter) *> pTriVal)
+       <|> pFts
+       <?> "operator (eq, gt, ...)"
+ 
++    pTriVal = try (string "null"    $> TriNull)
++          <|> try (string "unknown" $> TriUnknown)
++          <|> try (string "true"    $> TriTrue)
++          <|> try (string "false"   $> TriFalse)
++          <?> "null or trilean value (unknown, true, false)"
++
+     pFts = do
+       op   <- foldl1 (<|>) (try . string . toS <$> ftsOps)
+       lang <- optionMaybe $ try (between (char '(') (char ')') (many (letter <|> digit <|> oneOf "_")))
+       pDelimiter >> Fts (toS op) (toS <$> lang) <$> pSVal
+ 
+-    ops = M.filterWithKey (const . flip notElem ("in":ftsOps)) operators
++    ops = M.filterWithKey (const . flip notElem ("in":"is":ftsOps)) operators
+     ftsOps = M.keys ftsOperators
+ 
+ pSingleVal :: Parser SingleVal
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 939d9b19..f33ba9a1 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -31,6 +31,7 @@ module PostgREST.Request.Types
+   , ReadRequest
+   , SelectItem
+   , SingleVal
++  , TrileanVal(..)
+   , fstFieldNames
+   ) where
+ 
+@@ -209,6 +210,7 @@ data OpExpr =
+ data Operation
+   = Op Operator SingleVal
+   | In ListVal
++  | Is TrileanVal
+   | Fts Operator (Maybe Language) SingleVal
+   deriving (Eq)
+ 
+@@ -220,3 +222,11 @@ type SingleVal = Text
+ 
+ -- | Represents a list value in a filter, e.g. id=in.(val1,val2,val3)
+ type ListVal = [Text]
++
++-- | Three-valued logic values
++data TrileanVal
++  = TriTrue
++  | TriFalse
++  | TriNull
++  | TriUnknown
++  deriving Eq

@@ -1,0 +1,179 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 7b4ebfff..631b4b12 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -174,10 +174,12 @@ test-suite spec
+                       Feature.ConcurrentSpec
+                       Feature.CorsSpec
+                       Feature.DeleteSpec
++                      Feature.DisabledOpenApiSpec
+                       Feature.EmbedDisambiguationSpec
+                       Feature.ExtraSearchPathSpec
+                       Feature.HtmlRawOutputSpec
+                       Feature.InsertSpec
++                      Feature.IgnoreAclOpenApiSpec
+                       Feature.JsonOperatorSpec
+                       Feature.MultipleSchemaSpec
+                       Feature.NoJwtSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 87b82c5e..bc79abc8 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -53,7 +53,8 @@ import qualified PostgREST.Request.DbRequestBuilder as ReqBuilder
+ 
+ import PostgREST.AppState                (AppState)
+ import PostgREST.Config                  (AppConfig (..),
+-                                          LogLevel (..))
++                                          LogLevel (..),
++                                          OpenAPIMode (..))
+ import PostgREST.Config.PgVersion        (PgVersion (..))
+ import PostgREST.ContentType             (ContentType (..))
+ import PostgREST.DbStructure             (DbStructure (..),
+@@ -463,11 +464,19 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest _) = do
+   body <-
+-    lift $
+-      OpenAPI.encode conf dbStructure
+-        <$> SQL.statement tSchema (DbStructure.accessibleTables configDbPreparedStatements)
+-        <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+-        <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
++    lift $ case configOpenApiMode of
++      OAFollowACL ->
++        OpenAPI.encode conf dbStructure
++           <$> SQL.statement tSchema (DbStructure.accessibleTables configDbPreparedStatements)
++           <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
++           <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
++      OAIgnoreACL ->
++        OpenAPI.encode conf dbStructure
++              (DbStructure.dbTables dbStructure)
++              (DbStructure.dbProcs dbStructure)
++          <$> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
++      OADisabled ->
++        pure mempty
+ 
+   return $
+     Wai.responseLBS HTTP.status200
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index de4020ed..b1f18c1d 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -192,6 +192,10 @@ exampleConfigFile =
+       |## when none is provided, 660 is applied by default
+       |# server-unix-socket-mode = "660"
+       |
++      |## determine if swagger output should follow or ignore ACL constraints or be disabled entirely
++      |## admitted values: follow-acl, ignore-acl, disabled
++      |openapi-mode = "follow-acl"
++      |
+       |## base url for swagger output
+       |openapi-server-proxy-uri = ""
+       |
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index fd1b3bc3..d024ac08 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -16,6 +16,7 @@ module PostgREST.Config
+   , JSPath
+   , JSPathExp(..)
+   , LogLevel(..)
++  , OpenAPIMode(..)
+   , Proxy(..)
+   , toText
+   , isMalformedProxyUri
+@@ -85,6 +86,7 @@ data AppConfig = AppConfig
+   , configJwtSecret             :: Maybe B.ByteString
+   , configJwtSecretIsBase64     :: Bool
+   , configLogLevel              :: LogLevel
++  , configOpenApiMode           :: OpenAPIMode
+   , configOpenApiServerProxyUri :: Maybe Text
+   , configRawMediaTypes         :: [B.ByteString]
+   , configServerHost            :: Text
+@@ -101,6 +103,14 @@ instance Show LogLevel where
+   show LogWarn  = "warn"
+   show LogInfo  = "info"
+ 
++data OpenAPIMode = OAFollowACL | OAIgnoreACL | OADisabled
++  deriving Eq
++
++instance Show OpenAPIMode where
++  show OAFollowACL = "follow-acl"
++  show OAIgnoreACL = "ignore-acl"
++  show OADisabled  = "disabled"
++
+ -- | Dump the config
+ toText :: AppConfig -> Text
+ toText conf =
+@@ -127,6 +137,7 @@ toText conf =
+       ,("jwt-secret",                q . toS . showJwtSecret)
+       ,("jwt-secret-is-base64",          T.toLower . show . configJwtSecretIsBase64)
+       ,("log-level",                 q . show . configLogLevel)
++      ,("openapi-mode",              q . show . configOpenApiMode)
+       ,("openapi-server-proxy-uri",  q . fromMaybe mempty . configOpenApiServerProxyUri)
+       ,("raw-media-types",           q . toS . B.intercalate "," . configRawMediaTypes)
+       ,("server-host",               q . configServerHost)
+@@ -220,6 +231,7 @@ parser optPath env dbSettings =
+           (optBool "jwt-secret-is-base64")
+           (optBool "secret-is-base64"))
+     <*> parseLogLevel "log-level"
++    <*> parseOpenAPIMode "openapi-mode"
+     <*> parseOpenAPIServerProxyURI "openapi-server-proxy-uri"
+     <*> (maybe [] (fmap encodeUtf8 . splitOnCommas) <$> optValue "raw-media-types")
+     <*> (fromMaybe "!4" <$> optString "server-host")
+@@ -247,6 +259,15 @@ parser optPath env dbSettings =
+                 then fail "Invalid server-unix-socket-mode: needs to be between 600 and 777"
+                 else pure fileMode
+ 
++    parseOpenAPIMode :: C.Key -> C.Parser C.Config OpenAPIMode
++    parseOpenAPIMode k =
++      optString k >>= \case
++        Nothing           -> pure OAFollowACL
++        Just "follow-acl" -> pure OAFollowACL
++        Just "ignore-acl" -> pure OAIgnoreACL
++        Just "disabled"   -> pure OADisabled
++        Just _            -> fail "Invalid openapi-mode. Check your configuration."
++
+     parseOpenAPIServerProxyURI :: C.Key -> C.Parser C.Config (Maybe Text)
+     parseOpenAPIServerProxyURI k =
+       optString k >>= \case
+diff --git a/src/PostgREST/OpenAPI.hs b/src/PostgREST/OpenAPI.hs
+index a93f61a1..5b63adbe 100644
+--- a/src/PostgREST/OpenAPI.hs
++++ b/src/PostgREST/OpenAPI.hs
+@@ -40,8 +40,8 @@ import PostgREST.ContentType
+ import Protolude      hiding (Proxy, get, toS)
+ import Protolude.Conv (toS)
+ 
+-encode :: AppConfig -> DbStructure -> [Table] -> Maybe Text -> HashMap.HashMap k [ProcDescription] -> LBS.ByteString
+-encode conf dbStructure tables schemaDescription procs =
++encode :: AppConfig -> DbStructure -> [Table] -> HashMap.HashMap k [ProcDescription] -> Maybe Text -> LBS.ByteString
++encode conf dbStructure tables procs schemaDescription =
+   JSON.encode $
+     postgrestSpec
+       (dbRelationships dbStructure)
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 0c21cb42..0ea07584 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -44,7 +44,8 @@ import Network.Wai               (Request (..))
+ import Network.Wai.Parse         (parseHttpAccept)
+ import Web.Cookie                (parseCookies)
+ 
+-import PostgREST.Config                  (AppConfig (..))
++import PostgREST.Config                  (AppConfig (..),
++                                          OpenAPIMode (..))
+ import PostgREST.ContentType             (ContentType (..))
+ import PostgREST.DbStructure             (DbStructure (..))
+ import PostgREST.DbStructure.Identifiers (FieldName,
+@@ -313,8 +314,9 @@ userApiRequest conf@AppConfig{..} dbStructure req reqBody
+     in
+     case path of
+       []             -> case configDbRootSpec of
+-                          Just (QualifiedIdentifier pSch pName) -> TargetProc (callFindProc (if pSch == mempty then schema else pSch) pName) True
+-                          Nothing                               -> TargetDefaultSpec schema
++                          Just (QualifiedIdentifier pSch pName)     -> TargetProc (callFindProc (if pSch == mempty then schema else pSch) pName) True
++                          Nothing | configOpenApiMode == OADisabled -> TargetUnknown
++                                  | otherwise                       -> TargetDefaultSpec schema
+       [table]        -> TargetIdent $ QualifiedIdentifier schema table
+       ["rpc", pName] -> TargetProc (callFindProc schema pName) False
+       _              -> TargetUnknown

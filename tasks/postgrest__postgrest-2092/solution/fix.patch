@@ -1,0 +1,182 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ed9c6f07..7faa5ec9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Added
+ 
++ - #1933, Add a minimal health check endpoint on an admin port at the `<host>:<admin_server_port>/health` endpoint - @steve-chavez
++   + For enabling this, the `admin-server-port` config must be set explictly
++
+ ### Fixed
+ 
+  - #2020, Execute deferred constraint triggers when using `Prefer: tx=rollback` - @wolfgangwalther
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 89a75bbe..faf43ae7 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -30,9 +30,10 @@ import qualified Data.ByteString.Char8           as BS
+ import qualified Data.ByteString.Lazy            as LBS
+ import qualified Data.HashMap.Strict             as M
+ import qualified Data.Set                        as S
+-import qualified Hasql.DynamicStatements.Snippet as SQL
++import qualified Hasql.DynamicStatements.Snippet as SQL (Snippet)
+ import qualified Hasql.Pool                      as SQL
+-import qualified Hasql.Transaction               as SQL
++import qualified Hasql.Session                   as SQL (sql)
++import qualified Hasql.Transaction               as SQL hiding (sql)
+ import qualified Hasql.Transaction.Sessions      as SQL
+ import qualified Network.HTTP.Types.Header       as HTTP
+ import qualified Network.HTTP.Types.Status       as HTTP
+@@ -113,6 +114,11 @@ run installHandlers maybeRunWithSocket appState = do
+   when configDbChannelEnabled $ listener appState
+ 
+   let app = postgrest configLogLevel appState (connectionWorker appState)
++      adminApp = postgrestAdmin appState configDbChannelEnabled
++
++  whenJust configAdminServerPort $ \adminPort -> do
++    AppState.logWithZTime appState $ "Admin server listening on port " <> show adminPort
++    void . forkIO $ Warp.runSettings (serverSettings conf & setPort adminPort) adminApp
+ 
+   case configServerUnixSocket of
+     Just socket ->
+@@ -127,6 +133,9 @@ run installHandlers maybeRunWithSocket appState = do
+       do
+         AppState.logWithZTime appState $ "Listening on port " <> show configServerPort
+         Warp.runSettings (serverSettings conf) app
++  where
++    whenJust :: Applicative m => Maybe a -> (a -> m ()) -> m ()
++    whenJust mg f = maybe (pure ()) f mg
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+ serverSettings AppConfig{..} =
+@@ -135,6 +144,19 @@ serverSettings AppConfig{..} =
+     & setPort configServerPort
+     & setServerName ("postgrest/" <> prettyVersion)
+ 
++-- | PostgREST admin application
++postgrestAdmin :: AppState.AppState -> Bool -> Wai.Application
++postgrestAdmin appState configDbChannelEnabled req respond  =
++  case Wai.pathInfo req of
++    ["health"] ->
++      if configDbChannelEnabled then do
++        listenerOn <- AppState.getIsListenerOn appState
++        respond $ Wai.responseLBS (if listenerOn then HTTP.status200 else HTTP.status503) [] mempty
++      else do
++        result <- SQL.use (AppState.getPool appState) $ SQL.sql "SELECT 1"
++        respond $ Wai.responseLBS (if isRight result then HTTP.status200 else HTTP.status503) [] mempty
++    _ -> respond $ Wai.responseLBS HTTP.status404 [] mempty
++
+ -- | PostgREST application
+ postgrest :: LogLevel -> AppState.AppState -> IO () -> Wai.Application
+ postgrest logLev appState connWorker =
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 77819f2e..47eeaa12 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -4,6 +4,7 @@ module PostgREST.AppState
+   ( AppState
+   , getConfig
+   , getDbStructure
++  , getIsListenerOn
+   , getIsWorkerOn
+   , getJsonDbS
+   , getMainThreadId
+@@ -16,6 +17,7 @@ module PostgREST.AppState
+   , logWithZTime
+   , putConfig
+   , putDbStructure
++  , putIsListenerOn
+   , putIsWorkerOn
+   , putJsonDbS
+   , putPgVersion
+@@ -53,6 +55,8 @@ data AppState = AppState
+   , stateIsWorkerOn   :: IORef Bool
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+   , stateListener     :: MVar ()
++  -- | State of the LISTEN channel, used for health checks
++  , stateIsListenerOn :: IORef Bool
+   -- | Config that can change at runtime
+   , stateConf         :: IORef AppConfig
+   -- | Time used for verifying JWT expiration
+@@ -78,6 +82,7 @@ initWithPool newPool conf =
+     <*> newIORef mempty
+     <*> newIORef False
+     <*> newEmptyMVar
++    <*> newIORef False
+     <*> newIORef conf
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getZonedTime }
+@@ -153,3 +158,9 @@ waitListener = takeMVar . stateListener
+ -- the connectionWorker is the only mvar producer.
+ signalListener :: AppState -> IO ()
+ signalListener appState = void $ tryPutMVar (stateListener appState) ()
++
++getIsListenerOn :: AppState -> IO Bool
++getIsListenerOn = readIORef . stateIsListenerOn
++
++putIsListenerOn :: AppState -> Bool -> IO ()
++putIsListenerOn = atomicWriteIORef . stateIsListenerOn
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 6cd604df..2f80c1bd 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -199,6 +199,9 @@ exampleConfigFile =
+       |## when none is provided, 660 is applied by default
+       |# server-unix-socket-mode = "660"
+       |
++      |## admin server for health checks, it's disabled by default unless a port is specified
++      |# admin-server-port = 3001
++      |
+       |## determine if the OpenAPI output should follow or ignore role privileges or be disabled entirely
+       |## admitted values: follow-privileges, ignore-privileges, disabled
+       |openapi-mode = "follow-privileges"
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index d5d63cd9..1f315e69 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -93,6 +93,7 @@ data AppConfig = AppConfig
+   , configServerPort            :: Int
+   , configServerUnixSocket      :: Maybe FilePath
+   , configServerUnixSocketMode  :: FileMode
++  , configAdminServerPort       :: Maybe Int
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo
+@@ -147,6 +148,7 @@ toText conf =
+       ,("server-port",                   show . configServerPort)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
++      ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
+       ]
+ 
+     -- quote all app.settings
+@@ -242,6 +244,7 @@ parser optPath env dbSettings =
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
++    <*> optInt "admin-server-port"
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 9f716e38..5fdd3bca 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -200,6 +200,7 @@ listener appState = do
+     case dbOrError of
+       Right db -> do
+         AppState.logWithZTime appState $ "Listening for notifications on the " <> dbChannel <> " channel"
++        AppState.putIsListenerOn appState True
+         SQL.listen db $ SQL.toPgIdentifier dbChannel
+         SQL.waitForNotifications handleNotification db
+       _ ->
+@@ -208,6 +209,7 @@ listener appState = do
+     handleFinally dbChannel _ = do
+       -- if the thread dies, we try to recover
+       AppState.logWithZTime appState $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
++      AppState.putIsListenerOn appState False
+       -- assume the pool connection was also lost, call the connection worker
+       connectionWorker appState
+       -- retry the listener

@@ -1,0 +1,156 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 343d96c1..807f3411 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,7 +11,6 @@ A preview of the next release can be installed from
+ 
+ - [#1660](https://github.com/babashka/babashka/issues/1660): add `:deps-root` as part of hash to avoid caching issue with `deps.clj`
+ - [#1632](https://github.com/babashka/babashka/issues/1632): fix `(.readPassword (System/console))` by upgrading GraalVM to `21.0.2`
+-- [#1661](https://github.com/babashka/babashka/issues/1661): follow symlink when reading adjacent bb.edn
+ 
+ ## 1.3.188 (2023-01-12)
+ 
+diff --git a/appveyor.yml b/appveyor.yml
+index a962e308..e4e2d072 100644
+--- a/appveyor.yml
++++ b/appveyor.yml
+@@ -23,9 +23,6 @@ cache:
+ 
+ clone_script:
+ - cmd: git config --global core.autocrlf true
+-
+-- cmd: git config --global core.symlinks true
+-
+ - ps: >-
+     if(-not $env:APPVEYOR_PULL_REQUEST_NUMBER) {
+       git clone -q --branch=$env:APPVEYOR_REPO_BRANCH https://github.com/$env:APPVEYOR_REPO_NAME.git $env:APPVEYOR_BUILD_FOLDER
+@@ -39,8 +36,6 @@ clone_script:
+     }
+ - cmd: git submodule update --init --recursive
+ 
+-- cmd: git reset --hard
+-
+ build_script:
+ # TODO: Extract the zip by removing the top level folder to remove the hardcoded path for GRAALVM_HOME
+ - cmd: >-
+diff --git a/src/babashka/main.clj b/src/babashka/main.clj
+index f02ebdd8..b4f48ddb 100644
+--- a/src/babashka/main.clj
++++ b/src/babashka/main.clj
+@@ -1140,36 +1140,29 @@ Use bb run --help to show this help output.
+                         (catch Exception _ false))
+                bin))))))
+ 
+-(defn resolve-symbolic-link [f]
+-  (if (and f (fs/exists? f))
+-    (str (fs/real-path f))
+-    f))
+-
+ (defn main [& args]
+   (let [bin-jar (binary-invoked-as-jar)
+         args (if bin-jar
+                (list* "--jar" bin-jar "--" args)
+                args)
+         [args opts] (parse-global-opts args)
+-        [args {:keys [config merge-deps debug] :as opts}]
++        [args {:keys [jar file config merge-deps debug] :as opts}]
+         (if-not (or (:file opts)
+                     (:jar opts))
+           (parse-file-opt args opts)
+           [args opts])
+-        {:keys [jar file]} opts
+-        abs-path resolve-symbolic-link
++        ;; _ (prn :args args :opts opts)
++        abs-path #(-> % io/file .getAbsolutePath)
+         config (cond
+                  config (if (fs/exists? config) (abs-path config)
+                             (when debug
+                               (binding [*out* *err*]
+                                 (println "[babashka] WARNING: config file does not exist:" config))
+                               nil))
+-                 jar (let [jar (resolve-symbolic-link jar)]
+-                       (some-> [jar] cp/new-loader (cp/resource "META-INF/bb.edn") .toString))
++                 jar (some-> [jar] cp/new-loader (cp/resource "META-INF/bb.edn") .toString)
+                  :else (if (and file (fs/exists? file))
+                          ;; file relative to bb.edn
+-                         (let [file (abs-path file) ;; follow symlink
+-                               rel-bb-edn (fs/file (fs/parent file) "bb.edn")]
++                         (let [rel-bb-edn (fs/file (fs/parent file) "bb.edn")]
+                            (if (fs/exists? rel-bb-edn)
+                              (abs-path rel-bb-edn)
+                              ;; fall back to local bb.edn
+diff --git a/test-resources/symlink-adjacent-bb b/test-resources/symlink-adjacent-bb
+deleted file mode 120000
+index 40b5d4bf..00000000
+--- a/test-resources/symlink-adjacent-bb
++++ /dev/null
+@@ -1 +0,0 @@
+-adjacent_bb/medley.bb
+\ No newline at end of file
+diff --git a/test/babashka/bb_edn_test.clj b/test/babashka/bb_edn_test.clj
+index 1d778077..424c17b7 100644
+--- a/test/babashka/bb_edn_test.clj
++++ b/test/babashka/bb_edn_test.clj
+@@ -8,7 +8,8 @@
+    [borkdude.deps]
+    [clojure.edn :as edn]
+    [clojure.string :as str]
+-   [clojure.test :as test :refer [deftest is testing]]))
++   [clojure.test :as test :refer [deftest is testing]]
++   [babashka.test-utils :as tu]))
+ 
+ (defn bb [& args]
+   (let [args (map str args)
+@@ -320,8 +321,8 @@
+   (testing "call to run in missing dir gives 'cannot run program' message"
+     (test-utils/with-config
+       (pr-str '{:tasks {foo (clojure {:dir "../missingdir"} "-M" "-r")}})
+-      ;; check rough text of error message, specific message about missing directory is OS-dependent
+-      (is (thrown-with-msg? Exception #"Cannot run program .* \(in directory \"\.\.[/\\]missingdir\"\)"
++      ; check rough text of error message, specific message about missing directory is OS-dependent
++      (is (thrown-with-msg? Exception #"Cannot run program .* \(in directory \"\.\.[/\\]missingdir\"\)" 
+                             (bb "run" "foo"))))))
+ 
+ (deftest list-tasks-test
+@@ -409,7 +410,7 @@ even more stuff here\"
+             entries (cp/split-classpath out)
+             entry (first entries)]
+         (is (= 1 (count entries)))
+-        (is (= (fs/real-path (fs/parent config)) (fs/real-path (fs/parent entry))))
++        (is (= (fs/parent config) (fs/parent entry)))
+         (is (str/ends-with? entry "src"))))))
+ 
+ (deftest without-deps-test
+@@ -513,7 +514,7 @@ even more stuff here\"
+       (testing "default deps-root path is same as bb.edn"
+         (let [out (bb "--config" config "cp")
+               entries (cp/split-classpath out)]
+-          (is (= (fs/real-path(fs/parent f)) (fs/real-path (fs/parent (first entries)))))))
++          (is (= (fs/parent f) (fs/parent (first entries))))))
+       (spit config
+             '{:paths ["src"]
+               :deps {local/dep {:local/root "local-dep"}}
+@@ -523,13 +524,11 @@ even more stuff here\"
+               _ (spit (str (fs/file root "deps.edn")) {})
+               out (bb "--config" config "cp")
+               entries (cp/split-classpath out)]
+-          (is (= (fs/real-path (fs/parent f)) (fs/real-path (fs/parent (first entries))))))))))
++          (is (= (fs/parent f) (fs/parent (first entries)))))))))
+ 
+ (deftest adjacent-bb-edn-test
+   (is (= {1 {:id 1}} (bb "test-resources/adjacent_bb/medley.bb")))
+-  (is (= {1 {:id 1}} (bb "-f" "test-resources/adjacent_bb/medley.bb")))
+-  (testing "symlink"
+-    (is (= {1 {:id 1}} (bb (str (fs/file "test-resources" "symlink-adjacent-bb")))))))
++  (is (= {1 {:id 1}} (bb "-f" "test-resources/adjacent_bb/medley.bb"))))
+ 
+ (deftest non-existing-tasks-in-run-gives-exit-code-1
+   (is (thrown? Exception (bb "-Sdeps" "{:tasks {foo {:task (run (quote bar))}}}" "foo"))))
+@@ -538,6 +537,6 @@ even more stuff here\"
+   (is (= 6 (bb "-Sdeps" "" "-e" "(+ 1 2 3)"))))
+ 
+ (deftest warning-on-override-task
+-  (when-not test-utils/native?
++  (when-not tu/native?
+     (binding [*out* *err*]
+       (is (str/includes? (with-out-str (bb "-Sdeps" "{:tasks {run {:task 1}}}" "run")) "'run' override")))))

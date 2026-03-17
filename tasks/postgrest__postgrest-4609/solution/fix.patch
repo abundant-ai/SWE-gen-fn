@@ -1,0 +1,112 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9ff6622b..c8395447 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,9 +13,12 @@ All notable changes to this project will be documented in this file. From versio
+ - Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
+   + Removed unnecessary double count when building the `Content-Range`.
+ - Add config `client_error_verbosity` to customize error verbosity by @taimoorzaeem in #4088, #3980, #3824
++- Add `Vary` header to responses by @develop7 in #4609
+ 
+ ### Changed
+ 
++- All responses now include a `Vary` header by @develop7 in #4609
++
+ - Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+   + Now fails at startup. Prior to this, it failed with `PGRST205` on requests related to these schemas.
+ 
+diff --git a/docs/postgrest.dict b/docs/postgrest.dict
+index a890f85f..4f969e43 100644
+--- a/docs/postgrest.dict
++++ b/docs/postgrest.dict
+@@ -15,6 +15,7 @@ BOM
+ Bytea
+ Cardano
+ cd
++CDNs
+ centric
+ CLI
+ CMS
+diff --git a/docs/references/api.rst b/docs/references/api.rst
+index 36a964b2..62d905bd 100644
+--- a/docs/references/api.rst
++++ b/docs/references/api.rst
+@@ -21,6 +21,7 @@ PostgREST exposes three database objects of a schema as resources: tables, views
+    api/aggregate_functions.rst
+    api/openapi.rst
+    api/preferences.rst
++   api/vary_header.rst
+    api/*
+ 
+ .. raw:: html
+diff --git a/docs/references/api/vary_header.rst b/docs/references/api/vary_header.rst
+new file mode 100644
+index 00000000..41b564bc
+--- /dev/null
++++ b/docs/references/api/vary_header.rst
+@@ -0,0 +1,16 @@
++.. _vary_header:
++
++Vary Header
++===========
++
++In order to assist caching proxies and CDNs, PostgREST includes a ``Vary`` header of value
++``Accept, Prefer, Range`` in its responses which should fit most of the bills. As any other
++response header, it's available for override
++by updating ``response.headers`` GUC variable accordingly, for example:
++
++.. code-block:: postgres
++
++   -- Override the Vary header to include Accept, Prefer and X-Test-Vary headers
++   perform set_config('response.headers', '[{"Vary": "Accept, Prefer, X-Test-Vary"}]', true);
++
++In this case PostgREST will use provided value verbatim.
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 72e9ba34..bbf6e070 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -60,15 +60,16 @@ import PostgREST.SchemaCache          (SchemaCache (..))
+ import PostgREST.TimeIt               (timeItT)
+ import PostgREST.Version              (docsVersion, prettyVersion)
+ 
+-import qualified Data.ByteString.Char8  as BS
+-import qualified Data.List              as L
+-import           Data.Streaming.Network (bindPortTCP,
+-                                         bindRandomPortTCP)
+-import qualified Data.Text              as T
+-import qualified Network.HTTP.Types     as HTTP
+-import qualified Network.Socket         as NS
+-import           PostgREST.Unix         (createAndBindDomainSocket)
+-import           Protolude              hiding (Handler)
++import qualified Data.ByteString.Char8     as BS
++import qualified Data.List                 as L
++import           Data.Streaming.Network    (bindPortTCP,
++                                            bindRandomPortTCP)
++import qualified Data.Text                 as T
++import qualified Network.HTTP.Types        as HTTP
++import qualified Network.HTTP.Types.Header as HTTP (hVary)
++import qualified Network.Socket            as NS
++import           PostgREST.Unix            (createAndBindDomainSocket)
++import           Protolude                 hiding (Handler)
+ 
+ type Handler = ExceptT Error
+ 
+@@ -208,7 +209,17 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthRe
+ 
+   where
+     toWaiResponse :: ServerTiming -> Response.PgrstResponse -> Wai.Response
+-    toWaiResponse timing (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([serverTimingHeader timing | configServerTimingEnabled])) bod
++    toWaiResponse timing (Response.PgrstResponse st hdrs bod) =
++      Wai.responseLBS st (hdrs ++ serverTimingHeaders timing ++ [varyHeader | not $ varyHeaderPresent hdrs]) bod
++
++    serverTimingHeaders :: ServerTiming -> [HTTP.Header]
++    serverTimingHeaders timing = [serverTimingHeader timing | configServerTimingEnabled]
++
++    varyHeader :: HTTP.Header
++    varyHeader = (HTTP.hVary, "Accept, Prefer, Range")
++
++    varyHeaderPresent :: [HTTP.Header] -> Bool
++    varyHeaderPresent = any (\(h, _v) -> h == HTTP.hVary)
+ 
+     withTiming :: Handler IO a -> Handler IO (Maybe Double, a)
+     withTiming f = if configServerTimingEnabled

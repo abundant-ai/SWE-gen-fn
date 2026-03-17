@@ -1,0 +1,193 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 27893bf0..77c2624b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -27,6 +27,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Changed
+ 
++ - #1927, Overloaded Functions: If there's a function "my_func" having a single unnamed json param and other overloaded pairs(with any number of params), PostgREST won't be able to resolve a POST request to "my_func". For solving this, you can name the unnamed json param `my_func(json) -> my_func(prm json)`.
+  - #1857, Make GUC names for headers, cookies and jwt claims compatible with PostgreSQL v14 - @laurenceisla, @robertsosinski
+    + Getting the value for a header GUC on PostgreSQL 14 is done using `current_setting('request.headers')::json->>'name-of-header'` and in a similar way for `request.cookies` and `request.jwt.claims`
+    + PostgreSQL versions below 14 can opt in to the new JSON GUCs by setting the `db-use-legacy-gucs` config option to false (true by default)
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index ac420038..06272856 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -490,31 +490,11 @@ rawContentTypes AppConfig{..} =
+ findProc :: QualifiedIdentifier -> S.Set Text -> Bool -> ProcsMap -> ContentType -> Bool -> Either ApiRequestError ProcDescription
+ findProc qi argumentsKeys paramsAsSingleObject allProcs contentType isInvPost =
+   case matchProc of
+-    ([], [])     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) paramsAsSingleObject contentType isInvPost
+-    -- If there are no functions with named arguments, fallback to the single unnamed argument function
+-    ([], [proc]) -> Right proc
+-    ([], procs)  -> Left $ AmbiguousRpc (toList procs)
+-    -- Matches the functions with named arguments
+-    ([proc], _)  -> Right proc
+-    (procs, _)   -> Left $ AmbiguousRpc (toList procs)
++    []     -> Left $ NoRpc (qiSchema qi) (qiName qi) (S.toList argumentsKeys) paramsAsSingleObject contentType isInvPost
++    [proc] -> Right proc
++    procs  -> Left $ AmbiguousRpc (toList procs)
+   where
+-    matchProc = overloadedProcPartition $ M.lookupDefault mempty qi allProcs -- first find the proc by name
+-    -- The partition obtained has the form (overloadedProcs,fallbackProcs)
+-    -- where fallbackProcs are functions with a single unnamed parameter
+-    overloadedProcPartition procs = foldr select ([],[]) procs
+-    select proc ~(ts,fs)
+-      | matchesParams proc         = (proc:ts,fs)
+-      | hasSingleUnnamedParam proc = (ts,proc:fs)
+-      | otherwise                  = (ts,fs)
+-    -- If the function is called with post and has a single unnamed parameter
+-    -- it can be called depending on content type and the parameter type
+-    hasSingleUnnamedParam proc = isInvPost && case pdParams proc of
+-      [ProcParam "" ppType _ _]
+-        | contentType == CTApplicationJSON -> ppType `elem` ["json", "jsonb"]
+-        | contentType == CTTextPlain       -> ppType == "text"
+-        | contentType == CTOctetStream     -> ppType == "bytea"
+-        | otherwise                        -> False
+-      _ -> False
++    matchProc = filter matchesParams $ M.lookupDefault mempty qi allProcs -- first find the proc by name
+     matchesParams proc =
+       let params = pdParams proc in
+       -- exceptional case for Prefer: params=single-object
+@@ -522,7 +502,16 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentType isInvPost =
+         then length params == 1 && (ppType <$> headMay params) `elem` [Just "json", Just "jsonb"]
+       -- If the function has no parameters, the arguments keys must be empty as well
+       else if null params
+-        then null argumentsKeys && contentType `notElem` [CTTextPlain, CTOctetStream]
++        then null argumentsKeys
++      -- If the function is called with post and has a single unnamed parameter
++      -- it can be called depending on content type and the parameter type
++      else if isInvPost && length params == 1 && (ppName <$> headMay params) == Just mempty
++        then case headMay params of
++          Just prm | contentType == CTApplicationJSON -> ppType prm `elem` ["json", "jsonb"]
++                   | contentType == CTTextPlain       -> ppType prm == "text"
++                   | contentType == CTOctetStream     -> ppType prm == "bytea"
++                   | otherwise                        -> False
++          Nothing  -> False
+       -- A function has optional and required parameters. Optional parameters have a default value and
+       -- don't require arguments for the function to be executed, required parameters must have an argument present.
+       else case L.partition ppReq params of
+diff --git a/test/Feature/RpcSpec.hs b/test/Feature/RpcSpec.hs
+index 4a45f6e8..0e1eeedc 100644
+--- a/test/Feature/RpcSpec.hs
++++ b/test/Feature/RpcSpec.hs
+@@ -1164,60 +1164,13 @@ spec actualPgVersion =
+             , matchHeaders = [ matchContentTypeJson ]
+             }
+ 
+-        it "should be able to resolve when a single unnamed json parameter exists and other overloaded functions are found" $ do
+-          request methodPost "/rpc/overloaded_unnamed_param" [("Content-Type", "application/json")]
+-              [json|{}|]
+-            `shouldRespondWith`
+-              [json| 1 |]
+-              { matchStatus  = 200
+-              , matchHeaders = [matchContentTypeJson]
+-              }
++        it "will not be able to resolve when a single unnamed json parameter exists and other overloaded functions exist" $
+           request methodPost "/rpc/overloaded_unnamed_param" [("Content-Type", "application/json")]
+               [json|{"x": 1, "y": 2}|]
+-            `shouldRespondWith`
+-              [json| 3 |]
+-              { matchStatus  = 200
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-        it "should be able to fallback to the single unnamed parameter function when other overloaded functions are not found" $ do
+-          request methodPost "/rpc/overloaded_unnamed_param"
+-              [("Content-Type", "application/json")]
+-              [json|{"A": 1, "B": 2, "C": 3}|]
+-            `shouldRespondWith`
+-              [json|{"A": 1, "B": 2, "C": 3}|]
+-          request methodPost "/rpc/overloaded_unnamed_param"
+-              [("Content-Type", "text/plain"), ("Accept", "text/plain")]
+-              [str|unnamed text arg|]
+-            `shouldRespondWith`
+-              [str|unnamed text arg|]
+-          let file = unsafePerformIO $ BL.readFile "test/C.png"
+-          r <- request methodPost "/rpc/overloaded_unnamed_param"
+-            [("Content-Type", "application/octet-stream"), ("Accept", "application/octet-stream")]
+-            file
+-          liftIO $ do
+-            let respBody = simpleBody r
+-            respBody `shouldBe` file
+-
+-        it "should fail to fallback to any single unnamed parameter function when using an unsupported Content-Type header" $ do
+-          request methodPost "/rpc/overloaded_unnamed_param"
+-              [("Content-Type", "text/csv")]
+-              "a,b\n1,2\n4,6\n100,200"
+-            `shouldRespondWith`
+-              [json| {
+-                "hint":"If a new function was created in the database with this name and parameters, try reloading the schema cache.",
+-                "message":"Could not find the test.overloaded_unnamed_param(a, b) function in the schema cache"}|]
+-              { matchStatus  = 404
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-        it "should fail with multiple choices when two fallback functions with single unnamed json and jsonb parameters exist" $ do
+-          request methodPost "/rpc/overloaded_unnamed_json_jsonb_param" [("Content-Type", "application/json")]
+-              [json|{"A": 1, "B": 2, "C": 3}|]
+             `shouldRespondWith`
+               [json| {
+                 "hint":"Try renaming the parameters or the function itself in the database so function overloading can be resolved",
+-                "message":"Could not choose the best candidate function between: test.overloaded_unnamed_json_jsonb_param( => json), test.overloaded_unnamed_json_jsonb_param( => jsonb)"}|]
++                "message":"Could not choose the best candidate function between: test.overloaded_unnamed_param( => json), test.overloaded_unnamed_param(x => integer, y => integer)"}|]
+               { matchStatus  = 300
+               , matchHeaders = [matchContentTypeJson]
+               }
+diff --git a/test/fixtures/schema.sql b/test/fixtures/schema.sql
+index dcf1364a..5fc54890 100644
+--- a/test/fixtures/schema.sql
++++ b/test/fixtures/schema.sql
+@@ -2304,48 +2304,24 @@ $$ language sql;
+ 
+ create or replace function test.unnamed_text_param(text) returns text as $$
+   select $1;
+-$$ language sql;
++$$ language sql ;
+ 
+ create or replace function test.unnamed_bytea_param(bytea) returns bytea as $$
+   select $1::bytea;
+-$$ language sql;
++$$ language sql ;
+ 
+ create or replace function test.unnamed_int_param(int) returns int as $$
+   select $1;
+ $$ language sql;
+ 
+-create or replace function test.overloaded_unnamed_param(json) returns json as $$
++create or replace function test.overloaded_unnamed_param(json) returns int as $$
+   select $1;
+ $$ language sql;
+ 
+-create or replace function test.overloaded_unnamed_param(bytea) returns bytea as $$
+-select $1;
+-$$ language sql;
+-
+-create or replace function test.overloaded_unnamed_param(text) returns text as $$
+-select $1;
+-$$ language sql;
+-
+-create or replace function test.overloaded_unnamed_param() returns int as $$
+-select 1;
+-$$ language sql;
+-
+ create or replace function test.overloaded_unnamed_param(x int, y int) returns int as $$
+   select x + y;
+ $$ language sql;
+ 
+-create or replace function test.overloaded_unnamed_json_jsonb_param(json) returns json as $$
+-select $1;
+-$$ language sql;
+-
+-create or replace function test.overloaded_unnamed_json_jsonb_param(jsonb) returns jsonb as $$
+-select $1;
+-$$ language sql;
+-
+-create or replace function test.overloaded_unnamed_json_jsonb_param(x int, y int) returns int as $$
+-select x + y;
+-$$ language sql;
+-
+ create table products(
+   id int primary key
+ , name text

@@ -1,0 +1,161 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 04716db4..14a2e1de 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+  - #1933, #2109, Add a minimal health check endpoint - @steve-chavez
+    + For enabling this, the `admin-server-port` config must be set explictly
+-   + The check is at the `<host>:<admin_server_port>/live` endpoint. A 200 OK status will be returned if postgrest is alive, otherwise a 503 will be returned.
++   + A `<host>:<admin_server_port>/live` endpoint is available for checking if postgrest is running on its port/socket. 200 OK = alive, 503 = dead.
+    + A `<host>:<admin_server_port>/ready` endpoint is available for checking a correct internal state(the database connection plus the schema cache). 200 OK = ready, 503 = not ready.
+ 
+ ### Fixed
+@@ -19,6 +19,8 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2077, Fix `is` not working with upper or mixed case values like `NULL, TrUe, FaLsE` - @steve-chavez
+  - #2024, Fix schema cache loading when views with XMLTABLE and DEFAULT are present - @wolfgangwalther
+  - #1724, Fix wrong CORS header Authentication -> Authorization - @wolfgangwalther
++ - #2107, Clarify error for failed schema cache load. - @steve-chavez
++   + From `Database connection lost. Retrying the connection` to `Could not query the database for the schema cache. Retrying.`
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+index a10f2a35..2f292290 100644
+--- a/src/PostgREST/Admin.hs
++++ b/src/PostgREST/Admin.hs
+@@ -21,16 +21,16 @@ import Protolude
+ -- | PostgREST admin application
+ postgrestAdmin :: AppState.AppState -> AppConfig -> Wai.Application
+ postgrestAdmin appState appConfig req respond  = do
+-  isMainAppReachable <- isRight <$> reachMainApp appConfig
++  isMainAppReachable  <- isRight <$> reachMainApp appConfig
++  isSchemaCacheLoaded <- isJust <$> AppState.getDbStructure appState
++  isConnectionUp      <-
++    if configDbChannelEnabled appConfig
++      then AppState.getIsListenerOn appState
++      else isRight <$> SQL.use (AppState.getPool appState) (SQL.sql "SELECT 1")
+ 
+   case Wai.pathInfo req of
+     ["ready"] ->
+-      if configDbChannelEnabled appConfig then do
+-        listenerOn <- AppState.getIsListenerOn appState
+-        respond $ Wai.responseLBS (if listenerOn && isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
+-      else do
+-        result <- SQL.use (AppState.getPool appState) $ SQL.sql "SELECT 1"
+-        respond $ Wai.responseLBS (if isRight result && isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
++      respond $ Wai.responseLBS (if isMainAppReachable && isConnectionUp && isSchemaCacheLoaded then HTTP.status200 else HTTP.status503) [] mempty
+     ["live"] ->
+       respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
+     _ ->
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 62dfd7ac..f7c13d3e 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -191,7 +191,7 @@ postgrestResponse conf maybeDbStructure jsonDbS pgVer pool time req = do
+       Just dbStructure ->
+         return dbStructure
+       Nothing ->
+-        throwError Error.ConnectionLostError
++        throwError Error.NoSchemaCacheError
+ 
+   apiRequest@ApiRequest{..} <-
+     liftEither . mapLeft Error.ApiRequestError $
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index d6163b9d..c4da56fe 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -108,9 +108,8 @@ putPgVersion = atomicWriteIORef . statePgVersion
+ getDbStructure :: AppState -> IO (Maybe DbStructure)
+ getDbStructure = readIORef . stateDbStructure
+ 
+-putDbStructure :: AppState -> DbStructure -> IO ()
+-putDbStructure appState structure =
+-  atomicWriteIORef (stateDbStructure appState) $ Just structure
++putDbStructure :: AppState -> Maybe DbStructure -> IO ()
++putDbStructure appState = atomicWriteIORef (stateDbStructure appState)
+ 
+ getJsonDbS :: AppState -> IO ByteString
+ getJsonDbS = readIORef . stateJsonDbS
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index c3fc8c3a..9dd737d4 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -280,7 +280,7 @@ data Error
+   = GucHeadersError
+   | GucStatusError
+   | BinaryFieldError ContentType
+-  | ConnectionLostError
++  | NoSchemaCacheError
+   | PutMatchingPkError
+   | PutRangeNotAllowedError
+   | JwtTokenMissing
+@@ -294,7 +294,7 @@ instance PgrstError Error where
+   status GucHeadersError         = HTTP.status500
+   status GucStatusError          = HTTP.status500
+   status (BinaryFieldError _)    = HTTP.status406
+-  status ConnectionLostError     = HTTP.status503
++  status NoSchemaCacheError      = HTTP.status503
+   status PutMatchingPkError      = HTTP.status400
+   status PutRangeNotAllowedError = HTTP.status400
+   status JwtTokenMissing         = HTTP.status500
+@@ -317,8 +317,8 @@ instance JSON.ToJSON Error where
+     "message" .= ("response.status guc must be a valid status code" :: Text)]
+   toJSON (BinaryFieldError ct)          = JSON.object [
+     "message" .= ((T.decodeUtf8 (ContentType.toMime ct) <> " requested but more than one column was selected") :: Text)]
+-  toJSON ConnectionLostError       = JSON.object [
+-    "message" .= ("Database connection lost. Retrying the connection." :: Text)]
++  toJSON NoSchemaCacheError       = JSON.object [
++    "message" .= ("Could not query the database for the schema cache. Retrying." :: Text)]
+ 
+   toJSON PutRangeNotAllowedError   = JSON.object [
+     "message" .= ("Range header and limit/offset querystring parameters are not allowed for PUT" :: Text)]
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 5fdd3bca..5cdc5fd0 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -91,6 +91,7 @@ connectionWorker appState = do
+               -- do nothing and proceed if the load was successful
+               return ()
+             SCOnRetry ->
++              -- retry reloading the schema cache
+               work
+             SCFatalFail ->
+               -- die if our schema cache query has an error
+@@ -169,12 +170,13 @@ loadSchemaCache appState = do
+           AppState.logWithZTime appState hint
+           return SCFatalFail
+         Nothing -> do
++          AppState.putDbStructure appState Nothing
+           AppState.logWithZTime appState "An error ocurred when loading the schema cache"
+           putErr
+           return SCOnRetry
+ 
+     Right dbStructure -> do
+-      AppState.putDbStructure appState dbStructure
++      AppState.putDbStructure appState (Just dbStructure)
+       when (isJust configDbRootSpec) .
+         AppState.putJsonDbS appState . LBS.toStrict $ JSON.encode dbStructure
+       AppState.logWithZTime appState "Schema cache loaded"
+@@ -247,7 +249,7 @@ reReadConfig startingUp appState = do
+               AppState.logWithZTime appState hint
+               killThread (AppState.getMainThreadId appState)
+             Nothing -> do
+-              AppState.logWithZTime appState $ show e
++              putErr
+           pure []
+         Right x -> pure x
+     else
+@@ -257,10 +259,10 @@ reReadConfig startingUp appState = do
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up
+       else
+-        AppState.logWithZTime appState $ "Failed re-loading config: " <> err
++        AppState.logWithZTime appState $ "Failed reloading config: " <> err
+     Right newConf -> do
+       AppState.putConfig appState newConf
+       if startingUp then
+         pass
+       else
+-        AppState.logWithZTime appState "Config re-loaded"
++        AppState.logWithZTime appState "Config reloaded"

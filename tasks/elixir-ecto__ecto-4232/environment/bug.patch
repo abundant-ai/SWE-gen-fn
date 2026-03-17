@@ -1,0 +1,211 @@
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index 2a2ee10a..f74e2672 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -416,12 +416,15 @@ defmodule Ecto.Query.Builder do
+     """
+   end
+ 
+-  def escape({:selected_as, _, [name]}, _type, params_acc, _vars, _env) do
+-    name = quoted_atom!(name, "selected_as/1")
++  def escape({:selected_as, _, [name]}, _type, params_acc, _vars, _env) when is_atom(name) do
+     expr = {:{}, [], [:selected_as, [], [name]]}
+     {expr, params_acc}
+   end
+ 
++  def escape({:selected_as, _, [name]}, _type, _params_acc, _vars, _env) do
++    error! "selected_as/1 expects `name` to be an atom, got `#{inspect(name)}`"
++  end
++
+   def escape({quantifier, meta, [subquery]}, type, params_acc, vars, env) when quantifier in [:all, :any, :exists] do
+     {subquery, params_acc} = escape({:subquery, meta, [subquery]}, type, params_acc, vars, env)
+     {{:{}, [], [quantifier, [], [subquery]]}, params_acc}
+@@ -1269,7 +1272,7 @@ defmodule Ecto.Query.Builder do
+   @doc """
+   Called by the select escaper at compile time and dynamic builder at runtime to track select aliases
+   """
+-  def add_select_alias(aliases, name) when is_map(aliases) and is_atom(name) do
++  def add_select_alias(aliases, name) do
+     case aliases do
+       %{^name => _} ->
+         error! "the alias `#{inspect(name)}` has been specified more than once using `selected_as/2`"
+@@ -1279,16 +1282,6 @@ defmodule Ecto.Query.Builder do
+     end
+   end
+ 
+-  def add_select_alias(aliases, name) do
+-    aliases =
+-      case aliases do
+-        %{} -> Macro.escape(aliases)
+-        aliases -> aliases
+-      end
+-
+-    quote do: Ecto.Query.Builder.add_select_alias(unquote(aliases), unquote(name))
+-  end
+-
+   @doc """
+   Applies a query at compilation time or at runtime.
+ 
+diff --git a/lib/ecto/query/builder/select.ex b/lib/ecto/query/builder/select.ex
+index 3de10f1d..2e816d88 100644
+--- a/lib/ecto/query/builder/select.ex
++++ b/lib/ecto/query/builder/select.ex
+@@ -112,14 +112,17 @@ defmodule Ecto.Query.Builder.Select do
+   end
+ 
+   # aliased values
+-  defp escape({:selected_as, _, [expr, name]}, {params, acc}, vars, env) do
+-    name = Builder.quoted_atom!(name, "selected_as/2")
++  defp escape({:selected_as, _, [expr, name]}, {params, acc}, vars, env) when is_atom(name) do
+     {escaped, {params, acc}} = Builder.escape(expr, :any, {params, acc}, vars, env)
+     expr = {:{}, [], [:selected_as, [], [escaped, name]]}
+     aliases = Builder.add_select_alias(acc.aliases, name)
+     {expr, {params, %{acc | aliases: aliases}}}
+   end
+ 
++  defp escape({:selected_as, _, [_expr, name]}, {_params, _acc}, _vars, _env) do
++    Builder.error! "selected_as/2 expects `name` to be an atom, got `#{inspect(name)}`"
++  end
++
+   defp escape(expr, params_acc, vars, env) do
+     Builder.escape(expr, :any, params_acc, vars, {env, &escape_expansion/5})
+   end
+@@ -293,7 +296,7 @@ defmodule Ecto.Query.Builder.Select do
+     {expr, {params, acc}} = escape(expr, binding, env)
+     params = Builder.escape_params(params)
+     take = {:%{}, [], Map.to_list(acc.take)}
+-    aliases = escape_aliases(acc.aliases)
++    aliases = {:%{}, [], Map.to_list(acc.aliases)}
+ 
+     select = quote do: %Ecto.Query.SelectExpr{
+                          expr: unquote(expr),
+@@ -314,9 +317,6 @@ defmodule Ecto.Query.Builder.Select do
+     end
+   end
+ 
+-  defp escape_aliases(%{} = aliases), do: {:%{}, [], Map.to_list(aliases)}
+-  defp escape_aliases(aliases), do: aliases
+-
+   @doc """
+   The callback applied by `build/5` to build the query.
+   """
+diff --git a/test/ecto/query/builder/group_by_test.exs b/test/ecto/query/builder/group_by_test.exs
+index 21cb7681..05e56807 100644
+--- a/test/ecto/query/builder/group_by_test.exs
++++ b/test/ecto/query/builder/group_by_test.exs
+@@ -32,7 +32,7 @@ defmodule Ecto.Query.Builder.GroupByTest do
+     end
+ 
+     test "raises if name given to selected_as/1 is not an atom" do
+-      message = "expected literal atom or interpolated value in selected_as/1, got: `\"ident\"`"
++      message = "selected_as/1 expects `name` to be an atom, got `\"ident\"`"
+ 
+       assert_raise Ecto.Query.CompileError, message, fn ->
+         escape(:group_by, quote do selected_as("ident") end, {[], %{}}, [], __ENV__)
+@@ -66,16 +66,5 @@ defmodule Ecto.Query.Builder.GroupByTest do
+         group_by("posts", [p], ^temp)
+       end
+     end
+-
+-    test "supports interpolated atom names in selected_as/1" do
+-      query = from p in "posts", select: selected_as(p.id, :ident), group_by: selected_as(^:ident)
+-      assert [{:selected_as, [], [:ident]}] = hd(query.group_bys).expr
+-
+-      message = "expected atom in selected_as/1, got: `\"ident\"`"
+-
+-      assert_raise Ecto.Query.CompileError, message, fn ->
+-        from p in "posts", select: selected_as(p.id, :ident), group_by: selected_as(^"ident")
+-      end
+-    end
+   end
+ end
+diff --git a/test/ecto/query/builder/order_by_test.exs b/test/ecto/query/builder/order_by_test.exs
+index 333c6a05..da76e079 100644
+--- a/test/ecto/query/builder/order_by_test.exs
++++ b/test/ecto/query/builder/order_by_test.exs
+@@ -78,7 +78,7 @@ defmodule Ecto.Query.Builder.OrderByTest do
+     end
+ 
+     test "raises if name given to selected_as/1 is not an atom" do
+-      message = "expected literal atom or interpolated value in selected_as/1, got: `\"ident\"`"
++      message = "selected_as/1 expects `name` to be an atom, got `\"ident\"`"
+ 
+       assert_raise Ecto.Query.CompileError, message, fn ->
+         escape(:order_by, quote do selected_as("ident") end, {[], %{}}, [], __ENV__)
+@@ -174,17 +174,6 @@ defmodule Ecto.Query.Builder.OrderByTest do
+              [{1, {0, :foo}}, {"bar", {0, :bar}}, {2, {0, :baz}}, {"bat", {0, :bat}}]
+     end
+ 
+-    test "supports interpolated atomnames in selected_as/1" do
+-      query = from p in "posts", select: selected_as(p.id, :ident), order_by: selected_as(^:ident)
+-      assert [asc: {:selected_as, [], [:ident]}] = hd(query.order_bys).expr
+-
+-      message = "expected atom in selected_as/1, got: `\"ident\"`"
+-
+-      assert_raise Ecto.Query.CompileError, message, fn ->
+-        from p in "posts", select: selected_as(p.id, :ident), order_by: selected_as(^"ident")
+-      end
+-    end
+-
+     test "raises on invalid direction" do
+       assert_raise ArgumentError, ~r"expected one of :asc,", fn ->
+         temp = :temp
+diff --git a/test/ecto/query/builder/select_test.exs b/test/ecto/query/builder/select_test.exs
+index eee0b740..7a8902ab 100644
+--- a/test/ecto/query/builder/select_test.exs
++++ b/test/ecto/query/builder/select_test.exs
+@@ -175,7 +175,7 @@ defmodule Ecto.Query.Builder.SelectTest do
+     end
+ 
+     test "raises if name given to selected_as/2 is not an atom" do
+-      message = "expected literal atom or interpolated value in selected_as/2, got: `\"ident\"`"
++      message = "selected_as/2 expects `name` to be an atom, got `\"ident\"`"
+ 
+       assert_raise Ecto.Query.CompileError, message, fn ->
+         escape(quote do selected_as(p.id, "ident") end, [], __ENV__)
+@@ -417,45 +417,6 @@ defmodule Ecto.Query.Builder.SelectTest do
+       end
+     end
+ 
+-    test "supports interpolated atom names in selected_as/2" do
+-      escaped_alias1 = {:selected_as, [], [{{:., [], [{:&, [], [0]}, :id]}, [], []}, :ident]}
+-      escaped_alias2 = {:selected_as, [], [{{:., [], [{:&, [], [0]}, :id]}, [], []}, :ident2]}
+-
+-      query1 = from p in "posts", select: {selected_as(p.id, ^:ident), selected_as(p.id, :ident2)}
+-      query2 = from p in "posts", select: {selected_as(p.id, :ident), selected_as(p.id, ^:ident2)}
+-      query3 = from p in "posts", select: {selected_as(p.id, ^:ident), selected_as(p.id, ^:ident2)}
+-
+-      assert query1.select.expr == query2.select.expr
+-      assert query2.select.expr == query3.select.expr
+-      assert query1.select.aliases == query2.select.aliases
+-      assert query2.select.aliases == query3.select.aliases
+-      assert %{ident: _, ident2: _} = query1.select.aliases
+-      assert {:{}, [], [escaped_alias1, escaped_alias2]} == query1.select.expr
+-
+-      message = "expected atom in selected_as/2, got: `\"ident\"`"
+-
+-      assert_raise Ecto.Query.CompileError, message, fn ->
+-        from p in "posts", select: selected_as(p.id, ^"ident")
+-      end
+-    end
+-
+-    test "supports interpolated atom names in selected_as/2 with select_merge" do
+-      escaped_select_alias = {:selected_as, [], [{{:., [], [{:&, [], [0]}, :visits]}, [], []}, :select]}
+-      escaped_merge_alias = {:selected_as, [], [{{:., [], [{:&, [], [0]}, :title]}, [], []}, :merge]}
+-
+-      # merging into a map
+-      select = :select
+-      merge = :merge
+-      query = from p in "posts", select: %{v: selected_as(p.visits, ^select)}, select_merge: %{title: selected_as(p.title, ^merge)}
+-      assert query.select.expr == {:%{}, [], [v: escaped_select_alias, title: escaped_merge_alias]}
+-      assert %{select: _, merge: _} = query.select.aliases
+-
+-      # merging into a source
+-      query = from c in Comment, select_merge: %{title: selected_as(c.title, ^:merge)}
+-      assert query.select.expr == {:merge, [], [{:&, [], [0]}, {:%{}, [], [title: escaped_merge_alias]}]}
+-      assert %{merge: _} = query.select.aliases
+-    end
+-
+     test "raises on list or tuple values in interpolated map" do
+       message = ~r/Interpolated map values in :select can only be/
+ 

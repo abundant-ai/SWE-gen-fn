@@ -1,0 +1,1476 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index caaa0a28..742a2e24 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,10 +12,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + A `<host>:<admin_server_port>/live` endpoint is available for checking if postgrest is running on its port/socket. 200 OK = alive, 503 = dead.
+    + A `<host>:<admin_server_port>/ready` endpoint is available for checking a correct internal state(the database connection plus the schema cache). 200 OK = ready, 503 = not ready.
+  - #1988, Add the current user to the request log on stdout - @DavidLindbom, @wolfgangwalther
+- - #1823, Add the ability to run postgrest without any configuration. @wolfgangwalther
+-   + #1991, Add the ability to run without `db-uri` using libpq's PG environment variables to connect. @wolfgangwalther
+-   + #1769, Add the ability to run without `db-schemas`, defaulting to `db-schemas=public`. @wolfgangwalther
+-   + #1689, Add the ability to run without `db-anon-role` disabling anonymous access. @wolfgangwalther
+ 
+ ### Fixed
+ 
+diff --git a/main/Main.hs b/main/Main.hs
+index 5d5e18a7..d9d39373 100644
+--- a/main/Main.hs
++++ b/main/Main.hs
+@@ -2,11 +2,15 @@
+ 
+ module Main (main) where
+ 
++import qualified Data.Map.Strict as M
++
+ import System.IO (BufferMode (..), hSetBuffering)
+ 
+ import qualified PostgREST.App as App
+ import qualified PostgREST.CLI as CLI
+ 
++import PostgREST.Config (readPGRSTEnvironment)
++
+ import Protolude
+ 
+ #ifndef mingw32_HOST_OS
+@@ -16,7 +20,8 @@ import qualified PostgREST.Unix as Unix
+ main :: IO ()
+ main = do
+   setBuffering
+-  opts <- CLI.readCLIShowHelp
++  hasPGRSTEnv <- not . M.null <$> readPGRSTEnvironment
++  opts <- CLI.readCLIShowHelp hasPGRSTEnv
+   CLI.main installSignalHandlers runAppInSocket opts
+ 
+ installSignalHandlers :: App.SignalHandlerInstaller
+diff --git a/nix/tools/loadtest.nix b/nix/tools/loadtest.nix
+index 0f097a11..c2c282b4 100644
+--- a/nix/tools/loadtest.nix
++++ b/nix/tools/loadtest.nix
+@@ -45,11 +45,6 @@ let
+         inRootDir = true;
+       }
+       ''
+-        # previously required settings to make this work with older branches
+-        export PGRST_DB_ANON_ROLE="postgrest_test_anonymous"
+-        export PGRST_DB_URI="postgresql://"
+-        export PGRST_DB_SCHEMAS="test"
+-
+         export PGRST_DB_CONFIG="false"
+         export PGRST_DB_POOL="1"
+         export PGRST_DB_TX_END="rollback-allow-override"
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+index 736ccb9b..4e281a37 100644
+--- a/nix/tools/withTools.nix
++++ b/nix/tools/withTools.nix
+@@ -25,6 +25,7 @@ let
+             "ARG_USE_ENV([PGUSER], [postgrest_test_authenticator], [Authenticator PG role])"
+             "ARG_USE_ENV([PGDATABASE], [postgres], [PG database name])"
+             "ARG_USE_ENV([PGRST_DB_SCHEMAS], [test], [Schema to expose])"
++            "ARG_USE_ENV([PGRST_DB_ANON_ROLE], [postgrest_test_anonymous], [Anonymous PG role])"
+           ];
+         positionalCompletion = "_command";
+         inRootDir = true;
+@@ -34,7 +35,7 @@ let
+       }
+       ''
+         # avoid starting multiple layers of withTmpDb
+-        if test -v PGHOST; then
++        if test -v PGRST_DB_URI; then
+           exec "$_arg_command" "''${_arg_leftovers[@]}"
+         fi
+ 
+@@ -52,7 +53,9 @@ let
+         export PGHOST="$tmpdir/socket"
+         export PGUSER
+         export PGDATABASE
++        export PGRST_DB_URI="postgresql:///$PGDATABASE?host=$PGHOST&user=$PGUSER"
+         export PGRST_DB_SCHEMAS
++        export PGRST_DB_ANON_ROLE
+ 
+         log "Initializing database cluster..."
+         # We try to make the database cluster as independent as possible from the host
+diff --git a/postgrest.cabal b/postgrest.cabal
+index daeab955..bf82f8fc 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -185,7 +185,6 @@ test-suite spec
+                       Feature.JsonOperatorSpec
+                       Feature.LegacyGucsSpec
+                       Feature.MultipleSchemaSpec
+-                      Feature.NoAnonSpec
+                       Feature.NoJwtSpec
+                       Feature.NonexistentSchemaSpec
+                       Feature.OpenApiSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index a100e26b..9e0ddb9c 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -208,7 +208,7 @@ postgrestResponse conf@AppConfig{..} maybeDbStructure jsonDbS pgVer pool AuthRes
+ 
+   let handleReq apiReq = handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+-  runDbHandler pool (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
++  runDbHandler pool (txMode apiRequest) (authRole /= configDbAnonRole) configDbPreparedStatements .
+     Middleware.optionalRollback conf apiRequest $
+       Middleware.runPgLocals conf authClaims authRole handleReq apiRequest jsonDbS pgVer
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 093300d0..0b148269 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -32,7 +32,7 @@ import qualified Network.Wai.Middleware.HttpAuth as Wai
+ 
+ import Control.Lens            (set)
+ import Control.Monad.Except    (liftEither)
+-import Data.Either.Combinators (mapLeft)
++import Data.Either.Combinators (mapLeft, mapRight)
+ import Data.List               (lookup)
+ import Data.Time.Clock         (UTCTime)
+ import System.IO.Unsafe        (unsafePerformIO)
+@@ -71,17 +71,16 @@ parseToken AppConfig{..} token time = do
+     jwtClaimsError JWT.JWTExpired = JwtTokenInvalid "JWT expired"
+     jwtClaimsError e              = JwtTokenInvalid $ show e
+ 
+-parseClaims :: Monad m =>
+-  AppConfig -> JSON.Value -> ExceptT Error m AuthResult
+-parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+-  -- role defaults to anon if not specified in jwt
+-  role <- liftEither . maybeToRight JwtTokenRequired $
+-    unquoted <$> walkJSPath (Just jclaims) configJwtRoleClaimKey <|> configDbAnonRole
+-  return AuthResult
+-           { authClaims = mclaims & M.insert "role" (JSON.toJSON role)
+-           , authRole = role
+-           }
++parseClaims :: AppConfig -> JSON.Value -> AuthResult
++parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) =
++  AuthResult
++  { authClaims = mclaims & M.insert "role" (JSON.toJSON role)
++  , authRole = role
++  }
+   where
++    -- role defaults to anon if not specified in jwt
++    role = maybe configDbAnonRole unquoted (walkJSPath (Just jclaims) configJwtRoleClaimKey)
++
+     walkJSPath :: Maybe JSON.Value -> JSPath -> Maybe JSON.Value
+     walkJSPath x                      []                = x
+     walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (M.lookup key o) rest
+@@ -92,7 +91,7 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
+     unquoted (JSON.String t) = t
+     unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
+ -- impossible case - just added to please -Wincomplete-patterns
+-parseClaims _ _ = return AuthResult { authClaims = M.empty, authRole = mempty }
++parseClaims _ _ = AuthResult { authClaims = M.empty, authRole = mempty }
+ 
+ -- | Validate authorization header.
+ --   Parse and store JWT claims for future use in the request.
+@@ -102,11 +101,11 @@ middleware appState app req respond = do
+   time <- getTime appState
+ 
+   let token = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
+-  authResult <- runExceptT $
+-    parseToken conf (LBS.fromStrict token) time >>=
+-    parseClaims conf
++  claims <- runExceptT $ parseToken conf (LBS.fromStrict token) time
+ 
+-  let req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
++  let
++    authResult = mapRight (parseClaims conf) claims
++    req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
+   app req' respond
+ 
+ authResultKey :: Vault.Key (Either Error AuthResult)
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 0a7a9bf0..6f83d1d3 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -82,12 +82,12 @@ data Command
+   | CmdDumpSchema
+ 
+ -- | Read command line interface options. Also prints help.
+-readCLIShowHelp :: IO CLI
+-readCLIShowHelp =
++readCLIShowHelp :: Bool -> IO CLI
++readCLIShowHelp hasEnvironment =
+   O.customExecParser prefs opts
+   where
+     prefs = O.prefs $ O.showHelpOnError <> O.showHelpOnEmpty
+-    opts = O.info parser $ O.fullDesc <> progDesc
++    opts = O.info parser $ O.fullDesc <> progDesc <> footer
+     parser = O.helper <*> exampleParser <*> cliParser
+ 
+     progDesc =
+@@ -96,6 +96,11 @@ readCLIShowHelp =
+         <> BS.unpack prettyVersion
+         <> " / create a REST API to an existing Postgres database"
+ 
++    footer =
++      O.footer $
++        "To run PostgREST, please pass the FILENAME argument"
++        <> " or set PGRST_ environment variables."
++
+     exampleParser =
+       O.infoOption exampleConfigFile $
+         O.long "example"
+@@ -106,12 +111,12 @@ readCLIShowHelp =
+     cliParser =
+       CLI
+         <$> (dumpConfigFlag <|> dumpSchemaFlag)
+-        <*> O.optional configFileOption
++        <*> optionalIf hasEnvironment configFileOption
+ 
+     configFileOption =
+       O.strArgument $
+         O.metavar "FILENAME"
+-        <> O.help "Path to configuration file"
++        <> O.help "Path to configuration file (optional with PGRST_ environment variables)"
+ 
+     dumpConfigFlag =
+       O.flag CmdRun CmdDumpConfig $
+@@ -123,6 +128,10 @@ readCLIShowHelp =
+         O.long "dump-schema"
+         <> O.help "Dump loaded schema as JSON and exit (for debugging, output structure is unstable)"
+ 
++    optionalIf :: Alternative f => Bool -> f a -> f (Maybe a)
++    optionalIf True  = O.optional
++    optionalIf False = fmap Just
++
+ exampleConfigFile :: [Char]
+ exampleConfigFile =
+   [str|### REQUIRED:
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 278db164..1f315e69 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -63,7 +63,7 @@ import Protolude hiding (Proxy, toList)
+ 
+ data AppConfig = AppConfig
+   { configAppSettings           :: [(Text, Text)]
+-  , configDbAnonRole            :: Maybe Text
++  , configDbAnonRole            :: Text
+   , configDbChannel             :: Text
+   , configDbChannelEnabled      :: Bool
+   , configDbExtraSearchPath     :: [Text]
+@@ -121,7 +121,7 @@ toText conf =
+   where
+     -- apply conf to all pgrst settings
+     pgrstSettings = (\(k, v) -> (k, v conf)) <$>
+-      [("db-anon-role",              q . fromMaybe "" . configDbAnonRole)
++      [("db-anon-role",              q . configDbAnonRole)
+       ,("db-channel",                q . configDbChannel)
+       ,("db-channel-enabled",            T.toLower . show . configDbChannelEnabled)
+       ,("db-extra-search-path",      q . T.intercalate "," . configDbExtraSearchPath)
+@@ -207,7 +207,7 @@ parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> C.Parser C.Config A
+ parser optPath env dbSettings =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+-    <*> optString "db-anon-role"
++    <*> reqString "db-anon-role"
+     <*> (fromMaybe "pgrst" <$> optString "db-channel")
+     <*> (fromMaybe True <$> optBool "db-channel-enabled")
+     <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
+@@ -220,12 +220,13 @@ parser optPath env dbSettings =
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")
+     <*> (fmap toQi <$> optWithAlias (optString "db-root-spec")
+                                     (optString "root-spec"))
+-    <*> (fromList . maybe ["public"] splitOnCommas <$> optWithAlias (optValue "db-schemas")
+-                                                                    (optValue "db-schema"))
++    <*> (fromList . splitOnCommas <$> reqWithAlias (optValue "db-schemas")
++                                                   (optValue "db-schema")
++                                                   "missing key: either db-schemas or db-schema must be set")
+     <*> (fromMaybe True <$> optBool "db-config")
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+-    <*> (fromMaybe "postgresql://" <$> optString "db-uri")
++    <*> reqString "db-uri"
+     <*> (fromMaybe True <$> optBool "db-use-legacy-gucs")
+     <*> pure optPath
+     <*> pure Nothing
+@@ -316,12 +317,24 @@ parser optPath env dbSettings =
+         Nothing  -> pure [JSPKey "role"]
+         Just rck -> either (fail . show) pure $ pRoleClaimKey rck
+ 
++    reqWithAlias :: C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a) -> [Char] -> C.Parser C.Config a
++    reqWithAlias orig alias err =
++      orig >>= \case
++        Just v  -> pure v
++        Nothing ->
++          alias >>= \case
++            Just v  -> pure v
++            Nothing -> fail err
++
+     optWithAlias :: C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a)
+     optWithAlias orig alias =
+       orig >>= \case
+         Just v  -> pure $ Just v
+         Nothing -> alias
+ 
++    reqString :: C.Key -> C.Parser C.Config Text
++    reqString k = overrideFromDbOrEnvironment C.required k coerceText
++
+     optString :: C.Key -> C.Parser C.Config (Maybe Text)
+     optString k = mfilter (/= "") <$> overrideFromDbOrEnvironment C.optional k coerceText
+ 
+@@ -349,7 +362,7 @@ parser optPath env dbSettings =
+           let dbSettingName = T.pack $ dashToUnderscore <$> toS key in
+           if dbSettingName `notElem` [
+             "server_host", "server_port", "server_unix_socket", "server_unix_socket_mode", "log_level",
+-            "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_timeout", "db_config"]
++            "db_anon_role", "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_timeout", "db_config"]
+           then lookup dbSettingName dbSettings
+           else Nothing
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index c1de4544..a150e2be 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -274,7 +274,6 @@ data Error
+   | PutRangeNotAllowedError
+   | JwtTokenMissing
+   | JwtTokenInvalid Text
+-  | JwtTokenRequired
+   | SingularityError Integer
+   | NotFound
+   | ApiRequestError ApiRequestError
+@@ -289,7 +288,6 @@ instance PgrstError Error where
+   status PutRangeNotAllowedError = HTTP.status400
+   status JwtTokenMissing         = HTTP.status500
+   status (JwtTokenInvalid _)     = HTTP.unauthorized401
+-  status JwtTokenRequired        = HTTP.unauthorized401
+   status (SingularityError _)    = HTTP.status406
+   status NotFound                = HTTP.status404
+   status (PgErr err)             = status err
+@@ -297,7 +295,6 @@ instance PgrstError Error where
+ 
+   headers (SingularityError _)     = [ContentType.toHeader CTSingularJSON]
+   headers (JwtTokenInvalid m)      = [ContentType.toHeader CTApplicationJSON, invalidTokenHeader m]
+-  headers JwtTokenRequired         = [ContentType.toHeader CTApplicationJSON, requiredTokenHeader]
+   headers (PgErr err)              = headers err
+   headers (ApiRequestError err)    = headers err
+   headers _                        = [ContentType.toHeader CTApplicationJSON]
+@@ -325,8 +322,6 @@ instance JSON.ToJSON Error where
+     "message" .= ("Server lacks JWT secret" :: Text)]
+   toJSON (JwtTokenInvalid message) = JSON.object [
+     "message" .= (message :: Text)]
+-  toJSON JwtTokenRequired          = JSON.object [
+-    "message" .= ("Anonymous access is disabled" :: Text)]
+   toJSON NotFound = JSON.object []
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+@@ -335,8 +330,5 @@ invalidTokenHeader :: Text -> Header
+ invalidTokenHeader m =
+   ("WWW-Authenticate", "Bearer error=\"invalid_token\", " <> "error_description=" <> encodeUtf8 (show m))
+ 
+-requiredTokenHeader :: Header
+-requiredTokenHeader = ("WWW-Authenticate", "Bearer")
+-
+ singularityError :: (Integral a) => a -> Error
+ singularityError = SingularityError . toInteger
+diff --git a/test/io/configs/aliases.config b/test/io/configs/aliases.config
+index 6a9482e8..d22999fc 100644
+--- a/test/io/configs/aliases.config
++++ b/test/io/configs/aliases.config
+@@ -1,6 +1,10 @@
++db-anon-role = "required"
++db-uri = "required"
++
+ db-schema = "provided_through_alias"
+ max-rows = 1000
+ pre-request = "check_alias"
+ role-claim-key = ".aliased"
+ root-spec = "open_alias"
+ secret-is-base64 = true
++db-config = false
+diff --git a/test/io/configs/app-settings.config b/test/io/configs/app-settings.config
+new file mode 100644
+index 00000000..65408c91
+--- /dev/null
++++ b/test/io/configs/app-settings.config
+@@ -0,0 +1,2 @@
++app.settings.external_api_secret = "0123456789abcdef"
++db-config = false
+diff --git a/test/io/configs/base64-secret-from-file.config b/test/io/configs/base64-secret-from-file.config
+new file mode 100644
+index 00000000..d31f6f5d
+--- /dev/null
++++ b/test/io/configs/base64-secret-from-file.config
+@@ -0,0 +1,4 @@
++# Read secret from a file: /dev/stdin (alias for standard input)
++jwt-secret = "@/dev/stdin"
++jwt-secret-is-base64 = true
++db-config = false
+diff --git a/test/io/configs/boolean-numeric.config b/test/io/configs/boolean-numeric.config
+index fc0d7f39..315e546c 100644
+--- a/test/io/configs/boolean-numeric.config
++++ b/test/io/configs/boolean-numeric.config
+@@ -1,3 +1,8 @@
++db-uri = "required"
++db-schemas = "required"
++db-anon-role = "required"
++
+ db-channel-enabled = "1"
+ db-prepared-statements = "0"
+ jwt-secret-is-base64 = "2"
++db-config = false
+diff --git a/test/io/configs/boolean-string.config b/test/io/configs/boolean-string.config
+index 25b1d27c..0a4c68ff 100644
+--- a/test/io/configs/boolean-string.config
++++ b/test/io/configs/boolean-string.config
+@@ -1,3 +1,8 @@
++db-uri = "required"
++db-schemas = "required"
++db-anon-role = "required"
++
+ db-channel-enabled = "true"
+ db-prepared-statements = "FALSE"
+ jwt-secret-is-base64 = "\"true\""
++db-config = false
+diff --git a/test/io/configs/dburi-from-file.config b/test/io/configs/dburi-from-file.config
+new file mode 100644
+index 00000000..a9d8441b
+--- /dev/null
++++ b/test/io/configs/dburi-from-file.config
+@@ -0,0 +1,3 @@
++db-uri = "@/dev/stdin"
++jwt-secret = "reallyreallyreallyreallyverysafe"
++db-config = false
+diff --git a/test/io/configs/defaults.config b/test/io/configs/defaults.config
+index f2cbab20..6cec3a71 100644
+--- a/test/io/configs/defaults.config
++++ b/test/io/configs/defaults.config
+@@ -1,2 +1,5 @@
+-# Not the default, but only works with PG* variables, which are not set
++db-uri = "required"
++db-schemas = "required"
++db-anon-role = "required"
++# Not the default, but only works with proper db-uri
+ db-config = false
+diff --git a/test/io/configs/expected/aliases.config b/test/io/configs/expected/aliases.config
+index c03f098e..4ca5c65b 100644
+--- a/test/io/configs/expected/aliases.config
++++ b/test/io/configs/expected/aliases.config
+@@ -1,4 +1,4 @@
+-db-anon-role = ""
++db-anon-role = "required"
+ db-channel = "pgrst"
+ db-channel-enabled = true
+ db-extra-search-path = "public"
+@@ -9,9 +9,9 @@ db-pre-request = "check_alias"
+ db-prepared-statements = true
+ db-root-spec = "open_alias"
+ db-schemas = "provided_through_alias"
+-db-config = true
++db-config = false
+ db-tx-end = "commit"
+-db-uri = "postgresql://"
++db-uri = "required"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"aliased\""
+diff --git a/test/io/configs/expected/boolean-numeric.config b/test/io/configs/expected/boolean-numeric.config
+index 3aa9dc6a..3be0ecc9 100644
+--- a/test/io/configs/expected/boolean-numeric.config
++++ b/test/io/configs/expected/boolean-numeric.config
+@@ -1,4 +1,4 @@
+-db-anon-role = ""
++db-anon-role = "required"
+ db-channel = "pgrst"
+ db-channel-enabled = true
+ db-extra-search-path = "public"
+@@ -8,10 +8,10 @@ db-pool-timeout = 10
+ db-pre-request = ""
+ db-prepared-statements = false
+ db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
++db-schemas = "required"
++db-config = false
+ db-tx-end = "commit"
+-db-uri = "postgresql://"
++db-uri = "required"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io/configs/expected/boolean-string.config b/test/io/configs/expected/boolean-string.config
+index 3aa9dc6a..3be0ecc9 100644
+--- a/test/io/configs/expected/boolean-string.config
++++ b/test/io/configs/expected/boolean-string.config
+@@ -1,4 +1,4 @@
+-db-anon-role = ""
++db-anon-role = "required"
+ db-channel = "pgrst"
+ db-channel-enabled = true
+ db-extra-search-path = "public"
+@@ -8,10 +8,10 @@ db-pool-timeout = 10
+ db-pre-request = ""
+ db-prepared-statements = false
+ db-root-spec = ""
+-db-schemas = "public"
+-db-config = true
++db-schemas = "required"
++db-config = false
+ db-tx-end = "commit"
+-db-uri = "postgresql://"
++db-uri = "required"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io/configs/expected/defaults.config b/test/io/configs/expected/defaults.config
+index 8c1d8967..a90007d7 100644
+--- a/test/io/configs/expected/defaults.config
++++ b/test/io/configs/expected/defaults.config
+@@ -1,4 +1,4 @@
+-db-anon-role = ""
++db-anon-role = "required"
+ db-channel = "pgrst"
+ db-channel-enabled = true
+ db-extra-search-path = "public"
+@@ -8,10 +8,10 @@ db-pool-timeout = 10
+ db-pre-request = ""
+ db-prepared-statements = true
+ db-root-spec = ""
+-db-schemas = "public"
++db-schemas = "required"
+ db-config = false
+ db-tx-end = "commit"
+-db-uri = "postgresql://"
++db-uri = "required"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+index 5f9d38fb..9e13dc33 100644
+--- a/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -1,4 +1,4 @@
+-db-anon-role = "other"
++db-anon-role = "postgrest_test_anonymous"
+ db-channel = "postgrest"
+ db-channel-enabled = false
+ db-extra-search-path = "public,extensions,other"
+@@ -11,7 +11,7 @@ db-root-spec = "other_root"
+ db-schemas = "test,other_tenant1,other_tenant2"
+ db-config = true
+ db-tx-end = "rollback-allow-override"
+-db-uri = "postgresql://"
++db-uri = "<REPLACED_WITH_DB_URI>"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://otherexample.org"
+ jwt-role-claim-key = ".\"other\".\"role\""
+diff --git a/test/io/configs/expected/no-defaults-with-db.config b/test/io/configs/expected/no-defaults-with-db.config
+index 40eee3c8..7a5affb2 100644
+--- a/test/io/configs/expected/no-defaults-with-db.config
++++ b/test/io/configs/expected/no-defaults-with-db.config
+@@ -1,4 +1,4 @@
+-db-anon-role = "anonymous"
++db-anon-role = "postgrest_test_anonymous"
+ db-channel = "postgrest"
+ db-channel-enabled = false
+ db-extra-search-path = "public,extensions,private"
+@@ -11,7 +11,7 @@ db-root-spec = "root"
+ db-schemas = "test,tenant1,tenant2"
+ db-config = true
+ db-tx-end = "commit-allow-override"
+-db-uri = "postgresql://"
++db-uri = "<REPLACED_WITH_DB_URI>"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://example.org"
+ jwt-role-claim-key = ".\"a\".\"role\""
+diff --git a/test/io/configs/expected/types.config b/test/io/configs/expected/types.config
+index 3f2a2b4d..1d91f505 100644
+--- a/test/io/configs/expected/types.config
++++ b/test/io/configs/expected/types.config
+@@ -1,4 +1,4 @@
+-db-anon-role = ""
++db-anon-role = "required"
+ db-channel = "pgrst"
+ db-channel-enabled = true
+ db-extra-search-path = "public"
+@@ -8,10 +8,10 @@ db-pool-timeout = 10
+ db-pre-request = ""
+ db-prepared-statements = true
+ db-root-spec = ""
+-db-schemas = "public"
++db-schemas = "required"
+ db-config = true
+ db-tx-end = "commit"
+-db-uri = "postgresql://"
++db-uri = "required"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io/configs/role-claim-key.config b/test/io/configs/role-claim-key.config
+new file mode 100644
+index 00000000..dc22cf7a
+--- /dev/null
++++ b/test/io/configs/role-claim-key.config
+@@ -0,0 +1,3 @@
++jwt-role-claim-key = "$(ROLE_CLAIM_KEY)"
++jwt-secret = "reallyreallyreallyreallyverysafe"
++db-config = false
+diff --git a/test/io/configs/secret-from-file.config b/test/io/configs/secret-from-file.config
+new file mode 100644
+index 00000000..6be2deee
+--- /dev/null
++++ b/test/io/configs/secret-from-file.config
+@@ -0,0 +1,4 @@
++# Read secret from a file: /dev/stdin (alias for standard input)
++jwt-secret = "@/dev/stdin"
++jwt-secret-is-base64 = false
++db-config = false
+diff --git a/test/io/configs/sigusr2-settings-external-secret.config b/test/io/configs/sigusr2-settings-external-secret.config
+new file mode 100644
+index 00000000..b3fe854e
+--- /dev/null
++++ b/test/io/configs/sigusr2-settings-external-secret.config
+@@ -0,0 +1,3 @@
++jwt-secret = "$(JWT_SECRET_FILE)"
++jwt-secret-is-base64 = false
++db-config = false
+diff --git a/test/io/configs/sigusr2-settings.config b/test/io/configs/sigusr2-settings.config
+index b3f84247..cc14ac70 100644
+--- a/test/io/configs/sigusr2-settings.config
++++ b/test/io/configs/sigusr2-settings.config
+@@ -1,5 +1,5 @@
+-# will be replaced in test
+ db-schemas = "public"
+ 
+ app.settings.name_var = "John"
+ jwt-secret = "invalidinvalidinvalidinvalidinvalid"
++db-config = false
+diff --git a/test/io/configs/simple.config b/test/io/configs/simple.config
+new file mode 100644
+index 00000000..b5833825
+--- /dev/null
++++ b/test/io/configs/simple.config
+@@ -0,0 +1,2 @@
++jwt-secret = "reallyreallyreallyreallyverysafe"
++db-config = false
+diff --git a/test/io/configs/types.config b/test/io/configs/types.config
+index 3e198114..e4e75124 100644
+--- a/test/io/configs/types.config
++++ b/test/io/configs/types.config
+@@ -1,4 +1,7 @@
+ # tests how config options fall back with invalid types
++db-anon-role = "required"
++db-schemas = "required"
++db-uri = "required"
+ 
+ # expects string
+ app.settings.test = false
+diff --git a/test/io/db_config.sql b/test/io/db_config.sql
+index bafcc491..57caf252 100644
+--- a/test/io/db_config.sql
++++ b/test/io/db_config.sql
+@@ -7,7 +7,6 @@ ALTER ROLE db_config_authenticator SET pgrst.raw_media_types = 'application/vnd.
+ ALTER ROLE db_config_authenticator SET pgrst.jwt_secret = 'REALLY=REALLY=REALLY=REALLY=VERY=SAFE';
+ ALTER ROLE db_config_authenticator SET pgrst.jwt_secret_is_base64 = 'false';
+ ALTER ROLE db_config_authenticator SET pgrst.jwt_role_claim_key = '."a"."role"';
+-ALTER ROLE db_config_authenticator SET pgrst.db_anon_role = 'anonymous';
+ ALTER ROLE db_config_authenticator SET pgrst.db_tx_end = 'commit-allow-override';
+ ALTER ROLE db_config_authenticator SET pgrst.db_schemas = 'test, tenant1, tenant2';
+ ALTER ROLE db_config_authenticator SET pgrst.db_root_spec = 'root';
+@@ -30,6 +29,7 @@ ALTER ROLE db_config_authenticator SET pgrst.server_port = 'ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.server_unix_socket = 'ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.server_unix_socket_mode = 'ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.log_level = 'ignored';
++ALTER ROLE db_config_authenticator SET pgrst.db_anon_role = 'ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.db_uri = 'postgresql://ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.db_channel_enabled = 'ignored';
+ ALTER ROLE db_config_authenticator SET pgrst.db_channel = 'ignored';
+@@ -45,7 +45,6 @@ ALTER ROLE other_authenticator SET pgrst.raw_media_types = 'application/vnd.pgrs
+ ALTER ROLE other_authenticator SET pgrst.jwt_secret = 'ODERREALLYREALLYREALLYREALLYVERYSAFE';
+ ALTER ROLE other_authenticator SET pgrst.jwt_secret_is_base64 = 'true';
+ ALTER ROLE other_authenticator SET pgrst.jwt_role_claim_key = '."other"."role"';
+-ALTER ROLE other_authenticator SET pgrst.db_anon_role = 'other';
+ ALTER ROLE other_authenticator SET pgrst.db_tx_end = 'rollback-allow-override';
+ ALTER ROLE other_authenticator SET pgrst.db_schemas = 'test, other_tenant1, other_tenant2';
+ ALTER ROLE other_authenticator SET pgrst.db_root_spec = 'other_root';
+diff --git a/test/io/fixtures.sql b/test/io/fixtures.sql
+index 2e95e113..4c8a3a3c 100644
+--- a/test/io/fixtures.sql
++++ b/test/io/fixtures.sql
+@@ -1,8 +1,6 @@
+ \ir db_config.sql
+ 
+ CREATE ROLE postgrest_test_anonymous;
+-ALTER ROLE :USER SET pgrst.db_anon_role = 'postgrest_test_anonymous';
+-
+ CREATE ROLE postgrest_test_author;
+ 
+ GRANT postgrest_test_anonymous, postgrest_test_author TO :USER;
+diff --git a/test/io/fixtures.yaml b/test/io/fixtures.yaml
+index 45f71e24..d13010ae 100644
+--- a/test/io/fixtures.yaml
++++ b/test/io/fixtures.yaml
+@@ -10,17 +10,35 @@ cli:
+     args: ['-e']
+   - name: dump config
+     args: ['--dump-config']
++    use_defaultenv: true
+   - name: dump schema
+     args: ['--dump-schema']
+     use_defaultenv: true
+-  - name: no config
+ # failures: config files
++  - name: no config
++    expect: error
+   - name: non-existant config file
+     expect: error
+     args: ['does_not_exist.conf']
+   - name: invalid config file
+     expect: error
+     args: ['test/io-tests/configs/invalid.yaml']
++# failures: required config options
++  - name: missing db-anon-role
++    expect: error
++    env:
++      PGRST_DB_URI: required
++      PGRST_DB_SCHEMAS: required
++  - name: missing db-schemas
++    expect: error
++    env:
++      PGRST_DB_ANON_ROLE: required
++      PGRST_DB_URI: required
++  - name: missing db-uri
++    expect: error
++    env:
++      PGRST_DB_ANON_ROLE: required
++      PGRST_DB_SCHEMAS: required
+ # failures: wrong config values
+   - name: invalid server-unix-socket-mode not octal
+     expect: error
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index a8a59279..0c7c66e6 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -79,20 +79,17 @@ class PostgrestProcess:
+ @pytest.fixture
+ def dburi():
+     "Postgres database connection URI."
+-    dbname = os.environ["PGDATABASE"]
+-    host = os.environ["PGHOST"]
+-    user = os.environ["PGUSER"]
+-    return f"postgresql://?dbname={dbname}&host={host}&user={user}".encode()
++    return os.getenv("PGRST_DB_URI").encode()
+ 
+ 
+ @pytest.fixture
+ def defaultenv():
+     "Default environment for PostgREST."
+     return {
+-        "PGDATABASE": os.environ["PGDATABASE"],
+-        "PGHOST": os.environ["PGHOST"],
+-        "PGUSER": os.environ["PGUSER"],
+-        "PGRST_DB_CONFIG": "true",
++        "PGRST_DB_URI": os.environ["PGRST_DB_URI"],
++        "PGRST_DB_SCHEMAS": "public",
++        "PGRST_DB_ANON_ROLE": os.environ["PGRST_DB_ANON_ROLE"],
++        "PGRST_DB_CONFIG": "false",
+         "PGRST_LOG_LEVEL": "info",
+     }
+ 
+@@ -312,14 +309,20 @@ def test_expected_config_from_db_settings(defaultenv, role, expectedconfig):
+ 
+     config = CONFIGSDIR / "no-defaults.config"
+ 
++    db_uri = defaultenv["PGRST_DB_URI"].replace(
++        "user=postgrest_test_authenticator", f"user={role}"
++    )
+     env = {
+         **defaultenv,
+-        "PGUSER": role,
+-        "PGRST_DB_URI": "postgresql://",
++        "PGRST_DB_URI": db_uri,
+         "PGRST_DB_CONFIG": "true",
+     }
++    expected = (
++        (CONFIGSDIR / "expected" / expectedconfig)
++        .read_text()
++        .replace("<REPLACED_WITH_DB_URI>", env["PGRST_DB_URI"])
++    )
+ 
+-    expected = (CONFIGSDIR / "expected" / expectedconfig).read_text()
+     assert dumpconfig(configpath=config, env=env) == expected
+ 
+ 
+@@ -372,85 +375,32 @@ def test_port_connection(defaultenv):
+ )
+ def test_read_secret_from_file(secretpath, defaultenv):
+     "Authorization should succeed when the secret is read from a file."
+-
+-    env = {**defaultenv, "PGRST_JWT_SECRET": f"@{secretpath}"}
+-
+     if secretpath.suffix == ".b64":
+-        env["PGRST_JWT_SECRET_IS_BASE64"] = "true"
++        configfile = CONFIGSDIR / "base64-secret-from-file.config"
++    else:
++        configfile = CONFIGSDIR / "secret-from-file.config"
+ 
+     secret = secretpath.read_bytes()
+     headers = authheader(secretpath.with_suffix(".jwt").read_text())
+ 
+-    with run(stdin=secret, env=env) as postgrest:
+-        response = postgrest.session.get("/authors_only", headers=headers)
+-        print(response.text)
+-        assert response.status_code == 200
+-
+-
+-def test_read_secret_from_stdin(defaultenv):
+-    "Authorization should succeed when the secret is read from stdin."
+-
+-    env = {**defaultenv, "PGRST_DB_CONFIG": "false", "PGRST_JWT_SECRET": "@/dev/stdin"}
+-
+-    headers = jwtauthheader({"role": "postgrest_test_author"}, SECRET)
+-
+-    with run(stdin=SECRET.encode(), env=env) as postgrest:
+-        response = postgrest.session.get("/authors_only", headers=headers)
+-        print(response.text)
+-        assert response.status_code == 200
+-
+-
+-# TODO: This test would fail right now, because of
+-# https://github.com/PostgREST/postgrest/issues/2126
+-@pytest.mark.skip
+-def test_read_secret_from_stdin_dbconfig(defaultenv):
+-    "Authorization should succeed when the secret is read from stdin with db-config=true."
+-
+-    env = {**defaultenv, "PGRST_DB_CONFIG": "true", "PGRST_JWT_SECRET": "@/dev/stdin"}
+-
+-    headers = jwtauthheader({"role": "postgrest_test_author"}, SECRET)
+-
+-    with run(stdin=SECRET.encode(), env=env) as postgrest:
++    with run(configfile, stdin=secret, env=defaultenv) as postgrest:
+         response = postgrest.session.get("/authors_only", headers=headers)
+-        print(response.text)
+         assert response.status_code == 200
+ 
+ 
+-def test_connect_with_dburi(dburi, defaultenv):
+-    "Connecting with db-uri instead of LIPQ* environment variables should work."
+-    defaultenv_without_libpq = {
+-        key: value
+-        for key, value in defaultenv.items()
+-        if key not in ["PGDATABASE", "PGHOST", "PGUSER"]
+-    }
+-    env = {**defaultenv_without_libpq, "PGRST_DB_URI": dburi.decode()}
+-    with run(env=env):
++def test_read_dburi_from_file_without_eol(dburi, defaultenv):
++    "Reading the dburi from a file with a single line should work."
++    config = CONFIGSDIR / "dburi-from-file.config"
++    env = {key: value for key, value in defaultenv.items() if key != "PGRST_DB_URI"}
++    with run(config, env=env, stdin=dburi):
+         pass
+ 
+ 
+-def test_read_dburi_from_stdin_without_eol(dburi, defaultenv):
+-    "Reading the dburi from stdin with a single line should work."
+-    defaultenv_without_libpq = {
+-        key: value
+-        for key, value in defaultenv.items()
+-        if key not in ["PGDATABASE", "PGHOST", "PGUSER"]
+-    }
+-    env = {**defaultenv_without_libpq, "PGRST_DB_URI": "@/dev/stdin"}
+-
+-    with run(env=env, stdin=dburi):
+-        pass
+-
+-
+-def test_read_dburi_from_stdin_with_eol(dburi, defaultenv):
+-    "Reading the dburi from stdin containing a newline should work."
+-    defaultenv_without_libpq = {
+-        key: value
+-        for key, value in defaultenv.items()
+-        if key not in ["PGDATABASE", "PGHOST", "PGUSER"]
+-    }
+-    env = {**defaultenv_without_libpq, "PGRST_DB_URI": "@/dev/stdin"}
+-
+-    with run(env=env, stdin=dburi + b"\n"):
++def test_read_dburi_from_file_with_eol(dburi, defaultenv):
++    "Reading the dburi from a file containing a newline should work."
++    config = CONFIGSDIR / "dburi-from-file.config"
++    env = {key: value for key, value in defaultenv.items() if key != "PGRST_DB_URI"}
++    with run(config, env=env, stdin=dburi + b"\n"):
+         pass
+ 
+ 
+@@ -461,12 +411,11 @@ def test_role_claim_key(roleclaim, defaultenv):
+     "Authorization should depend on a correct role-claim-key and JWT claim."
+     env = {
+         **defaultenv,
+-        "PGRST_JWT_ROLE_CLAIM_KEY": roleclaim["key"],
+-        "PGRST_JWT_SECRET": SECRET,
++        "ROLE_CLAIM_KEY": roleclaim["key"],
+     }
+     headers = jwtauthheader(roleclaim["data"], SECRET)
+ 
+-    with run(env=env) as postgrest:
++    with run(CONFIGSDIR / "role-claim-key.config", env=env) as postgrest:
+         response = postgrest.session.get("/authors_only", headers=headers)
+         assert response.status_code == roleclaim["expected_status"]
+ 
+@@ -476,11 +425,11 @@ def test_invalid_role_claim_key(invalidroleclaimkey, defaultenv):
+     "Given an invalid role-claim-key, Postgrest should exit with a non-zero exit code."
+     env = {
+         **defaultenv,
+-        "PGRST_JWT_ROLE_CLAIM_KEY": invalidroleclaimkey,
++        "ROLE_CLAIM_KEY": invalidroleclaimkey,
+     }
+ 
+     with pytest.raises(PostgrestError):
+-        dump = dumpconfig(env=env)
++        dump = dumpconfig(CONFIGSDIR / "role-claim-key.config", env=env)
+         for line in dump.split("\n"):
+             if line.startswith("jwt-role-claim-key"):
+                 print(line)
+@@ -509,13 +458,10 @@ def test_iat_claim(defaultenv):
+     https://github.com/PostgREST/postgrest/issues/1139
+ 
+     """
+-
+-    env = {**defaultenv, "PGRST_JWT_SECRET": SECRET}
+-
+     claim = {"role": "postgrest_test_author", "iat": datetime.utcnow()}
+     headers = jwtauthheader(claim, SECRET)
+ 
+-    with run(env=env) as postgrest:
++    with run(CONFIGSDIR / "simple.config", env=defaultenv) as postgrest:
+         for _ in range(10):
+             response = postgrest.session.get("/authors_only", headers=headers)
+             assert response.status_code == 200
+@@ -530,10 +476,7 @@ def test_app_settings(defaultenv):
+     See: https://github.com/PostgREST/postgrest/issues/1141
+ 
+     """
+-
+-    env = {**defaultenv, "PGRST_APP_SETTINGS_EXTERNAL_API_SECRET": "0123456789abcdef"}
+-
+-    with run(env=env) as postgrest:
++    with run(CONFIGSDIR / "app-settings.config", env=defaultenv) as postgrest:
+         # Wait for the db pool to time out, set to 1s in config
+         time.sleep(2)
+ 
+@@ -544,7 +487,7 @@ def test_app_settings(defaultenv):
+ 
+ 
+ def test_app_settings_reload(tmp_path, defaultenv):
+-    "App settings should be reloaded from file when PostgREST is sent SIGUSR2."
++    "App settings should be reloaded when PostgREST is sent SIGUSR2."
+     config = (CONFIGSDIR / "sigusr2-settings.config").read_text()
+     configfile = tmp_path / "test.config"
+     configfile.write_text(config)
+@@ -566,7 +509,7 @@ def test_app_settings_reload(tmp_path, defaultenv):
+ 
+ 
+ def test_jwt_secret_reload(tmp_path, defaultenv):
+-    "JWT secret should be reloaded from file when PostgREST is sent SIGUSR2."
++    "JWT secret should be reloaded when PostgREST is sent SIGUSR2."
+     config = (CONFIGSDIR / "sigusr2-settings.config").read_text()
+     configfile = tmp_path / "test.config"
+     configfile.write_text(config)
+@@ -591,6 +534,8 @@ def test_jwt_secret_reload(tmp_path, defaultenv):
+ 
+ def test_jwt_secret_external_file_reload(tmp_path, defaultenv):
+     "JWT secret external file should be reloaded when PostgREST is sent a SIGUSR2 or a NOTIFY."
++    config = CONFIGSDIR / "sigusr2-settings-external-secret.config"
++
+     headers = jwtauthheader({"role": "postgrest_test_author"}, SECRET)
+ 
+     external_secret_file = tmp_path / "jwt-secret-config"
+@@ -598,20 +543,18 @@ def test_jwt_secret_external_file_reload(tmp_path, defaultenv):
+ 
+     env = {
+         **defaultenv,
+-        "PGRST_JWT_SECRET": f"@{external_secret_file}",
++        "JWT_SECRET_FILE": f"@{external_secret_file}",
+         "PGRST_DB_CHANNEL_ENABLED": "true",
+-        "PGRST_DB_CONFIG": "false",
+-        "PGRST_DB_ANON_ROLE": "postgrest_test_anonymous",  # required for NOTIFY
+     }
+ 
+-    with run(env=env) as postgrest:
++    with run(config, env=env) as postgrest:
+         response = postgrest.session.get("/authors_only", headers=headers)
+         assert response.status_code == 401
+ 
+         # change external file
+         external_secret_file.write_text(SECRET)
+ 
+-        # SIGUSR1 doesn't reload external files, at least when db-config=false
++        # SIGUSR1 doesn't reload external files
+         postgrest.process.send_signal(signal.SIGUSR1)
+         time.sleep(0.1)
+ 
+@@ -629,8 +572,7 @@ def test_jwt_secret_external_file_reload(tmp_path, defaultenv):
+         external_secret_file.write_text("invalid" * 5)
+ 
+         # reload config and external file with NOTIFY
+-        response = postgrest.session.post("/rpc/reload_pgrst_config")
+-        assert response.status_code == 200
++        postgrest.session.post("/rpc/reload_pgrst_config")
+         time.sleep(0.1)
+ 
+         response = postgrest.session.get("/authors_only", headers=headers)
+@@ -638,12 +580,14 @@ def test_jwt_secret_external_file_reload(tmp_path, defaultenv):
+ 
+ 
+ def test_db_schema_reload(tmp_path, defaultenv):
+-    "DB schema should be reloaded from file when PostgREST is sent SIGUSR2."
++    "DB schema should be reloaded when PostgREST is sent SIGUSR2."
+     config = (CONFIGSDIR / "sigusr2-settings.config").read_text()
+     configfile = tmp_path / "test.config"
+     configfile.write_text(config)
+ 
+-    with run(configfile, env=defaultenv) as postgrest:
++    env = {key: value for key, value in defaultenv.items() if key != "PGRST_DB_SCHEMAS"}
++
++    with run(configfile, env=env) as postgrest:
+         response = postgrest.session.get("/rpc/get_guc_value?name=search_path")
+         assert response.text == '"public, public"'
+ 
+@@ -690,12 +634,14 @@ def test_db_schema_notify_reload(defaultenv):
+ 
+ def test_max_rows_reload(defaultenv):
+     "max-rows should be reloaded from role settings when PostgREST receives a SIGUSR2."
++    config = CONFIGSDIR / "sigusr2-settings.config"
++
+     env = {
+         **defaultenv,
+         "PGRST_DB_CONFIG": "true",
+     }
+ 
+-    with run(env=env) as postgrest:
++    with run(config, env=env) as postgrest:
+         response = postgrest.session.head("/projects")
+         assert response.status_code == 200
+         assert response.headers["Content-Range"] == "0-4/*"
+@@ -823,9 +769,12 @@ def test_admin_ready_wo_channel(defaultenv):
+ def test_admin_ready_includes_schema_cache_state(defaultenv):
+     "Should get a failed response from the admin server ready endpoint when the schema cache is not loaded"
+ 
++    db_uri = defaultenv["PGRST_DB_URI"].replace(
++        "postgrest_test_authenticator", "limited_authenticator"
++    )
+     env = {
+         **defaultenv,
+-        "PGUSER": "limited_authenticator",
++        "PGRST_DB_URI": db_uri,
+         "PGRST_DB_ANON_ROLE": "limited_authenticator",
+     }
+ 
+diff --git a/test/spec/Feature/AsymmetricJwtSpec.hs b/test/spec/Feature/AsymmetricJwtSpec.hs
+index 44597a64..c2c46b23 100644
+--- a/test/spec/Feature/AsymmetricJwtSpec.hs
++++ b/test/spec/Feature/AsymmetricJwtSpec.hs
+@@ -1,5 +1,6 @@
+ module Feature.AsymmetricJwtSpec where
+ 
++-- {{{ Imports
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+@@ -8,6 +9,7 @@ import Test.Hspec.Wai
+ 
+ import Protolude
+ import SpecHelper
++-- }}}
+ 
+ spec :: SpecWith ((), Application)
+ spec = describe "server started with asymmetric JWK" $
+diff --git a/test/spec/Feature/AudienceJwtSecretSpec.hs b/test/spec/Feature/AudienceJwtSecretSpec.hs
+index 1302e02e..e5a91ff3 100644
+--- a/test/spec/Feature/AudienceJwtSecretSpec.hs
++++ b/test/spec/Feature/AudienceJwtSecretSpec.hs
+@@ -1,5 +1,6 @@
+ module Feature.AudienceJwtSecretSpec where
+ 
++-- {{{ Imports
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+@@ -8,6 +9,7 @@ import Test.Hspec.Wai
+ 
+ import Protolude  hiding (get)
+ import SpecHelper
++-- }}}
+ 
+ spec :: SpecWith ((), Application)
+ spec = describe "test handling of aud claims in JWT" $ do
+diff --git a/test/spec/Feature/BinaryJwtSecretSpec.hs b/test/spec/Feature/BinaryJwtSecretSpec.hs
+index 996243d1..599f7e2f 100644
+--- a/test/spec/Feature/BinaryJwtSecretSpec.hs
++++ b/test/spec/Feature/BinaryJwtSecretSpec.hs
+@@ -1,5 +1,6 @@
+ module Feature.BinaryJwtSecretSpec where
+ 
++-- {{{ Imports
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+@@ -8,6 +9,7 @@ import Test.Hspec.Wai
+ 
+ import Protolude
+ import SpecHelper
++-- }}}
+ 
+ spec :: SpecWith ((), Application)
+ spec = describe "server started with binary JWT secret" $
+diff --git a/test/spec/Feature/NoAnonSpec.hs b/test/spec/Feature/NoAnonSpec.hs
+deleted file mode 100644
+index b46adb81..00000000
+--- a/test/spec/Feature/NoAnonSpec.hs
++++ /dev/null
+@@ -1,30 +0,0 @@
+-module Feature.NoAnonSpec where
+-
+-import Network.Wai (Application)
+-
+-import Network.HTTP.Types
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec = describe "server started without anonymous role" $ do
+-  it "behaves normally on attempted auth" $ do
+-    -- token body: { "role": "postgrest_test_author" }
+-    let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"
+-    request methodGet "/authors_only"
+-        [auth]
+-        ""
+-      `shouldRespondWith`
+-        200
+-
+-  it "responds with error when user does not attempt auth" $
+-    get "/items"
+-      `shouldRespondWith`
+-        [json|{"message":"Anonymous access is disabled"}|]
+-        { matchStatus  = 401
+-        , matchHeaders = ["WWW-Authenticate" <:> "Bearer"]
+-        }
+diff --git a/test/spec/Feature/NoJwtSpec.hs b/test/spec/Feature/NoJwtSpec.hs
+index 770a0afc..4e7b6524 100644
+--- a/test/spec/Feature/NoJwtSpec.hs
++++ b/test/spec/Feature/NoJwtSpec.hs
+@@ -1,5 +1,7 @@
+ module Feature.NoJwtSpec where
+ 
++-- {{{ Imports
++
+ import Network.Wai (Application)
+ 
+ import Network.HTTP.Types
+@@ -7,21 +9,23 @@ import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get)
++import Protolude
+ import SpecHelper
++-- }}}
+ 
+ spec :: SpecWith ((), Application)
+ spec = describe "server started without JWT secret" $ do
+ 
++  -- this test will stop working 9999999999s after the UNIX EPOCH
+   it "responds with error on attempted auth" $ do
+-    -- token body: { "role": "postgrest_test_author" }
+-    let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"
+-    request methodGet "/authors_only"
+-        [auth]
+-        ""
++    let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjk5OTk5OTk5OTksInJvbGUiOiJwb3N0Z3Jlc3RfdGVzdF9hdXRob3IiLCJpZCI6Impkb2UifQ.Dpss-QoLYjec5OTsOaAc3FNVsSjA89wACoV-0ra3ClA"
++    request methodGet "/authors_only" [auth] ""
+       `shouldRespondWith`
+-        [json|{"message":"Server lacks JWT secret"}|]
+-        { matchStatus  = 500 }
++      [json|{"message":"Server lacks JWT secret"}|]
++      { matchStatus  = 500
++      , matchHeaders = [ matchContentTypeJson ]
++      }
+ 
+   it "behaves normally when user does not attempt auth" $
+-    get "/items" `shouldRespondWith` 200
++    request methodGet "/items" [] ""
++      `shouldRespondWith` 200
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index f607525a..4202e004 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -37,7 +37,6 @@ import qualified Feature.InsertSpec
+ import qualified Feature.JsonOperatorSpec
+ import qualified Feature.LegacyGucsSpec
+ import qualified Feature.MultipleSchemaSpec
+-import qualified Feature.NoAnonSpec
+ import qualified Feature.NoJwtSpec
+ import qualified Feature.NonexistentSchemaSpec
+ import qualified Feature.OpenApiSpec
+@@ -59,19 +58,22 @@ import qualified Feature.UpsertSpec
+ 
+ main :: IO ()
+ main = do
+-  pool <- P.acquire (3, 10, toUtf8 $ configDbUri testCfg)
++  testDbConn <- getEnvVarWithDefault "PGRST_DB_URI" "postgres://postgrest_test@localhost/postgrest_test"
++
++  pool <- P.acquire (3, 10, toS testDbConn)
+ 
+   actualPgVersion <- either (panic.show) id <$> P.use pool queryPgVersion
+ 
+   baseDbStructure <-
+     loadDbStructure pool
+-      (configDbSchemas testCfg)
+-      (configDbExtraSearchPath testCfg)
++      (configDbSchemas $ testCfg testDbConn)
++      (configDbExtraSearchPath $ testCfg testDbConn)
+       actualPgVersion
+ 
+   let
+     -- For tests that run with the same refDbStructure
+-    app config = do
++    app cfg = do
++      let config = cfg testDbConn
+       appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putDbStructure appState (Just baseDbStructure)
+@@ -80,7 +82,8 @@ main = do
+       return ((), postgrest LogCrit appState $ pure ())
+ 
+     -- For tests that run with a different DbStructure(depends on configSchemas)
+-    appDbs config = do
++    appDbs cfg = do
++      let config = cfg testDbConn
+       customDbStructure <-
+         loadDbStructure pool
+           (configDbSchemas config)
+@@ -97,7 +100,6 @@ main = do
+       maxRowsApp           = app testMaxRowsCfg
+       disabledOpenApi      = app testDisabledOpenApiCfg
+       proxyApp             = app testProxyCfg
+-      noAnonApp            = app testCfgNoAnon
+       noJwtApp             = app testCfgNoJWT
+       binaryJwtApp         = app testCfgBinaryJWT
+       audJwtApp            = app testCfgAudienceJWT
+@@ -118,8 +120,8 @@ main = do
+ 
+   let analyze :: IO ()
+       analyze = do
+-        analyzeTable "items"
+-        analyzeTable "child_entities"
++        analyzeTable testDbConn "items"
++        analyzeTable testDbConn "child_entities"
+ 
+       specs = uncurry describe <$> [
+           ("Feature.AndOrParamsSpec"         , Feature.AndOrParamsSpec.spec actualPgVersion)
+@@ -172,10 +174,6 @@ main = do
+     parallel $ before proxyApp $
+       describe "Feature.ProxySpec" Feature.ProxySpec.spec
+ 
+-    -- this test runs without an anonymous role
+-    parallel $ before noAnonApp $
+-      describe "Feature.NoAnonSpec" Feature.NoAnonSpec.spec
+-
+     -- this test runs without a JWT secret
+     parallel $ before noJwtApp $
+       describe "Feature.NoJwtSpec" Feature.NoJwtSpec.spec
+diff --git a/test/spec/QueryCost.hs b/test/spec/QueryCost.hs
+index 1ede9727..4e719d2f 100644
+--- a/test/spec/QueryCost.hs
++++ b/test/spec/QueryCost.hs
+@@ -11,7 +11,8 @@ import qualified Hasql.Transaction                 as HT
+ import qualified Hasql.Transaction.Sessions        as HT
+ import           Text.Heredoc
+ 
+-import Protolude hiding (get, toS)
++import Protolude      hiding (get, toS)
++import Protolude.Conv (toS)
+ 
+ import PostgREST.Query.QueryBuilder (requestToCallProcQuery)
+ import PostgREST.Request.Types
+@@ -19,11 +20,14 @@ import PostgREST.Request.Types
+ import PostgREST.DbStructure.Identifiers
+ import PostgREST.DbStructure.Proc
+ 
++import SpecHelper (getEnvVarWithDefault)
++
+ import Test.Hspec
+ 
+ main :: IO ()
+ main = do
+-  pool <- P.acquire (3, 10, "postgresql://")
++  testDbConn <- getEnvVarWithDefault "PGRST_DB_URI" "postgres://postgrest_test@localhost/postgrest_test"
++  pool <- P.acquire (3, 10, toS testDbConn)
+ 
+   hspec $ describe "QueryCost" $
+     context "call proc query" $ do
+diff --git a/test/spec/SpecHelper.hs b/test/spec/SpecHelper.hs
+index 3412b88b..8941d9a6 100644
+--- a/test/spec/SpecHelper.hs
++++ b/test/spec/SpecHelper.hs
+@@ -72,11 +72,11 @@ getEnvVarWithDefault :: Text -> Text -> IO Text
+ getEnvVarWithDefault var def = toS <$>
+   getEnv (toS var) `E.catchIOError` const (return $ toS def)
+ 
+-baseCfg :: AppConfig
+-baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
++_baseCfg :: AppConfig
++_baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   AppConfig {
+     configAppSettings           = [ ("app.settings.app_host", "localhost") , ("app.settings.external_api_secret", "0123456789abcdef") ]
+-  , configDbAnonRole            = Just "postgrest_test_anonymous"
++  , configDbAnonRole            = "postgrest_test_anonymous"
+   , configDbChannel             = mempty
+   , configDbChannelEnabled      = True
+   , configDbExtraSearchPath     = []
+@@ -88,7 +88,7 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbRootSpec            = Nothing
+   , configDbSchemas             = fromList ["test"]
+   , configDbConfig              = False
+-  , configDbUri                 = "postgresql://"
++  , configDbUri                 = mempty
+   , configDbUseLegacyGucs       = True
+   , configFilePath              = Nothing
+   , configJWKS                  = parseSecret <$> secret
+@@ -109,93 +109,90 @@ baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configAdminServerPort       = Nothing
+   }
+ 
+-testCfg :: AppConfig
+-testCfg = baseCfg
++testCfg :: Text -> AppConfig
++testCfg testDbConn = _baseCfg { configDbUri = testDbConn }
+ 
+-testCfgDisallowRollback :: AppConfig
+-testCfgDisallowRollback = baseCfg { configDbTxAllowOverride = False, configDbTxRollbackAll = False }
++testCfgDisallowRollback :: Text -> AppConfig
++testCfgDisallowRollback testDbConn = (testCfg testDbConn) { configDbTxAllowOverride = False, configDbTxRollbackAll = False }
+ 
+-testCfgForceRollback :: AppConfig
+-testCfgForceRollback = baseCfg { configDbTxAllowOverride = False, configDbTxRollbackAll = True }
++testCfgForceRollback :: Text -> AppConfig
++testCfgForceRollback testDbConn = (testCfg testDbConn) { configDbTxAllowOverride = False, configDbTxRollbackAll = True }
+ 
+-testCfgNoAnon :: AppConfig
+-testCfgNoAnon = baseCfg { configDbAnonRole = Nothing }
++testCfgNoJWT :: Text -> AppConfig
++testCfgNoJWT testDbConn = (testCfg testDbConn) { configJwtSecret = Nothing, configJWKS = Nothing }
+ 
+-testCfgNoJWT :: AppConfig
+-testCfgNoJWT = baseCfg { configJwtSecret = Nothing, configJWKS = Nothing }
++testUnicodeCfg :: Text -> AppConfig
++testUnicodeCfg testDbConn = (testCfg testDbConn) { configDbSchemas = fromList ["تست"] }
+ 
+-testUnicodeCfg :: AppConfig
+-testUnicodeCfg = baseCfg { configDbSchemas = fromList ["تست"] }
++testMaxRowsCfg :: Text -> AppConfig
++testMaxRowsCfg testDbConn = (testCfg testDbConn) { configDbMaxRows = Just 2 }
+ 
+-testMaxRowsCfg :: AppConfig
+-testMaxRowsCfg = baseCfg { configDbMaxRows = Just 2 }
++testDisabledOpenApiCfg :: Text -> AppConfig
++testDisabledOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OADisabled }
+ 
+-testDisabledOpenApiCfg :: AppConfig
+-testDisabledOpenApiCfg = baseCfg { configOpenApiMode = OADisabled }
++testIgnorePrivOpenApiCfg :: Text -> AppConfig
++testIgnorePrivOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OAIgnorePriv, configDbSchemas = fromList ["test", "v1"] }
+ 
+-testIgnorePrivOpenApiCfg :: AppConfig
+-testIgnorePrivOpenApiCfg = baseCfg { configOpenApiMode = OAIgnorePriv, configDbSchemas = fromList ["test", "v1"] }
++testProxyCfg :: Text -> AppConfig
++testProxyCfg testDbConn = (testCfg testDbConn) { configOpenApiServerProxyUri = Just "https://postgrest.com/openapi.json" }
+ 
+-testProxyCfg :: AppConfig
+-testProxyCfg = baseCfg { configOpenApiServerProxyUri = Just "https://postgrest.com/openapi.json" }
+-
+-testCfgBinaryJWT :: AppConfig
+-testCfgBinaryJWT =
++testCfgBinaryJWT :: Text -> AppConfig
++testCfgBinaryJWT testDbConn =
+   let secret = Just . B64.decodeLenient $ "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+-  baseCfg {
++  (testCfg testDbConn) {
+     configJwtSecret = secret
+   , configJWKS = parseSecret <$> secret
+   }
+ 
+-testCfgAudienceJWT :: AppConfig
+-testCfgAudienceJWT =
++testCfgAudienceJWT :: Text -> AppConfig
++testCfgAudienceJWT testDbConn =
+   let secret = Just . B64.decodeLenient $ "cmVhbGx5cmVhbGx5cmVhbGx5cmVhbGx5dmVyeXNhZmU=" in
+-  baseCfg {
++  (testCfg testDbConn) {
+     configJwtSecret = secret
+   , configJwtAudience = Just "youraudience"
+   , configJWKS = parseSecret <$> secret
+   }
+ 
+-testCfgAsymJWK :: AppConfig
+-testCfgAsymJWK =
++testCfgAsymJWK :: Text -> AppConfig
++testCfgAsymJWK testDbConn =
+   let secret = Just $ encodeUtf8 [str|{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}|]
+-  in baseCfg {
++  in (testCfg testDbConn) {
+     configJwtSecret = secret
+   , configJWKS = parseSecret <$> secret
+   }
+ 
+-testCfgAsymJWKSet :: AppConfig
+-testCfgAsymJWKSet =
++testCfgAsymJWKSet :: Text -> AppConfig
++testCfgAsymJWKSet testDbConn =
+   let secret = Just $ encodeUtf8 [str|{"keys": [{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}]}|]
+-  in baseCfg {
++  in (testCfg testDbConn) {
+     configJwtSecret = secret
+   , configJWKS = parseSecret <$> secret
+   }
+ 
+-testNonexistentSchemaCfg :: AppConfig
+-testNonexistentSchemaCfg = baseCfg { configDbSchemas = fromList ["nonexistent"] }
++testNonexistentSchemaCfg :: Text -> AppConfig
++testNonexistentSchemaCfg testDbConn = (testCfg testDbConn) { configDbSchemas = fromList ["nonexistent"] }
+ 
+-testCfgExtraSearchPath :: AppConfig
+-testCfgExtraSearchPath = baseCfg { configDbExtraSearchPath = ["public", "extensions"] }
++testCfgExtraSearchPath :: Text -> AppConfig
++testCfgExtraSearchPath testDbConn = (testCfg testDbConn) { configDbExtraSearchPath = ["public", "extensions"] }
+ 
+-testCfgRootSpec :: AppConfig
+-testCfgRootSpec = baseCfg { configDbRootSpec = Just $ QualifiedIdentifier mempty "root"}
++testCfgRootSpec :: Text -> AppConfig
++testCfgRootSpec testDbConn = (testCfg testDbConn) { configDbRootSpec = Just $ QualifiedIdentifier mempty "root"}
+ 
+-testCfgHtmlRawOutput :: AppConfig
+-testCfgHtmlRawOutput = baseCfg { configRawMediaTypes = ["text/html"] }
++testCfgHtmlRawOutput :: Text -> AppConfig
++testCfgHtmlRawOutput testDbConn = (testCfg testDbConn) { configRawMediaTypes = ["text/html"] }
+ 
+-testCfgResponseHeaders :: AppConfig
+-testCfgResponseHeaders = baseCfg { configDbPreRequest = Just $ QualifiedIdentifier mempty "custom_headers" }
++testCfgResponseHeaders :: Text -> AppConfig
++testCfgResponseHeaders testDbConn = (testCfg testDbConn) { configDbPreRequest = Just $ QualifiedIdentifier mempty "custom_headers" }
+ 
+-testMultipleSchemaCfg :: AppConfig
+-testMultipleSchemaCfg = baseCfg { configDbSchemas = fromList ["v1", "v2"] }
++testMultipleSchemaCfg :: Text -> AppConfig
++testMultipleSchemaCfg testDbConn = (testCfg testDbConn) { configDbSchemas = fromList ["v1", "v2"] }
+ 
+-testCfgLegacyGucs :: AppConfig
+-testCfgLegacyGucs = baseCfg { configDbUseLegacyGucs = False }
++testCfgLegacyGucs :: Text -> AppConfig
++testCfgLegacyGucs testDbConn = (testCfg testDbConn) { configDbUseLegacyGucs = False }
+ 
+-analyzeTable :: Text -> IO ()
+-analyzeTable tableName =
+-  void $ readProcess "psql" ["--set", "ON_ERROR_STOP=1", "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []
++analyzeTable :: Text -> Text -> IO ()
++analyzeTable dbConn tableName =
++  void $ readProcess "psql" ["--set", "ON_ERROR_STOP=1", toS dbConn, "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []
+ 
+ rangeHdrs :: ByteRange -> [Header]
+ rangeHdrs r = [rangeUnit, (hRange, renderByteRange r)]

@@ -1,0 +1,313 @@
+diff --git a/lib/ecto/query/builder/cte.ex b/lib/ecto/query/builder/cte.ex
+index e052a2b7..18cd0121 100644
+--- a/lib/ecto/query/builder/cte.ex
++++ b/lib/ecto/query/builder/cte.ex
+@@ -94,19 +94,11 @@ defmodule Ecto.Query.Builder.CTE do
+   end
+ 
+   @doc false
+-  def apply_cte(nil, name, with_query, materialized) when is_boolean(materialized) do
+-    %Ecto.Query.WithExpr{queries: [{name, %{materialized: materialized}, with_query}]}
++  def apply_cte(nil, name, with_query, materialized) do
++    %Ecto.Query.WithExpr{queries: [{name, materialized, with_query}]}
+   end
+ 
+-  def apply_cte(nil, name, with_query, _materialized)  do
+-    %Ecto.Query.WithExpr{queries: [{name, %{}, with_query}]}
+-  end
+-
+-  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, materialized) when is_boolean(materialized) do
+-    %{with_expr | queries:  List.keystore(queries, name, 0, {name, %{materialized: materialized}, with_query})}
+-  end
+-
+-  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, _materialized) do
+-    %{with_expr | queries:  List.keystore(queries, name, 0, {name, %{}, with_query})}
++  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, materialized) do
++    %{with_expr | queries: List.keystore(queries, name, 0, {name, materialized, with_query})}
+   end
+ end
+diff --git a/lib/ecto/query/inspect.ex b/lib/ecto/query/inspect.ex
+index f7f326a9..bb9fbbb0 100644
+--- a/lib/ecto/query/inspect.ex
++++ b/lib/ecto/query/inspect.ex
+@@ -53,13 +53,13 @@ defimpl Inspect, for: Ecto.Query do
+     case query.with_ctes do
+       %WithExpr{recursive: recursive, queries: [_ | _] = queries} ->
+         with_ctes =
+-          Enum.map(queries, fn {name, cte_opts, query} ->
++          Enum.map(queries, fn {name, materialized, query} ->
+             cte = case query do
+               %Ecto.Query{} -> __MODULE__.inspect(query, opts)
+               %Ecto.Query.QueryExpr{} -> expr(query, {})
+             end
+ 
+-            concat(["|> with_cte(\"" <> name <> "\", materialized: ", inspect(cte_opts[:materialized]), ", as: ", cte, ")"])
++            concat(["|> with_cte(\"" <> name <> "\", materialized: ", inspect(materialized), ", as: ", cte, ")"])
+           end)
+ 
+         result = if recursive, do: glue(result, "\n", "|> recursive_ctes(true)"), else: result
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index ab5627bc..87dcecab 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -755,13 +755,13 @@ defmodule Ecto.Query.Planner do
+     # In here we add each cte as its own entry in the cache key.
+     # We could group them to avoid multiple keys, but since they are uncommon, we keep it simple.
+     Enum.reduce queries, cache_and_params, fn
+-      {name, opts, %Ecto.Query{} = query}, {cache, params} ->
++      {name, materialized, %Ecto.Query{} = query}, {cache, params} ->
+         {_, params, inner_cache} = traverse_cache(query, :all, {[], params}, adapter)
+-        {merge_cache({key, name, opts[:materialized], inner_cache}, cache, inner_cache != :nocache), params}
++        {merge_cache({key, name, materialized, inner_cache}, cache, inner_cache != :nocache), params}
+ 
+-      {name, opts, %Ecto.Query.QueryExpr{} = query_expr}, {cache, params} ->
++      {name, materialized, %Ecto.Query.QueryExpr{} = query_expr}, {cache, params} ->
+         {params, cacheable?} = cast_and_merge_params(:with_cte, query, query_expr, params, adapter)
+-        {merge_cache({key, name, opts[:materialized], expr_to_cache(query_expr)}, cache, cacheable?), params}
++        {merge_cache({key, name, materialized, expr_to_cache(query_expr)}, cache, cacheable?), params}
+     end
+   end
+ 
+@@ -919,13 +919,13 @@ defmodule Ecto.Query.Planner do
+   defp plan_ctes(%Ecto.Query{with_ctes: %{queries: queries}} = query, adapter) do
+     queries =
+       Enum.map queries, fn
+-        {name, opts, %Ecto.Query{} = cte_query} ->
++        {name, materialized, %Ecto.Query{} = cte_query} ->
+           {planned_query, _params, _key} = cte_query |> attach_prefix(query) |> plan(:all, adapter)
+           planned_query = planned_query |> ensure_select(true)
+-          {name, opts, planned_query}
++          {name, materialized, planned_query}
+ 
+-        {name, opts, other} ->
+-          {name, opts, other}
++        {name, materialized, other} ->
++          {name, materialized, other}
+       end
+ 
+     put_in(query.with_ctes.queries, queries)
+@@ -1044,7 +1044,7 @@ defmodule Ecto.Query.Planner do
+ 
+     {queries, counter} =
+       Enum.reduce with_expr.queries, {[], counter}, fn
+-        {name, opts, %Ecto.Query{} = inner_query}, {queries, counter} ->
++        {name, materialized, %Ecto.Query{} = inner_query}, {queries, counter} ->
+           inner_query = put_in(inner_query.aliases[@parent_as], query)
+ 
+           # We don't want to use normalize_subquery_select because we are
+@@ -1059,12 +1059,12 @@ defmodule Ecto.Query.Planner do
+           inner_query = put_in(inner_query.select.fields, fields)
+           {_, inner_query} = pop_in(inner_query.aliases[@parent_as])
+ 
+-          {[{name, opts, inner_query} | queries], counter}
++          {[{name, materialized, inner_query} | queries], counter}
+ 
+-        {name, opts, %QueryExpr{expr: {:fragment, _, _} = fragment} = query_expr}, {queries, counter} ->
++        {name, materialized, %QueryExpr{expr: {:fragment, _, _} = fragment} = query_expr}, {queries, counter} ->
+           {fragment, counter} = prewalk_source(fragment, :with_cte, query, with_expr, counter, adapter)
+           query_expr = %{query_expr | expr: fragment}
+-          {[{name, opts, query_expr} | queries], counter}
++          {[{name, materialized, query_expr} | queries], counter}
+       end
+ 
+     {%{with_expr | queries: Enum.reverse(queries)}, counter}
+diff --git a/test/ecto/query/builder/cte_test.exs b/test/ecto/query/builder/cte_test.exs
+index a8c2fa03..b09f1777 100644
+--- a/test/ecto/query/builder/cte_test.exs
++++ b/test/ecto/query/builder/cte_test.exs
+@@ -12,7 +12,7 @@ defmodule Ecto.Query.Builder.CTETest do
+   test "fragment CTE" do
+     query = "products" |> with_cte("categories", as: fragment("SELECT * FROM categories"))
+ 
+-    assert [{"categories", %{}, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
++    assert [{"categories", nil, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
+     assert {:fragment, [], [raw: "SELECT * FROM categories"]} = expr
+     refute query.with_ctes.recursive
+   end
+@@ -21,7 +21,7 @@ defmodule Ecto.Query.Builder.CTETest do
+     cte = from c in "categories", where: not is_nil(c.parent_id)
+     query = from(p in "products") |> with_cte("categories", as: ^cte, materialized: true)
+ 
+-    assert [{"categories", %{materialized: true}, %Ecto.Query{from: from}}] = query.with_ctes.queries
++    assert [{"categories", true, %Ecto.Query{from: from}}] = query.with_ctes.queries
+     assert %Ecto.Query.FromExpr{source: {"categories", nil}} = from
+   end
+ 
+@@ -29,7 +29,7 @@ defmodule Ecto.Query.Builder.CTETest do
+     cte = from c in "categories", where: not is_nil(c.parent_id)
+     query = from(p in "products") |> with_cte("categories", as: ^cte, materialized: false)
+ 
+-    assert [{"categories", %{materialized: false}, %Ecto.Query{from: from}}] = query.with_ctes.queries
++    assert [{"categories", false, %Ecto.Query{from: from}}] = query.with_ctes.queries
+     assert %Ecto.Query.FromExpr{source: {"categories", nil}} = from
+   end
+ 
+@@ -37,7 +37,7 @@ defmodule Ecto.Query.Builder.CTETest do
+     cte = from c in "categories", where: not is_nil(c.parent_id)
+     query = from(p in "products") |> with_cte("categories", as: ^cte)
+ 
+-    assert [{"categories", %{}, %Ecto.Query{from: from}}] = query.with_ctes.queries
++    assert [{"categories", nil, %Ecto.Query{from: from}}] = query.with_ctes.queries
+     assert %Ecto.Query.FromExpr{source: {"categories", nil}} = from
+   end
+ 
+@@ -47,7 +47,7 @@ defmodule Ecto.Query.Builder.CTETest do
+     tree = initial |> union_all(^recursion)
+     query = "products" |> recursive_ctes(true) |> with_cte("tree", as: ^tree)
+ 
+-    assert [{"tree", %{}, ^tree}] = query.with_ctes.queries
++    assert [{"tree", nil, ^tree}] = query.with_ctes.queries
+     assert query.with_ctes.recursive
+   end
+ 
+@@ -67,7 +67,7 @@ defmodule Ecto.Query.Builder.CTETest do
+       |> with_cte("cte1", as: ^cte1)
+       |> with_cte("cte2", as: fragment("SELECT * FROM tbl2"))
+ 
+-    assert [{"cte1", %{}, ^cte1}, {"cte2", %{}, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
++    assert [{"cte1", nil, ^cte1}, {"cte2", nil, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
+     assert {:fragment, [], [raw: "SELECT * FROM tbl2"]} = expr
+   end
+ 
+@@ -88,7 +88,7 @@ defmodule Ecto.Query.Builder.CTETest do
+     cte2 = from(p in "tbl2")
+     query = %Ecto.Query{} |> with_cte("cte", as: ^cte1) |> with_cte("cte", as: ^cte2)
+ 
+-    assert [{"cte", %{}, ^cte2}] = query.with_ctes.queries
++    assert [{"cte", nil, ^cte2}] = query.with_ctes.queries
+   end
+ 
+   test "uses an interpolated CTE name" do
+@@ -101,7 +101,7 @@ defmodule Ecto.Query.Builder.CTETest do
+       |> with_cte(^cte1_name, as: ^cte1)
+       |> with_cte(^cte2_name, as: fragment("SELECT * FROM tbl2"))
+ 
+-    assert [{^cte1_name, %{}, ^cte1}, {^cte2_name, %{}, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
++    assert [{^cte1_name, nil, ^cte1}, {^cte2_name, nil, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
+     assert {:fragment, [], [raw: "SELECT * FROM tbl2"]} = expr
+   end
+ 
+@@ -110,7 +110,7 @@ defmodule Ecto.Query.Builder.CTETest do
+ 
+   test "allows macros on name and query" do
+     query = %Ecto.Query{} |> with_cte(name(), as: query())
+-    assert [{"cte", %{}, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
++    assert [{"cte", nil, %Ecto.Query.QueryExpr{expr: expr}}] = query.with_ctes.queries
+     assert {:fragment, [], [raw: "query"]} = expr
+   end
+ end
+diff --git a/test/ecto/query/planner_test.exs b/test/ecto/query/planner_test.exs
+index 26a3f1d0..eeb39c23 100644
+--- a/test/ecto/query/planner_test.exs
++++ b/test/ecto/query/planner_test.exs
+@@ -690,7 +690,7 @@ defmodule Ecto.Query.PlannerTest do
+         Comment
+         |> with_cte("cte", as: ^put_query_prefix(Comment, "another"))
+         |> plan()
+-      %{queries: [{"cte", %{}, query}]} = with_expr
++      %{queries: [{"cte", nil, query}]} = with_expr
+       assert query.sources == {{"comments", Comment, "another"}}
+       assert %Ecto.Query.SelectExpr{expr: {:&, [], [0]}} = query.select
+       assert [
+@@ -705,7 +705,7 @@ defmodule Ecto.Query.PlannerTest do
+         Comment
+         |> with_cte("cte", as: ^(from(c in Comment, where: c in ^[1, 2, 3])))
+         |> plan()
+-      %{queries: [{"cte", %{}, query}]} = with_expr
++      %{queries: [{"cte", nil, query}]} = with_expr
+       assert query.sources == {{"comments", Comment, nil}}
+       assert %Ecto.Query.SelectExpr{expr: {:&, [], [0]}} = query.select
+       assert :nocache = cache
+@@ -715,7 +715,7 @@ defmodule Ecto.Query.PlannerTest do
+         |> recursive_ctes(true)
+         |> with_cte("cte", as: fragment("SELECT * FROM comments WHERE id = ?", ^123))
+         |> plan()
+-      %{queries: [{"cte", %{}, query_expr}]} = with_expr
++      %{queries: [{"cte", nil, query_expr}]} = with_expr
+       expr = {:fragment, [], [raw: "SELECT * FROM comments WHERE id = ", expr: {:^, [], [0]}, raw: ""]}
+       assert expr == query_expr.expr
+       assert [:all, {:from, {"comments", Comment, _, nil}, []}, {:recursive_cte, "cte", nil, ^expr}] = cache
+@@ -738,7 +738,7 @@ defmodule Ecto.Query.PlannerTest do
+         |> select([c, r], c)
+         |> plan(:update_all)
+ 
+-      %{queries: [{"recent_comments", %{}, cte}]} = with_expr
++      %{queries: [{"recent_comments", nil, cte}]} = with_expr
+       assert {{"comments", Comment, "another"}} = cte.sources
+       assert %{expr: {:^, [], [0]}, params: [{500, :integer}]} = cte.limit
+ 
+@@ -770,7 +770,7 @@ defmodule Ecto.Query.PlannerTest do
+         |> select([c, r], c)
+         |> plan(:delete_all)
+ 
+-      %{queries: [{"recent_comments", %{}, cte}]} = with_expr
++      %{queries: [{"recent_comments", nil, cte}]} = with_expr
+       assert {{"comments", Comment, "another"}} = cte.sources
+       assert %{expr: {:^, [], [0]}, params: [{500, :integer}]} = cte.limit
+ 
+@@ -788,17 +788,17 @@ defmodule Ecto.Query.PlannerTest do
+ 
+     test "prefixes" do
+       {%{with_ctes: with_expr} = query, _, _, _} = Comment |> with_cte("cte", as: ^from(c in Comment)) |> plan()
+-      %{queries: [{"cte", %{}, cte_query}]} = with_expr
++      %{queries: [{"cte", nil, cte_query}]} = with_expr
+       assert query.sources == {{"comments", Comment, nil}}
+       assert cte_query.sources == {{"comments", Comment, nil}}
+ 
+       {%{with_ctes: with_expr} = query, _, _, _} = Comment |> with_cte("cte", as: ^from(c in Comment)) |> Map.put(:prefix, "global") |> plan()
+-      %{queries: [{"cte", %{}, cte_query}]} = with_expr
++      %{queries: [{"cte", nil, cte_query}]} = with_expr
+       assert query.sources == {{"comments", Comment, "global"}}
+       assert cte_query.sources == {{"comments", Comment, "global"}}
+ 
+       {%{with_ctes: with_expr} = query, _, _, _} = Comment |> with_cte("cte", as: ^(from(c in Comment) |> Map.put(:prefix, "cte"))) |> Map.put(:prefix, "global") |> plan()
+-      %{queries: [{"cte", %{}, cte_query}]} = with_expr
++      %{queries: [{"cte", nil, cte_query}]} = with_expr
+       assert query.sources == {{"comments", Comment, "global"}}
+       assert cte_query.sources == {{"comments", Comment, "cte"}}
+     end
+@@ -1257,7 +1257,7 @@ defmodule Ecto.Query.PlannerTest do
+         Comment
+         |> with_cte("cte", as: ^from(c in "comments", select: %{id: c.id, text: c.text}))
+         |> normalize()
+-      %{queries: [{"cte", %{}, query}]} = with_expr
++      %{queries: [{"cte", nil, query}]} = with_expr
+       assert query.sources == {{"comments", nil, nil}}
+       assert {:%{}, [], [id: _, text: _]} = query.select.expr
+       assert  [id: {{:., _, [{:&, _, [0]}, :id]}, _, []},
+@@ -1267,7 +1267,7 @@ defmodule Ecto.Query.PlannerTest do
+         Comment
+         |> with_cte("cte", as: ^(from(c in Comment, where: c in ^[1, 2, 3])))
+         |> normalize()
+-      %{queries: [{"cte", %{}, query}]} = with_expr
++      %{queries: [{"cte", nil, query}]} = with_expr
+       assert query.sources == {{"comments", Comment, nil}}
+       assert {:%{}, [], [id: _, text: _] ++ _} = query.select.expr
+       assert  [{:id, {{:., _, [{:&, _, [0]}, :id]}, _, []}},
+@@ -1295,7 +1295,7 @@ defmodule Ecto.Query.PlannerTest do
+         |> select([agg_v], agg_v.bucket)
+ 
+       query = normalize(query)
+-      [{"agg_values", %{}, query}] = query.with_ctes.queries
++      [{"agg_values", nil, query}] = query.with_ctes.queries
+       assert Macro.to_string(query.select.fields) == "[bucket: ^1 + &0.number()]"
+     end
+ 
+@@ -1306,7 +1306,7 @@ defmodule Ecto.Query.PlannerTest do
+         |> select([e], [:parent])
+         |> normalize()
+ 
+-      [{"cte", %{}, query}] = query.with_ctes.queries
++      [{"cte", nil, query}] = query.with_ctes.queries
+       assert Macro.to_string(query.select.fields) == "[child: &0.child()]"
+     end
+   end
+@@ -1820,7 +1820,7 @@ defmodule Ecto.Query.PlannerTest do
+     test "with CTEs" do
+       cte_query = from(s in "schema", select: %{x1: selected_as(s.x, :integer), x2: s.x})
+ 
+-      %{with_ctes: %{queries: [{"schema_cte", %{}, inner_query}]}} =
++      %{with_ctes: %{queries: [{"schema_cte", nil, inner_query}]}} =
+         Comment
+         |> with_cte("schema_cte", as: ^cte_query)
+         |> normalize()

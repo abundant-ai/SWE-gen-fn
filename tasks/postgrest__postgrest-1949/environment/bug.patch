@@ -1,0 +1,986 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 82d773a7..e5ae0ed8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,9 +14,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Enables uploading bytea to a function with `Content-Type: application/octet-stream`
+    + Enables uploading raw text to a function with `Content-Type: text/plain`
+ - #1938, Allow escaping inside double quotes with a backslash, e.g. `?col=in.("Double\"Quote")`, `?col=in.("Back\\slash")` - @steve-chavez
+-- #1075, Allow filtering top-level resource based on embedded resources filters - @steve-chavez, @Iced-Sun
+-   + This is enabled by adding `!inner` to the embedded resource, e.g. `/projects?select=*,clients!inner(*)&clients.id=eq.12`
+-   + This behavior can be enabled by default with the `db-embed-default-join='inner'` config option, which saves the need for specifying `!inner` on every request. In this case, you can go back to the previous behavior per request by specifying `!left`  on the embedded resource, e.g `/projects?select=*,clients!left(*)&clients.id=eq.12`
+ 
+ ### Fixed
+ 
+@@ -582,4 +579,4 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Fixed
+ - Make filter position match docs, e.g. `?order=col.asc` rather
+-  than `?order=asc.col`.
+\ No newline at end of file
++  than `?order=asc.col`.
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 07462b32..2ef76351 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -176,7 +176,6 @@ test-suite spec
+                       Feature.DeleteSpec
+                       Feature.DisabledOpenApiSpec
+                       Feature.EmbedDisambiguationSpec
+-                      Feature.EmbedInnerJoinSpec
+                       Feature.ExtraSearchPathSpec
+                       Feature.HtmlRawOutputSpec
+                       Feature.InsertSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 69a6bf81..7c05402f 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -572,7 +572,7 @@ returnsScalar _                   = False
+ readRequest :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m ReadRequest
+ readRequest QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
+   liftEither $
+-    ReqBuilder.readRequest qiSchema qiName configDbMaxRows configDbEmbedDefaultJoin
++    ReqBuilder.readRequest qiSchema qiName configDbMaxRows
+       (dbRelationships dbStructure)
+       apiRequest
+ 
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index a0363e5c..be25bfae 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -57,7 +57,6 @@ import PostgREST.Config.JSPath           (JSPath, JSPathExp (..),
+ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+ import PostgREST.DbStructure.Identifiers (QualifiedIdentifier, toQi)
+-import PostgREST.Request.Types           (JoinType (..))
+ 
+ import Protolude      hiding (Proxy, toList, toS)
+ import Protolude.Conv (toS)
+@@ -80,7 +79,6 @@ data AppConfig = AppConfig
+   , configDbTxAllowOverride     :: Bool
+   , configDbTxRollbackAll       :: Bool
+   , configDbUri                 :: Text
+-  , configDbEmbedDefaultJoin    :: JoinType
+   , configFilePath              :: Maybe FilePath
+   , configJWKS                  :: Maybe JWKSet
+   , configJwtAudience           :: Maybe StringOrURI
+@@ -134,7 +132,6 @@ toText conf =
+       ,("db-config",                 q . T.toLower . show . configDbConfig)
+       ,("db-tx-end",                 q . showTxEnd)
+       ,("db-uri",                    q . configDbUri)
+-      ,("db-embed-default-join",     q . show . configDbEmbedDefaultJoin)
+       ,("jwt-aud",                       toS . encode . maybe "" toJSON . configJwtAudience)
+       ,("jwt-role-claim-key",        q . T.intercalate mempty . fmap show . configJwtRoleClaimKey)
+       ,("jwt-secret",                q . toS . showJwtSecret)
+@@ -225,7 +222,6 @@ parser optPath env dbSettings =
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+     <*> reqString "db-uri"
+-    <*> parseEmbedDefaultJoin "db-embed-default-join"
+     <*> pure optPath
+     <*> pure Nothing
+     <*> parseJwtAudience "jwt-aud"
+@@ -308,14 +304,6 @@ parser optPath env dbSettings =
+         Just "rollback-allow-override" -> pure $ f (True,       True)
+         Just _                         -> fail "Invalid transaction termination. Check your configuration."
+ 
+-    parseEmbedDefaultJoin :: C.Key -> C.Parser C.Config JoinType
+-    parseEmbedDefaultJoin k =
+-      optString k >>= \case
+-        Nothing      -> pure JTLeft
+-        Just "left"  -> pure JTLeft
+-        Just "inner" -> pure JTInner
+-        Just _       -> fail "Invalid db-embed-default-join. Check your configuration."
+-
+     parseRoleClaimKey :: C.Key -> C.Key -> C.Parser C.Config JSPath
+     parseRoleClaimKey k al =
+       optWithAlias (optString k) (optString al) >>= \case
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index c9c597a5..5542b5d7 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -50,31 +50,22 @@ readRequestToQuery (Node (Select colSelects mainQi tblAlias implJoins logicFores
+     (joins, selects) = foldr getJoinsSelects ([],[]) forest
+ 
+ getJoinsSelects :: ReadRequest -> ([H.Snippet], [H.Snippet]) -> ([H.Snippet], [H.Snippet])
+-getJoinsSelects rr@(Node (_, (name, Just Relationship{relCardinality=card,relTable=Table{tableName=table}}, alias, _, Just joinType, _)) _) (j,s) =
++getJoinsSelects rr@(Node (_, (name, Just Relationship{relCardinality=card,relTable=Table{tableName=table}}, alias, _, _)) _) (j,s) =
+   let subquery = readRequestToQuery rr in
+   case card of
+     M2O _ ->
+       let aliasOrName = fromMaybe name alias
+           localTableName = pgFmtIdent $ table <> "_" <> aliasOrName
+           sel = H.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
+-          joi = (if joinType == JTInner then " INNER" else " LEFT")
+-            <> " JOIN LATERAL( " <> subquery <> " ) AS " <> H.sql localTableName <> " ON TRUE " in
++          joi = " LEFT JOIN LATERAL( " <> subquery <> " ) AS " <> H.sql localTableName <> " ON TRUE " in
+       (joi:j,sel:s)
+-    _ -> case joinType of
+-      JTInner ->
+-        let aliasOrName = fromMaybe name alias
+-            localTableName = pgFmtIdent $ table <> "_" <> aliasOrName
+-            sel = H.sql $ localTableName <> "._ AS " <> pgFmtIdent aliasOrName
+-            joi = "INNER JOIN LATERAL( SELECT json_agg(_) AS _ FROM (" <> subquery <> " ) _) AS " <>
+-                  H.sql localTableName <> " ON " <> H.sql localTableName <> "IS NOT NULL" in
+-        (joi:j,sel:s)
+-      JTLeft ->
+-        let sel = "COALESCE (("
+-               <> "SELECT json_agg(" <> H.sql (pgFmtIdent table) <> ".*) "
+-               <> "FROM (" <> subquery <> ") " <> H.sql (pgFmtIdent table) <> " "
+-               <> "), '[]') AS " <> H.sql (pgFmtIdent (fromMaybe name alias)) in
+-        (j,sel:s)
+-getJoinsSelects _ _ = ([], [])
++    _ ->
++      let sel = "COALESCE (("
++             <> "SELECT json_agg(" <> H.sql (pgFmtIdent table) <> ".*) "
++             <> "FROM (" <> subquery <> ") " <> H.sql (pgFmtIdent table) <> " "
++             <> "), '[]') AS " <> H.sql (pgFmtIdent (fromMaybe name alias)) in
++      (j,sel:s)
++getJoinsSelects (Node (_, (_, Nothing, _, _, _)) _) _ = ([], [])
+ 
+ mutateRequestToQuery :: MutateRequest -> H.Snippet
+ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 8bad1460..d1ec1355 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -206,11 +206,11 @@ pgFmtField :: QualifiedIdentifier -> Field -> H.Snippet
+ pgFmtField table (c, jp) = H.sql (pgFmtColumn table c) <> pgFmtJsonPath jp
+ 
+ pgFmtSelectItem :: QualifiedIdentifier -> SelectItem -> H.Snippet
+-pgFmtSelectItem table (f@(fName, jp), Nothing, alias, _, _) = pgFmtField table f <> H.sql (pgFmtAs fName jp alias)
++pgFmtSelectItem table (f@(fName, jp), Nothing, alias, _) = pgFmtField table f <> H.sql (pgFmtAs fName jp alias)
+ -- Ideally we'd quote the cast with "pgFmtIdent cast". However, that would invalidate common casts such as "int", "bigint", etc.
+ -- Try doing: `select 1::"bigint"` - it'll err, using "int8" will work though. There's some parser magic that pg does that's invalidated when quoting.
+ -- Not quoting should be fine, we validate the input on Parsers.
+-pgFmtSelectItem table (f@(fName, jp), Just cast, alias, _, _) = "CAST (" <> pgFmtField table f <> " AS " <> H.sql (encodeUtf8 cast) <> " )" <> H.sql (pgFmtAs fName jp alias)
++pgFmtSelectItem table (f@(fName, jp), Just cast, alias, _) = "CAST (" <> pgFmtField table f <> " AS " <> H.sql (encodeUtf8 cast) <> " )" <> H.sql (pgFmtAs fName jp alias)
+ 
+ pgFmtOrderTerm :: QualifiedIdentifier -> OrderTerm -> H.Snippet
+ pgFmtOrderTerm qi ot =
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index ebfd1079..4d71bbb4 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -61,11 +61,11 @@ import Protolude hiding (from)
+ -- | Builds the ReadRequest tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+-readRequest :: Schema -> TableName -> Maybe Integer -> JoinType -> [Relationship] -> ApiRequest -> Either Error ReadRequest
+-readRequest schema rootTableName maxRows defJoinType allRels apiRequest  =
++readRequest :: Schema -> TableName -> Maybe Integer -> [Relationship] -> ApiRequest -> Either Error ReadRequest
++readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange maxRows =<<
+-  augmentRequestWithJoin schema rootRels defJoinType =<<
++  augmentRequestWithJoin schema rootRels =<<
+   (addFiltersOrdersRanges apiRequest . initReadRequest rootName =<< pRequestSelect sel)
+   where
+     sel = fromMaybe "*" $ iSelect apiRequest -- default to all columns requested (SELECT *) for a non existent ?select querystring param
+@@ -100,16 +100,16 @@ initReadRequest rootQi =
+     rootDepth = 0
+     rootSchema = qiSchema rootQi
+     rootName = qiName rootQi
+-    initial = Node (Select [] rootQi Nothing [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, Nothing, rootDepth)) []
++    initial = Node (Select [] rootQi Nothing [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, rootDepth)) []
+     treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
+-    treeEntry depth (Node fld@((fn, _),_,alias, hint, joinType) fldForest) (Node (q, i) rForest) =
++    treeEntry depth (Node fld@((fn, _),_,alias, embedHint) fldForest) (Node (q, i) rForest) =
+       let nxtDepth = succ depth in
+       case fldForest of
+         [] -> Node (q {select=fld:select q}, i) rForest
+         _  -> Node (q, i) $
+               foldr (treeEntry nxtDepth)
+               (Node (Select [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] [] allRange,
+-                (fn, Nothing, alias, hint, joinType, nxtDepth)) [])
++                (fn, Nothing, alias, embedHint, nxtDepth)) [])
+               fldForest:rForest
+ 
+ -- | Enforces the `max-rows` config on the result
+@@ -119,26 +119,26 @@ treeRestrictRange maxRows request = pure $ nodeRestrictRange maxRows <$> request
+     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
+     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+ 
+-augmentRequestWithJoin :: Schema -> [Relationship] -> JoinType -> ReadRequest -> Either ApiRequestError ReadRequest
+-augmentRequestWithJoin schema allRels defJoinType request =
+-  addRels schema allRels Nothing defJoinType request
++augmentRequestWithJoin :: Schema -> [Relationship] -> ReadRequest -> Either ApiRequestError ReadRequest
++augmentRequestWithJoin schema allRels request =
++  addRels schema allRels Nothing request
+   >>= addJoinConditions Nothing
+ 
+-addRels :: Schema -> [Relationship] -> Maybe ReadRequest -> JoinType -> ReadRequest -> Either ApiRequestError ReadRequest
+-addRels schema allRels parentNode defJoinType (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
++addRels :: Schema -> [Relationship] -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
++addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, depth)) forest) =
+   case parentNode of
+     Just (Node (Select{from=parentNodeQi}, _) _) ->
+       let newFrom r = if qiName tbl == nodeName then tableQi (relForeignTable r) else tbl
+-          newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType <|> Just defJoinType, depth))) <$> rel
++          newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, Nothing, depth))) <$> rel
+           rel = findRel schema allRels (qiName parentNodeQi) nodeName hint
+       in
+       Node <$> newReadNode <*> (updateForest . hush $ Node <$> newReadNode <*> pure forest)
+     _ ->
+-      let rn = (query, (nodeName, Nothing, alias, Nothing, joinType, depth)) in
++      let rn = (query, (nodeName, Nothing, alias, Nothing, depth)) in
+       Node rn <$> updateForest (Just $ Node rn forest)
+   where
+     updateForest :: Maybe ReadRequest -> Either ApiRequestError [ReadRequest]
+-    updateForest rq = addRels schema allRels rq defJoinType `traverse` forest
++    updateForest rq = addRels schema allRels rq `traverse` forest
+ 
+ -- Finds a relationship between an origin and a target in the request:
+ -- /origin?select=target(*) If more than one relationship is found then the
+@@ -150,7 +150,7 @@ addRels schema allRels parentNode defJoinType (Node (query@Select{from=tbl}, (no
+ -- target = table / view / constraint / column-from-origin
+ -- hint   = table / view / constraint / column-from-origin / column-from-target
+ -- (hint can take table / view values to aid in finding the junction in an m2m relationship)
+-findRel :: Schema -> [Relationship] -> NodeName -> NodeName -> Maybe Hint -> Either ApiRequestError Relationship
++findRel :: Schema -> [Relationship] -> NodeName -> NodeName -> Maybe EmbedHint -> Either ApiRequestError Relationship
+ findRel schema allRels origin target hint =
+   case rel of
+     []  -> Left $ NoRelBetween origin target
+@@ -210,7 +210,7 @@ findRel schema allRels origin target hint =
+ 
+ -- previousAlias is only used for the case of self joins
+ addJoinConditions :: Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
+-addJoinConditions previousAlias (Node node@(query@Select{from=tbl}, nodeProps@(_, rel, _, _, _, depth)) forest) =
++addJoinConditions previousAlias (Node node@(query@Select{from=tbl}, nodeProps@(_, rel, _, _, depth)) forest) =
+   case rel of
+     Just r@Relationship{relCardinality=M2M Junction{junTable}} ->
+       let rq = augmentQuery r in
+@@ -307,7 +307,7 @@ addProperty f (targetNodeName:remainingPath, a) (Node rn forest) =
+     Nothing -> Node rn forest -- the property is silenty dropped in the Request does not contain the required path
+     Just tn -> Node rn (addProperty f (remainingPath, a) tn:delete tn forest)
+   where
+-    pathNode = find (\(Node (_,(nodeName,_,alias,_,_, _)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
++    pathNode = find (\(Node (_,(nodeName,_,alias,_,_)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
+ 
+ mutateRequest :: Schema -> TableName -> ApiRequest -> [FieldName] -> ReadRequest -> Either Error MutateRequest
+ mutateRequest schema tName apiRequest pkCols readReq = mapLeft ApiRequestError $
+@@ -379,7 +379,7 @@ returningCols rr@(Node _ forest) pkCols
+     -- projects.  So this adds the foreign key columns to ensure the embedding
+     -- succeeds, result would be `RETURNING name, client_id`.
+     fkCols = concat $ mapMaybe (\case
+-        Node (_, (_, Just Relationship{relColumns=cols}, _, _, _, _)) _ -> Just cols
++        Node (_, (_, Just Relationship{relColumns=cols}, _, _, _)) _ -> Just cols
+         _                                                        -> Nothing
+       ) forest
+     -- However if the "client_id" is present, e.g. mutateRequest to
+diff --git a/src/PostgREST/Request/Parsers.hs b/src/PostgREST/Request/Parsers.hs
+index ee480990..a73ea269 100644
+--- a/src/PostgREST/Request/Parsers.hs
++++ b/src/PostgREST/Request/Parsers.hs
+@@ -158,23 +158,13 @@ pRelationSelect :: Parser SelectItem
+ pRelationSelect = lexeme $ try ( do
+     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+     fld <- pField
+-    prm1 <- optionMaybe pEmbedParam
+-    prm2 <- optionMaybe pEmbedParam
+-    return (fld, Nothing, alias, embedParamHint prm1 <|> embedParamHint prm2, embedParamJoin prm1 <|> embedParamJoin prm2)
++    hint <- optionMaybe (
++        try ( char '!' *> pFieldName) <|>
++        -- deprecated, remove in next major version
++        try ( char '.' *> pFieldName)
++      )
++    return (fld, Nothing, alias, hint)
+   )
+-  where
+-    pEmbedParam :: Parser EmbedParam
+-    pEmbedParam =
+-      char '!' *> (
+-        try (string "left"  $> EPJoinType JTLeft)  <|>
+-        try (string "inner" $> EPJoinType JTInner) <|>
+-        try (EPHint <$> pFieldName))
+-    embedParamHint prm = case prm of
+-      Just (EPHint hint) -> Just hint
+-      _                  -> Nothing
+-    embedParamJoin prm = case prm of
+-      Just (EPJoinType jt) -> Just jt
+-      _                    -> Nothing
+ 
+ pFieldSelect :: Parser SelectItem
+ pFieldSelect = lexeme $
+@@ -183,11 +173,11 @@ pFieldSelect = lexeme $
+       alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
+       fld <- pField
+       cast' <- optionMaybe (string "::" *> many letter)
+-      return (fld, toS <$> cast', alias, Nothing, Nothing)
++      return (fld, toS <$> cast', alias, Nothing)
+   )
+   <|> do
+     s <- pStar
+-    return ((s, []), Nothing, Nothing, Nothing, Nothing)
++    return ((s, []), Nothing, Nothing, Nothing)
+ 
+ pOpExpr :: Parser SingleVal -> Parser OpExpr
+ pOpExpr pSVal = try ( string "not" *> pDelimiter *> (OpExpr True <$> pOperation)) <|> OpExpr False <$> pOperation
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 9c1a792d..a0f800d6 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -2,16 +2,14 @@
+ module PostgREST.Request.Types
+   ( Alias
+   , Depth
+-  , EmbedParam(..)
++  , EmbedHint
+   , EmbedPath
+   , Field
+   , Filter(..)
+-  , Hint
+   , CallQuery(..)
+   , CallParams(..)
+   , CallRequest
+   , JoinCondition(..)
+-  , JoinType(..)
+   , JsonOperand(..)
+   , JsonOperation(..)
+   , JsonPath
+@@ -56,7 +54,7 @@ type MutateRequest = MutateQuery
+ type CallRequest = CallQuery
+ 
+ type ReadNode =
+-  (ReadQuery, (NodeName, Maybe Relationship, Maybe Alias, Maybe Hint, Maybe JoinType, Depth))
++  (ReadQuery, (NodeName, Maybe Relationship, Maybe Alias, Maybe EmbedHint, Depth))
+ 
+ type NodeName = Text
+ type Depth = Integer
+@@ -142,27 +140,16 @@ data CallParams
+   | OnePosParam ProcParam -- ^ Call with positional params(only one supported): func(val)
+ 
+ -- | The select value in `/tbl?select=alias:field::cast`
+-type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe Hint, Maybe JoinType)
++type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe EmbedHint)
+ 
+ type Field = (FieldName, JsonPath)
+ type Cast = Text
+ type Alias = Text
+-type Hint = Text
+-
+-data EmbedParam
+-  -- | Disambiguates an embedding operation when there's multiple relationships
+-  -- between two tables. Can be the name of a foreign key constraint, column
+-  -- name or the junction in an m2m relationship.
+-  = EPHint Hint
+-  | EPJoinType JoinType
+-
+-data JoinType
+-  = JTInner
+-  | JTLeft
+-  deriving Eq
+-instance Show JoinType where
+-  show JTInner = "inner"
+-  show JTLeft  = "left"
++
++-- | Disambiguates an embedding operation when there's multiple relationships
++-- between two tables. Can be the name of a foreign key constraint, column
++-- name or the junction in an m2m relationship.
++type EmbedHint = Text
+ 
+ -- | Path of the embedded levels, e.g "clients.projects.name=eq.." gives Path
+ -- ["clients", "projects"]
+@@ -189,7 +176,7 @@ data JsonOperand
+ -- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
+ fstFieldNames :: ReadRequest -> [FieldName]
+ fstFieldNames (Node (sel, _) _) =
+-  fst . (\(f, _, _, _, _) -> f) <$> select sel
++  fst . (\(f, _, _, _) -> f) <$> select sel
+ 
+ 
+ -- | Boolean logic expression tree e.g. "and(name.eq.N,or(id.eq.1,id.eq.2))" is:
+diff --git a/test/Feature/EmbedDisambiguationSpec.hs b/test/Feature/EmbedDisambiguationSpec.hs
+index f3fa405c..9db3c3ea 100644
+--- a/test/Feature/EmbedDisambiguationSpec.hs
++++ b/test/Feature/EmbedDisambiguationSpec.hs
+@@ -423,6 +423,16 @@ spec =
+                  "refereeds":[]}]
+             }]|] { matchHeaders = [matchContentTypeJson] }
+ 
++    -- TODO Remove in next major version
++    describe "old dot '.' symbol, deprecated" $
++      it "still works" $ do
++        get "/clients?id=eq.1&select=id,projects:projects.client_id(id,tasks(id))" `shouldRespondWith`
++          [json|[{"id":1,"projects":[{"id":1,"tasks":[{"id":1},{"id":2}]},{"id":2,"tasks":[{"id":3},{"id":4}]}]}]|]
++          { matchHeaders = [matchContentTypeJson] }
++        get "/tasks?select=id,users:users.users_tasks(id)" `shouldRespondWith`
++          [json|[{"id":1,"users":[{"id":1},{"id":3}]},{"id":2,"users":[{"id":1}]},{"id":3,"users":[{"id":1}]},{"id":4,"users":[{"id":1}]},{"id":5,"users":[{"id":2},{"id":3}]},{"id":6,"users":[{"id":2}]},{"id":7,"users":[{"id":2}]},{"id":8,"users":[]}]|]
++          { matchHeaders = [matchContentTypeJson] }
++
+     context "m2m embed when there's a junction in an internal schema" $ do
+       -- https://github.com/PostgREST/postgrest/issues/1736
+       it "works with no ambiguity when there's an exposed view of the junction" $ do
+diff --git a/test/Feature/EmbedInnerJoinSpec.hs b/test/Feature/EmbedInnerJoinSpec.hs
+deleted file mode 100644
+index ad0bd5f8..00000000
+--- a/test/Feature/EmbedInnerJoinSpec.hs
++++ /dev/null
+@@ -1,260 +0,0 @@
+-module Feature.EmbedInnerJoinSpec where
+-
+-import Network.Wai (Application)
+-
+-import Test.Hspec
+-import Test.Hspec.Wai
+-import Test.Hspec.Wai.JSON
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec =
+-  describe "Embedding with an inner join" $ do
+-    context "many-to-one relationships" $ do
+-      it "ignores null embeddings while the default left join doesn't" $ do
+-        get "/projects?select=id,clients!inner(id)" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"clients":{"id":1}}, {"id":2,"clients":{"id":1}},
+-            {"id":3,"clients":{"id":2}}, {"id":4,"clients":{"id":2}}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/projects?select=id,clients!left(id)" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"clients":{"id":1}}, {"id":2,"clients":{"id":1}},
+-            {"id":3,"clients":{"id":2}}, {"id":4,"clients":{"id":2}},
+-            {"id":5,"clients":null}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when the embedded table is filtered" $ do
+-        get "/projects?select=id,clients!inner(id)&clients.id=eq.1" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"clients":{"id":1}},
+-            {"id":2,"clients":{"id":1}}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/projects?select=id,clients!inner(id)&clients.id=eq.2" `shouldRespondWith`
+-          [json|[
+-            {"id":3,"clients":{"id":2}},
+-            {"id":4,"clients":{"id":2}}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/projects?select=id,clients!inner(id)&clients.id=eq.0" `shouldRespondWith`
+-          [json|[]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when a two levels below embedded table is filtered" $ do
+-        get "/tasks?select=id,projects!inner(id,clients!inner(id))&projects.clients.id=eq.1" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"projects":{"id":1,"clients":{"id":1}}},
+-            {"id":2,"projects":{"id":1,"clients":{"id":1}}},
+-            {"id":3,"projects":{"id":2,"clients":{"id":1}}},
+-            {"id":4,"projects":{"id":2,"clients":{"id":1}}}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/tasks?select=id,projects!inner(id,clients!inner(id))&projects.clients.id=eq.2" `shouldRespondWith`
+-          [json|[
+-            {"id":5,"projects":{"id":3,"clients":{"id":2}}},
+-            {"id":6,"projects":{"id":3,"clients":{"id":2}}},
+-            {"id":7,"projects":{"id":4,"clients":{"id":2}}},
+-            {"id":8,"projects":{"id":4,"clients":{"id":2}}}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "only affects the source table rows if his direct embedding is an inner join" $
+-        get "/tasks?select=id,projects(id,clients!inner(id))&projects.clients.id=eq.2" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"projects":null},
+-            {"id":2,"projects":null},
+-            {"id":3,"projects":null},
+-            {"id":4,"projects":null},
+-            {"id":5,"projects":{"id":3,"clients":{"id":2}}},
+-            {"id":6,"projects":{"id":3,"clients":{"id":2}}},
+-            {"id":7,"projects":{"id":4,"clients":{"id":2}}},
+-            {"id":8,"projects":{"id":4,"clients":{"id":2}}}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "works with views" $
+-        get "/books?select=title,authors!inner(name)&authors.name=eq.George%20Orwell" `shouldRespondWith`
+-          [json| [{"title":"1984","authors":{"name":"George Orwell"}}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-    context "one-to-many relationships" $ do
+-      it "ignores empty array embeddings while the default left join doesn't" $ do
+-        get "/entities?select=id,child_entities!inner(id)" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"child_entities":[{"id":1}, {"id":2}, {"id":4}, {"id":5}]},
+-            {"id":2,"child_entities":[{"id":3}, {"id":6}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/entities?select=id,child_entities!left(id)" `shouldRespondWith`
+-          [json| [
+-            {"id":1,"child_entities":[{"id":1}, {"id":2}, {"id":4}, {"id":5}]},
+-            {"id":2,"child_entities":[{"id":3}, {"id":6}]},
+-            {"id":3,"child_entities":[]},
+-            {"id":4,"child_entities":[]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when the embedded table is filtered" $ do
+-        get "/entities?select=id,child_entities!inner(id)&child_entities.id=eq.1" `shouldRespondWith`
+-          [json|[{"id":1,"child_entities":[{"id":1}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/entities?select=id,child_entities!inner(id)&child_entities.id=eq.3" `shouldRespondWith`
+-          [json|[{"id":2,"child_entities":[{"id":3}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/entities?select=id,child_entities!inner(id)&child_entities.id=eq.0" `shouldRespondWith`
+-          [json|[]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when a two levels below embedded table is filtered" $ do
+-        get "/entities?select=id,child_entities!inner(id,grandchild_entities!inner(id))&child_entities.grandchild_entities.id=in.(1,5)"
+-          `shouldRespondWith`
+-          [json|[
+-            {
+-              "id": 1,
+-              "child_entities": [
+-                { "id": 1, "grandchild_entities": [ { "id": 1 } ] },
+-                { "id": 2, "grandchild_entities": [ { "id": 5 } ] }]
+-            }
+-          ]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/entities?select=id,child_entities!inner(id,grandchild_entities!inner(id))&child_entities.grandchild_entities.id=eq.2" `shouldRespondWith`
+-          [json|[
+-            {
+-              "id": 1,
+-              "child_entities": [
+-                { "id": 1, "grandchild_entities": [ { "id": 2 } ] } ]
+-            }
+-          ]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "only affects the source table rows if his direct embedding is an inner join" $
+-        get "/entities?select=id,child_entities!inner(id,grandchild_entities(id))&child_entities.grandchild_entities.id=eq.2" `shouldRespondWith`
+-          [json|[
+-            {
+-              "id": 1,
+-              "child_entities": [
+-                { "id": 1, "grandchild_entities": [ { "id": 2 } ] },
+-                { "id": 2, "grandchild_entities": [] },
+-                { "id": 4, "grandchild_entities": [] },
+-                { "id": 5, "grandchild_entities": [] } ]
+-            },
+-            {
+-              "id": 2,
+-              "child_entities": [
+-                { "id": 3, "grandchild_entities": [] },
+-                { "id": 6, "grandchild_entities": [] } ]
+-            }
+-          ]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "works with views" $
+-        get "/authors?select=*,books!inner(*)&books.title=eq.1984" `shouldRespondWith`
+-          [json| [{"id":1,"name":"George Orwell","books":[{"id":1,"title":"1984","publication_year":1949,"author_id":1}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-    context "many-to-many relationships" $ do
+-      it "ignores empty array embeddings while the default left join doesn't" $ do
+-        get "/products?select=id,suppliers!inner(id)" `shouldRespondWith`
+-          [json| [
+-            {"id":1,"suppliers":[{"id":1}, {"id":2}]},
+-            {"id":2,"suppliers":[{"id":1}, {"id":3}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/products?select=id,suppliers!left(id)" `shouldRespondWith`
+-          [json| [
+-            {"id":1,"suppliers":[{"id":1}, {"id":2}]},
+-            {"id":2,"suppliers":[{"id":1}, {"id":3}]},
+-            {"id":3,"suppliers":[]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when the embedded table is filtered" $ do
+-        get "/products?select=id,suppliers!inner(id)&suppliers.id=eq.2" `shouldRespondWith`
+-          [json| [{"id":1,"suppliers":[{"id":2}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/products?select=id,suppliers!inner(id)&suppliers.id=eq.3" `shouldRespondWith`
+-          [json| [{"id":2,"suppliers":[{"id":3}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/products?select=id,suppliers!inner(id)&suppliers.id=eq.0" `shouldRespondWith`
+-          [json| [] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "filters source tables when a two levels below embedded table is filtered" $ do
+-        get "/products?select=id,suppliers!inner(id,trade_unions!inner(id))&suppliers.trade_unions.id=eq.3"
+-          `shouldRespondWith`
+-          [json|[{"id":1,"suppliers":[{"id":2,"trade_unions":[{"id":3}]}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/products?select=id,suppliers!inner(id,trade_unions!inner(id))&suppliers.trade_unions.id=eq.4"
+-          `shouldRespondWith`
+-          [json|[{"id":1,"suppliers":[{"id":2,"trade_unions":[{"id":4}]}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "only affects the source table rows if his direct embedding is an inner join" $
+-        get "/products?select=id,suppliers!inner(id,trade_unions(id))&suppliers.trade_unions.id=eq.3" `shouldRespondWith`
+-          [json|[
+-            {"id":1,"suppliers":[{"id":1,"trade_unions":[]}, {"id":2,"trade_unions":[{"id":3}]}]},
+-            {"id":2,"suppliers":[{"id":1,"trade_unions":[]}, {"id":3,"trade_unions":[]}]}]|]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-      it "works with views" $ do
+-        get "/actors?select=*,films!inner(*)&films.title=eq.douze%20commandements" `shouldRespondWith`
+-          [json| [{"id":1,"name":"john","films":[{"id":12,"title":"douze commandements"}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-        get "/films?select=*,actors!inner(*)&actors.name=eq.john" `shouldRespondWith`
+-          [json| [{"id":12,"title":"douze commandements","actors":[{"id":1,"name":"john"}]}] |]
+-          { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works with m2o and m2m relationships combined" $
+-      get "/projects?select=name,clients!inner(name),users!inner(name)" `shouldRespondWith`
+-        [json| [
+-          {"name":"Windows 7","clients":{"name":"Microsoft"},"users":[{"name":"Angela Martin"}, {"name":"Dwight Schrute"}]},
+-          {"name":"Windows 10","clients":{"name":"Microsoft"},"users":[{"name":"Angela Martin"}]},
+-          {"name":"IOS","clients":{"name":"Apple"},"users":[{"name":"Michael Scott"}, {"name":"Dwight Schrute"}]},
+-          {"name":"OSX","clients":{"name":"Apple"},"users":[{"name":"Michael Scott"}]}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works with rpc" $
+-      get "/rpc/getallprojects?select=id,clients!inner(id)&clients.id=eq.1" `shouldRespondWith`
+-        [json| [{"id":1,"clients":{"id":1}}, {"id":2,"clients":{"id":1}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works when using hints" $ do
+-      get "/projects?select=id,clients!client!inner(id)&clients.id=eq.2" `shouldRespondWith`
+-        [json| [{"id":3,"clients":{"id":2}}, {"id":4,"clients":{"id":2}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-      get "/projects?select=id,client!inner(id)&client.id=eq.2" `shouldRespondWith`
+-        [json| [{"id":3,"client":{"id":2}}, {"id":4,"client":{"id":2}}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-notDefaultConfig :: SpecWith ((), Application)
+-notDefaultConfig =
+-  describe "Embedding with a default inner join(db-embed-default-join = 'inner')" $ do
+-    it "works on many-to-one relationships" $
+-      get "/tasks?select=id,projects(id,clients(id))&projects.clients.id=eq.1" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"projects":{"id":1,"clients":{"id":1}}},
+-          {"id":2,"projects":{"id":1,"clients":{"id":1}}},
+-          {"id":3,"projects":{"id":2,"clients":{"id":1}}},
+-          {"id":4,"projects":{"id":2,"clients":{"id":1}}}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works on one-to-many relationships" $
+-      get "/entities?select=id,child_entities(id,grandchild_entities(id))&child_entities.grandchild_entities.id=in.(1,5)"
+-        `shouldRespondWith`
+-        [json|[
+-          {
+-            "id": 1,
+-            "child_entities": [
+-              { "id": 1, "grandchild_entities": [ { "id": 1 } ] },
+-              { "id": 2, "grandchild_entities": [ { "id": 5 } ] }]
+-          }
+-        ]|]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "works on many-to-many relationships" $
+-      get "/products?select=id,suppliers(id,trade_unions(id))&suppliers.trade_unions.id=eq.3"
+-        `shouldRespondWith`
+-        [json|[{"id":1,"suppliers":[{"id":2,"trade_unions":[{"id":3}]}]}] |]
+-        { matchHeaders = [matchContentTypeJson] }
+-
+-    it "can restore default left join behavior" $
+-      get "/projects?select=id,clients!left(id)" `shouldRespondWith`
+-        [json|[
+-          {"id":1,"clients":{"id":1}}, {"id":2,"clients":{"id":1}},
+-          {"id":3,"clients":{"id":2}}, {"id":4,"clients":{"id":2}},
+-          {"id":5,"clients":null}]|]
+-        { matchHeaders = [matchContentTypeJson] }
+diff --git a/test/Main.hs b/test/Main.hs
+index f5f7822a..385b7637 100644
+--- a/test/Main.hs
++++ b/test/Main.hs
+@@ -30,7 +30,6 @@ import qualified Feature.CorsSpec
+ import qualified Feature.DeleteSpec
+ import qualified Feature.DisabledOpenApiSpec
+ import qualified Feature.EmbedDisambiguationSpec
+-import qualified Feature.EmbedInnerJoinSpec
+ import qualified Feature.ExtraSearchPathSpec
+ import qualified Feature.HtmlRawOutputSpec
+ import qualified Feature.IgnorePrivOpenApiSpec
+@@ -95,7 +94,6 @@ main = do
+ 
+   let withApp              = app testCfg
+       maxRowsApp           = app testMaxRowsCfg
+-      embedInnerJoinApp    = app testEmbedInnerJoinCfg
+       disabledOpenApi      = app testDisabledOpenApiCfg
+       proxyApp             = app testProxyCfg
+       noJwtApp             = app testCfgNoJWT
+@@ -127,7 +125,6 @@ main = do
+         , ("Feature.CorsSpec"                , Feature.CorsSpec.spec)
+         , ("Feature.DeleteSpec"              , Feature.DeleteSpec.spec)
+         , ("Feature.EmbedDisambiguationSpec" , Feature.EmbedDisambiguationSpec.spec)
+-        , ("Feature.EmbedInnerJoinSpec"      , Feature.EmbedInnerJoinSpec.spec)
+         , ("Feature.InsertSpec"              , Feature.InsertSpec.spec actualPgVersion)
+         , ("Feature.JsonOperatorSpec"        , Feature.JsonOperatorSpec.spec actualPgVersion)
+         , ("Feature.OpenApiSpec"             , Feature.OpenApiSpec.spec actualPgVersion)
+@@ -210,10 +207,6 @@ main = do
+     parallel $ before multipleSchemaApp $
+       describe "Feature.MultipleSchemaSpec" $ Feature.MultipleSchemaSpec.spec actualPgVersion
+ 
+-    -- this test runs with db-embed-default-join = inner
+-    before embedInnerJoinApp $
+-      describe "Feature.EmbedInnerJoinSpecNotDefaultConfig" Feature.EmbedInnerJoinSpec.notDefaultConfig
+-
+     -- Note: the rollback tests can not run in parallel, because they test persistance and
+     -- this results in race conditions
+ 
+diff --git a/test/SpecHelper.hs b/test/SpecHelper.hs
+index 290efc81..b325e1b7 100644
+--- a/test/SpecHelper.hs
++++ b/test/SpecHelper.hs
+@@ -28,7 +28,6 @@ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..),
+                                           parseSecret)
+ import PostgREST.DbStructure.Identifiers (QualifiedIdentifier (..))
+-import PostgREST.Request.Types           (JoinType (..))
+ import Protolude                         hiding (toS)
+ import Protolude.Conv                    (toS)
+ 
+@@ -90,7 +89,6 @@ _baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbSchemas             = fromList ["test"]
+   , configDbConfig              = False
+   , configDbUri                 = mempty
+-  , configDbEmbedDefaultJoin    = JTLeft
+   , configFilePath              = Nothing
+   , configJWKS                  = parseSecret <$> secret
+   , configJwtAudience           = Nothing
+@@ -127,9 +125,6 @@ testUnicodeCfg testDbConn = (testCfg testDbConn) { configDbSchemas = fromList ["
+ testMaxRowsCfg :: Text -> AppConfig
+ testMaxRowsCfg testDbConn = (testCfg testDbConn) { configDbMaxRows = Just 2 }
+ 
+-testEmbedInnerJoinCfg :: Text -> AppConfig
+-testEmbedInnerJoinCfg testDbConn = (testCfg testDbConn) { configDbEmbedDefaultJoin = JTInner }
+-
+ testDisabledOpenApiCfg :: Text -> AppConfig
+ testDisabledOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OADisabled }
+ 
+diff --git a/test/fixtures/data.sql b/test/fixtures/data.sql
+index 142cc01a..5104c177 100644
+--- a/test/fixtures/data.sql
++++ b/test/fixtures/data.sql
+@@ -691,19 +691,4 @@ DO $do$BEGIN
+     INSERT INTO test.reference_to_partitioned(id) VALUES (1);
+     INSERT INTO test.reference_to_partitioned(id, id_a, name_a) VALUES (2, 2, 'first');
+   END IF;
+-END$do$;
+-
+-TRUNCATE TABLE test.products CASCADE;
+-INSERT INTO test.products (id, name) VALUES (1,'product-1'), (2,'product-2'), (3,'product-3');
+-
+-TRUNCATE TABLE test.suppliers CASCADE;
+-INSERT INTO test.suppliers (id, name) VALUES (1,'supplier-1'), (2,'supplier-2'), (3, 'supplier-3');
+-
+-TRUNCATE TABLE test.products_suppliers CASCADE;
+-INSERT INTO test.products_suppliers (product_id, supplier_id) VALUES (1,1), (1,2), (2,1), (2,3);
+-
+-TRUNCATE TABLE test.trade_unions CASCADE;
+-INSERT INTO test.trade_unions (id, name) VALUES (1,'union-1'), (2,'union-2'), (3, 'union-3'), (4, 'union-4');
+-
+-TRUNCATE TABLE test.suppliers_trade_unions CASCADE;
+-INSERT INTO test.suppliers_trade_unions (supplier_id, trade_union_id) VALUES (1,1), (1,2), (2,3), (2,4);
+\ No newline at end of file
++END$do$;
+\ No newline at end of file
+diff --git a/test/fixtures/privileges.sql b/test/fixtures/privileges.sql
+index 82843388..187106dc 100644
+--- a/test/fixtures/privileges.sql
++++ b/test/fixtures/privileges.sql
+@@ -151,11 +151,6 @@ GRANT ALL ON TABLE
+     , schauspieler
+     , filme
+     , rollen
+-    , products
+-    , suppliers
+-    , products_suppliers
+-    , trade_unions
+-    , suppliers_trade_unions
+ TO postgrest_test_anonymous;
+ 
+ GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
+diff --git a/test/fixtures/schema.sql b/test/fixtures/schema.sql
+index 3768c64b..c77d7fe9 100644
+--- a/test/fixtures/schema.sql
++++ b/test/fixtures/schema.sql
+@@ -2284,30 +2284,3 @@ $$ language sql;
+ create or replace function test.overloaded_unnamed_param(x int, y int) returns int as $$
+   select x + y;
+ $$ language sql;
+-
+-create table products(
+-  id int primary key
+-, name text
+-);
+-
+-create table suppliers(
+-  id int primary key
+-, name text
+-);
+-
+-create table products_suppliers(
+-  product_id int references products(id),
+-  supplier_id int references suppliers(id),
+-  primary key (product_id, supplier_id)
+-);
+-
+-create table trade_unions(
+-  id int primary key
+-, name text
+-);
+-
+-create table suppliers_trade_unions(
+-  supplier_id int references suppliers(id),
+-  trade_union_id int references trade_unions(id),
+-  primary key (supplier_id, trade_union_id)
+-);
+\ No newline at end of file
+diff --git a/test/io-tests/configs/expected/aliases.config b/test/io-tests/configs/expected/aliases.config
+index 5630c775..bff40f09 100644
+--- a/test/io-tests/configs/expected/aliases.config
++++ b/test/io-tests/configs/expected/aliases.config
+@@ -12,7 +12,6 @@ db-schemas = "provided_through_alias"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
+-db-embed-default-join = "left"
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"aliased\""
+ jwt-secret = ""
+diff --git a/test/io-tests/configs/expected/boolean-numeric.config b/test/io-tests/configs/expected/boolean-numeric.config
+index a87effad..38ed48e5 100644
+--- a/test/io-tests/configs/expected/boolean-numeric.config
++++ b/test/io-tests/configs/expected/boolean-numeric.config
+@@ -12,7 +12,6 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
+-db-embed-default-join = "left"
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io-tests/configs/expected/boolean-string.config b/test/io-tests/configs/expected/boolean-string.config
+index a87effad..38ed48e5 100644
+--- a/test/io-tests/configs/expected/boolean-string.config
++++ b/test/io-tests/configs/expected/boolean-string.config
+@@ -12,7 +12,6 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
+-db-embed-default-join = "left"
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io-tests/configs/expected/defaults.config b/test/io-tests/configs/expected/defaults.config
+index 26ce87c0..e7a072f1 100644
+--- a/test/io-tests/configs/expected/defaults.config
++++ b/test/io-tests/configs/expected/defaults.config
+@@ -12,7 +12,6 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
+-db-embed-default-join = "left"
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+index 2ebbc007..78bb1659 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -12,7 +12,6 @@ db-schemas = "test,other_tenant1,other_tenant2"
+ db-config = "true"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "<REPLACED_WITH_DB_URI>"
+-db-embed-default-join = "inner"
+ jwt-aud = "https://otherexample.org"
+ jwt-role-claim-key = ".\"other\".\"role\""
+ jwt-secret = "ODERREALLYREALLYREALLYREALLYVERYSAFE"
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db.config b/test/io-tests/configs/expected/no-defaults-with-db.config
+index cf112f4e..7c615a0c 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db.config
+@@ -12,7 +12,6 @@ db-schemas = "test,tenant1,tenant2"
+ db-config = "true"
+ db-tx-end = "commit-allow-override"
+ db-uri = "<REPLACED_WITH_DB_URI>"
+-db-embed-default-join = "inner"
+ jwt-aud = "https://example.org"
+ jwt-role-claim-key = ".\"a\".\"role\""
+ jwt-secret = "OVERRIDEREALLYREALLYREALLYREALLYVERYSAFE"
+diff --git a/test/io-tests/configs/expected/no-defaults.config b/test/io-tests/configs/expected/no-defaults.config
+index 1bdbb156..a675c7ef 100644
+--- a/test/io-tests/configs/expected/no-defaults.config
++++ b/test/io-tests/configs/expected/no-defaults.config
+@@ -12,7 +12,6 @@ db-schemas = "multi,tenant,setup"
+ db-config = "false"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
+-db-embed-default-join = "inner"
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".\"user\"[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+diff --git a/test/io-tests/configs/expected/types.config b/test/io-tests/configs/expected/types.config
+index e4be8133..4d2df4d2 100644
+--- a/test/io-tests/configs/expected/types.config
++++ b/test/io-tests/configs/expected/types.config
+@@ -12,7 +12,6 @@ db-schemas = "required"
+ db-config = "true"
+ db-tx-end = "commit"
+ db-uri = "required"
+-db-embed-default-join = "left"
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+diff --git a/test/io-tests/configs/no-defaults-env.yaml b/test/io-tests/configs/no-defaults-env.yaml
+index 9cafc5fb..6fab3ac5 100644
+--- a/test/io-tests/configs/no-defaults-env.yaml
++++ b/test/io-tests/configs/no-defaults-env.yaml
+@@ -14,7 +14,6 @@ PGRST_DB_SCHEMAS: multi,   tenant,setup
+ PGRST_DB_CONFIG: false
+ PGRST_DB_TX_END: rollback-allow-override
+ PGRST_DB_URI: tmp_db
+-PGRST_DB_EMBED_DEFAULT_JOIN: inner
+ PGRST_JWT_AUD: 'https://postgrest.org'
+ PGRST_JWT_ROLE_CLAIM_KEY: '.user[0]."real-role"'
+ PGRST_JWT_SECRET: c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5
+diff --git a/test/io-tests/configs/no-defaults.config b/test/io-tests/configs/no-defaults.config
+index 2a83b8ce..f2b107b6 100644
+--- a/test/io-tests/configs/no-defaults.config
++++ b/test/io-tests/configs/no-defaults.config
+@@ -12,7 +12,6 @@ db-schemas = "multi,   tenant,setup"
+ db-config = "false"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
+-db-embed-default-join = "inner"
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".user[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+diff --git a/test/io-tests/fixtures.yaml b/test/io-tests/fixtures.yaml
+index 7db1771f..7e28bc88 100644
+--- a/test/io-tests/fixtures.yaml
++++ b/test/io-tests/fixtures.yaml
+@@ -179,8 +179,3 @@ invalidopenapimodes:
+   - 'follow-'
+   - 'ignore-'
+   - '.#$$%&$%/'
+-
+-invalidjointypes:
+-  - 'left!'
+-  - 'right'
+-  - '.#$$%&$%/'
+diff --git a/test/io-tests/test_io.py b/test/io-tests/test_io.py
+index 6ee92fd1..94ff66a9 100644
+--- a/test/io-tests/test_io.py
++++ b/test/io-tests/test_io.py
+@@ -440,21 +440,6 @@ def test_invalid_openapi_mode(invalidopenapimodes, defaultenv):
+                 print(line)
+ 
+ 
+-@pytest.mark.parametrize("invalidjointypes", FIXTURES["invalidjointypes"])
+-def test_invalid_db_embed_default_join(invalidjointypes, defaultenv):
+-    "Given an invalid db-embed-default-join, Postgrest should exit with a non-zero exit code."
+-    env = {
+-        **defaultenv,
+-        "PGRST_DB_EMBED_DEFAULT_JOIN": invalidjointypes,
+-    }
+-
+-    with pytest.raises(PostgrestError):
+-        dump = dumpconfig(CONFIGSDIR / "defaults.config", env=env)
+-        for line in dump.split("\n"):
+-            if line.startswith("db-embed-default-join"):
+-                print(line)
+-
+-
+ def test_iat_claim(defaultenv):
+     """
+     A claim with an 'iat' (issued at) attribute should be successful.

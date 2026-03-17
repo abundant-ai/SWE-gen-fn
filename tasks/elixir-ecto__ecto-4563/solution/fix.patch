@@ -1,0 +1,146 @@
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index d831c28f..20ed4fe2 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -480,20 +480,36 @@ defmodule Ecto.Query.API do
+   def fragment(fragments), do: doc!([fragments])
+ 
+   @doc """
+-  Allows a literal identifier or number to be injected into a fragment:
++  Allows a dynamic identifier to be injected into a fragment:
+ 
+       collation = "es_ES"
+-      fragment("? COLLATE ?", ^name, literal(^collation))
++      select("posts", [p], fragment("? COLLATE ?", p.title, identifier(^"es_ES")))
++
++  The example above will inject the value of `collation` directly
++  into the query instead of treating it as a query parameter. It will
++  generate a query such as `SELECT p0.title COLLATE "es_ES" FROM "posts" AS p0`
++  as opposed to `SELECT p0.title COLLATE $1 FROM "posts" AS p0`.
++
++  Note that each different value of `collation` will emit a different query,
++  which will be independently prepared and cached.
++  """
++  def identifier(binary), do: doc!([binary])
++
++  @doc """
++  Allows a dynamic string or number to be injected into a fragment:
+ 
+       limit = 10
+-      limit(query, fragment("?", literal(^limit)))
++      "posts" |> select([p], p.title) |> limit(fragment("?", constant(^limit)))
++
++  The example above will inject the value of `limit` directly
++  into the query instead of treating it as a query parameter. It will
++  generate a query such as `SELECT p0.title FROM "posts" AS p0 LIMIT 1`
++  as opposed to `SELECT p0.title FROM "posts" AS p0` LIMIT $1`.
+ 
+-  The example above will inject `collation` and `limit` into the queries as
+-  literals instead of query parameters. Note that each different value passed
+-  to `literal/1` will emit a different query, which will be independently prepared
+-  and cached.
++  Note that each different value of `limit` will emit a different query,
++  which will be independently prepared and cached.
+   """
+-  def literal(literal), do: doc!([literal])
++  def constant(value), do: doc!([value])
+ 
+   @doc """
+   Allows a list argument to be spliced into a fragment.
+@@ -507,7 +523,7 @@ defmodule Ecto.Query.API do
+   You may only splice runtime values. For example, this would not work because
+   query bindings are compile-time constructs:
+ 
+-      from p in Post, where: fragment("concat(?)", splice(^[p.count, " ", "count"])
++      from p in Post, where: fragment("concat(?)", splice(^[p.count, " ", "count"]))
+   """
+   def splice(list), do: doc!([list])
+ 
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index 6d40a4a3..f1e3256b 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -751,16 +751,45 @@ defmodule Ecto.Query.Builder do
+     )
+   end
+ 
+-  defp escape_fragment({:literal, _meta, [expr]}, params_acc, _vars, _env) do
++  defp escape_fragment({:literal, meta, [expr]}, params_acc, vars, env) do
++    env =
++      case env do
++        {env, _fun} -> env
++        env -> env
++      end
++
++    IO.warn(
++      "`literal/1` is deprecated. Please use `identifier/1` instead.",
++      Macro.Env.stacktrace(env)
++    )
++
++    escape_fragment({:identifier, meta, [expr]}, params_acc, vars, env)
++  end
++
++  defp escape_fragment({:identifier, _meta, [expr]}, params_acc, _vars, _env) do
++    case expr do
++      {:^, _, [expr]} ->
++        checked = quote do: Ecto.Query.Builder.identifier!(unquote(expr))
++        escaped = {:{}, [], [:identifier, [], [checked]]}
++        {escaped, params_acc}
++
++      _ ->
++        error!(
++          "identifier/1 in fragment expects an interpolated value, such as identifier(^value), got `#{Macro.to_string(expr)}`"
++        )
++    end
++  end
++
++  defp escape_fragment({:constant, _meta, [expr]}, params_acc, _vars, _env) do
+     case expr do
+       {:^, _, [expr]} ->
+-        checked = quote do: Ecto.Query.Builder.literal!(unquote(expr))
+-        escaped = {:{}, [], [:literal, [], [checked]]}
++        checked = quote do: Ecto.Query.Builder.constant!(unquote(expr))
++        escaped = {:{}, [], [:constant, [], [checked]]}
+         {escaped, params_acc}
+ 
+       _ ->
+         error!(
+-          "literal/1 in fragment expects an interpolated value, such as literal(^value), got `#{Macro.to_string(expr)}`"
++          "constant/1 in fragment expects an interpolated value, such as constant(^value), got `#{Macro.to_string(expr)}`"
+         )
+     end
+   end
+@@ -1254,14 +1283,27 @@ defmodule Ecto.Query.Builder do
+   end
+ 
+   @doc """
+-  Called by escaper at runtime to verify literal in fragments.
++  Called by escaper at runtime to verify identifier in fragments.
+   """
+-  def literal!(literal) when is_binary(literal), do: literal
+-  def literal!(literal) when is_number(literal), do: literal
++  def identifier!(identifier) do
++    if is_binary(identifier) do
++      identifier
++    else
++      raise ArgumentError,
++            "identifier(^value) expects `value` to be a string, got `#{inspect(identifier)}`"
++    end
++  end
+ 
+-  def literal!(literal) do
+-    raise ArgumentError,
+-          "literal(^value) expects `value` to be a string or a number, got `#{inspect(literal)}`"
++  @doc """
++  Called by escaper at runtime to verify constant in fragments.
++  """
++  def constant!(constant) do
++    if is_binary(constant) or is_number(constant) do
++      constant
++    else
++      raise ArgumentError,
++            "constant(^value) expects `value` to be a string or a number, got `#{inspect(constant)}`"
++    end
+   end
+ 
+   @doc """

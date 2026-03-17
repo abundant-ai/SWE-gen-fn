@@ -1,0 +1,172 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index 310fb8c2..c6214eed 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -87,7 +87,7 @@ library
+                     , hasql-dynamic-statements  == 0.3.1
+                     , hasql-notifications       >= 0.1 && < 0.3
+                     , hasql-pool                >= 0.5 && < 0.6
+-                    , hasql-transaction         >= 0.7.2 && < 1.1
++                    , hasql-transaction         >= 1.0.1 && < 1.1
+                     , heredoc                   >= 0.2 && < 0.3
+                     , http-types                >= 0.12.2 && < 0.13
+                     , insert-ordered-containers >= 0.2.2 && < 0.3
+@@ -214,7 +214,7 @@ test-suite spec
+                     , contravariant     >= 1.4 && < 1.6
+                     , hasql             >= 1.4 && < 1.5
+                     , hasql-pool        >= 0.5 && < 0.6
+-                    , hasql-transaction >= 0.7.2 && < 1.1
++                    , hasql-transaction >= 1.0.1 && < 1.1
+                     , heredoc           >= 0.2 && < 0.3
+                     , hspec             >= 2.3 && < 2.8
+                     , hspec-wai         >= 0.10 && < 0.12
+@@ -259,7 +259,7 @@ test-suite spec-querycost
+                      , hasql             >= 1.4 && < 1.5
+                      , hasql-dynamic-statements  == 0.3.1
+                      , hasql-pool        >= 0.5 && < 0.6
+-                     , hasql-transaction >= 0.7.2 && < 1.1
++                     , hasql-transaction >= 1.0.1 && < 1.1
+                      , heredoc           >= 0.2 && < 0.3
+                      , hspec             >= 2.3 && < 2.8
+                      , hspec-wai         >= 0.10 && < 0.12
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 8426ef2e..18c96c6b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -190,14 +190,15 @@ postgrestResponse conf maybeDbStructure jsonDbS pgVer pool time req = do
+     handleReq apiReq =
+       handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+-  runDbHandler pool (txMode apiRequest) jwtClaims .
++  runDbHandler pool (txMode apiRequest) jwtClaims (configDbPreparedStatements conf) .
+     Middleware.optionalRollback conf apiRequest $
+       Middleware.runPgLocals conf jwtClaims handleReq apiRequest jsonDbS
+ 
+-runDbHandler :: SQL.Pool -> SQL.Mode -> Auth.JWTClaims -> DbHandler a -> Handler IO a
+-runDbHandler pool mode jwtClaims handler = do
++runDbHandler :: SQL.Pool -> SQL.Mode -> Auth.JWTClaims -> Bool -> DbHandler a -> Handler IO a
++runDbHandler pool mode jwtClaims prepared handler = do
+   dbResp <-
+-    lift . SQL.use pool . SQL.transaction SQL.ReadCommitted mode $ runExceptT handler
++    let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
++    lift . SQL.use pool . transaction SQL.ReadCommitted mode $ runExceptT handler
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 503323b2..64539ea7 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -54,8 +54,9 @@ dumpSchema :: AppState -> IO LBS.ByteString
+ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
++    let transaction = if configDbPreparedStatements then HT.transaction else HT.unpreparedTransaction in
+     P.use (AppState.getPool appState) $
+-      HT.transaction HT.ReadCommitted HT.Read $
++      transaction HT.ReadCommitted HT.Read $
+         queryDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 24cc3d47..fa6f48a5 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -25,9 +25,10 @@ queryPgVersion = H.statement mempty $ H.Statement sql HE.noParams versionRow Fal
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+ 
+-queryDbSettings :: P.Pool -> IO (Either P.UsageError [(Text, Text)])
+-queryDbSettings pool =
+-  P.use pool . HT.transaction HT.ReadCommitted HT.Read $
++queryDbSettings :: P.Pool -> Bool -> IO (Either P.UsageError [(Text, Text)])
++queryDbSettings pool prepared =
++  let transaction = if prepared then HT.transaction else HT.unpreparedTransaction in
++  P.use pool . transaction HT.ReadCommitted HT.Read $
+     HT.statement mempty dbSettingsStatement
+ 
+ -- | Get db settings from the connection role. Global settings will be overridden by database specific settings.
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index de5708ee..dc14ddec 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -239,8 +239,22 @@ checkIsFatal (PgError _ (P.ConnectionError e))
+   | otherwise = Nothing
+   where isAuthFailureMessage = "FATAL:  password authentication failed" `isPrefixOf` toS failureMessage
+         failureMessage = fromMaybe mempty e
+--- Chek for a syntax error(42601 is the pg code). This would mean the error is on our part somehow, so we treat it as fatal.
+-checkIsFatal (PgError _ (P.SessionError (H.QueryError _ _ (H.ResultError (H.ServerError "42601" e _ _))))) = Just $ toS e
++checkIsFatal (PgError _ (P.SessionError (H.QueryError _ _ (H.ResultError serverError))))
++  = case serverError of
++      -- Check for a syntax error (42601 is the pg code). This would mean the error is on our part somehow, so we treat it as fatal.
++      H.ServerError "42601" _ _ _
++        -> Just "Hint: This is probably a bug in PostgREST, please report it at https://github.com/PostgREST/postgrest/issues"
++      -- Check for a "prepared statement <name> already exists" error (Code 42P05: duplicate_prepared_statement).
++      -- This would mean that a connection pooler in transaction mode is being used
++      -- while prepared statements are enabled in the PostgREST configuration,
++      -- both of which are incompatible with each other.
++      H.ServerError "42P05" _ _ _
++        -> Just "Hint: If you are using connection poolers in transaction mode, try setting db-prepared-statements to false."
++      -- Check for a "transaction blocks not allowed in statement pooling mode" error (Code 08P01: protocol_violation).
++      -- This would mean that a connection pooler in statement mode is being used which is not supported in PostgREST.
++      H.ServerError "08P01" "transaction blocks not allowed in statement pooling mode" _ _
++        -> Just "Hint: Connection poolers in statement mode are not supported."
++      _ -> Nothing
+ checkIsFatal _ = Nothing
+ 
+ 
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index a298244f..c282bb54 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -151,7 +151,8 @@ loadSchemaCache :: AppState -> IO SCacheStatus
+ loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
+-    P.use (AppState.getPool appState) . HT.transaction HT.ReadCommitted HT.Read $
++    let transaction = if configDbPreparedStatements then HT.transaction else HT.unpreparedTransaction in
++    P.use (AppState.getPool appState) . transaction HT.ReadCommitted HT.Read $
+       queryDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
+   case result of
+     Left e -> do
+@@ -159,12 +160,10 @@ loadSchemaCache appState = do
+         err = PgError False e
+         putErr = AppState.logWithZTime appState . toS $ errorPayload err
+       case checkIsFatal err of
+-        Just _  -> do
++        Just hint -> do
+           AppState.logWithZTime appState "A fatal error ocurred when loading the schema cache"
+           putErr
+-          AppState.logWithZTime appState $
+-            "This is probably a bug in PostgREST, please report it at "
+-            <> "https://github.com/PostgREST/postgrest/issues"
++          AppState.logWithZTime appState hint
+           return SCFatalFail
+         Nothing -> do
+           AppState.logWithZTime appState "An error ocurred when loading the schema cache"
+@@ -229,12 +228,21 @@ reReadConfig startingUp appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   dbSettings <-
+     if configDbConfig then do
+-      qDbSettings <- queryDbSettings $ AppState.getPool appState
++      qDbSettings <- queryDbSettings (AppState.getPool appState) configDbPreparedStatements
+       case qDbSettings of
+         Left e -> do
+-          AppState.logWithZTime appState $
+-            "An error ocurred when trying to query database settings for the config parameters:\n"
+-            <> show e
++          let
++            err = PgError False e
++            putErr = AppState.logWithZTime appState . toS $ errorPayload err
++          AppState.logWithZTime appState
++            "An error ocurred when trying to query database settings for the config parameters"
++          case checkIsFatal err of
++            Just hint -> do
++              putErr
++              AppState.logWithZTime appState hint
++              killThread (AppState.getMainThreadId appState)
++            Nothing -> do
++              AppState.logWithZTime appState $ show e
+           pure []
+         Right x -> pure x
+     else

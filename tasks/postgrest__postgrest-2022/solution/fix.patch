@@ -1,0 +1,141 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 27893bf0..de41d1c7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,6 +30,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1857, Make GUC names for headers, cookies and jwt claims compatible with PostgreSQL v14 - @laurenceisla, @robertsosinski
+    + Getting the value for a header GUC on PostgreSQL 14 is done using `current_setting('request.headers')::json->>'name-of-header'` and in a similar way for `request.cookies` and `request.jwt.claims`
+    + PostgreSQL versions below 14 can opt in to the new JSON GUCs by setting the `db-use-legacy-gucs` config option to false (true by default)
++ - #1783, Partitions (created using `PARTITION OF`) are no longer included in the schema cache. - @laurenceisla
+ 
+ ## [8.0.0] - 2021-07-25
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index e828ccc1..922306d9 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -462,12 +462,12 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       (if invMethod == InvHead then mempty else LBS.fromStrict body)
+ 
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+-handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest _) = do
++handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest ctxPgVersion) = do
+   body <-
+     lift $ case configOpenApiMode of
+       OAFollowPriv ->
+         OpenAPI.encode conf dbStructure
+-           <$> SQL.statement tSchema (DbStructure.accessibleTables configDbPreparedStatements)
++           <$> SQL.statement tSchema (DbStructure.accessibleTables ctxPgVersion configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+       OAIgnorePriv ->
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 65d868d0..95346e20 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -53,6 +53,7 @@ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+ dumpSchema :: AppState -> IO LBS.ByteString
+ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
++  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) $
+@@ -60,6 +61,7 @@ dumpSchema appState = do
+         queryDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
++          actualPgVersion
+           configDbPreparedStatements
+   SQL.release $ AppState.getPool appState
+   case result of
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 5fbb88a8..87b48c8c 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -41,6 +41,7 @@ import Data.Set                      as S (fromList)
+ import Data.Text                     (split)
+ import Text.InterpolatedString.Perl6 (q)
+ 
++import PostgREST.Config.PgVersion         (PgVersion, pgVersion100)
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..),
+                                            Schema, TableName)
+ import PostgREST.DbStructure.Proc         (PgType (..),
+@@ -82,10 +83,10 @@ type ViewColumn = Column
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
+-queryDbStructure :: [Schema] -> [Schema] -> Bool -> SQL.Transaction DbStructure
+-queryDbStructure schemas extraSearchPath prepared = do
++queryDbStructure :: [Schema] -> [Schema] -> PgVersion -> Bool -> SQL.Transaction DbStructure
++queryDbStructure schemas extraSearchPath pgVer prepared = do
+   SQL.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+-  tabs    <- SQL.statement mempty $ allTables prepared
++  tabs    <- SQL.statement mempty $ allTables pgVer prepared
+   cols    <- SQL.statement schemas $ allColumns tabs prepared
+   srcCols <- SQL.statement (schemas, extraSearchPath) $ pfkSourceColumns cols prepared
+   m2oRels <- SQL.statement mempty $ allM2ORels tabs cols prepared
+@@ -311,8 +312,8 @@ schemaDescription =
+       where
+         n.nspname = $1 |]
+ 
+-accessibleTables :: Bool -> SQL.Statement Schema [Table]
+-accessibleTables =
++accessibleTables :: PgVersion -> Bool -> SQL.Statement Schema [Table]
++accessibleTables pgVer =
+   SQL.Statement sql (param HE.text) decodeTables
+  where
+   sql = [q|
+@@ -350,7 +351,8 @@ accessibleTables =
+       left join pg_catalog.pg_description as d on d.objoid = c.oid and d.objsubid = 0
+     where
+       c.relkind in ('v','r','m','f','p')
+-      and n.nspname = $1
++      and n.nspname = $1 |]
++      <> relIsNotPartition pgVer <> [q|
+       and (
+         pg_has_role(c.relowner, 'USAGE')
+         or has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+@@ -445,8 +447,8 @@ addViewPrimaryKeys srcCols = concatMap (\pk ->
+                 filter (\(col, _) -> colTable col == pkTable pk && colName col == pkName pk) srcCols in
+   pk : viewPks)
+ 
+-allTables :: Bool -> SQL.Statement () [Table]
+-allTables =
++allTables :: PgVersion -> Bool -> SQL.Statement () [Table]
++allTables pgVer =
+   SQL.Statement sql HE.noParams decodeTables
+  where
+   sql = [q|
+@@ -484,9 +486,13 @@ allTables =
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     LEFT JOIN pg_catalog.pg_description as d on d.objoid = c.oid and d.objsubid = 0
+     WHERE c.relkind IN ('v','r','m','f','p')
+-      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
++      AND n.nspname NOT IN ('pg_catalog', 'information_schema') |]
++      <> relIsNotPartition pgVer <> [q|
+     ORDER BY table_schema, table_name |]
+ 
++relIsNotPartition :: PgVersion -> SqlQuery
++relIsNotPartition pgVer = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
++
+ allColumns :: [Table] -> Bool -> SQL.Statement [Schema] [Column]
+ allColumns tabs =
+  SQL.Statement sql (arrayParam HE.text) (decodeColumns tabs)
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 0144ef54..9f716e38 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -152,10 +152,11 @@ connectionStatus appState =
+ loadSchemaCache :: AppState -> IO SCacheStatus
+ loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
++  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) . transaction SQL.ReadCommitted SQL.Read $
+-      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
++      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath actualPgVersion configDbPreparedStatements
+   case result of
+     Left e -> do
+       let

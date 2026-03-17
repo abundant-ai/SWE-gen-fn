@@ -1,0 +1,187 @@
+diff --git a/ChangeLog.md b/ChangeLog.md
+index 67c21680a..b36affcc3 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -21,10 +21,6 @@ Behavior changes:
+   character in Stack's 'programs' path, as GHC 9.4.1 and later do not work if
+   there is a space in the path to the `ghc` executable. S-8432 now presents as a
+   warning and not an error.
+-* Stack respects the `--no-run-tests` and `--no-run-benchmarks` flags when
+-  determining build actions. Previously Stack respected the flags when executing
+-  the run test suites or run benchmarks actions for each targeted project
+-  package.
+ 
+ Other enhancements:
+ 
+diff --git a/doc/maintainers/stack_errors.md b/doc/maintainers/stack_errors.md
+index c8a56e7f9..358b90c36 100644
+--- a/doc/maintainers/stack_errors.md
++++ b/doc/maintainers/stack_errors.md
+@@ -5,7 +5,7 @@
+ In connection with considering Stack's support of the
+ [Haskell Error Index](https://errors.haskell.org/) initiative, this page seeks
+ to take stock of the errors that Stack itself can raise, by reference to the
+-`master` branch of the Stack repository. Last updated: 2024-09-07.
++`master` branch of the Stack repository. Last updated: 2024-08-02.
+ 
+ *   `Stack.main`: catches exceptions from action `commandLineHandler`.
+ 
+@@ -385,7 +385,6 @@ to take stock of the errors that Stack itself can raise, by reference to the
+         [S-8100] | GHCProfOptionInvalid
+         [S-1727] | NotOnlyLocal [PackageName] [Text]
+         [S-6362] | CompilerVersionMismatch (Maybe (ActualCompiler, Arch)) (WantedCompiler, Arch) GHCVariant CompilerBuild VersionCheck WantedCompilerSetter Text
+-        [S-4660] | ActionNotFilteredBug StyleDoc
+         ~~~
+ 
+     -   `Stack.Types.Compiler.CompilerException`
+diff --git a/src/Stack/Build/Execute.hs b/src/Stack/Build/Execute.hs
+index 9aca5c869..1df18efe1 100644
+--- a/src/Stack/Build/Execute.hs
++++ b/src/Stack/Build/Execute.hs
+@@ -367,18 +367,8 @@ executePlan' :: HasEnvConfig env
+              -> ExecuteEnv
+              -> RIO env ()
+ executePlan' installedMap0 targets plan ee = do
+-  config <- view configL
+   let !buildOpts = ee.buildOpts
+       !testOpts = buildOpts.testOpts
+-      !benchmarkOpts = buildOpts.benchmarkOpts
+-      runTests = testOpts.runTests
+-      runBenchmarks = benchmarkOpts.runBenchmarks
+-      noNotifyIfNoRunTests = not config.notifyIfNoRunTests
+-      noNotifyIfNoRunBenchmarks = not config.notifyIfNoRunBenchmarks
+-      hasTests = not . Set.null . testComponents . taskComponents
+-      hasBenches = not . Set.null . benchComponents . taskComponents
+-      tests = Map.elems $ Map.filter hasTests plan.finals
+-      benches = Map.elems $ Map.filter hasBenches plan.finals
+   when testOpts.coverage deleteHpcReports
+   cv <- view actualCompilerVersionL
+   whenJust (nonEmpty $ Map.toList plan.unregisterLocal) $ \ids -> do
+@@ -410,24 +400,6 @@ executePlan' installedMap0 targets plan ee = do
+         buildOpts.keepGoing
+   terminal <- view terminalL
+   terminalWidth <- view termWidthL
+-  unless (noNotifyIfNoRunTests || runTests || null tests) $
+-    prettyInfo $
+-      fillSep
+-        [ flow "All test running disabled by"
+-        , style Shell "--no-run-tests"
+-        , flow "flag. To mute this message in future, set"
+-        , style Shell (flow "notify-if-no-run-tests: false")
+-        , flow "in Stack's configuration."
+-        ]
+-  unless (noNotifyIfNoRunBenchmarks || runBenchmarks || null benches) $
+-    prettyInfo $
+-      fillSep
+-        [ flow "All benchmark running disabled by"
+-        , style Shell "--no-run-benchmarks"
+-        , flow "flag. To mute this message in future, set"
+-        , style Shell (flow "notify-if-no-run-benchmarks: false")
+-        , flow "in Stack's configuration."
+-        ]
+   errs <- liftIO $ runActions threads keepGoing actions $
+     \doneVar actionsVar -> do
+       let total = length actions
+@@ -592,9 +564,8 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+             , concurrency = ConcurrencyAllowed
+             }
+       ) $
+-      -- These are the "final" actions - running test suites and benchmarks,
+-      -- unless --no-run-tests or --no-run-benchmarks is enabled.
+-      ( if Set.null tests || not runTests
++      -- These are the "final" actions - running tests and benchmarks.
++      ( if Set.null tests
+           then id
+           else (:) Action
+             { actionId = ActionId pkgId ATRunTests
+@@ -607,7 +578,7 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+             , concurrency = ConcurrencyAllowed
+             }
+       ) $
+-      ( if Set.null benches || not runBenchmarks
++      ( if Set.null benches
+           then id
+           else (:) Action
+             { actionId = ActionId pkgId ATRunBenchmarks
+@@ -644,8 +615,6 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+   bopts = ee.buildOpts
+   topts = bopts.testOpts
+   beopts = bopts.benchmarkOpts
+-  runTests = topts.runTests
+-  runBenchmarks = beopts.runBenchmarks
+ 
+ taskComponents :: Task -> Set NamedComponent
+ taskComponents task =
+diff --git a/src/Stack/Build/ExecutePackage.hs b/src/Stack/Build/ExecutePackage.hs
+index 4a1a7a911..f8e070c2b 100644
+--- a/src/Stack/Build/ExecutePackage.hs
++++ b/src/Stack/Build/ExecutePackage.hs
+@@ -996,7 +996,12 @@ singleTest topts testsToRun ac ee task installedMap = do
+                       announce "rerunning previously failed test"
+                       pure True
+                 TSUnknown -> pure True
+-          else prettyThrowM $ ActionNotFilteredBug "singleTest"
++          else do
++            notifyIfNoRunTests <- view $ configL . to (.notifyIfNoRunTests)
++            when notifyIfNoRunTests $
++              announce "Test running disabled by --no-run-tests flag."
++            pure False
++
+       when toRun $ do
+         buildDir <- distDirFromDir pkgDir
+         hpcDir <- hpcDirFromDir pkgDir
+@@ -1257,10 +1262,17 @@ singleBench beopts benchesToRun ac ee task installedMap = do
+       let args = map unqualCompToString benchesToRun <> maybe []
+                        ((:[]) . ("--benchmark-options=" <>))
+                        beopts.additionalArgs
++
+       toRun <-
+         if beopts.runBenchmarks
+           then pure True
+-          else prettyThrowM $ ActionNotFilteredBug "singleBench"
++          else do
++            notifyIfNoRunBenchmarks <-
++              view $ configL . to (.notifyIfNoRunBenchmarks)
++            when notifyIfNoRunBenchmarks $
++              announce "Benchmark running disabled by --no-run-benchmarks flag."
++            pure False
++
+       when toRun $ do
+         announce "benchmarks"
+         cabal CloseOnException KeepTHLoading ("bench" : args)
+diff --git a/src/Stack/Types/Build/Exception.hs b/src/Stack/Types/Build/Exception.hs
+index eb230835d..b24909459 100644
+--- a/src/Stack/Types/Build/Exception.hs
++++ b/src/Stack/Types/Build/Exception.hs
+@@ -261,7 +261,6 @@ data BuildPrettyException
+       VersionCheck
+       WantedCompilerSetter -- Way that the wanted compiler is set
+       StyleDoc -- recommended resolution
+-  | ActionNotFilteredBug StyleDoc
+   deriving (Show, Typeable)
+ 
+ instance Pretty BuildPrettyException where
+@@ -451,12 +450,6 @@ instance Pretty BuildPrettyException where
+          ]
+     <> blankLine
+     <> resolution
+-  pretty (ActionNotFilteredBug source) = bugPrettyReport "S-4660" $
+-    fillSep
+-      [ source
+-      , flow "is seeking to run an action that should have been filtered from \
+-             \the list of actions."
+-      ]
+ 
+ instance Exception BuildPrettyException
+ 
+diff --git a/tests/integration/tests/3959-order-of-flags/Main.hs b/tests/integration/tests/3959-order-of-flags/Main.hs
+index 4825c0405..650bf9246 100644
+--- a/tests/integration/tests/3959-order-of-flags/Main.hs
++++ b/tests/integration/tests/3959-order-of-flags/Main.hs
+@@ -17,5 +17,5 @@ checkFlagsAfterCommand = stackCheckStderr ["build", "--test", "--no-run-tests"]
+ 
+ checker :: String -> IO ()
+ checker output = do
+-  let testsAreDisabled = any (\ln -> "All test running disabled by" `isInfixOf` ln) (lines output)
++  let testsAreDisabled = any (\ln -> "Test running disabled by" `isInfixOf` ln) (lines output)
+   unless testsAreDisabled $ fail "Tests should not be run"

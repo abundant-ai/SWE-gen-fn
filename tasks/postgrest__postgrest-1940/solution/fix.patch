@@ -1,0 +1,78 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5f837b3d..e5ae0ed8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,11 +13,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Enables calling a function with a single json parameter without using `Prefer: params=single-object`
+    + Enables uploading bytea to a function with `Content-Type: application/octet-stream`
+    + Enables uploading raw text to a function with `Content-Type: text/plain`
++- #1938, Allow escaping inside double quotes with a backslash, e.g. `?col=in.("Double\"Quote")`, `?col=in.("Back\\slash")` - @steve-chavez
+ 
+ ### Fixed
+ 
+  - #1871, Fix OpenAPI missing default values for String types and identify Array types as "array" instead of "string" - @laurenceisla
+  - #1930, Fix RPC return type handling for `RETURNS TABLE` with a single column. Regression of #1615. - @wolfgangwalther
++ - #1938, Fix using single double quotes(`"`) and backslashes(`/`) as values on the "in" operator - @steve-chavez
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index 7ecb283b..d1ec1355 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -123,7 +123,8 @@ normalizedBody body =
+ singleParameter :: Maybe BL.ByteString -> ByteString -> H.Snippet
+ singleParameter body typ =
+   if typ == "bytea"
+-    then H.encoderAndParam (HE.nullable HE.bytea) (toS <$> body) -- needed because bytea fails with HE.unknown(pg tries to utf8 encode)
++    -- TODO: Hasql fails when using HE.unknown with bytea(pg tries to utf8 encode).
++    then H.encoderAndParam (HE.nullable HE.bytea) (toS <$> body)
+     else H.encoderAndParam (HE.nullable HE.unknown) (toS <$> body) <> "::" <> H.sql typ
+ 
+ selectBody :: SqlFragment
+@@ -138,6 +139,15 @@ pgFmtLit x =
+    then "E" <> slashed
+    else slashed
+ 
++-- Here we build the pg array literal, e.g '{"Hebdon, John","Other","Another"}', manually.
++-- This is necessary to pass an "unknown" array and let pg infer the type.
++pgFmtArrayLit :: [Text] -> Text
++pgFmtArrayLit vals =
++ let trimmed = trimNullChars
++     slashed = T.replace "\\" "\\\\" . trimmed
++     escaped x = "\"" <> T.replace "\"" "\\\"" (slashed x) <> "\"" in
++ "{" <> T.intercalate "," (escaped <$> vals) <> "}"
++
+ -- TODO: refactor by following https://github.com/PostgREST/postgrest/pull/1631#issuecomment-711070833
+ pgFmtIdent :: Text -> SqlFragment
+ pgFmtIdent x = encodeUtf8 $ "\"" <> T.replace "\"" "\"\"" (trimNullChars x) <> "\""
+@@ -220,12 +230,9 @@ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper
+    -- We don't use "IN", we use "= ANY". IN has the following disadvantages:
+    -- + No way to use an empty value on IN: "col IN ()" is invalid syntax. With ANY we can do "= ANY('{}')"
+    -- + Can invalidate prepared statements: multiple parameters on an IN($1, $2, $3) will lead to using different prepared statements and not take advantage of caching.
+-   In vals -> pgFmtField table fld <> " " <>
+-    case vals of
++   In vals -> pgFmtField table fld <> " " <> case vals of
+       [""] -> "= ANY('{}') "
+-      -- Here we build the pg array, e.g '{"Hebdon, John","Other","Another"}', manually. We quote the values to prevent the "," being treated as an element separator.
+-      -- TODO: Ideally this would be done on Hasql with an encoder, but the "array unknown" is not working(Hasql doesn't pass any value).
+-      _    -> "= ANY (" <> unknownLiteral ("{" <> T.intercalate "," ((\x -> "\"" <> x <> "\"") <$> vals) <> "}") <> ")"
++      _    -> "= ANY (" <> unknownLiteral (pgFmtArrayLit vals) <> ") "
+ 
+    Fts op lang val ->
+      pgFmtFieldOp op <> "(" <> ftsLang lang <> unknownLiteral val <> ") "
+diff --git a/src/PostgREST/Request/Parsers.hs b/src/PostgREST/Request/Parsers.hs
+index 0c4cbb97..a73ea269 100644
+--- a/src/PostgREST/Request/Parsers.hs
++++ b/src/PostgREST/Request/Parsers.hs
+@@ -207,7 +207,9 @@ pListElement :: Parser Text
+ pListElement = try (pQuotedValue <* notFollowedBy (noneOf ",)")) <|> (toS <$> many (noneOf ",)"))
+ 
+ pQuotedValue :: Parser Text
+-pQuotedValue = toS <$> (char '"' *> many (noneOf "\"") <* char '"')
++pQuotedValue = toS <$> (char '"' *> many pCharsOrSlashed <* char '"')
++  where
++    pCharsOrSlashed = noneOf "\\\"" <|> (char '\\' *> anyChar)
+ 
+ pDelimiter :: Parser Char
+ pDelimiter = char '.' <?> "delimiter (.)"

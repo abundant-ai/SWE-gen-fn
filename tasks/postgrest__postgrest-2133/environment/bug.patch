@@ -1,0 +1,210 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b13cf636..caaa0a28 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -27,7 +27,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2107, Clarify error for failed schema cache load. - @steve-chavez
+    + From `Database connection lost. Retrying the connection` to `Could not query the database for the schema cache. Retrying.`
+  - #2120, Fix reading database configuration properly when `=` is present in value - @wolfgangwalther
+- - #1771, Fix silently ignoring filter on a non-existent embedded resource - @steve-chavez
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 6a2eb930..c1de4544 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -68,7 +68,6 @@ instance PgrstError ApiRequestError where
+   status NoRpc{}                 = HTTP.status404
+   status (UnacceptableSchema _)  = HTTP.status406
+   status (ContentTypeError _)    = HTTP.status415
+-  status (NotEmbedded _)         = HTTP.status400
+ 
+   headers _ = [ContentType.toHeader CTApplicationJSON]
+ 
+@@ -112,9 +111,6 @@ instance JSON.ToJSON ApiRequestError where
+     "message" .= ("The schema must be one of the following: " <> T.intercalate ", " schemas)]
+   toJSON (ContentTypeError cts)    = JSON.object [
+     "message" .= ("None of these Content-Types are available: " <> T.intercalate ", " (map T.decodeUtf8 cts))]
+-  toJSON (NotEmbedded resource) = JSON.object [
+-    "hint"    .= ("Verify that '" <> resource <> "' is included in the 'select' query parameter." :: Text),
+-    "message" .= ("Cannot apply filter because '" <> resource <> "' is not an embedded resource in this request" :: Text)]
+ 
+ compressedRel :: Relationship -> JSON.Value
+ compressedRel Relationship{..} =
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index eb0e05a4..ed60dfe9 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -64,12 +64,9 @@ readRequest schema rootTableName maxRows allRels apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange maxRows =<<
+   augmentRequestWithJoin schema rootRels =<<
+-  addLogicTrees apiRequest =<<
+-  addRanges apiRequest =<<
+-  addOrders apiRequest =<<
+-  addFilters apiRequest (initReadRequest rootName qsSelect)
++  addFiltersOrdersRanges apiRequest (initReadRequest rootName sel)
+   where
+-    QueryParams.QueryParams{..} = iQueryParams apiRequest
++    sel = QueryParams.qsSelect $ iQueryParams apiRequest
+     (rootName, rootRels) = rootWithRels schema rootTableName allRels (iAction apiRequest)
+ 
+ -- Get the root table name with its relationships according to the Action type.
+@@ -254,11 +251,16 @@ getJoinConditions previousAlias newAlias (Relationship Table{tableSchema=tSchema
+     removeSourceCTESchema :: Schema -> TableName -> QualifiedIdentifier
+     removeSourceCTESchema schema tbl = QualifiedIdentifier (if tbl == decodeUtf8 sourceCTEName then mempty else schema) tbl
+ 
+-addFilters :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+-addFilters ApiRequest{..} rReq =
+-  foldr addFilterToNode (Right rReq) flts
++addFiltersOrdersRanges :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
++addFiltersOrdersRanges ApiRequest{..} rReq = do
++  flip (foldr addLogicTree) qsLogic <$> (foldr addRange rOrds <$> ranges)
+   where
++    rFlts = foldr addFilter rReq flts
++    rOrds = foldr addOrder rFlts qsOrder
+     QueryParams.QueryParams{..} = iQueryParams
++    ranges :: Either ApiRequestError [(EmbedPath, NonnegRange)]
++    ranges = first QueryParamError $ QueryParams.pRequestRange `traverse` M.toList iRange
++    -- there can be no filters on the root table when we are doing insert/update/delete
+     flts =
+       case iAction of
+         ActionInvoke InvGet  -> qsFilters
+@@ -267,51 +269,38 @@ addFilters ApiRequest{..} rReq =
+         ActionRead _         -> qsFilters
+         _                    -> qsFiltersNotRoot
+ 
+-    addFilterToNode :: (EmbedPath, Filter) -> Either ApiRequestError ReadRequest ->  Either ApiRequestError ReadRequest
+-    addFilterToNode =
+-      updateNode (\flt (Node (q@Select {where_=lf}, i) f) -> Node (q{where_=addFilterToLogicForest flt lf}::ReadQuery, i) f)
++addFilterToNode :: Filter -> ReadRequest -> ReadRequest
++addFilterToNode flt (Node (q@Select {where_=lf}, i) f) = Node (q{where_=addFilterToLogicForest flt lf}::ReadQuery, i) f
+ 
+-addOrders :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+-addOrders ApiRequest{..} rReq =
+-  foldr addOrderToNode (Right rReq) qsOrder
+-  where
+-    QueryParams.QueryParams{..} = iQueryParams
++addFilter :: (EmbedPath, Filter) -> ReadRequest -> ReadRequest
++addFilter = addProperty addFilterToNode
+ 
+-    addOrderToNode :: (EmbedPath, [OrderTerm]) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
+-    addOrderToNode = updateNode (\o (Node (q,i) f) -> Node (q{order=o}, i) f)
++addOrderToNode :: [OrderTerm] -> ReadRequest -> ReadRequest
++addOrderToNode o (Node (q,i) f) = Node (q{order=o}, i) f
+ 
+-addRanges :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+-addRanges ApiRequest{..} rReq =
+-  foldr addRangeToNode (Right rReq) =<< ranges
+-  where
+-    ranges :: Either ApiRequestError [(EmbedPath, NonnegRange)]
+-    ranges = first QueryParamError $ QueryParams.pRequestRange `traverse` M.toList iRange
++addOrder :: (EmbedPath, [OrderTerm]) -> ReadRequest -> ReadRequest
++addOrder = addProperty addOrderToNode
+ 
+-    addRangeToNode :: (EmbedPath, NonnegRange) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
+-    addRangeToNode = updateNode (\r (Node (q,i) f) -> Node (q{range_=r}, i) f)
++addRangeToNode :: NonnegRange -> ReadRequest -> ReadRequest
++addRangeToNode r (Node (q,i) f) = Node (q{range_=r}, i) f
+ 
+-addLogicTrees :: ApiRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+-addLogicTrees ApiRequest{..} rReq =
+-  foldr addLogicTreeToNode (Right rReq) qsLogic
+-  where
+-    QueryParams.QueryParams{..} = iQueryParams
++addRange :: (EmbedPath, NonnegRange) -> ReadRequest -> ReadRequest
++addRange = addProperty addRangeToNode
++
++addLogicTreeToNode :: LogicTree -> ReadRequest -> ReadRequest
++addLogicTreeToNode t (Node (q@Select{where_=lf},i) f) = Node (q{where_=t:lf}::ReadQuery, i) f
++
++addLogicTree :: (EmbedPath, LogicTree) -> ReadRequest -> ReadRequest
++addLogicTree = addProperty addLogicTreeToNode
+ 
+-    addLogicTreeToNode :: (EmbedPath, LogicTree) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
+-    addLogicTreeToNode = updateNode (\t (Node (q@Select{where_=lf},i) f) -> Node (q{where_=t:lf}::ReadQuery, i) f)
+-
+--- Find a Node of the Tree and apply a function to it
+-updateNode :: (a -> ReadRequest -> ReadRequest) -> (EmbedPath, a) -> Either ApiRequestError ReadRequest -> Either ApiRequestError ReadRequest
+-updateNode f ([], a) rr = f a <$> rr
+-updateNode _ _ (Left e) = Left e
+-updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+-  case findNode of
+-    Nothing -> Left $ NotEmbedded targetNodeName
+-    Just target ->
+-      (\node -> Node rootNode $ node : delete target forest) <$>
+-      updateNode f (remainingPath, a) (Right target)
++addProperty :: (a -> ReadRequest -> ReadRequest) -> (EmbedPath, a) -> ReadRequest -> ReadRequest
++addProperty f ([], a) rr = f a rr
++addProperty f (targetNodeName:remainingPath, a) (Node rn forest) =
++  case pathNode of
++    Nothing -> Node rn forest -- the property is silenty dropped in the Request does not contain the required path
++    Just tn -> Node rn (addProperty f (remainingPath, a) tn:delete tn forest)
+   where
+-    findNode :: Maybe ReadRequest
+-    findNode = find (\(Node (_,(nodeName,_,alias,_,_, _)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
++    pathNode = find (\(Node (_,(nodeName,_,alias,_,_, _)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
+ 
+ mutateRequest :: Schema -> TableName -> ApiRequest -> [FieldName] -> ReadRequest -> Either Error MutateRequest
+ mutateRequest schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 38a58b45..f52467f3 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -71,7 +71,6 @@ data ApiRequestError
+   | UnacceptableSchema [Text]
+   | ContentTypeError [ByteString]
+   | UnsupportedVerb                -- Unreachable?
+-  | NotEmbedded Text
+ 
+ data QPError = QPError Text Text
+ 
+diff --git a/test/spec/Feature/QuerySpec.hs b/test/spec/Feature/QuerySpec.hs
+index efac5d28..5a38fb14 100644
+--- a/test/spec/Feature/QuerySpec.hs
++++ b/test/spec/Feature/QuerySpec.hs
+@@ -257,34 +257,20 @@ spec actualPgVersion = do
+     it "cannot access a computed column that is outside of the config schema" $
+       get "/items?always_false=is.false" `shouldRespondWith` 400
+ 
++    it "matches filtering nested items 2" $
++      get "/clients?select=id,projects(id,tasks2(id,name))&projects.tasks.name=like.Design*" `shouldRespondWith`
++        [json| {
++          "hint":"Verify that 'projects' and 'tasks2' exist in the schema 'test' and that there is a foreign key relationship between them. If a new relationship was created, try reloading the schema cache.",
++          "message":"Could not find a relationship between 'projects' and 'tasks2' in the schema cache"}|]
++        { matchStatus  = 400
++        , matchHeaders = [matchContentTypeJson]
++        }
++
+     it "matches filtering nested items" $
+       get "/clients?select=id,projects(id,tasks(id,name))&projects.tasks.name=like.Design*" `shouldRespondWith`
+         [json|[{"id":1,"projects":[{"id":1,"tasks":[{"id":1,"name":"Design w7"}]},{"id":2,"tasks":[{"id":3,"name":"Design w10"}]}]},{"id":2,"projects":[{"id":3,"tasks":[{"id":5,"name":"Design IOS"}]},{"id":4,"tasks":[{"id":7,"name":"Design OSX"}]}]}]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    it "errs when the embedded resource doesn't exist and an embedded filter is applied to it" $ do
+-      get "/clients?select=*&non_existent_projects.name=like.*NonExistent*" `shouldRespondWith`
+-        [json|
+-          {"hint":"Verify that 'non_existent_projects' is included in the 'select' query parameter.",
+-          "message":"Cannot apply filter because 'non_existent_projects' is not an embedded resource in this request"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/clients?select=*,amiga_projects:projects(*)&amiga_projectsss.name=ilike.*Amiga*" `shouldRespondWith`
+-        [json|
+-          {"hint":"Verify that 'amiga_projectsss' is included in the 'select' query parameter.",
+-           "message":"Cannot apply filter because 'amiga_projectsss' is not an embedded resource in this request"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-      get "/clients?select=id,projects(id,tasks(id,name))&projects.tasks2.name=like.Design*" `shouldRespondWith`
+-        [json|
+-          {"hint":"Verify that 'tasks2' is included in the 'select' query parameter.",
+-           "message":"Cannot apply filter because 'tasks2' is not an embedded resource in this request"}|]
+-        { matchStatus  = 400
+-        , matchHeaders = [matchContentTypeJson]
+-        }
+-
+     it "matches with cs operator" $
+       get "/complex_items?select=id&arr_data=cs.{2}" `shouldRespondWith`
+         [json|[{"id":2},{"id":3}]|]

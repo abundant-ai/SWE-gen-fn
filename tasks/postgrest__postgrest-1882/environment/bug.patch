@@ -1,0 +1,460 @@
+diff --git a/postgrest.cabal b/postgrest.cabal
+index bf88ceb1..631b4b12 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -179,7 +179,7 @@ test-suite spec
+                       Feature.ExtraSearchPathSpec
+                       Feature.HtmlRawOutputSpec
+                       Feature.InsertSpec
+-                      Feature.IgnorePrivOpenApiSpec
++                      Feature.IgnoreAclOpenApiSpec
+                       Feature.JsonOperatorSpec
+                       Feature.MultipleSchemaSpec
+                       Feature.NoJwtSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 8426ef2e..bc79abc8 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -28,7 +28,6 @@ import System.Posix.Types       (FileMode)
+ 
+ import qualified Data.ByteString.Char8           as BS8
+ import qualified Data.ByteString.Lazy            as LBS
+-import qualified Data.HashMap.Strict             as Map
+ import qualified Data.Set                        as Set
+ import qualified Hasql.DynamicStatements.Snippet as SQL
+ import qualified Hasql.Pool                      as SQL
+@@ -466,15 +465,15 @@ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest _) = do
+   body <-
+     lift $ case configOpenApiMode of
+-      OAFollowPriv ->
++      OAFollowACL ->
+         OpenAPI.encode conf dbStructure
+            <$> SQL.statement tSchema (DbStructure.accessibleTables configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+-      OAIgnorePriv ->
++      OAIgnoreACL ->
+         OpenAPI.encode conf dbStructure
+-              (filter (\x -> tableSchema x == tSchema) $ DbStructure.dbTables dbStructure)
+-              (Map.filterWithKey (\(QualifiedIdentifier sch _) _ ->  sch == tSchema) $ DbStructure.dbProcs dbStructure)
++              (DbStructure.dbTables dbStructure)
++              (DbStructure.dbProcs dbStructure)
+           <$> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+       OADisabled ->
+         pure mempty
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 503323b2..fc9d2f78 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -192,11 +192,11 @@ exampleConfigFile =
+       |## when none is provided, 660 is applied by default
+       |# server-unix-socket-mode = "660"
+       |
+-      |## determine if the OpenAPI output should follow or ignore role privileges or be disabled entirely
+-      |## admitted values: follow-privileges, ignore-privileges, disabled
+-      |openapi-mode = "follow-privileges"
++      |## determine if swagger output should follow or ignore ACL constraints or be disabled entirely
++      |## admitted values: follow-acl, ignore-acl, disabled
++      |openapi-mode = "follow-acl"
+       |
+-      |## base url for the OpenAPI output
++      |## base url for swagger output
+       |openapi-server-proxy-uri = ""
+       |
+       |## choose a secret, JSON Web Key (or set) to enable JWT auth
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index be25bfae..8ba7d43e 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -103,13 +103,13 @@ instance Show LogLevel where
+   show LogWarn  = "warn"
+   show LogInfo  = "info"
+ 
+-data OpenAPIMode = OAFollowPriv | OAIgnorePriv | OADisabled
++data OpenAPIMode = OAFollowACL | OAIgnoreACL | OADisabled
+   deriving Eq
+ 
+ instance Show OpenAPIMode where
+-  show OAFollowPriv = "follow-privileges"
+-  show OAIgnorePriv = "ignore-privileges"
+-  show OADisabled   = "disabled"
++  show OAFollowACL = "follow-acl"
++  show OAIgnoreACL = "ignore-acl"
++  show OADisabled  = "disabled"
+ 
+ -- | Dump the config
+ toText :: AppConfig -> Text
+@@ -262,11 +262,11 @@ parser optPath env dbSettings =
+     parseOpenAPIMode :: C.Key -> C.Parser C.Config OpenAPIMode
+     parseOpenAPIMode k =
+       optString k >>= \case
+-        Nothing                  -> pure OAFollowPriv
+-        Just "follow-privileges" -> pure OAFollowPriv
+-        Just "ignore-privileges" -> pure OAIgnorePriv
+-        Just "disabled"          -> pure OADisabled
+-        Just _                   -> fail "Invalid openapi-mode. Check your configuration."
++        Nothing           -> pure OAFollowACL
++        Just "follow-acl" -> pure OAFollowACL
++        Just "ignore-acl" -> pure OAIgnoreACL
++        Just "disabled"   -> pure OADisabled
++        Just _            -> fail "Invalid openapi-mode. Check your configuration."
+ 
+     parseOpenAPIServerProxyURI :: C.Key -> C.Parser C.Config (Maybe Text)
+     parseOpenAPIServerProxyURI k =
+diff --git a/test/Feature/IgnoreAclOpenApiSpec.hs b/test/Feature/IgnoreAclOpenApiSpec.hs
+index 9e9f29af..7305d461 100644
+--- a/test/Feature/IgnoreAclOpenApiSpec.hs
++++ b/test/Feature/IgnoreAclOpenApiSpec.hs
+@@ -1,4 +1,4 @@
+-module Feature.IgnorePrivOpenApiSpec where
++module Feature.IgnoreAclOpenApiSpec where
+ 
+ import Control.Lens ((^?))
+ 
+@@ -32,17 +32,6 @@ spec = describe "OpenAPI Ignore ACL" $ do
+ 
+       liftIO $ tableTag `shouldBe` Just [aesonQQ|"authors_only"|]
+ 
+-    it "only includes tables that belong to another schema if the Accept-Profile header is used" $ do
+-      r1 <- simpleBody <$> get "/"
+-      let tableKey1 = r1 ^? key "paths" . key "/children"
+-
+-      liftIO $ tableKey1 `shouldBe` Nothing
+-
+-      r2 <- simpleBody <$> request methodGet "/" [("Accept-Profile", "v1")] ""
+-      let tableKey2 = r2 ^? key "paths" . key "/children"
+-
+-      liftIO $ tableKey2 `shouldNotBe` Nothing
+-
+   describe "RPC" $ do
+ 
+     it "includes privileged function even if user does not have permission" $ do
+@@ -52,14 +41,3 @@ spec = describe "OpenAPI Ignore ACL" $ do
+                     . nth 0
+ 
+       liftIO $ funcTag `shouldBe` Just [aesonQQ|"(rpc) privileged_hello"|]
+-
+-    it "only includes functions that belong to another schema if the Accept-Profile header is used" $ do
+-      r1 <- simpleBody <$> get "/"
+-      let funcKey1 = r1 ^? key "paths" . key "/rpc/get_parents_below"
+-
+-      liftIO $ funcKey1 `shouldBe` Nothing
+-
+-      r2 <- simpleBody <$> request methodGet "/" [("Accept-Profile", "v1")] ""
+-      let funcKey2 = r2 ^? key "paths" . key "/rpc/get_parents_below"
+-
+-      liftIO $ funcKey2 `shouldNotBe` Nothing
+diff --git a/test/Feature/IgnorePrivOpenApiSpec.hs b/test/Feature/IgnorePrivOpenApiSpec.hs
+deleted file mode 100644
+index 8ff6791f..00000000
+--- a/test/Feature/IgnorePrivOpenApiSpec.hs
++++ /dev/null
+@@ -1,65 +0,0 @@
+-module Feature.IgnorePrivOpenApiSpec where
+-
+-import Control.Lens ((^?))
+-
+-import Data.Aeson.Lens
+-import Data.Aeson.QQ
+-
+-import Network.HTTP.Types
+-import Network.Wai        (Application)
+-import Network.Wai.Test   (SResponse (..))
+-
+-import Test.Hspec     hiding (pendingWith)
+-import Test.Hspec.Wai
+-
+-import Protolude  hiding (get)
+-import SpecHelper
+-
+-spec :: SpecWith ((), Application)
+-spec = describe "OpenAPI Ignore Privileges" $ do
+-  it "root path returns a valid openapi spec" $ do
+-    validateOpenApiResponse [("Accept", "application/openapi+json")]
+-    request methodHead "/" (acceptHdrs "application/openapi+json") ""
+-      `shouldRespondWith` "" { matchStatus  = 200 }
+-
+-  describe "table" $ do
+-
+-    it "includes privileged table even if user does not have permission" $ do
+-      r <- simpleBody <$> get "/"
+-      let tableTag = r ^? key "paths" . key "/authors_only"
+-                     . key "post" . key "tags"
+-                     . nth 0
+-
+-      liftIO $ tableTag `shouldBe` Just [aesonQQ|"authors_only"|]
+-
+-    it "only includes tables that belong to another schema if the Accept-Profile header is used" $ do
+-      r1 <- simpleBody <$> get "/"
+-      let tableKey1 = r1 ^? key "paths" . key "/children"
+-
+-      liftIO $ tableKey1 `shouldBe` Nothing
+-
+-      r2 <- simpleBody <$> request methodGet "/" [("Accept-Profile", "v1")] ""
+-      let tableKey2 = r2 ^? key "paths" . key "/children"
+-
+-      liftIO $ tableKey2 `shouldNotBe` Nothing
+-
+-  describe "RPC" $ do
+-
+-    it "includes privileged function even if user does not have permission" $ do
+-      r <- simpleBody <$> get "/"
+-      let funcTag = r ^? key "paths" . key "/rpc/privileged_hello"
+-                    . key "post" . key "tags"
+-                    . nth 0
+-
+-      liftIO $ funcTag `shouldBe` Just [aesonQQ|"(rpc) privileged_hello"|]
+-
+-    it "only includes functions that belong to another schema if the Accept-Profile header is used" $ do
+-      r1 <- simpleBody <$> get "/"
+-      let funcKey1 = r1 ^? key "paths" . key "/rpc/get_parents_below"
+-
+-      liftIO $ funcKey1 `shouldBe` Nothing
+-
+-      r2 <- simpleBody <$> request methodGet "/" [("Accept-Profile", "v1")] ""
+-      let funcKey2 = r2 ^? key "paths" . key "/rpc/get_parents_below"
+-
+-      liftIO $ funcKey2 `shouldNotBe` Nothing
+diff --git a/test/Main.hs b/test/Main.hs
+index 8a6344f6..2ece4a75 100644
+--- a/test/Main.hs
++++ b/test/Main.hs
+@@ -32,7 +32,7 @@ import qualified Feature.DisabledOpenApiSpec
+ import qualified Feature.EmbedDisambiguationSpec
+ import qualified Feature.ExtraSearchPathSpec
+ import qualified Feature.HtmlRawOutputSpec
+-import qualified Feature.IgnorePrivOpenApiSpec
++import qualified Feature.IgnoreAclOpenApiSpec
+ import qualified Feature.InsertSpec
+ import qualified Feature.JsonOperatorSpec
+ import qualified Feature.MultipleSchemaSpec
+@@ -95,6 +95,7 @@ main = do
+   let withApp              = app testCfg
+       maxRowsApp           = app testMaxRowsCfg
+       disabledOpenApi      = app testDisabledOpenApiCfg
++      ignoreAclOpenApi     = app testIgnoreAclOpenApiCfg
+       proxyApp             = app testProxyCfg
+       noJwtApp             = app testCfgNoJWT
+       binaryJwtApp         = app testCfgBinaryJWT
+@@ -111,7 +112,6 @@ main = do
+       unicodeApp           = appDbs testUnicodeCfg
+       nonexistentSchemaApp = appDbs testNonexistentSchemaCfg
+       multipleSchemaApp    = appDbs testMultipleSchemaCfg
+-      ignorePrivOpenApi    = appDbs testIgnorePrivOpenApiCfg
+ 
+   let analyze :: IO ()
+       analyze = do
+@@ -161,8 +161,8 @@ main = do
+       describe "Feature.DisabledOpenApiSpec" Feature.DisabledOpenApiSpec.spec
+ 
+     -- this test runs with openapi-mode set to ignore-acl
+-    parallel $ before ignorePrivOpenApi $
+-      describe "Feature.IgnorePrivOpenApiSpec" Feature.IgnorePrivOpenApiSpec.spec
++    parallel $ before ignoreAclOpenApi $
++      describe "Feature.IgnoreAclOpenApiSpec" Feature.IgnoreAclOpenApiSpec.spec
+ 
+     -- this test runs with a proxy
+     parallel $ before proxyApp $
+diff --git a/test/SpecHelper.hs b/test/SpecHelper.hs
+index b325e1b7..8584c050 100644
+--- a/test/SpecHelper.hs
++++ b/test/SpecHelper.hs
+@@ -96,7 +96,7 @@ _baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configJwtSecret             = secret
+   , configJwtSecretIsBase64     = False
+   , configLogLevel              = LogCrit
+-  , configOpenApiMode           = OAFollowPriv
++  , configOpenApiMode           = OAFollowACL
+   , configOpenApiServerProxyUri = Nothing
+   , configRawMediaTypes         = []
+   , configServerHost            = "localhost"
+@@ -128,8 +128,8 @@ testMaxRowsCfg testDbConn = (testCfg testDbConn) { configDbMaxRows = Just 2 }
+ testDisabledOpenApiCfg :: Text -> AppConfig
+ testDisabledOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OADisabled }
+ 
+-testIgnorePrivOpenApiCfg :: Text -> AppConfig
+-testIgnorePrivOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OAIgnorePriv, configDbSchemas = fromList ["test", "v1"] }
++testIgnoreAclOpenApiCfg :: Text -> AppConfig
++testIgnoreAclOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OAIgnoreACL }
+ 
+ testProxyCfg :: Text -> AppConfig
+ testProxyCfg testDbConn = (testCfg testDbConn) { configOpenApiServerProxyUri = Just "https://postgrest.com/openapi.json" }
+diff --git a/test/fixtures/roles.sql b/test/fixtures/roles.sql
+index 332f40e2..2e566cda 100644
+--- a/test/fixtures/roles.sql
++++ b/test/fixtures/roles.sql
+@@ -59,4 +59,3 @@ ALTER ROLE other_authenticator SET pgrst.db_prepared_statements = 'false';
+ ALTER ROLE other_authenticator SET pgrst.db_pre_request = 'test.other_custom_headers';
+ ALTER ROLE other_authenticator SET pgrst.db_max_rows = '100';
+ ALTER ROLE other_authenticator SET pgrst.db_extra_search_path = 'public, extensions, other';
+-ALTER ROLE other_authenticator SET pgrst.openapi_mode = 'disabled';
+diff --git a/test/io-tests/configs/expected/aliases.config b/test/io-tests/configs/expected/aliases.config
+index bff40f09..cff99f29 100644
+--- a/test/io-tests/configs/expected/aliases.config
++++ b/test/io-tests/configs/expected/aliases.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"aliased\""
+ jwt-secret = ""
+ jwt-secret-is-base64 = true
+ log-level = "error"
+-openapi-mode = "follow-privileges"
++openapi-mode = "follow-acl"
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+ server-host = "!4"
+diff --git a/test/io-tests/configs/expected/boolean-numeric.config b/test/io-tests/configs/expected/boolean-numeric.config
+index 38ed48e5..70f0ce53 100644
+--- a/test/io-tests/configs/expected/boolean-numeric.config
++++ b/test/io-tests/configs/expected/boolean-numeric.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+ jwt-secret-is-base64 = true
+ log-level = "error"
+-openapi-mode = "follow-privileges"
++openapi-mode = "follow-acl"
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+ server-host = "!4"
+diff --git a/test/io-tests/configs/expected/boolean-string.config b/test/io-tests/configs/expected/boolean-string.config
+index 38ed48e5..70f0ce53 100644
+--- a/test/io-tests/configs/expected/boolean-string.config
++++ b/test/io-tests/configs/expected/boolean-string.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+ jwt-secret-is-base64 = true
+ log-level = "error"
+-openapi-mode = "follow-privileges"
++openapi-mode = "follow-acl"
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+ server-host = "!4"
+diff --git a/test/io-tests/configs/expected/defaults.config b/test/io-tests/configs/expected/defaults.config
+index e7a072f1..dc1d281b 100644
+--- a/test/io-tests/configs/expected/defaults.config
++++ b/test/io-tests/configs/expected/defaults.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+ jwt-secret-is-base64 = false
+ log-level = "error"
+-openapi-mode = "follow-privileges"
++openapi-mode = "follow-acl"
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+ server-host = "!4"
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+index 78bb1659..412c4ed4 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"other\".\"role\""
+ jwt-secret = "ODERREALLYREALLYREALLYREALLYVERYSAFE"
+ jwt-secret-is-base64 = true
+ log-level = "info"
+-openapi-mode = "disabled"
++openapi-mode = "ignore-acl"
+ openapi-server-proxy-uri = "https://otherexample.org/api"
+ raw-media-types = "application/vnd.pgrst.other-db-config"
+ server-host = "0.0.0.0"
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db.config b/test/io-tests/configs/expected/no-defaults-with-db.config
+index 7c615a0c..56d43817 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"a\".\"role\""
+ jwt-secret = "OVERRIDEREALLYREALLYREALLYREALLYVERYSAFE"
+ jwt-secret-is-base64 = true
+ log-level = "info"
+-openapi-mode = "ignore-privileges"
++openapi-mode = "ignore-acl"
+ openapi-server-proxy-uri = "https://example.org/api"
+ raw-media-types = "application/vnd.pgrst.db-config"
+ server-host = "0.0.0.0"
+diff --git a/test/io-tests/configs/expected/no-defaults.config b/test/io-tests/configs/expected/no-defaults.config
+index a675c7ef..b4c9b6f1 100644
+--- a/test/io-tests/configs/expected/no-defaults.config
++++ b/test/io-tests/configs/expected/no-defaults.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"user\"[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+ jwt-secret-is-base64 = true
+ log-level = "info"
+-openapi-mode = "ignore-privileges"
++openapi-mode = "ignore-acl"
+ openapi-server-proxy-uri = "https://postgrest.org"
+ raw-media-types = "application/vnd.pgrst.config"
+ server-host = "0.0.0.0"
+diff --git a/test/io-tests/configs/expected/types.config b/test/io-tests/configs/expected/types.config
+index 4d2df4d2..3e0efba9 100644
+--- a/test/io-tests/configs/expected/types.config
++++ b/test/io-tests/configs/expected/types.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".\"role\""
+ jwt-secret = ""
+ jwt-secret-is-base64 = false
+ log-level = "error"
+-openapi-mode = "follow-privileges"
++openapi-mode = "follow-acl"
+ openapi-server-proxy-uri = ""
+ raw-media-types = ""
+ server-host = "!4"
+diff --git a/test/io-tests/configs/no-defaults-env.yaml b/test/io-tests/configs/no-defaults-env.yaml
+index 6fab3ac5..c6942479 100644
+--- a/test/io-tests/configs/no-defaults-env.yaml
++++ b/test/io-tests/configs/no-defaults-env.yaml
+@@ -19,7 +19,7 @@ PGRST_JWT_ROLE_CLAIM_KEY: '.user[0]."real-role"'
+ PGRST_JWT_SECRET: c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5
+ PGRST_JWT_SECRET_IS_BASE64: true
+ PGRST_LOG_LEVEL: info
+-PGRST_OPENAPI_MODE: 'ignore-privileges'
++PGRST_OPENAPI_MODE: 'ignore-acl'
+ PGRST_OPENAPI_SERVER_PROXY_URI: 'https://postgrest.org'
+ PGRST_RAW_MEDIA_TYPES: application/vnd.pgrst.config
+ PGRST_SERVER_HOST: 0.0.0.0
+diff --git a/test/io-tests/configs/no-defaults.config b/test/io-tests/configs/no-defaults.config
+index f2b107b6..01d47f90 100644
+--- a/test/io-tests/configs/no-defaults.config
++++ b/test/io-tests/configs/no-defaults.config
+@@ -17,7 +17,7 @@ jwt-role-claim-key = ".user[0].\"real-role\""
+ jwt-secret = "c2VjdXJpdHl0aHJvdWdob2JzY3VyaXR5"
+ jwt-secret-is-base64 = true
+ log-level = "info"
+-openapi-mode = "ignore-privileges"
++openapi-mode = "ignore-acl"
+ openapi-server-proxy-uri = "https://postgrest.org"
+ raw-media-types = "application/vnd.pgrst.config"
+ server-host = "0.0.0.0"
+diff --git a/test/io-tests/fixtures.yaml b/test/io-tests/fixtures.yaml
+index 7e28bc88..838943b7 100644
+--- a/test/io-tests/fixtures.yaml
++++ b/test/io-tests/fixtures.yaml
+@@ -174,8 +174,3 @@ invalidroleclaimkeys:
+   - '.my_role;;domain'
+   - '.#$$%&$%/'
+   - '1234'
+-
+-invalidopenapimodes:
+-  - 'follow-'
+-  - 'ignore-'
+-  - '.#$$%&$%/'
+diff --git a/test/io-tests/test_io.py b/test/io-tests/test_io.py
+index 0cc2fd52..15be81b0 100644
+--- a/test/io-tests/test_io.py
++++ b/test/io-tests/test_io.py
+@@ -425,21 +425,6 @@ def test_invalid_role_claim_key(invalidroleclaimkey, defaultenv):
+                 print(line)
+ 
+ 
+-@pytest.mark.parametrize("invalidopenapimodes", FIXTURES["invalidopenapimodes"])
+-def test_invalid_openapi_mode(invalidopenapimodes, defaultenv):
+-    "Given an invalid openapi-mode, Postgrest should exit with a non-zero exit code."
+-    env = {
+-        **defaultenv,
+-        "PGRST_OPENAPI_MODE": invalidopenapimodes,
+-    }
+-
+-    with pytest.raises(PostgrestError):
+-        dump = dumpconfig(CONFIGSDIR / "defaults.config", env=env)
+-        for line in dump.split("\n"):
+-            if line.startswith("openapi-mode"):
+-                print(line)
+-
+-
+ def test_iat_claim(defaultenv):
+     """
+     A claim with an 'iat' (issued at) attribute should be successful.

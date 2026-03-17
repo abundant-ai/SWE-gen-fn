@@ -1,0 +1,329 @@
+diff --git a/main/Main.hs b/main/Main.hs
+index d9d39373..15abf009 100644
+--- a/main/Main.hs
++++ b/main/Main.hs
+@@ -44,4 +44,5 @@ setBuffering = do
+   -- output, the buffer overflows, a hFlush is issued or the handle is closed
+   hSetBuffering stdout LineBuffering
+   hSetBuffering stdin LineBuffering
+-  hSetBuffering stderr LineBuffering
++  -- NoBuffering: output is written immediately and never stored in the buffer
++  hSetBuffering stderr NoBuffering
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 87b82c5e..74ca6168 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -116,14 +116,13 @@ run installHandlers maybeRunWithSocket appState = do
+     Just socket ->
+       -- run the postgrest application with user defined socket. Only for UNIX systems
+       case maybeRunWithSocket of
+-        Just runWithSocket -> do
+-          AppState.logWithZTime appState $ "Listening on unix socket " <> show socket
++        Just runWithSocket ->
+           runWithSocket (serverSettings conf) app configServerUnixSocketMode socket
+         Nothing ->
+           panic "Cannot run with socket on non-unix plattforms."
+     Nothing ->
+       do
+-        AppState.logWithZTime appState $ "Listening on port " <> show configServerPort
++        putStrLn $ ("Listening on port " :: Text) <> show configServerPort
+         Warp.runSettings (serverSettings conf) app
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index bc9da187..fa021dd2 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -12,7 +12,6 @@ module PostgREST.AppState
+   , getTime
+   , init
+   , initWithPool
+-  , logWithZTime
+   , putConfig
+   , putDbStructure
+   , putIsWorkerOn
+@@ -29,8 +28,6 @@ import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                            updateAction)
+ import Data.IORef         (IORef, atomicWriteIORef, newIORef,
+                            readIORef)
+-import Data.Time          (ZonedTime, defaultTimeLocale, formatTime,
+-                           getZonedTime)
+ import Data.Time.Clock    (UTCTime, getCurrentTime)
+ 
+ import PostgREST.Config           (AppConfig (..))
+@@ -54,11 +51,7 @@ data AppState = AppState
+   , stateListener     :: MVar ()
+   -- | Config that can change at runtime
+   , stateConf         :: IORef AppConfig
+-  -- | Time used for verifying JWT expiration
+   , stateGetTime      :: IO UTCTime
+-  -- | Time with time zone used for worker logs
+-  , stateGetZTime     :: IO ZonedTime
+-  -- | Used for killing the main thread in case a subthread fails
+   , stateMainThreadId :: ThreadId
+   }
+ 
+@@ -70,14 +63,14 @@ init conf = do
+ initWithPool :: P.Pool -> AppConfig -> IO AppState
+ initWithPool newPool conf =
+   AppState newPool
+-    <$> newIORef minimumPgVersion -- assume we're in a supported version when starting, this will be corrected on a later step
++    -- assume we're in a supported version when starting, this will be corrected on a later step
++    <$> newIORef minimumPgVersion
+     <*> newIORef Nothing
+     <*> newIORef mempty
+     <*> newIORef False
+     <*> newEmptyMVar
+     <*> newIORef conf
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
+-    <*> mkAutoUpdate defaultUpdateSettings { updateAction = getZonedTime }
+     <*> myThreadId
+ 
+ initPool :: AppConfig -> IO P.Pool
+@@ -124,12 +117,6 @@ putConfig = atomicWriteIORef . stateConf
+ getTime :: AppState -> IO UTCTime
+ getTime = stateGetTime
+ 
+--- | Log to stderr with local time
+-logWithZTime :: AppState -> Text -> IO ()
+-logWithZTime appState txt = do
+-  zTime <- stateGetZTime appState
+-  hPutStrLn stderr $ toS (formatTime defaultTimeLocale "%d/%b/%Y:%T %z: " zTime) <> txt
+-
+ getMainThreadId :: AppState -> ThreadId
+ getMainThreadId = stateMainThreadId
+ 
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 24cc3d47..5cb20876 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -15,9 +15,10 @@ import qualified Hasql.Statement            as H
+ import qualified Hasql.Transaction          as HT
+ import qualified Hasql.Transaction.Sessions as HT
+ 
++import Data.Text.IO                  (hPutStrLn)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+-import Protolude
++import Protolude hiding (hPutStrLn)
+ 
+ queryPgVersion :: H.Session PgVersion
+ queryPgVersion = H.statement mempty $ H.Statement sql HE.noParams versionRow False
+@@ -25,10 +26,18 @@ queryPgVersion = H.statement mempty $ H.Statement sql HE.noParams versionRow Fal
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+ 
+-queryDbSettings :: P.Pool -> IO (Either P.UsageError [(Text, Text)])
+-queryDbSettings pool =
+-  P.use pool . HT.transaction HT.ReadCommitted HT.Read $
+-    HT.statement mempty dbSettingsStatement
++queryDbSettings :: P.Pool -> IO [(Text, Text)]
++queryDbSettings pool = do
++  result <-
++    P.use pool . HT.transaction HT.ReadCommitted HT.Read $
++      HT.statement mempty dbSettingsStatement
++  case result of
++    Left  e -> do
++      hPutStrLn stderr $
++        "An error ocurred when trying to query database settings for the config parameters:\n"
++        <> show e
++      pure []
++    Right x -> pure x
+ 
+ -- | Get db settings from the connection role. Global settings will be overridden by database specific settings.
+ dbSettingsStatement :: H.Statement () [(Text, Text)]
+diff --git a/src/PostgREST/Unix.hs b/src/PostgREST/Unix.hs
+index e003ccb2..86d42bac 100644
+--- a/src/PostgREST/Unix.hs
++++ b/src/PostgREST/Unix.hs
+@@ -23,6 +23,7 @@ import Protolude
+ runAppWithSocket :: Warp.Settings -> Application -> FileMode -> FilePath -> IO ()
+ runAppWithSocket settings app socketFileMode socketFilePath =
+   bracket createAndBindSocket Socket.close $ \socket -> do
++    putStrLn $ ("Listening on unix socket " :: Text) <> show socketFilePath
+     Socket.listen socket Socket.maxListenQueue
+     Warp.runSettingsSocket settings socket app
+   where
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index a298244f..cae6e8b3 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -16,6 +16,7 @@ import qualified Hasql.Transaction.Sessions as HT
+ 
+ import Control.Retry (RetryStatus, capDelay, exponentialBackoff,
+                       retrying, rsPreviousDelay)
++import Data.Text.IO  (hPutStrLn)
+ 
+ import PostgREST.AppState         (AppState)
+ import PostgREST.Config           (AppConfig (..), readAppConfig)
+@@ -27,7 +28,7 @@ import PostgREST.Error            (PgError (PgError), checkIsFatal,
+ 
+ import qualified PostgREST.AppState as AppState
+ 
+-import Protolude      hiding (head, toS)
++import Protolude      hiding (hPutStrLn, head, toS)
+ import Protolude.Conv (toS)
+ 
+ 
+@@ -66,12 +67,12 @@ connectionWorker appState = do
+   where
+     work = do
+       AppConfig{..} <- AppState.getConfig appState
+-      AppState.logWithZTime appState "Attempting to connect to the database..."
+-      connected <- connectionStatus appState
++      putStrLn ("Attempting to connect to the database..." :: Text)
++      connected <- connectionStatus $ AppState.getPool appState
+       case connected of
+         FatalConnectionError reason ->
+           -- Fatal error when connecting
+-          AppState.logWithZTime appState reason >> killThread (AppState.getMainThreadId appState)
++          hPutStrLn stderr reason >> killThread (AppState.getMainThreadId appState)
+         NotConnected ->
+           -- Unreachable because connectionStatus will keep trying to connect
+           return ()
+@@ -80,7 +81,7 @@ connectionWorker appState = do
+           AppState.putPgVersion appState actualPgVersion
+           when configDbChannelEnabled $
+             AppState.signalListener appState
+-          AppState.logWithZTime appState "Connection successful"
++          putStrLn ("Connection successful" :: Text)
+           -- this could be fail because the connection drops, but the
+           -- loadSchemaCache will pick the error and retry again
+           when configDbConfig $ reReadConfig False appState
+@@ -105,12 +106,11 @@ connectionWorker appState = do
+ --
+ -- The connection tries are capped, but if the connection times out no error is
+ -- thrown, just 'False' is returned.
+-connectionStatus :: AppState -> IO ConnectionStatus
+-connectionStatus appState =
++connectionStatus :: P.Pool -> IO ConnectionStatus
++connectionStatus pool =
+   retrying retrySettings shouldRetry $
+     const $ P.release pool >> getConnectionStatus
+   where
+-    pool = AppState.getPool appState
+     retrySettings = capDelay delayMicroseconds $ exponentialBackoff backoffMicroseconds
+     delayMicroseconds = 32000000 -- 32 seconds
+     backoffMicroseconds = 1000000 -- 1 second
+@@ -121,7 +121,7 @@ connectionStatus appState =
+       case pgVersion of
+         Left e -> do
+           let err = PgError False e
+-          AppState.logWithZTime appState . toS $ errorPayload err
++          hPutStrLn stderr . toS $ errorPayload err
+           case checkIsFatal err of
+             Just reason ->
+               return $ FatalConnectionError reason
+@@ -140,7 +140,7 @@ connectionStatus appState =
+       let
+         delay = fromMaybe 0 (rsPreviousDelay rs) `div` backoffMicroseconds
+         itShould = NotConnected == isConnSucc
+-      when itShould . AppState.logWithZTime appState $
++      when itShould . putStrLn $
+         "Attempting to reconnect to the database in "
+         <> (show delay::Text)
+         <> " seconds..."
+@@ -157,17 +157,17 @@ loadSchemaCache appState = do
+     Left e -> do
+       let
+         err = PgError False e
+-        putErr = AppState.logWithZTime appState . toS $ errorPayload err
++        putErr = hPutStrLn stderr . toS . errorPayload $ err
+       case checkIsFatal err of
+         Just _  -> do
+-          AppState.logWithZTime appState "A fatal error ocurred when loading the schema cache"
++          hPutStrLn stderr "A fatal error ocurred when loading the schema cache"
+           putErr
+-          AppState.logWithZTime appState $
++          hPutStrLn stderr $
+             "This is probably a bug in PostgREST, please report it at "
+             <> "https://github.com/PostgREST/postgrest/issues"
+           return SCFatalFail
+         Nothing -> do
+-          AppState.logWithZTime appState "An error ocurred when loading the schema cache"
++          hPutStrLn stderr "An error ocurred when loading the schema cache"
+           putErr
+           return SCOnRetry
+ 
+@@ -175,7 +175,7 @@ loadSchemaCache appState = do
+       AppState.putDbStructure appState dbStructure
+       when (isJust configDbRootSpec) $
+         AppState.putJsonDbS appState $ toS $ JSON.encode dbStructure
+-      AppState.logWithZTime appState "Schema cache loaded"
++      putStrLn ("Schema cache loaded" :: Text)
+       return SCLoaded
+ 
+ -- | Starts a dedicated pg connection to LISTEN for notifications.  When a
+@@ -189,7 +189,7 @@ listener appState = do
+   -- The listener has to wait for a signal from the connectionWorker.
+   -- This is because when the connection to the db is lost, the listener also
+   -- tries to recover the connection, but not with the same pace as the connectionWorker.
+-  -- Not waiting makes stderr quickly fill with connection retries messages from the listener.
++  -- Not waiting makes stdout quickly fill with connection retries messages from the listener.
+   AppState.waitListener appState
+ 
+   -- forkFinally allows to detect if the thread dies
+@@ -197,7 +197,7 @@ listener appState = do
+     dbOrError <- C.acquire $ toS configDbUri
+     case dbOrError of
+       Right db -> do
+-        AppState.logWithZTime appState $ "Listening for notifications on the " <> dbChannel <> " channel"
++        putStrLn $ "Listening for notifications on the " <> dbChannel <> " channel"
+         N.listen db $ N.toPgIdentifier dbChannel
+         N.waitForNotifications handleNotification db
+       _ ->
+@@ -205,7 +205,7 @@ listener appState = do
+   where
+     handleFinally dbChannel _ = do
+       -- if the thread dies, we try to recover
+-      AppState.logWithZTime appState $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
++      putStrLn $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
+       -- assume the pool connection was also lost, call the connection worker
+       connectionWorker appState
+       -- retry the listener
+@@ -228,15 +228,8 @@ reReadConfig :: Bool -> AppState -> IO ()
+ reReadConfig startingUp appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   dbSettings <-
+-    if configDbConfig then do
+-      qDbSettings <- queryDbSettings $ AppState.getPool appState
+-      case qDbSettings of
+-        Left e -> do
+-          AppState.logWithZTime appState $
+-            "An error ocurred when trying to query database settings for the config parameters:\n"
+-            <> show e
+-          pure []
+-        Right x -> pure x
++    if configDbConfig then
++      queryDbSettings (AppState.getPool appState)
+     else
+       pure mempty
+   readAppConfig dbSettings configFilePath (Just configDbUri) >>= \case
+@@ -244,10 +237,10 @@ reReadConfig startingUp appState = do
+       if startingUp then
+         panic err -- die on invalid config if the program is starting up
+       else
+-        AppState.logWithZTime appState $ "Failed re-loading config: " <> err
++        hPutStrLn stderr $ "Failed re-loading config: " <> err
+     Right newConf -> do
+       AppState.putConfig appState newConf
+       if startingUp then
+         pass
+       else
+-        AppState.logWithZTime appState "Config re-loaded"
++        putStrLn ("Config re-loaded" :: Text)
+diff --git a/test/io-tests/test_io.py b/test/io-tests/test_io.py
+index 15be81b0..5aa18b43 100644
+--- a/test/io-tests/test_io.py
++++ b/test/io-tests/test_io.py
+@@ -684,10 +684,6 @@ def test_invalid_role_claim_key_notify_reload(defaultenv):
+     with run(env=env) as postgrest:
+         postgrest.session.post("/rpc/invalid_role_claim_key_reload")
+ 
+-        # skips the first lines from stderr, the "Attempting to connect to database", "Connection successful", etc.
+-        # this is a hack to avoid readline() from locking up the test
+-        for _ in range(6):
+-            postgrest.process.stderr.readline()
+         assert "failed to parse role-claim-key value" in str(
+             postgrest.process.stderr.readline()
+         )

@@ -1,0 +1,543 @@
+diff --git a/src/dune_lang/package_variable_name.ml b/src/dune_lang/package_variable_name.ml
+index 767be6c78..19196a9c4 100644
+--- a/src/dune_lang/package_variable_name.ml
++++ b/src/dune_lang/package_variable_name.ml
+@@ -45,14 +45,8 @@ let name = of_string "name"
+ let build = of_string "build"
+ let post = of_string "post"
+ let dev = of_string "dev"
+-let installed = of_string "installed"
+ let one_of t xs = List.mem xs ~equal t
+ 
+-(** Returns the slang value of a variable for an absent package. Returns None
+-    for variables without known values or contexts where substitution shouldn't
+-    occur. *)
+-let absent_package_value t = if equal t installed then Some (Slang.bool false) else None
+-
+ let platform_specific =
+   Set.of_list [ arch; os; os_version; os_distribution; os_family; sys_ocaml_version ]
+ ;;
+@@ -75,7 +69,6 @@ let all_known =
+   ; build
+   ; post
+   ; dev
+-  ; installed
+   ]
+ ;;
+ 
+diff --git a/src/dune_lang/package_variable_name.mli b/src/dune_lang/package_variable_name.mli
+index 35cc40346..849d90099 100644
+--- a/src/dune_lang/package_variable_name.mli
++++ b/src/dune_lang/package_variable_name.mli
+@@ -32,14 +32,8 @@ val version : t
+ val post : t
+ val build : t
+ val dev : t
+-val installed : t
+ val one_of : t -> t list -> bool
+ 
+-(** Returns the slang value of a variable for an absent package. Returns None
+-    for variables without known values or contexts where substitution shouldn't
+-    occur. *)
+-val absent_package_value : t -> Slang.t option
+-
+ (** The set of variable names whose values are expected to differ depending on
+     the current platform. *)
+ val platform_specific : Set.t
+diff --git a/src/dune_pkg/lock_pkg.ml b/src/dune_pkg/lock_pkg.ml
+index ddf670880..936c2b460 100644
+--- a/src/dune_pkg/lock_pkg.ml
++++ b/src/dune_pkg/lock_pkg.ml
+@@ -54,50 +54,40 @@ let invalid_variable_error ~loc variable =
+     [ Pp.textf "Variable %S is not supported." (OpamVariable.to_string variable) ]
+ ;;
+ 
+-(* CR-someday Alizter: This function is very mysterious and does a lot of
+-   things. We should either make it easier to understand or refactor it into
+-   more logical steps. Comments explaining what [packages] is would also be
+-   useful. (It's for {foo+bar+zar:asdf} payloads). *)
+-let opam_variable_to_slang =
+-  let opam_var_to_pform variable_name scope =
+-    Package_variable.to_pform { Package_variable.name = variable_name; scope }
+-    |> Slang.pform
++let opam_variable_to_slang ~loc packages variable =
++  let variable_string = OpamVariable.to_string variable in
++  let convert_with_package_name package_name =
++    match is_valid_package_variable_name variable_string with
++    | false -> invalid_variable_error ~loc variable
++    | true ->
++      let pform =
++        let name = Package_variable_name.of_string variable_string in
++        let scope : Package_variable.Scope.t =
++          match package_name with
++          | None -> Self
++          | Some p -> Package (Package_name.of_opam_package_name p)
++        in
++        Package_variable.to_pform { Package_variable.name; scope }
++      in
++      Slang.pform pform
+   in
+-  fun ~loc ~packages_in_solution packages variable ->
+-    let variable_string = OpamVariable.to_string variable in
+-    let variable_name = Package_variable_name.of_string variable_string in
+-    let convert_with_package_name package_name =
+-      match is_valid_package_variable_name variable_string with
+-      | false -> invalid_variable_error ~loc variable
+-      | true ->
+-        (match package_name with
+-         | Some p ->
+-           let pkg_name = Package_name.of_opam_package_name p in
+-           let pform = opam_var_to_pform variable_name (Package pkg_name) in
+-           if Package_name.Map.mem packages_in_solution pkg_name
+-           then pform
+-           else
+-             Package_variable_name.absent_package_value variable_name
+-             |> Option.value ~default:pform
+-         | None -> opam_var_to_pform variable_name Self)
+-    in
+-    match packages with
+-    | [] ->
+-      (match is_valid_global_variable_name variable_string with
+-       | false ->
+-         (* Note that there's no syntactic distinction between global variables
++  match packages with
++  | [] ->
++    (match is_valid_global_variable_name variable_string with
++     | false ->
++       (* Note that there's no syntactic distinction between global variables
+           and package variables in the current package. This check will prevent
+           invalid global variable names from being used for package variables in the
+           current package where the optional qualifier "_:" is omitted. *)
+-         invalid_variable_error ~loc variable
+-       | true ->
+-         (match Pform.Var.of_opam_global_variable_name variable_string with
+-          | Some global_var -> Slang.pform (Pform.Var global_var)
+-          | None -> convert_with_package_name None))
+-    | [ package_name ] -> convert_with_package_name package_name
+-    | many ->
+-      let many = List.map many ~f:convert_with_package_name in
+-      Slang.blang (Blang.And (List.map many ~f:(fun slang -> Blang.Expr slang)))
++       invalid_variable_error ~loc variable
++     | true ->
++       (match Pform.Var.of_opam_global_variable_name variable_string with
++        | Some global_var -> Slang.pform (Pform.Var global_var)
++        | None -> convert_with_package_name None))
++  | [ package_name ] -> convert_with_package_name package_name
++  | many ->
++    let many = List.map many ~f:convert_with_package_name in
++    Slang.blang (Blang.And (List.map many ~f:(fun slang -> Blang.Expr slang)))
+ ;;
+ 
+ (* Handles the special case for packages whose names contain '+' characters
+@@ -123,11 +113,11 @@ let desugar_special_string_interpolation_syntax
+   | _ -> fident
+ ;;
+ 
+-let opam_fident_to_slang ~loc ~packages_in_solution fident =
++let opam_fident_to_slang ~loc fident =
+   let packages, variable, string_converter =
+     OpamFilter.desugar_fident fident |> desugar_special_string_interpolation_syntax
+   in
+-  let slang = opam_variable_to_slang ~loc ~packages_in_solution packages variable in
++  let slang = opam_variable_to_slang ~loc packages variable in
+   match string_converter with
+   | None -> slang
+   | Some (then_, else_) ->
+@@ -135,21 +125,17 @@ let opam_fident_to_slang ~loc ~packages_in_solution fident =
+        an undefined variable. The catch_undefined_var operator is used to
+        convert expressions that throw undefined variable exceptions into false.
+     *)
+-    (match slang with
+-     | Form (_, Blang (Blang.Const false)) -> Slang.text else_
+-     | _ ->
+-       let condition =
+-         Blang.Expr (Slang.catch_undefined_var slang ~fallback:(Slang.bool false))
+-       in
+-       Slang.if_ condition ~then_:(Slang.text then_) ~else_:(Slang.text else_))
++    let condition =
++      Blang.Expr (Slang.catch_undefined_var slang ~fallback:(Slang.bool false))
++    in
++    Slang.if_ condition ~then_:(Slang.text then_) ~else_:(Slang.text else_)
+ ;;
+ 
+-let opam_raw_fident_to_slang ~loc ~packages_in_solution raw_ident =
+-  OpamTypesBase.filter_ident_of_string raw_ident
+-  |> opam_fident_to_slang ~loc ~packages_in_solution
++let opam_raw_fident_to_slang ~loc raw_ident =
++  OpamTypesBase.filter_ident_of_string raw_ident |> opam_fident_to_slang ~loc
+ ;;
+ 
+-let opam_string_to_slang ~packages_in_solution ~package ~loc opam_string =
++let opam_string_to_slang ~package ~loc opam_string =
+   Re.Seq.split_full OpamFilter.string_interp_regex opam_string
+   |> Seq.map ~f:(function
+     | `Text text -> Slang.text text
+@@ -160,7 +146,7 @@ let opam_string_to_slang ~packages_in_solution ~package ~loc opam_string =
+          when String.starts_with ~prefix:"%{" interp
+               && String.ends_with ~suffix:"}%" interp ->
+          let ident = String.sub ~pos:2 ~len:(String.length interp - 4) interp in
+-         opam_raw_fident_to_slang ~loc ~packages_in_solution ident
++         opam_raw_fident_to_slang ~loc ident
+        | other ->
+          User_error.raise
+            ~loc
+@@ -230,11 +216,11 @@ let resolve_depopts ~resolve depopts =
+    These two Slang operators are used to emulate Opam's undefined value
+    semantics.
+ *)
+-let filter_to_blang ~packages_in_solution ~package ~loc filter =
++let filter_to_blang ~package ~loc filter =
+   let filter_to_slang (filter : OpamTypes.filter) =
+     match filter with
+-    | FString s -> opam_string_to_slang ~packages_in_solution ~package ~loc s
+-    | FIdent fident -> opam_fident_to_slang ~loc ~packages_in_solution fident
++    | FString s -> opam_string_to_slang ~package ~loc s
++    | FIdent fident -> opam_fident_to_slang ~loc fident
+     | other ->
+       Code_error.raise
+         "The opam file parser should only allow identifiers and strings in places where \
+@@ -282,7 +268,6 @@ let filter_to_blang ~packages_in_solution ~package ~loc filter =
+ ;;
+ 
+ let opam_commands_to_actions
+-      ~packages_in_solution
+       get_solver_var
+       loc
+       package
+@@ -302,9 +287,8 @@ let opam_commands_to_actions
+             let slang =
+               let slang =
+                 match simple_arg with
+-                | CString s -> opam_string_to_slang ~packages_in_solution ~package ~loc s
+-                | CIdent ident ->
+-                  opam_raw_fident_to_slang ~loc ~packages_in_solution ident
++                | CString s -> opam_string_to_slang ~package ~loc s
++                | CIdent ident -> opam_raw_fident_to_slang ~loc ident
+               in
+               Slang.simplify slang
+             in
+@@ -314,9 +298,8 @@ let opam_commands_to_actions
+                  | None -> slang
+                  | Some filter ->
+                    let filter_blang =
+-                     filter_to_blang ~packages_in_solution ~package ~loc filter
+-                     |> Slang.simplify_blang
+-                   in
++                     filter_to_blang ~package ~loc filter |> Slang.simplify_blang
++                   and slang = slang in
+                    let filter_blang_handling_undefined =
+                      (* Wrap the blang filter so that if any undefined
+                          variables are expanded while evaluating the filter,
+@@ -335,18 +318,17 @@ let opam_commands_to_actions
+       if List.is_empty terms
+       then None
+       else (
+-        let action = Action.Run terms in
+-        match filter with
+-        | None -> Some action
+-        | Some filter ->
+-          let condition =
+-            filter_to_blang ~packages_in_solution ~package ~loc filter
+-            |> Slang.simplify_blang
+-          in
+-          (match condition with
+-           | Const true -> Some action
+-           | Const false -> None
+-           | _ -> Some (Action.When (condition, action)))))
++        let action =
++          let action = Action.Run terms in
++          match filter with
++          | None -> action
++          | Some filter ->
++            let condition =
++              filter_to_blang ~package ~loc filter |> Slang.simplify_blang
++            in
++            Action.When (condition, action)
++        in
++        Some action))
+ ;;
+ 
+ (* Standard package variables that are always defined at build time.
+@@ -397,13 +379,12 @@ let rec filter_vars_are_defined : OpamTypes.filter -> bool = function
+ 
+    Depexts with filters that reference undefined variables are excluded, as
+    they would error at build time. *)
+-let depexts_to_conditional_external_dependencies ~packages_in_solution package depexts =
++let depexts_to_conditional_external_dependencies package depexts =
+   List.filter_map depexts ~f:(fun (sys_pkgs, filter) ->
+     let open Option.O in
+     let* () = Option.some_if (filter_vars_are_defined filter) () in
+     let condition =
+-      filter_to_blang ~packages_in_solution ~package ~loc:Loc.none filter
+-      |> Slang.simplify_blang
++      filter_to_blang ~package ~loc:Loc.none filter |> Slang.simplify_blang
+     in
+     let+ () = Option.some_if (not (Slang.Blang.equal condition Slang.Blang.false_)) () in
+     let external_package_names =
+@@ -508,7 +489,6 @@ let opam_package_to_lock_file_pkg
+     Solver_stats.Updater.expand_variable stats_updater variable_name;
+     Solver_env.get solver_env variable_name
+   in
+-  let packages_in_solution = version_by_package_name in
+   let build_command =
+     if Resolved_package.dune_build resolved_package
+     then Some Lock_dir.Build_command.Dune
+@@ -532,17 +512,12 @@ let opam_package_to_lock_file_pkg
+           | None -> action
+           | Some filter ->
+             let blang =
+-              filter_to_blang
+-                ~packages_in_solution
+-                ~package:opam_package
+-                ~loc:Loc.none
+-                filter
++              filter_to_blang ~package:opam_package ~loc:Loc.none filter
+               |> Slang.simplify_blang
+             in
+             Action.When (blang, action))
+       and build_step =
+         opam_commands_to_actions
+-          ~packages_in_solution
+           get_solver_var
+           loc
+           opam_package
+@@ -573,7 +548,6 @@ let opam_package_to_lock_file_pkg
+     if portable_lock_dir
+     then
+       depexts_to_conditional_external_dependencies
+-        ~packages_in_solution
+         opam_package
+         (OpamFile.OPAM.depexts opam_file)
+     else (
+@@ -592,7 +566,7 @@ let opam_package_to_lock_file_pkg
+   in
+   let install_command =
+     OpamFile.OPAM.install opam_file
+-    |> opam_commands_to_actions ~packages_in_solution get_solver_var loc opam_package
++    |> opam_commands_to_actions get_solver_var loc opam_package
+     |> make_action
+     |> Option.map ~f:(fun action -> lockfile_field_choice (build_env action))
+     |> Option.value ~default:Lock_dir.Conditional_choice.empty
+diff --git a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+index a070ca7c8..a80f3ded5 100644
+--- a/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
++++ b/test/blackbox-tests/test-cases/pkg/convert-opam-commands.t
+@@ -40,12 +40,7 @@ Make sure we don't mess up percent signs that aren't part of variable interpolat
+   > build: [ "./configure" "--prefix=%{prefix" ]
+   > EOF
+ 
+-  $ mkpkg foo
+-  $ mkpkg bar
+-  $ mkpkg baz
+-
+   $ mkpkg variable-types <<EOF
+-  > depends: [ "foo" ]
+   > build: [
+   >   ["echo" local_var]
+   >   ["echo" _:explicit_local_var]
+@@ -56,7 +51,6 @@ Make sure we don't mess up percent signs that aren't part of variable interpolat
+ 
+ Package for exercising opam filters on commands:
+   $ mkpkg exercise-filters <<EOF
+-  > depends: [ "foo" "bar" "baz" ]
+   > build: [
+   >   [ "echo" "a" ] { foo  }
+   >   [ "echo" "b" ] { foo & bar }
+@@ -79,7 +73,6 @@ Package for exercising opam filters on commands:
+ 
+ Package for exercising opam filters on terms:
+   $ mkpkg exercise-term-filters <<EOF
+-  > depends: [ "foo" "bar" "baz" ]
+   > build: [
+   >   [ "echo" "a" "b" { foo } "c" { bar & baz } ]
+   > ]
+@@ -94,7 +87,6 @@ Package which has boolean where string was expected. This should be caught while
+ 
+   $ solve standard-dune with-interpolation with-percent-sign variable-types
+   Solution for dune.lock:
+-  - foo.0.0.1
+   - standard-dune.0.0.1
+   - variable-types.0.0.1
+   - with-interpolation.0.0.1
+@@ -145,11 +137,6 @@ Package which has boolean where string was expected. This should be caught while
+        (run echo %{pkg-self:explicit_local_var})
+        (run echo %{pkg:foo:package_var})
+        (run echo %{os_family}))))))
+-  
+-  (depends
+-   (all_platforms (foo)))
+-
+-
+ 
+   $ solve with-malformed-interpolation
+   File "$TESTCASE_ROOT/mock-opam-repository/packages/with-malformed-interpolation/with-malformed-interpolation.0.0.1/opam", line 1, characters 0-0:
+@@ -161,10 +148,7 @@ Package which has boolean where string was expected. This should be caught while
+ 
+   $ solve exercise-filters
+   Solution for dune.lock:
+-  - bar.0.0.1
+-  - baz.0.0.1
+   - exercise-filters.0.0.1
+-  - foo.0.0.1
+ 
+   $ cat ${default_lock_dir}/exercise-filters.0.0.1.pkg
+   (version 0.0.1)
+@@ -205,18 +189,11 @@ Package which has boolean where string was expected. This should be caught while
+        (when
+         (and %{pkg:foo:installed} %{pkg:bar:installed} %{pkg:baz:installed})
+         (run echo m)))))))
+-  
+-  (depends
+-   (all_platforms
+-    (foo bar baz)))
+ 
+ Test that if opam filter translation is disabled the output doesn't contain any translated filters:
+   $ solve exercise-filters
+   Solution for dune.lock:
+-  - bar.0.0.1
+-  - baz.0.0.1
+   - exercise-filters.0.0.1
+-  - foo.0.0.1
+   $ cat ${default_lock_dir}/exercise-filters.0.0.1.pkg
+   (version 0.0.1)
+   
+@@ -256,17 +233,10 @@ Test that if opam filter translation is disabled the output doesn't contain any
+        (when
+         (and %{pkg:foo:installed} %{pkg:bar:installed} %{pkg:baz:installed})
+         (run echo m)))))))
+-  
+-  (depends
+-   (all_platforms
+-    (foo bar baz)))
+ 
+   $ solve exercise-term-filters
+   Solution for dune.lock:
+-  - bar.0.0.1
+-  - baz.0.0.1
+   - exercise-term-filters.0.0.1
+-  - foo.0.0.1
+   $ cat ${default_lock_dir}/exercise-term-filters.0.0.1.pkg
+   (version 0.0.1)
+   
+@@ -282,10 +252,6 @@ Test that if opam filter translation is disabled the output doesn't contain any
+          (and_absorb_undefined_var %{pkg-self:bar} %{pkg-self:baz})
+          false)
+         c))))))
+-  
+-  (depends
+-   (all_platforms
+-    (foo bar baz)))
+ 
+   $ solve filter-error-bool-where-string-expected
+   File "$TESTCASE_ROOT/mock-opam-repository/packages/filter-error-bool-where-string-expected/filter-error-bool-where-string-expected.0.0.1/opam", line 3, characters 33-34:
+@@ -297,7 +263,6 @@ Test that if opam filter translation is disabled the output doesn't contain any
+ 
+ Package with package conjunction and string selections inside variable interpolations:
+   $ mkpkg package-conjunction-and-string-selection <<EOF
+-  > depends: [ "foo" "bar" ]
+   > build: [
+   >   [ "echo" "a %{installed}% b" ]
+   >   [ "echo" "c %{installed?x:y}% d" ]
+@@ -318,8 +283,6 @@ Package with package conjunction and string selections inside variable interpola
+   > (package (name x) (depends package-conjunction-and-string-selection))
+   > EOF
+   Solution for dune.lock:
+-  - bar.0.0.1
+-  - foo.0.0.1
+   - package-conjunction-and-string-selection.0.0.1
+ Note that "enable" is not a true opam variable. Opam desugars occurrences of
+ "pkg:enable" into "pkg:enable?enable:disable" but if the explicit package scope
+@@ -392,7 +355,3 @@ preserved between opam and dune.
+           x
+           y)
+          -feature)))))))
+-  
+-  (depends
+-   (all_platforms
+-    (foo bar)))
+diff --git a/test/blackbox-tests/test-cases/pkg/depexts/unknown-variable.t b/test/blackbox-tests/test-cases/pkg/depexts/unknown-variable.t
+index a3c3d1a7b..8d75e3f35 100644
+--- a/test/blackbox-tests/test-cases/pkg/depexts/unknown-variable.t
++++ b/test/blackbox-tests/test-cases/pkg/depexts/unknown-variable.t
+@@ -36,4 +36,5 @@ standard package variable. Cases "a", "b", and "d" should be filtered:
+    (all_platforms (dep)))
+   
+   (depexts
+-   ((c) %{pkg:dep:installed}))
++   ((c) %{pkg:dep:installed})
++   ((d) %{pkg:nonexistent-pkg:installed}))
+diff --git a/test/blackbox-tests/test-cases/pkg/opam-var/absent-pkg-installed.t b/test/blackbox-tests/test-cases/pkg/opam-var/absent-pkg-installed.t
+index f82728637..4201f445e 100644
+--- a/test/blackbox-tests/test-cases/pkg/opam-var/absent-pkg-installed.t
++++ b/test/blackbox-tests/test-cases/pkg/opam-var/absent-pkg-installed.t
+@@ -18,9 +18,8 @@ bare ident, string interpolation, and filter context.
+   Solution for dune.lock:
+   - test-installed-var.0.0.1
+ 
+-The installed variable resolves to "false" at solve time (matching opam
+-semantics). In filter context, commands with always-false conditions are
+-removed, and commands with always-true conditions have their filters removed:
++Currently the installed variable is left as a pform. It should resolve to
++"false" at solve time (matching opam semantics):
+ 
+   $ cat dune.lock/test-installed-var.0.0.1.pkg
+   (version 0.0.1)
+@@ -29,14 +28,18 @@ removed, and commands with always-true conditions have their filters removed:
+    (all_platforms
+     ((action
+       (progn
+-       (run echo false)
+-       (run echo false)
+-       (run echo no)
+-       (run echo "not installed"))))))
++       (run echo %{pkg:absent:installed})
++       (run echo %{pkg:absent:installed})
++       (run
++        echo
++        (if (catch_undefined_var %{pkg:absent:installed} false) yes no))
++       (when %{pkg:absent:installed} (run echo installed))
++       (when (not %{pkg:absent:installed}) (run echo "not installed")))))))
+ 
+-The "enable" variable is desugared to "installed?enable:disable". Since
+-"installed" is known to be false for absent packages, the conditional is
+-evaluated at solve time:
++
++The "enable" variable is desugared to "installed?enable:disable". Currently the
++variable is left as a conditional. Since installed is false for absent packages,
++enable should resolve to "disable" at solve time:
+ 
+   $ mkpkg "test-enable-var" <<'EOF'
+   > build: [
+@@ -50,18 +53,6 @@ evaluated at solve time:
+   Solution for dune.lock:
+   - test-enable-var.0.0.1
+ 
+-The first two cases resolve to "disable" because "enable" is desugared to
+-"installed?enable:disable", and installed=false for absent packages.
+-
+-The third case "%{absent:enable?yes:no}%" is different: in opam, "enable" is a
+-pseudo-variable that only gets desugared when used without a "string converter"
+-(opam's term for the "?if_true:if_false" ternary suffix).
+-With a converter present, "enable" is treated as a literal variable name, but
+-no package actually defines an "enable" variable - it only exists as syntactic
+-sugar. Therefore "enable" is undefined, and undefined variables in ternary
+-context evaluate to the fallback ("no"). We could simplify this to "no" at
+-solve time, but it is tricky and this pattern does not appear in practice:
+-
+   $ cat dune.lock/test-enable-var.0.0.1.pkg
+   (version 0.0.1)
+   
+@@ -69,7 +60,11 @@ solve time, but it is tricky and this pattern does not appear in practice:
+    (all_platforms
+     ((action
+       (progn
+-       (run echo disable)
+-       (run echo disable)
++       (run
++        echo
++        (if (catch_undefined_var %{pkg:absent:installed} false) enable disable))
++       (run
++        echo
++        (if (catch_undefined_var %{pkg:absent:installed} false) enable disable))
+        (run echo (if (catch_undefined_var %{pkg:absent:enable} false) yes no)))))))
+ 

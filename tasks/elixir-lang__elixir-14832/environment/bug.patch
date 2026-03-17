@@ -1,0 +1,189 @@
+diff --git a/lib/elixir/src/elixir_expand.erl b/lib/elixir/src/elixir_expand.erl
+index b0d0fc021..6e81bc70e 100644
+--- a/lib/elixir/src/elixir_expand.erl
++++ b/lib/elixir/src/elixir_expand.erl
+@@ -257,12 +257,11 @@ expand({quote, Meta, [Opts, Do]}, S, E) when is_list(Do) ->
+   {EContext, SC, EC} = expand(QContext, SP, EP),
+   Quoted = elixir_quote:quote(Exprs, Q),
+   {EQuoted, ES, EQ} = expand(Quoted, SC, EC),
+-  BindingMeta = lists:keydelete(column, 1, Meta),
+ 
+   EBinding =
+       [{'{}', [],
+         ['=', [], [
+-          {'{}', [], [K, BindingMeta, EContext]},
++          {'{}', [], [K, Meta, EContext]},
+           V
+         ]
+        ]} || {K, V} <- Binding],
+diff --git a/lib/elixir/src/elixir_quote.erl b/lib/elixir/src/elixir_quote.erl
+index c229b1528..2b2781658 100644
+--- a/lib/elixir/src/elixir_quote.erl
++++ b/lib/elixir/src/elixir_quote.erl
+@@ -141,12 +141,16 @@ do_tuple_linify(Fun, Meta, Left, Right, Var) ->
+ %% lines are kept and hygiene mechanisms are disabled.
+ escape(Expr, Op, Unquote) ->
+   try
+-    do_quote(Expr, #elixir_quote{
++    Q = #elixir_quote{
+       line=true,
+       file=nil,
+       op=Op,
+       unquote=Unquote
+-    })
++    },
++    case Unquote of
++      true -> do_quote(Expr, Q);
++      false -> do_escape(Expr, Q)
++    end
+   catch
+     Kind:Reason:Stacktrace ->
+       Pruned = lists:dropwhile(fun
+@@ -158,15 +162,14 @@ escape(Expr, Op, Unquote) ->
+ 
+ do_escape({Left, Meta, Right}, #elixir_quote{op=escape_and_prune} = Q) when is_list(Meta) ->
+   TM = [{K, V} || {K, V} <- Meta, (K == no_parens) orelse (K == line) orelse (K == delimiter)],
+-  TL = do_quote(Left, Q),
+-  TR = do_quote(Right, Q),
++  TL = do_escape(Left, Q),
++  TR = do_escape(Right, Q),
+   {'{}', [], [TL, TM, TR]};
+ 
+ do_escape({Left, Right}, Q) ->
+-  {do_quote(Left, Q), do_quote(Right, Q)};
+-
++  {do_escape(Left, Q), do_escape(Right, Q)};
+ do_escape(Tuple, Q) when is_tuple(Tuple) ->
+-  TT = do_quote(tuple_to_list(Tuple), Q),
++  TT = do_escape(tuple_to_list(Tuple), Q),
+   {'{}', [], TT};
+ 
+ do_escape(BitString, _) when is_bitstring(BitString) ->
+@@ -203,10 +206,7 @@ do_escape(Map, Q) when is_map(Map) ->
+     end
+   else
+     _ ->
+-      TT = [
+-        {do_quote(K, Q), do_quote(V, Q)}
+-        || {K, V} <- lists:sort(maps:to_list(Map))
+-      ],
++      TT = [escape_map_key_value(K, V, Map, Q) || {K, V} <- lists:sort(maps:to_list(Map))],
+       {'%{}', [], TT}
+   end;
+ 
+@@ -214,7 +214,11 @@ do_escape([], _) ->
+   [];
+ 
+ do_escape([H | T], #elixir_quote{unquote=false} = Q) ->
+-  do_quote_simple_list(T, do_escape(H, Q), Q);
++  case is_list(T) of
++    true -> [do_escape(H, Q) | do_escape(T, Q)];
++    % improper list
++    false -> [{'|', [], [do_escape(H, Q), do_escape(T, Q)]}]
++  end;
+ 
+ do_escape([H | T], Q) ->
+   %% The improper case is inefficient, but improper lists are rare.
+@@ -224,7 +228,7 @@ do_escape([H | T], Q) ->
+     _:_ ->
+       {L, R} = reverse_improper(T, [H]),
+       TL = do_quote_splice(L, Q, [], []),
+-      TR = do_quote(R, Q),
++      TR = do_escape(R, Q),
+       update_last(TL, fun(X) -> {'|', [], [X, TR]} end)
+   end;
+ 
+@@ -241,6 +245,28 @@ do_escape(Fun, _) when is_function(Fun) ->
+ do_escape(Other, _) ->
+   bad_escape(Other).
+ 
++escape_map_key_value(K, V, Map, Q) ->
++  MaybeRef = if
++    is_reference(V) -> V;
++    is_tuple(V) -> find_tuple_ref(V, 1);
++    true -> nil
++  end,
++  if
++    is_reference(MaybeRef) ->
++      argument_error(<<('Elixir.Kernel':inspect(Map, []))/binary, " contains a reference (",
++                        ('Elixir.Kernel':inspect(MaybeRef, []))/binary, ") and therefore it cannot be escaped",
++                        (bad_escape_hint())/binary>>);
++    true ->
++      {do_escape(K, Q), do_escape(V, Q)}
++  end.
++
++find_tuple_ref(Tuple, Index) when Index > tuple_size(Tuple) -> nil;
++find_tuple_ref(Tuple, Index) ->
++  case element(Index, Tuple) of
++    Ref when is_reference(Ref) -> Ref;
++    _ -> find_tuple_ref(Tuple, Index + 1)
++  end.
++
+ bad_escape(Arg) ->
+   argument_error(<<"cannot escape ", ('Elixir.Kernel':inspect(Arg, []))/binary,
+                    (bad_escape_hint())/binary>>).
+@@ -357,6 +383,7 @@ do_quote({quote, Meta, [Opts, Arg]}, Q) when is_list(Meta) ->
+ 
+   {'{}', [], [quote, meta(NewMeta, Q), [TOpts, TArg]]};
+ 
++%
+ do_quote({unquote, Meta, [Expr]}, #elixir_quote{unquote=true, shallow_validate=Validate}) when is_list(Meta) ->
+   case Validate of
+     true -> {{'.', Meta, [?MODULE, shallow_validate_ast]}, Meta, [Expr]};
+@@ -593,10 +620,8 @@ argument_error(Message) ->
+ 
+ %% Helpers
+ 
+-meta(Meta, #elixir_quote{op=quote} = Q) ->
+-  generated(keep(keydelete(column, Meta), Q), Q);
+ meta(Meta, Q) ->
+-  do_quote(Meta, Q).
++  generated(keep(keydelete(column, Meta), Q), Q).
+ 
+ generated(Meta, #elixir_quote{generated=true}) -> [{generated, true} | Meta];
+ generated(Meta, #elixir_quote{generated=false}) -> Meta.
+diff --git a/lib/elixir/test/elixir/macro_test.exs b/lib/elixir/test/elixir/macro_test.exs
+index 429efe23c..23a1188be 100644
+--- a/lib/elixir/test/elixir/macro_test.exs
++++ b/lib/elixir/test/elixir/macro_test.exs
+@@ -82,9 +82,6 @@ test "with unquote" do
+ 
+       contents = quote(unquote: false, do: unquote(x))
+       assert Macro.escape(contents, unquote: true) == {:x, [], MacroTest}
+-
+-      contents = %{foo: quote(unquote: false, do: unquote(1))}
+-      assert Macro.escape(contents, unquote: true) == {:%{}, [], [foo: 1]}
+     end
+ 
+     test "with generated" do
+@@ -100,7 +97,6 @@ defp eval_escaped(contents) do
+     test "with remote unquote" do
+       contents = quote(unquote: false, do: Kernel.unquote(:is_atom)(:ok))
+       assert eval_escaped(contents) == quote(do: Kernel.is_atom(:ok))
+-      assert eval_escaped(%{foo: contents}) == %{foo: quote(do: Kernel.is_atom(:ok))}
+     end
+ 
+     test "with nested unquote" do
+@@ -144,9 +140,6 @@ test "with splicing" do
+         quote(unquote: false, do: [1, unquote_splicing([2]), 3, unquote_splicing([4]) | [5]])
+ 
+       assert eval_escaped(contents) == [1, 2, 3, 4, 5]
+-
+-      contents = %{foo: quote(unquote: false, do: [1, 2, unquote_splicing([3, 4, 5])])}
+-      assert eval_escaped(contents) == %{foo: [1, 2, 3, 4, 5]}
+     end
+ 
+     test "does not add context to quote" do
+@@ -161,6 +154,12 @@ test "escapes the content of :quote tuples" do
+                [:foo, {:{}, [], [:quote, [{:%{}, [], []}], [{:{}, [], []}]]}]
+     end
+ 
++    test "escape container when a reference cannot be escaped" do
++      assert_raise ArgumentError, ~r"contains a reference", fn ->
++        Macro.escape(%{re_pattern: {:re_pattern, 0, 0, 0, make_ref()}})
++      end
++    end
++
+     @tag :re_import
+     test "escape regex will remove references and replace it by a call to :re.import/1" do
+       assert {

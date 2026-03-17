@@ -1,0 +1,9 @@
+When generating authentication code with `Mix.Tasks.Phx.Gen.Auth.run/2`, the generated Ecto schemas and migrations currently hardcode timestamp behavior in some places instead of respecting the project’s configured timestamp settings. This is a follow-up to the introduction of configurable timestamps (from #5586), but some generation paths still set timestamps using defaults even when the project config specifies different timestamp types/options.
+
+Reproduction: create a new Phoenix project, configure Ecto timestamp behavior (for example, setting UTC vs naive datetimes and/or setting timestamp type/options used by `timestamps/0`), then run the auth generator (e.g., `mix phx.gen.auth Accounts User users`). Even though the project is configured for a specific timestamp type/options, parts of the generated auth code will still include timestamps that do not match the configured values.
+
+Expected behavior: all timestamp definitions produced by `Mix.Tasks.Phx.Gen.Auth` should consistently match the project configuration everywhere timestamps are generated, including any generated schemas, migrations, and related auth tables. The generator should not mix configured timestamps with default timestamps.
+
+Actual behavior: timestamps match configuration in some generated artifacts but not others, resulting in inconsistent timestamp fields/types/options across generated auth-related schemas/migrations.
+
+Fix `Mix.Tasks.Phx.Gen.Auth` so that every place it generates timestamps (including auxiliary tables used by the auth system) uses the configured timestamp settings. After the change, running `Mix.Tasks.Phx.Gen.Auth.run/2` in a project with non-default timestamp configuration should generate auth code whose timestamp fields align with that configuration consistently across all generated files.

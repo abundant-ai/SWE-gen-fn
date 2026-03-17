@@ -1,0 +1,1095 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 64788382..1788c3a2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,7 +10,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ ### Fixed
+ 
+  - #2020, Execute deferred constraint triggers when using `Prefer: tx=rollback` - @wolfgangwalther
+- - #2058, Return 204 No Content without Content-Type for PUT - @wolfgangwalther
+ 
+ ## [9.0.0] - 2021-11-25
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 89a75bbe..d70ac55e 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -374,7 +374,7 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+     if iPreferRepresentation == Full then
+       response HTTP.status200 (contentTypeHeaders context) (LBS.fromStrict resBody)
+     else
+-      response HTTP.status204 [] mempty
++      response HTTP.status204 (contentTypeHeaders context) mempty
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+diff --git a/src/PostgREST/Query/SqlFragment.hs b/src/PostgREST/Query/SqlFragment.hs
+index fb194121..e35a8c2d 100644
+--- a/src/PostgREST/Query/SqlFragment.hs
++++ b/src/PostgREST/Query/SqlFragment.hs
+@@ -172,10 +172,10 @@ asJsonF returnsScalar
+   | returnsScalar = "coalesce(json_agg(_postgrest_t.pgrst_scalar), '[]')::character varying"
+   | otherwise     = "coalesce(json_agg(_postgrest_t), '[]')::character varying"
+ 
+-asJsonSingleF :: Bool -> SqlFragment
++asJsonSingleF :: Bool -> SqlFragment --TODO! unsafe when the query actually returns multiple rows, used only on inserting and returning single element
+ asJsonSingleF returnsScalar
+-  | returnsScalar = "coalesce((json_agg(_postgrest_t.pgrst_scalar)->0)::text, 'null')"
+-  | otherwise     = "coalesce((json_agg(_postgrest_t)->0)::text, 'null')"
++  | returnsScalar = "coalesce(string_agg(to_json(_postgrest_t.pgrst_scalar)::text, ','), 'null')::character varying"
++  | otherwise     = "coalesce(string_agg(to_json(_postgrest_t)::text, ','), '')::character varying"
+ 
+ asBinaryF :: FieldName -> SqlFragment
+ asBinaryF fieldName = "coalesce(string_agg(_postgrest_t." <> pgFmtIdent fieldName <> ", ''), '')"
+diff --git a/test/Feature/DeleteSpec.hs b/test/Feature/DeleteSpec.hs
+index c695e462..86bc8984 100644
+--- a/test/Feature/DeleteSpec.hs
++++ b/test/Feature/DeleteSpec.hs
+@@ -7,23 +7,18 @@ import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get)
+-import SpecHelper
++import Protolude hiding (get)
+ 
+ spec :: SpecWith ((), Application)
+ spec =
+   describe "Deleting" $ do
+     context "existing record" $ do
+       it "succeeds with 204 and deletion count" $
+-        request methodDelete "/items?id=eq.1"
+-            []
+-            ""
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "*/*" ]
+-            }
++        request methodDelete "/items?id=eq.1" [] ""
++          `shouldRespondWith` ""
++          { matchStatus  = 204
++          , matchHeaders = ["Content-Range" <:> "*/*"]
++          }
+ 
+       it "returns the deleted item and count if requested" $
+         request methodDelete "/items?id=eq.2" [("Prefer", "return=representation"), ("Prefer", "count=exact")] ""
+@@ -33,24 +28,16 @@ spec =
+           }
+ 
+       it "ignores ?select= when return not set or return=minimal" $ do
+-        request methodDelete "/items?id=eq.3&select=id"
+-            []
+-            ""
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "*/*" ]
+-            }
+-        request methodDelete "/items?id=eq.3&select=id"
+-            [("Prefer", "return=minimal")]
+-            ""
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "*/*" ]
+-            }
++        request methodDelete "/items?id=eq.3&select=id" [] ""
++          `shouldRespondWith` ""
++          { matchStatus  = 204
++          , matchHeaders = ["Content-Range" <:> "*/*"]
++          }
++        request methodDelete "/items?id=eq.3&select=id" [("Prefer", "return=minimal")] ""
++          `shouldRespondWith` ""
++          { matchStatus  = 204
++          , matchHeaders = ["Content-Range" <:> "*/*"]
++          }
+ 
+       it "returns the deleted item and shapes the response" $
+         request methodDelete "/complex_items?id=eq.2&select=id,name" [("Prefer", "return=representation")] ""
+@@ -97,21 +84,9 @@ spec =
+             }
+ 
+       it "suceeds deleting the row with no explicit select when using return=minimal" $
+-        request methodDelete "/app_users?id=eq.2"
+-            [("Prefer", "return=minimal")]
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        request methodDelete "/app_users?id=eq.2" [("Prefer", "return=minimal")] mempty
++            `shouldRespondWith` 204
+ 
+       it "suceeds deleting the row with no explicit select by default" $
+-        request methodDelete "/app_users?id=eq.3"
+-            []
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        request methodDelete "/app_users?id=eq.3" [] mempty
++            `shouldRespondWith` 204
+diff --git a/test/Feature/IgnorePrivOpenApiSpec.hs b/test/Feature/IgnorePrivOpenApiSpec.hs
+index 6b070e2a..342143c3 100644
+--- a/test/Feature/IgnorePrivOpenApiSpec.hs
++++ b/test/Feature/IgnorePrivOpenApiSpec.hs
+@@ -19,14 +19,8 @@ spec :: SpecWith ((), Application)
+ spec = describe "OpenAPI Ignore Privileges" $ do
+   it "root path returns a valid openapi spec" $ do
+     validateOpenApiResponse [("Accept", "application/openapi+json")]
+-    request methodHead "/"
+-        (acceptHdrs "application/openapi+json")
+-        ""
+-      `shouldRespondWith`
+-        ""
+-        { matchStatus  = 200
+-        , matchHeaders = [ "Content-Type" <:> "application/openapi+json; charset=utf-8" ]
+-        }
++    request methodHead "/" (acceptHdrs "application/openapi+json") ""
++      `shouldRespondWith` "" { matchStatus  = 200 }
+ 
+   describe "table" $ do
+ 
+diff --git a/test/Feature/InsertSpec.hs b/test/Feature/InsertSpec.hs
+index b7aa31e8..b05dd806 100644
+--- a/test/Feature/InsertSpec.hs
++++ b/test/Feature/InsertSpec.hs
+@@ -45,30 +45,20 @@ spec actualPgVersion = do
+           }
+ 
+       it "ignores &select when return not set or using return=minimal" $ do
+-        request methodPost "/menagerie?select=integer,varchar"
+-            []
+-            [json| [{
+-              "integer": 15, "double": 3.14159, "varchar": "testing!",
+-              "boolean": false, "date": "1900-01-01", "money": "$3.99",
+-              "enum": "foo"
+-            }] |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
+-        request methodPost "/menagerie?select=integer,varchar"
+-            [("Prefer", "return=minimal")]
+-            [json| [{
+-              "integer": 16, "double": 3.14159, "varchar": "testing!",
+-              "boolean": false, "date": "1900-01-01", "money": "$3.99",
+-              "enum": "foo"
+-            }] |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        request methodPost "/menagerie?select=integer,varchar" []
++          [json| [{
++            "integer": 15, "double": 3.14159, "varchar": "testing!"
++          , "boolean": false, "date": "1900-01-01", "money": "$3.99"
++          , "enum": "foo"
++          }] |] `shouldRespondWith` ""
++          { matchStatus  = 201 }
++        request methodPost "/menagerie?select=integer,varchar" [("Prefer", "return=minimal")]
++          [json| [{
++            "integer": 16, "double": 3.14159, "varchar": "testing!"
++          , "boolean": false, "date": "1900-01-01", "money": "$3.99"
++          , "enum": "foo"
++          }] |] `shouldRespondWith` ""
++          { matchStatus  = 201 }
+ 
+     context "non uniform json array" $ do
+       it "rejects json array that isn't exclusivily composed of objects" $
+@@ -123,41 +113,29 @@ spec actualPgVersion = do
+ 
+     context "requesting headers only representation" $ do
+       it "should not throw and return location header when selecting without PK" $
+-        request methodPost "/projects?select=name,client_id"
+-            [("Prefer", "return=headers-only")]
+-            [json|{"id":11,"name":"New Project","client_id":2}|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/projects?id=eq.11"
+-                             , "Content-Range" <:> "*/*" ]
+-            }
++        request methodPost "/projects?select=name,client_id" [("Prefer", "return=headers-only")]
++          [json|{"id":11,"name":"New Project","client_id":2}|] `shouldRespondWith` ""
++          { matchStatus  = 201
++          , matchHeaders = [ "Location" <:> "/projects?id=eq.11"
++                           , "Content-Range" <:> "*/*" ]
++          }
+ 
+       when (actualPgVersion >= pgVersion110) $
+         it "should not throw and return location header for partitioned tables when selecting without PK" $
+-          request methodPost "/car_models"
+-              [("Prefer", "return=headers-only")]
+-              [json|{"name":"Enzo","year":2021}|]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 201
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Location" <:> "/car_models?name=eq.Enzo&year=eq.2021"
+-                               , "Content-Range" <:> "*/*" ]
+-              }
++          request methodPost "/car_models" [("Prefer", "return=headers-only")]
++            [json|{"name":"Enzo","year":2021}|] `shouldRespondWith` ""
++            { matchStatus  = 201
++            , matchHeaders = [ "Location" <:> "/car_models?name=eq.Enzo&year=eq.2021"
++                             , "Content-Range" <:> "*/*" ]
++            }
+ 
+     context "requesting no representation" $
+       it "should not throw and return no location header when selecting without PK" $
+-        request methodPost "/projects?select=name,client_id"
+-            []
+-            [json|{"id":12,"name":"New Project","client_id":2}|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hLocation ]
+-            }
++        request methodPost "/projects?select=name,client_id" []
++          [json|{"id":12,"name":"New Project","client_id":2}|] `shouldRespondWith` ""
++          { matchStatus  = 201
++          , matchHeaders = [ matchHeaderAbsent hLocation ]
++          }
+ 
+     context "from an html form" $
+       it "accepts disparate json types" $ do
+@@ -167,9 +145,7 @@ spec actualPgVersion = do
+               "boolean=false&date=1900-01-01&money=$3.99&enum=foo")
+           `shouldRespondWith`
+             ""
+-            { matchStatus = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType ]
+-            }
++            { matchStatus = 201 }
+ 
+     context "with no pk supplied" $ do
+       context "into a table with auto-incrementing pk" $
+@@ -181,14 +157,12 @@ spec actualPgVersion = do
+             `shouldRespondWith`
+               [json|""|]
+ 
+-          request methodPost "/auto_incrementing_pk"
+-              [("Prefer", "return=headers-only")]
++          request methodPost "/auto_incrementing_pk" [("Prefer", "return=headers-only")]
+               [json| { "non_nullable_string":"not null"} |]
+             `shouldRespondWith`
+               ""
+               { matchStatus  = 201
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Location" <:> "/auto_incrementing_pk?id=eq.2" ]
++              , matchHeaders = [ "Location" <:> "/auto_incrementing_pk?id=eq.2" ]
+               }
+ 
+       context "into a table with simple pk" $
+@@ -206,13 +180,11 @@ spec actualPgVersion = do
+ 
+       context "into a table with no pk" $ do
+         it "succeeds with 201 but no location header" $ do
+-          post "/no_pk"
+-              [json| { "a":"foo", "b":"bar" } |]
++          post "/no_pk" [json| { "a":"foo", "b":"bar" } |]
+             `shouldRespondWith`
+               ""
+               { matchStatus  = 201
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , matchHeaderAbsent hLocation ]
++              , matchHeaders = [matchHeaderAbsent hLocation]
+               }
+ 
+         it "returns full details of inserted record if asked" $ do
+@@ -259,14 +231,11 @@ spec actualPgVersion = do
+         let bulkData = [json| [ {"k1":21, "k2":"hello world"}
+                               , {"k1":22, "k2":"bye for now"}]
+                             |]
+-        request methodPost "/compound_pk"
+-            []
+-            bulkData
++        request methodPost "/compound_pk" [] bulkData
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hLocation ]
++            , matchHeaders = [matchHeaderAbsent hLocation]
+             }
+ 
+     context "with invalid json payload" $
+@@ -289,13 +258,7 @@ spec actualPgVersion = do
+ 
+     context "with valid json payload" $
+       it "succeeds and returns 201 created" $
+-        post "/simple_pk"
+-            [json| { "k":"k1", "extra":"e1" } |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus = 201
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        post "/simple_pk" [json| { "k":"k1", "extra":"e1" } |] `shouldRespondWith` 201
+ 
+     context "attempting to insert a row with the same primary key" $
+       it "fails returning a 409 Conflict" $
+@@ -330,26 +293,20 @@ spec actualPgVersion = do
+ 
+     context "empty objects" $ do
+       it "successfully inserts a row with all-default columns" $ do
+-        post "/items"
+-            [json|{}|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        post "/items" "{}" `shouldRespondWith` ""
++          { matchStatus  = 201
++          , matchHeaders = []
++          }
+         post "/items" "[{}]" `shouldRespondWith` ""
+           { matchStatus  = 201
+           , matchHeaders = []
+           }
+ 
+       it "successfully inserts two rows with all-default columns" $
+-        post "/items"
+-            [json|[{}, {}]|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 201
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        post "/items" "[{}, {}]" `shouldRespondWith` ""
++          { matchStatus  = 201
++          , matchHeaders = []
++          }
+ 
+       it "successfully inserts a row with all-default columns with prefer=rep" $ do
+         -- reset pk sequence first to make test repeatable
+@@ -498,10 +455,7 @@ spec actualPgVersion = do
+             [("Prefer", "tx=commit")]
+             ""
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++            204
+ 
+   describe "Row level permission" $
+     it "set user_id when inserting rows" $ do
+@@ -569,9 +523,7 @@ spec actualPgVersion = do
+           [json| { "v":"some value" } |]
+         `shouldRespondWith`
+           ""
+-          { matchStatus = 201
+-          , matchHeaders = [matchHeaderAbsent hContentType]
+-          }
++          { matchStatus = 201 }
+ 
+   describe "Inserting into VIEWs" $ do
+     context "requesting no representation" $
+@@ -581,8 +533,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , matchHeaderAbsent hLocation ]
++            , matchHeaders = [ matchHeaderAbsent hLocation ]
+             }
+ 
+     context "requesting header only representation" $ do
+@@ -592,8 +543,7 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/compound_pk_view?k1=eq.1&k2=eq.test"
++            , matchHeaders = [ "Location" <:> "/compound_pk_view?k1=eq.1&k2=eq.test"
+                              , "Content-Range" <:> "*/*" ]
+             }
+ 
+@@ -603,7 +553,6 @@ spec actualPgVersion = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/test_null_pk_competitors_sponsors?id=eq.1&sponsor_id=is.null"
++            , matchHeaders = [ "Location" <:> "/test_null_pk_competitors_sponsors?id=eq.1&sponsor_id=is.null"
+                              , "Content-Range" <:> "*/*" ]
+             }
+diff --git a/test/Feature/OpenApiSpec.hs b/test/Feature/OpenApiSpec.hs
+index 26abc1ab..e594bb04 100644
+--- a/test/Feature/OpenApiSpec.hs
++++ b/test/Feature/OpenApiSpec.hs
+@@ -22,13 +22,8 @@ spec :: PgVersion -> SpecWith ((), Application)
+ spec actualPgVersion = describe "OpenAPI" $ do
+   it "root path returns a valid openapi spec" $ do
+     validateOpenApiResponse [("Accept", "application/openapi+json")]
+-    request methodHead "/"
+-        (acceptHdrs "application/openapi+json") ""
+-      `shouldRespondWith`
+-        ""
+-        { matchStatus  = 200
+-        , matchHeaders = ["Content-Type" <:> "application/openapi+json; charset=utf-8"]
+-        }
++    request methodHead "/" (acceptHdrs "application/openapi+json") ""
++      `shouldRespondWith` "" { matchStatus  = 200 }
+ 
+   it "should respond to openapi request on none root path with 415" $
+     request methodGet "/items"
+diff --git a/test/Feature/QueryLimitedSpec.hs b/test/Feature/QueryLimitedSpec.hs
+index 006f652b..97d37d01 100644
+--- a/test/Feature/QueryLimitedSpec.hs
++++ b/test/Feature/QueryLimitedSpec.hs
+@@ -47,33 +47,23 @@ spec =
+ 
+     context "count=estimated" $ do
+       it "uses the query planner guess when query rows > maxRows" $
+-        request methodHead "/getallprojects_view"
+-            [("Prefer", "count=estimated")]
+-            ""
++        request methodHead "/getallprojects_view" [("Prefer", "count=estimated")] ""
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-1/2019" ]
++            , matchHeaders = ["Content-Range" <:> "0-1/2019"]
+             }
+ 
+       it "gives exact count when query rows <= maxRows" $
+-        request methodHead "/getallprojects_view?id=lt.3"
+-            [("Prefer", "count=estimated")]
+-            ""
++        request methodHead "/getallprojects_view?id=lt.3" [("Prefer", "count=estimated")] ""
+           `shouldRespondWith`
+             ""
+-            { matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-1/2" ]
+-            }
++            { matchHeaders = ["Content-Range" <:> "0-1/2"] }
+ 
+       it "only uses the query planner guess if it's indeed greater than the exact count" $
+-        request methodHead "/get_projects_above_view"
+-            [("Prefer", "count=estimated")]
+-            ""
++        request methodHead "/get_projects_above_view" [("Prefer", "count=estimated")] ""
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-1/3" ]
++            , matchHeaders = ["Content-Range" <:> "0-1/3"]
+             }
+diff --git a/test/Feature/RangeSpec.hs b/test/Feature/RangeSpec.hs
+index 05d95163..4ce0f6cf 100644
+--- a/test/Feature/RangeSpec.hs
++++ b/test/Feature/RangeSpec.hs
+@@ -109,10 +109,11 @@ spec = do
+       context "when I don't want the count" $ do
+         it "returns range Content-Range with /*" $
+           request methodGet "/menagerie"
+-              [("Prefer", "count=none")] ""
+-            `shouldRespondWith`
+-              [json|[]|]
+-              { matchHeaders = ["Content-Range" <:> "*/*"] }
++                  [("Prefer", "count=none")] ""
++            `shouldRespondWith` "[]"
++            { matchStatus  = 200
++            , matchHeaders = ["Content-Range" <:> "*/*"]
++            }
+ 
+         it "returns range Content-Range with range/*" $
+           request methodGet "/items?order=id"
+@@ -162,15 +163,11 @@ spec = do
+           { matchStatus  = 200
+           , matchHeaders = ["Content-Range" <:> "2-4/*"]
+           }
+-        request methodHead "/items?select=id&order=id.asc&limit=3&offset=2"
+-            []
+-            mempty
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 200
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "2-4/*" ]
+-            }
++        request methodHead "/items?select=id&order=id.asc&limit=3&offset=2" [] mempty
++          `shouldRespondWith` ""
++          { matchStatus  = 200
++          , matchHeaders = ["Content-Range" <:> "2-4/*"]
++          }
+ 
+       it "succeeds if offset equals 0 as a no-op" $
+         get "/items?select=id&offset=0&order=id"
+@@ -234,8 +231,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 200
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-14/15" ]
++            , matchHeaders = ["Content-Range" <:> "0-14/15"]
+             }
+ 
+         request methodHead "/child_entities"
+@@ -244,8 +240,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 200
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-5/6" ]
++            , matchHeaders = ["Content-Range" <:> "0-5/6"]
+             }
+ 
+         request methodHead "/getallprojects_view"
+@@ -254,8 +249,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-4/2019" ]
++            , matchHeaders = ["Content-Range" <:> "0-4/2019"]
+             }
+ 
+       it "ignores limit/offset on the planned count" $ do
+@@ -265,8 +259,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "3-4/15" ]
++            , matchHeaders = ["Content-Range" <:> "3-4/15"]
+             }
+ 
+         request methodHead "/child_entities?limit=2"
+@@ -275,8 +268,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-1/6" ]
++            , matchHeaders = ["Content-Range" <:> "0-1/6"]
+             }
+ 
+         request methodHead "/getallprojects_view?limit=2"
+@@ -285,8 +277,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-1/2019" ]
++            , matchHeaders = ["Content-Range" <:> "0-1/2019"]
+             }
+ 
+       it "works with two levels" $
+@@ -296,8 +287,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 200
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-5/6" ]
++            , matchHeaders = ["Content-Range" <:> "0-5/6"]
+             }
+ 
+     context "with range headers" $ do
+diff --git a/test/Feature/RollbackSpec.hs b/test/Feature/RollbackSpec.hs
+index a2f96d6e..5ed05b9c 100644
+--- a/test/Feature/RollbackSpec.hs
++++ b/test/Feature/RollbackSpec.hs
+@@ -7,8 +7,7 @@ import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get)
+-import SpecHelper
++import Protolude hiding (get)
+ 
+ -- two helpers functions to make sure that each test can setup and cleanup properly
+ 
+@@ -19,8 +18,7 @@ postItem =
+       [json|{"id":0}|]
+     `shouldRespondWith`
+       ""
+-      { matchStatus  = 201
+-      , matchHeaders = [matchHeaderAbsent hContentType]  }
++      { matchStatus  = 201 }
+ 
+ -- removes Items left over from POST, PUT, and PATCH
+ deleteItems =
+@@ -29,8 +27,7 @@ deleteItems =
+       ""
+     `shouldRespondWith`
+       ""
+-      { matchStatus  = 204
+-      , matchHeaders = [matchHeaderAbsent hContentType] }
++      { matchStatus  = 204 }
+ 
+ preferDefault  = [("Prefer", "return=representation")]
+ preferCommit   = [("Prefer", "return=representation"), ("Prefer", "tx=commit")]
+@@ -55,7 +52,7 @@ shouldRespondToReads reqHeaders respHeaders = do
+         ""
+       `shouldRespondWith`
+         ""
+-        { matchHeaders = matchContentTypeJson : respHeaders }
++        { matchHeaders = respHeaders }
+ 
+   it "responds to GET on RPC" $ do
+     request methodGet "/rpc/search?id=1"
+diff --git a/test/Feature/RpcPreRequestGucsSpec.hs b/test/Feature/RpcPreRequestGucsSpec.hs
+index 548ce18e..c615b0c2 100644
+--- a/test/Feature/RpcPreRequestGucsSpec.hs
++++ b/test/Feature/RpcPreRequestGucsSpec.hs
+@@ -7,8 +7,7 @@ import Test.Hspec          hiding (pendingWith)
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get, put)
+-import SpecHelper
++import Protolude hiding (get, put)
+ 
+ spec :: SpecWith ((), Application)
+ spec =
+@@ -16,11 +15,9 @@ spec =
+     it "succeeds setting the headers on POST" $
+       post "/items"
+           [json|[{"id": 11111}]|]
+-        `shouldRespondWith`
+-          ""
++        `shouldRespondWith` ""
+           { matchStatus = 201
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "X-Custom-Header" <:> "mykey=myval" ]
++          , matchHeaders = ["X-Custom-Header" <:> "mykey=myval"]
+           }
+ 
+     it "succeeds setting the headers on GET and HEAD" $ do
+@@ -36,37 +33,29 @@ spec =
+           ""
+         `shouldRespondWith`
+           ""
+-          { matchHeaders = [ matchContentTypeJson
+-                           , "Cache-Control" <:> "no-cache, no-store, must-revalidate" ]
+-          }
++          { matchHeaders = ["Cache-Control" <:> "no-cache, no-store, must-revalidate"] }
+ 
+       request methodHead "/projects"
+           [("Accept", "text/csv")]
+           ""
+         `shouldRespondWith`
+           ""
+-          { matchHeaders = [ "Content-Type" <:> "text/csv; charset=utf-8"
+-                           , "Content-Disposition" <:> "attachment; filename=projects.csv" ]
+-          }
++          { matchHeaders = ["Content-Disposition" <:> "attachment; filename=projects.csv"] }
+ 
+     it "succeeds setting the headers on PATCH" $
+         patch "/items?id=eq.1"
+             [json|[{"id": 11111}]|]
+-          `shouldRespondWith`
+-            ""
++          `shouldRespondWith` ""
+             { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "X-Custom-Header" <:> "mykey=myval" ]
++            , matchHeaders = ["X-Custom-Header" <:> "mykey=myval"]
+             }
+ 
+     it "succeeds setting the headers on PUT" $
+       put "/items?id=eq.1"
+           [json|[{"id": 1}]|]
+-        `shouldRespondWith`
+-          ""
++        `shouldRespondWith` ""
+           { matchStatus = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "X-Custom-Header" <:> "mykey=myval" ]
++          , matchHeaders = ["X-Custom-Header" <:> "mykey=myval"]
+           }
+ 
+     it "succeeds setting the headers on DELETE" $
+@@ -74,8 +63,7 @@ spec =
+         `shouldRespondWith`
+           ""
+           { matchStatus = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType
+-                           , "X-Custom-Header" <:> "mykey=myval" ]
++          , matchHeaders = ["X-Custom-Header" <:> "mykey=myval"]
+           }
+     it "can override the Content-Type header" $ do
+       request methodHead "/clients?id=eq.1"
+diff --git a/test/Feature/RpcSpec.hs b/test/Feature/RpcSpec.hs
+index f14bbfc9..b0fc0f7a 100644
+--- a/test/Feature/RpcSpec.hs
++++ b/test/Feature/RpcSpec.hs
+@@ -38,12 +38,10 @@ spec actualPgVersion =
+             , matchHeaders = ["Content-Range" <:> "0-0/*"]
+             }
+         request methodHead "/rpc/getitemrange?min=2&max=4"
+-            (rangeHdrs (ByteRangeFromTo 0 0)) ""
+-          `shouldRespondWith`
+-            ""
++                (rangeHdrs (ByteRangeFromTo 0 0)) ""
++           `shouldRespondWith` ""
+             { matchStatus = 200
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-0/*" ]
++            , matchHeaders = ["Content-Range" <:> "0-0/*"]
+             }
+ 
+       it "includes total count if requested" $ do
+@@ -61,12 +59,10 @@ spec actualPgVersion =
+             , matchHeaders = ["Content-Range" <:> "0-0/2"]
+             }
+         request methodHead "/rpc/getitemrange?min=2&max=4"
+-            (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
+-          `shouldRespondWith`
+-            ""
++                (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
++           `shouldRespondWith` ""
+             { matchStatus = 206
+-            , matchHeaders = [ matchContentTypeJson
+-                             , "Content-Range" <:> "0-0/2" ]
++            , matchHeaders = ["Content-Range" <:> "0-0/2"]
+             }
+ 
+       it "returns proper json" $ do
+@@ -93,8 +89,7 @@ spec actualPgVersion =
+             }
+         request methodHead "/rpc/getitemrange?min=2&max=4"
+                 (acceptHdrs "text/csv") ""
+-          `shouldRespondWith`
+-            ""
++           `shouldRespondWith` ""
+             { matchStatus = 200
+             , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
+             }
+@@ -333,7 +328,8 @@ spec actualPgVersion =
+         post "/rpc/ret_void"
+             [json|{}|]
+           `shouldRespondWith`
+-            [json|null|]
++            "null"
++            { matchHeaders = [matchContentTypeJson] }
+ 
+       it "returns null for an integer with null value" $
+         post "/rpc/ret_null"
+@@ -1085,8 +1081,7 @@ spec actualPgVersion =
+           `shouldRespondWith`
+             ""
+             { matchStatus = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Location" <:> "/stuff?id=eq.2&overriden=true" ]
++            , matchHeaders = ["Location" <:> "/stuff?id=eq.2&overriden=true"]
+             }
+ 
+       -- On https://github.com/PostgREST/postgrest/issues/1427#issuecomment-595907535
+diff --git a/test/Feature/SingularSpec.hs b/test/Feature/SingularSpec.hs
+index a6645f73..e80ba755 100644
+--- a/test/Feature/SingularSpec.hs
++++ b/test/Feature/SingularSpec.hs
+@@ -11,6 +11,7 @@ import Test.Hspec.Wai.JSON
+ import Protolude  hiding (get)
+ import SpecHelper
+ 
++
+ spec :: SpecWith ((), Application)
+ spec =
+   describe "Requesting singular json object" $ do
+@@ -60,9 +61,7 @@ spec =
+             [json| { address: "C Street" } |]
+           `shouldRespondWith`
+             ""
+-            { matchStatus  = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++            { matchStatus  = 204 }
+ 
+       it "raises an error for multiple rows" $ do
+         request methodPatch "/addresses"
+@@ -129,11 +128,9 @@ spec =
+         request methodPost "/addresses"
+             [("Prefer", "return=minimal"), singular]
+             [json| [ { id: 103, address: "xxx" } ] |]
+-          `shouldRespondWith`
+-            ""
++          `shouldRespondWith` ""
+             { matchStatus  = 201
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "*/*" ]
++            , matchHeaders = ["Content-Range" <:> "*/*"]
+             }
+ 
+       it "raises an error when attempting to create multiple entities" $ do
+diff --git a/test/Feature/UnicodeSpec.hs b/test/Feature/UnicodeSpec.hs
+index 9391836a..532c4ce3 100644
+--- a/test/Feature/UnicodeSpec.hs
++++ b/test/Feature/UnicodeSpec.hs
+@@ -7,8 +7,7 @@ import Test.Hspec
+ import Test.Hspec.Wai
+ import Test.Hspec.Wai.JSON
+ 
+-import Protolude  hiding (get)
+-import SpecHelper
++import Protolude hiding (get)
+ 
+ spec :: SpecWith ((), Application)
+ spec =
+@@ -32,7 +31,4 @@ spec =
+           [("Prefer", "tx=commit")]
+           ""
+         `shouldRespondWith`
+-          ""
+-          { matchStatus = 204
+-          , matchHeaders = [matchHeaderAbsent hContentType]
+-          }
++          204
+diff --git a/test/Feature/UpdateSpec.hs b/test/Feature/UpdateSpec.hs
+index 41371fc2..e511be2f 100644
+--- a/test/Feature/UpdateSpec.hs
++++ b/test/Feature/UpdateSpec.hs
+@@ -22,12 +22,11 @@ spec = do
+     context "on an empty table" $
+       it "indicates no records found to update by returning 404" $
+         request methodPatch "/empty_table" []
+-            [json| { "extra":20 } |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 404,
+-              matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++          [json| { "extra":20 } |]
++          `shouldRespondWith` ""
++          { matchStatus  = 404,
++            matchHeaders = []
++          }
+ 
+     context "with invalid json payload" $
+       it "fails with 400 and error" $
+@@ -54,8 +53,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "0-0/*" ]
++            , matchHeaders = ["Content-Range" <:> "0-0/*"]
+             }
+ 
+       it "returns empty array when no rows updated and return=rep" $
+@@ -91,8 +89,7 @@ spec = do
+           `shouldRespondWith`
+             ""
+             { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "0-1/*"
++            , matchHeaders = ["Content-Range" <:> "0-1/*"
+                              , "Preference-Applied" <:> "tx=commit" ]
+             }
+ 
+@@ -106,10 +103,7 @@ spec = do
+             [("Prefer", "tx=commit")]
+             [json| { b: "0" } |]
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++            204
+ 
+       it "can set a column to NULL" $ do
+         request methodPatch "/no_pk?a=eq.1"
+@@ -175,86 +169,63 @@ spec = do
+             { matchHeaders = [matchContentTypeJson] }
+ 
+       it "ignores ?select= when return not set or return=minimal" $ do
+-        request methodPatch "/items?id=eq.1&select=id"
+-            [] [json| { id:1 } |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "0-0/*" ]
+-            }
+-        request methodPatch "/items?id=eq.1&select=id"
+-            [("Prefer", "return=minimal")]
+-            [json| { id:1 } |]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus  = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
+-                             , "Content-Range" <:> "0-0/*" ]
+-            }
++        request methodPatch "/items?id=eq.1&select=id" [] [json| { id:1 } |]
++          `shouldRespondWith` ""
++          {
++            matchStatus  = 204,
++            matchHeaders = ["Content-Range" <:> "0-0/*"]
++          }
++        request methodPatch "/items?id=eq.1&select=id" [("Prefer", "return=minimal")] [json| { id:1 } |]
++          `shouldRespondWith` ""
++          {
++            matchStatus  = 204,
++            matchHeaders = ["Content-Range" <:> "0-0/*"]
++          }
+ 
+       context "when patching with an empty body" $ do
+         it "makes no updates and returns 204 without return= and without ?select=" $ do
+-          request methodPatch "/items"
+-              []
+-              [json| {} |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-          request methodPatch "/items"
+-              []
+-              [json| [] |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-          request methodPatch "/items"
+-              []
+-              [json| [{}] |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
++          request methodPatch "/items" [] [json| {} |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
++
++          request methodPatch "/items" [] [json| [] |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
++
++          request methodPatch "/items" [] [json| [{}] |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
+ 
+         it "makes no updates and returns 204 without return= and with ?select=" $ do
+-          request methodPatch "/items?select=id"
+-              []
+-              [json| {} |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-          request methodPatch "/items?select=id"
+-              []
+-              [json| [] |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
+-
+-          request methodPatch "/items?select=id"
+-              []
+-              [json| [{}] |]
+-            `shouldRespondWith`
+-              ""
+-              { matchStatus  = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType
+-                               , "Content-Range" <:> "*/*" ]
+-              }
++          request methodPatch "/items?select=id" [] [json| {} |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
++
++          request methodPatch "/items?select=id" [] [json| [] |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
++
++          request methodPatch "/items?select=id" [] [json| [{}] |]
++            `shouldRespondWith` ""
++            {
++              matchStatus  = 204,
++              matchHeaders = ["Content-Range" <:> "*/*"]
++            }
+ 
+         it "makes no updates and returns 200 with return=rep and without ?select=" $
+           request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
+@@ -368,21 +339,11 @@ spec = do
+ 
+   context "table with limited privileges" $ do
+     it "succeeds updating row and gives a 204 when using return=minimal" $
+-      request methodPatch "/app_users?id=eq.1"
+-          [("Prefer", "return=minimal")]
+-          [json| { "password": "passxyz" } |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus = 204
+-          , matchHeaders = [matchHeaderAbsent hContentType]
+-          }
++      request methodPatch "/app_users?id=eq.1" [("Prefer", "return=minimal")]
++        [json| { "password": "passxyz" } |]
++          `shouldRespondWith` 204
+ 
+     it "can update without return=minimal and no explicit select" $
+-      request methodPatch "/app_users?id=eq.1"
+-          []
+-          [json| { "password": "passabc" } |]
+-        `shouldRespondWith`
+-          ""
+-          { matchStatus = 204
+-          , matchHeaders = [matchHeaderAbsent hContentType]
+-          }
++      request methodPatch "/app_users?id=eq.1" []
++        [json| { "password": "passabc" } |]
++          `shouldRespondWith` 204
+diff --git a/test/Feature/UpsertSpec.hs b/test/Feature/UpsertSpec.hs
+index e33f24f1..e1962f4c 100644
+--- a/test/Feature/UpsertSpec.hs
++++ b/test/Feature/UpsertSpec.hs
+@@ -422,12 +422,6 @@ spec actualPgVersion =
+             }
+ 
+       it "works with PUT" $ do
+-        put "/UnitTest?idUnitTest=eq.1"
+-            [json| [ { "idUnitTest": 1, "nameUnitTest": "unit test 1" } ]|]
+-          `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++        put "/UnitTest?idUnitTest=eq.1" [json| [ { "idUnitTest": 1, "nameUnitTest": "unit test 1" } ]|] `shouldRespondWith` 204
+         get "/UnitTest?idUnitTest=eq.1" `shouldRespondWith`
+           [json| [ { "idUnitTest": 1, "nameUnitTest": "unit test 1" } ]|]

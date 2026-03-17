@@ -1,0 +1,614 @@
+diff --git a/nix/tools/devTools.nix b/nix/tools/devTools.nix
+index 808bebea..f1ef6d64 100644
+--- a/nix/tools/devTools.nix
++++ b/nix/tools/devTools.nix
+@@ -138,7 +138,7 @@ let
+           # to the hook file.
+           sed -i -e '/postgrest-git-hooks/d' .git/hooks/pre-{commit,push} 2> /dev/null || true
+ 
+-          if [ disabled != "$_arg_mode" ]; then
++          if [ disable != "$_arg_operation" ]; then
+             # The nix-shell && + nix-shell || pattern makes sure we can run the hook
+             # in a pure nix-shell, where nix-shell itself is not available, too.
+ 
+@@ -165,6 +165,17 @@ let
+           # The following unsets all GIT_ variables.
+           unset "''${!GIT_@}"
+ 
++          function restore () {
++            ref="$(git stash list --format=format:%gD --grep "$1" -n1)"
++            # this will avoid merge conflicts when applying the stash
++            ${git}/bin/git restore --source="$ref" .
++            # restore untracked files, too. could fail with no files
++            if [ "$(git show --numstat --format=oneline "$ref^3" | wc -l)" -gt 1 ]; then
++              ${git}/bin/git restore --overlay --source="$ref^3" .
++            fi
++            ${git}/bin/git stash drop "$ref"
++          }
++
+           case "$_arg_mode" in
+             basic)
+               case "$_arg_hook" in
+@@ -179,7 +190,7 @@ let
+                   if [ "$(git stash list --grep $stash)" ]; then
+                     # Only create the stash pop trap, if we actually created a stash.
+                     # Otherwise stash pop will cause havoc.
+-                    trap '${git}/bin/git stash pop $(git stash list --format=format:%gD --grep "$stash" -n1)' EXIT
++                    trap 'restore "$stash"' EXIT
+                   fi
+ 
+                   ${style}/bin/postgrest-style
+@@ -204,7 +215,7 @@ let
+                   if [ "$(git stash list --grep $stash)" ]; then
+                     # Only create the stash pop trap, if we actually created a stash.
+                     # Otherwise stash pop will cause havoc.
+-                    trap '${git}/bin/git stash pop $(git stash list --format=format:%gD --grep "$stash" -n1)' EXIT
++                    trap 'restore "$stash"' EXIT
+                   fi
+ 
+                   ${style}/bin/postgrest-style
+diff --git a/postgrest.cabal b/postgrest.cabal
+index daeab955..0e904449 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -167,42 +167,42 @@ test-suite spec
+                       NoImplicitPrelude
+   hs-source-dirs:     test/spec
+   main-is:            Main.hs
+-  other-modules:      Feature.AndOrParamsSpec
+-                      Feature.AsymmetricJwtSpec
+-                      Feature.AudienceJwtSecretSpec
+-                      Feature.AuthSpec
+-                      Feature.BinaryJwtSecretSpec
++  other-modules:      Feature.Auth.AsymmetricJwtSpec
++                      Feature.Auth.AudienceJwtSecretSpec
++                      Feature.Auth.AuthSpec
++                      Feature.Auth.BinaryJwtSecretSpec
++                      Feature.Auth.NoAnonSpec
++                      Feature.Auth.NoJwtSpec
+                       Feature.ConcurrentSpec
+                       Feature.CorsSpec
+-                      Feature.DeleteSpec
+-                      Feature.DisabledOpenApiSpec
+-                      Feature.EmbedDisambiguationSpec
+-                      Feature.EmbedInnerJoinSpec
+                       Feature.ExtraSearchPathSpec
+-                      Feature.HtmlRawOutputSpec
+-                      Feature.InsertSpec
+-                      Feature.IgnorePrivOpenApiSpec
+-                      Feature.JsonOperatorSpec
+                       Feature.LegacyGucsSpec
+-                      Feature.MultipleSchemaSpec
+-                      Feature.NoAnonSpec
+-                      Feature.NoJwtSpec
+-                      Feature.NonexistentSchemaSpec
+-                      Feature.OpenApiSpec
++                      Feature.OpenApi.DisabledOpenApiSpec
++                      Feature.OpenApi.IgnorePrivOpenApiSpec
++                      Feature.OpenApi.OpenApiSpec
++                      Feature.OpenApi.ProxySpec
++                      Feature.OpenApi.RootSpec
+                       Feature.OptionsSpec
+-                      Feature.ProxySpec
+-                      Feature.QueryLimitedSpec
+-                      Feature.QuerySpec
+-                      Feature.RangeSpec
+-                      Feature.RawOutputTypesSpec
++                      Feature.Query.AndOrParamsSpec
++                      Feature.Query.DeleteSpec
++                      Feature.Query.EmbedDisambiguationSpec
++                      Feature.Query.EmbedInnerJoinSpec
++                      Feature.Query.HtmlRawOutputSpec
++                      Feature.Query.InsertSpec
++                      Feature.Query.JsonOperatorSpec
++                      Feature.Query.MultipleSchemaSpec
++                      Feature.Query.ErrorSpec
++                      Feature.Query.QueryLimitedSpec
++                      Feature.Query.QuerySpec
++                      Feature.Query.RangeSpec
++                      Feature.Query.RawOutputTypesSpec
++                      Feature.Query.RpcSpec
++                      Feature.Query.SingularSpec
++                      Feature.Query.UnicodeSpec
++                      Feature.Query.UpdateSpec
++                      Feature.Query.UpsertSpec
+                       Feature.RollbackSpec
+-                      Feature.RootSpec
+                       Feature.RpcPreRequestGucsSpec
+-                      Feature.RpcSpec
+-                      Feature.SingularSpec
+-                      Feature.UnicodeSpec
+-                      Feature.UpdateSpec
+-                      Feature.UpsertSpec
+                       SpecHelper
+                       TestTypes
+   build-depends:      base              >= 4.9 && < 4.16
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index a100e26b..e9728f53 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -77,7 +77,7 @@ import PostgREST.GucHeader               (GucHeader,
+ import PostgREST.Request.ApiRequest      (Action (..),
+                                           ApiRequest (..),
+                                           InvokeMethod (..),
+-                                          Target (..))
++                                          Mutation (..), Target (..))
+ import PostgREST.Request.Preferences     (PreferCount (..),
+                                           PreferParameters (..),
+                                           PreferRepresentation (..),
+@@ -229,13 +229,13 @@ handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) ->
+       handleRead headersOnly identifier context
+-    (ActionCreate, TargetIdent identifier) ->
++    (ActionMutate MutationCreate, TargetIdent identifier) ->
+       handleCreate identifier context
+-    (ActionUpdate, TargetIdent identifier) ->
++    (ActionMutate MutationUpdate, TargetIdent identifier) ->
+       handleUpdate identifier context
+-    (ActionSingleUpsert, TargetIdent identifier) ->
++    (ActionMutate MutationSingleUpsert, TargetIdent identifier) ->
+       handleSingleUpsert identifier context
+-    (ActionDelete, TargetIdent identifier) ->
++    (ActionMutate MutationDelete, TargetIdent identifier) ->
+       handleDelete identifier context
+     (ActionInfo, TargetIdent identifier) ->
+       handleInfo identifier context
+@@ -243,6 +243,8 @@ handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+       handleInvoke invMethod proc context
+     (ActionInspect headersOnly, TargetDefaultSpec tSchema) ->
+       handleOpenApi headersOnly tSchema context
++    (ActionUnknown verb, _) ->
++      throwError $ Error.UnsupportedVerb verb
+     _ ->
+       throwError Error.NotFound
+ 
+@@ -313,7 +315,7 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+     ApiRequest{..} = ctxApiRequest
+     pkCols = tablePKCols ctxDbStructure qiSchema qiName
+ 
+-  WriteQueryResult{..} <- writeQuery identifier True pkCols context
++  WriteQueryResult{..} <- writeQuery MutationCreate identifier True pkCols context
+ 
+   let
+     response = gucResponse resGucStatus resGucHeaders
+@@ -344,7 +346,7 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+-  WriteQueryResult{..} <- writeQuery identifier False mempty context
++  WriteQueryResult{..} <- writeQuery MutationUpdate identifier False mempty context
+ 
+   let
+     response = gucResponse resGucStatus resGucHeaders
+@@ -369,7 +371,7 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   when (iTopLevelRange /= RangeQuery.allRange) $
+     throwError Error.PutRangeNotAllowedError
+ 
+-  WriteQueryResult{..} <- writeQuery identifier False mempty context
++  WriteQueryResult{..} <- writeQuery MutationSingleUpsert identifier False mempty context
+ 
+   let response = gucResponse resGucStatus resGucHeaders
+ 
+@@ -390,7 +392,7 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+ handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+-  WriteQueryResult{..} <- writeQuery identifier False mempty context
++  WriteQueryResult{..} <- writeQuery MutationDelete identifier False mempty context
+ 
+   let
+     response = gucResponse resGucStatus resGucHeaders
+@@ -522,13 +524,13 @@ data WriteQueryResult = WriteQueryResult
+   , resGucHeaders :: [GucHeader]
+   }
+ 
+-writeQuery :: QualifiedIdentifier -> Bool -> [Text] -> RequestContext -> DbHandler WriteQueryResult
+-writeQuery identifier@QualifiedIdentifier{..} isInsert pkCols context@RequestContext{..} = do
++writeQuery :: Mutation -> QualifiedIdentifier -> Bool -> [Text] -> RequestContext -> DbHandler WriteQueryResult
++writeQuery mutation identifier@QualifiedIdentifier{..} isInsert pkCols context@RequestContext{..} = do
+   readReq <- readRequest identifier context
+ 
+   mutateReq <-
+     liftEither $
+-      ReqBuilder.mutateRequest qiSchema qiName ctxApiRequest
++      ReqBuilder.mutateRequest mutation qiSchema qiName ctxApiRequest
+         (tablePKCols ctxDbStructure qiSchema qiName)
+         readReq
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index 6a2eb930..44f2de6c 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -55,20 +55,19 @@ class (JSON.ToJSON a) => PgrstError a where
+   errorResponseFor err = responseLBS (status err) (headers err) $ errorPayload err
+ 
+ instance PgrstError ApiRequestError where
+-  status InvalidRange            = HTTP.status416
+-  status InvalidFilters          = HTTP.status405
+-  status (InvalidBody _)         = HTTP.status400
+-  status UnsupportedVerb         = HTTP.status405
+-  status ActionInappropriate     = HTTP.status405
+-  status (ParseRequestError _ _) = HTTP.status400
+-  status (QueryParamError _)     = HTTP.status400
+-  status NoRelBetween{}          = HTTP.status400
+-  status AmbiguousRelBetween{}   = HTTP.status300
+-  status (AmbiguousRpc _)        = HTTP.status300
+-  status NoRpc{}                 = HTTP.status404
+-  status (UnacceptableSchema _)  = HTTP.status406
+-  status (ContentTypeError _)    = HTTP.status415
+-  status (NotEmbedded _)         = HTTP.status400
++  status ActionInappropriate   = HTTP.status405
++  status AmbiguousRelBetween{} = HTTP.status300
++  status AmbiguousRpc{}        = HTTP.status300
++  status ContentTypeError{}    = HTTP.status415
++  status InvalidBody{}         = HTTP.status400
++  status InvalidFilters        = HTTP.status405
++  status InvalidRange          = HTTP.status416
++  status NoRelBetween{}        = HTTP.status400
++  status NoRpc{}               = HTTP.status404
++  status NotEmbedded{}         = HTTP.status400
++  status ParseRequestError{}   = HTTP.status400
++  status QueryParamError{}     = HTTP.status400
++  status UnacceptableSchema{}  = HTTP.status406
+ 
+   headers _ = [ContentType.toHeader CTApplicationJSON]
+ 
+@@ -104,8 +103,6 @@ instance JSON.ToJSON ApiRequestError where
+         (_, True, CTApplicationJSON) -> prms <> " function or the " <> schema <> "." <> procName <>" function with a single unnamed json or jsonb parameter"
+         _                            -> prms <> " function") <>
+       " in the schema cache")]
+-  toJSON UnsupportedVerb = JSON.object [
+-    "message" .= ("Unsupported HTTP verb" :: Text)]
+   toJSON InvalidFilters = JSON.object [
+     "message" .= ("Filters must include all and only primary key columns with 'eq' operators" :: Text)]
+   toJSON (UnacceptableSchema schemas) = JSON.object [
+@@ -270,41 +267,43 @@ checkIsFatal _ = Nothing
+ 
+ 
+ data Error
+-  = GucHeadersError
+-  | GucStatusError
++  = ApiRequestError ApiRequestError
+   | BinaryFieldError ContentType
+-  | NoSchemaCacheError
+-  | PutMatchingPkError
+-  | PutRangeNotAllowedError
+-  | JwtTokenMissing
++  | GucHeadersError
++  | GucStatusError
+   | JwtTokenInvalid Text
++  | JwtTokenMissing
+   | JwtTokenRequired
+-  | SingularityError Integer
++  | NoSchemaCacheError
+   | NotFound
+-  | ApiRequestError ApiRequestError
+   | PgErr PgError
++  | PutMatchingPkError
++  | PutRangeNotAllowedError
++  | SingularityError Integer
++  | UnsupportedVerb Text
+ 
+ instance PgrstError Error where
++  status (ApiRequestError err)   = status err
++  status BinaryFieldError{}      = HTTP.status406
+   status GucHeadersError         = HTTP.status500
+   status GucStatusError          = HTTP.status500
+-  status (BinaryFieldError _)    = HTTP.status406
+-  status NoSchemaCacheError      = HTTP.status503
+-  status PutMatchingPkError      = HTTP.status400
+-  status PutRangeNotAllowedError = HTTP.status400
++  status JwtTokenInvalid{}       = HTTP.unauthorized401
+   status JwtTokenMissing         = HTTP.status500
+-  status (JwtTokenInvalid _)     = HTTP.unauthorized401
+   status JwtTokenRequired        = HTTP.unauthorized401
+-  status (SingularityError _)    = HTTP.status406
++  status NoSchemaCacheError      = HTTP.status503
+   status NotFound                = HTTP.status404
+   status (PgErr err)             = status err
+-  status (ApiRequestError err)   = status err
++  status PutMatchingPkError      = HTTP.status400
++  status PutRangeNotAllowedError = HTTP.status400
++  status SingularityError{}      = HTTP.status406
++  status UnsupportedVerb{}       = HTTP.status405
+ 
+-  headers (SingularityError _)     = [ContentType.toHeader CTSingularJSON]
+-  headers (JwtTokenInvalid m)      = [ContentType.toHeader CTApplicationJSON, invalidTokenHeader m]
+-  headers JwtTokenRequired         = [ContentType.toHeader CTApplicationJSON, requiredTokenHeader]
+-  headers (PgErr err)              = headers err
+-  headers (ApiRequestError err)    = headers err
+-  headers _                        = [ContentType.toHeader CTApplicationJSON]
++  headers (ApiRequestError err)  = headers err
++  headers (JwtTokenInvalid m)    = [ContentType.toHeader CTApplicationJSON, invalidTokenHeader m]
++  headers JwtTokenRequired       = [ContentType.toHeader CTApplicationJSON, requiredTokenHeader]
++  headers (PgErr err)            = headers err
++  headers SingularityError{}     = [ContentType.toHeader CTSingularJSON]
++  headers _                      = [ContentType.toHeader CTApplicationJSON]
+ 
+ instance JSON.ToJSON Error where
+   toJSON GucHeadersError           = JSON.object [
+@@ -332,6 +331,8 @@ instance JSON.ToJSON Error where
+   toJSON JwtTokenRequired          = JSON.object [
+     "message" .= ("Anonymous access is disabled" :: Text)]
+   toJSON NotFound = JSON.object []
++  toJSON (UnsupportedVerb verb) = JSON.object [
++    "message" .= ("Unsupported HTTP verb: " <> verb)]
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+ 
+diff --git a/src/PostgREST/Query/Statements.hs b/src/PostgREST/Query/Statements.hs
+index 3b2cbee7..57f6056c 100644
+--- a/src/PostgREST/Query/Statements.hs
++++ b/src/PostgREST/Query/Statements.hs
+@@ -65,7 +65,7 @@ createWriteStatement selectQuery mutateQuery wantSingle isInsert asCsv rep pKeys
+     "FROM (" <> selectF <> ") _postgrest_t"
+ 
+   locF =
+-    if isInsert && rep `elem` [Full, HeadersOnly]
++    if isInsert && rep /= None
+       then BS.unwords [
+         "CASE WHEN pg_catalog.count(_postgrest_t) = 1",
+           "THEN coalesce(" <> locationF pKeys <> ", " <> noLocationF <> ")",
+@@ -74,15 +74,15 @@ createWriteStatement selectQuery mutateQuery wantSingle isInsert asCsv rep pKeys
+       else noLocationF
+ 
+   bodyF
+-    | rep `elem` [None, HeadersOnly] = "''"
++    | rep /= Full = "''"
+     | asCsv = asCsvF
+     | wantSingle = asJsonSingleF False
+     | otherwise = asJsonF False
+ 
+   selectF
+     -- prevent using any of the column names in ?select= when no response is returned from the CTE
+-    | rep `elem` [None, HeadersOnly] = SQL.sql ("SELECT * FROM " <> sourceCTEName)
+-    | otherwise                      = selectQuery
++    | rep /= Full = SQL.sql ("SELECT * FROM " <> sourceCTEName)
++    | otherwise   = selectQuery
+ 
+   decodeStandard :: HD.Result ResultsWithCount
+   decodeStandard =
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 953a0035..a7a2cf7c 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -9,6 +9,7 @@ Description : PostgREST functions to translate HTTP request to a domain type cal
+ module PostgREST.Request.ApiRequest
+   ( ApiRequest(..)
+   , InvokeMethod(..)
++  , Mutation(..)
+   , ContentType(..)
+   , Action(..)
+   , Target(..)
+@@ -82,12 +83,17 @@ data Payload
+   | RawPay  { payRaw  :: LBS.ByteString }
+ 
+ data InvokeMethod = InvHead | InvGet | InvPost deriving Eq
++data Mutation = MutationCreate | MutationDelete | MutationSingleUpsert | MutationUpdate deriving Eq
++
+ -- | Types of things a user wants to do to tables/views/procs
+-data Action = ActionCreate       | ActionRead{isHead :: Bool}
+-            | ActionUpdate       | ActionDelete
+-            | ActionSingleUpsert | ActionInvoke InvokeMethod
+-            | ActionInfo         | ActionInspect{isHead :: Bool}
+-            deriving Eq
++data Action
++  = ActionMutate Mutation
++  | ActionRead {isHead :: Bool}
++  | ActionInvoke InvokeMethod
++  | ActionInfo
++  | ActionInspect {isHead :: Bool}
++  | ActionUnknown Text
++  deriving Eq
+ -- | The path info that will be mapped to a target (used to handle validations and errors before defining the Target)
+ data Path
+   = PathInfo
+@@ -214,11 +220,11 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+     _                             -> False
+   contentType = maybe CTApplicationJSON ContentType.decodeContentType $ lookupHeader "content-type"
+ 
+-  columns =
+-    if action `elem` [ActionCreate, ActionUpdate, ActionInvoke InvPost] then
+-      qsColumns
+-    else
+-      Nothing
++  columns = case action of
++    ActionMutate MutationCreate -> qsColumns
++    ActionMutate MutationUpdate -> qsColumns
++    ActionInvoke InvPost        -> qsColumns
++    _                           -> Nothing
+ 
+   payloadColumns =
+     case (contentType, action) of
+@@ -230,24 +236,23 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+         (Just RawJSON{}, Just cls)       -> cls
+         _                                -> S.empty
+   payload :: Either ByteString Payload
+-  payload = case contentType of
+-    CTApplicationJSON ->
++  payload = case (contentType, isTargetingProc) of
++    (CTApplicationJSON, _) ->
+       if isJust columns
+         then Right $ RawJSON reqBody
+         else note "All object keys must match" . payloadAttributes reqBody
+                =<< if LBS.null reqBody && isTargetingProc
+                      then Right emptyObject
+                      else first BS.pack $ JSON.eitherDecode reqBody
+-    CTTextCSV -> do
++    (CTTextCSV, _) -> do
+       json <- csvToJson <$> first BS.pack (CSV.decodeByName reqBody)
+       note "All lines must have same number of fields" $ payloadAttributes (JSON.encode json) json
+-    CTUrlEncoded ->
++    (CTUrlEncoded, _) ->
+       let paramsMap = M.fromList $ (T.decodeUtf8 *** JSON.String . T.decodeUtf8) <$> parseSimpleQuery (LBS.toStrict reqBody) in
+       Right $ ProcessedJSON (JSON.encode paramsMap) $ S.fromList (M.keys paramsMap)
+-    ct ->
+-      if isTargetingProc && ct `elem` [CTTextPlain, CTOctetStream]
+-        then Right $ RawPay reqBody
+-        else Left $ "Content-Type not acceptable: " <> ContentType.toMime ct
++    (CTTextPlain, True) -> Right $ RawPay reqBody
++    (CTOctetStream, True) -> Right $ RawPay reqBody
++    (ct, _) -> Left $ "Content-Type not acceptable: " <> ContentType.toMime ct
+   topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges -- if no limit is specified, get all the request rows
+   action =
+     case method of
+@@ -261,25 +266,24 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+                  | otherwise              -> ActionRead{isHead=False}
+       "POST"    -> if isTargetingProc
+                     then ActionInvoke InvPost
+-                    else ActionCreate
+-      "PATCH"   -> ActionUpdate
+-      "PUT"     -> ActionSingleUpsert
+-      "DELETE"  -> ActionDelete
++                    else ActionMutate MutationCreate
++      "PATCH"   -> ActionMutate MutationUpdate
++      "PUT"     -> ActionMutate MutationSingleUpsert
++      "DELETE"  -> ActionMutate MutationDelete
+       "OPTIONS" -> ActionInfo
+-      _         -> ActionInspect{isHead=False}
++      _         -> ActionUnknown $ T.decodeUtf8 method
+ 
+   defaultSchema = NonEmptyList.head configDbSchemas
+   profile
+     | length configDbSchemas <= 1 -- only enable content negotiation by profile when there are multiple schemas specified in the config
+       = Nothing
+-    | otherwise = case action of
++    | otherwise = case method of
+         -- POST/PATCH/PUT/DELETE don't use the same header as per the spec
+-        ActionCreate         -> contentProfile
+-        ActionUpdate         -> contentProfile
+-        ActionSingleUpsert   -> contentProfile
+-        ActionDelete         -> contentProfile
+-        ActionInvoke InvPost -> contentProfile
+-        _                    -> acceptProfile
++        "DELETE" -> contentProfile
++        "PATCH"  -> contentProfile
++        "POST"   -> contentProfile
++        "PUT"    -> contentProfile
++        _        -> acceptProfile
+     where
+       contentProfile = Just $ maybe defaultSchema T.decodeUtf8 $ lookupHeader "Content-Profile"
+       acceptProfile = Just $ maybe defaultSchema T.decodeUtf8 $ lookupHeader "Accept-Profile"
+@@ -297,9 +301,13 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+         | otherwise              -> Right $ TargetIdent $ QualifiedIdentifier pSchema pName
+       PathUnknown -> Right TargetUnknown
+ 
+-  shouldParsePayload = case (contentType, action) of
+-    (CTUrlEncoded, ActionInvoke InvPost) -> False
+-    (_, act)                             -> act `elem` [ActionCreate, ActionUpdate, ActionSingleUpsert, ActionInvoke InvPost]
++  shouldParsePayload = case (action, contentType) of
++    (ActionMutate MutationCreate, _)       -> True
++    (ActionInvoke InvPost, CTUrlEncoded)   -> False
++    (ActionInvoke InvPost, _)              -> True
++    (ActionMutate MutationSingleUpsert, _) -> True
++    (ActionMutate MutationUpdate, _)       -> True
++    _                                      -> False
+   relevantPayload = case (contentType, action) of
+     -- Though ActionInvoke GET/HEAD doesn't really have a payload, we use the payload variable as a way
+     -- to store the query string arguments to the function.
+@@ -440,18 +448,21 @@ findProc qi argumentsKeys paramsAsSingleObject allProcs contentType isInvPost =
+       | otherwise                  = (ts,fs)
+     -- If the function is called with post and has a single unnamed parameter
+     -- it can be called depending on content type and the parameter type
+-    hasSingleUnnamedParam proc = isInvPost && case pdParams proc of
+-      [ProcParam "" ppType _ _]
+-        | contentType == CTApplicationJSON -> ppType `elem` ["json", "jsonb"]
+-        | contentType == CTTextPlain       -> ppType == "text"
+-        | contentType == CTOctetStream     -> ppType == "bytea"
+-        | otherwise                        -> False
+-      _ -> False
++    hasSingleUnnamedParam ProcDescription{pdParams=[ProcParam{ppType}]} = isInvPost && case (contentType, ppType) of
++      (CTApplicationJSON, "json")  -> True
++      (CTApplicationJSON, "jsonb") -> True
++      (CTTextPlain, "text")        -> True
++      (CTOctetStream, "bytea")     -> True
++      _                            -> False
++    hasSingleUnnamedParam _ = False
+     matchesParams proc =
+-      let params = pdParams proc in
++      let
++        params = pdParams proc
++        firstType = (ppType <$> headMay params)
++      in
+       -- exceptional case for Prefer: params=single-object
+       if paramsAsSingleObject
+-        then length params == 1 && (ppType <$> headMay params) `elem` [Just "json", Just "jsonb"]
++        then length params == 1 && (firstType == Just "json" || firstType == Just "jsonb")
+       -- If the function has no parameters, the arguments keys must be empty as well
+       else if null params
+         then null argumentsKeys && contentType `notElem` [CTTextPlain, CTOctetStream]
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index eb0e05a4..f9df1b84 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -46,6 +46,7 @@ import PostgREST.RangeQuery               (NonnegRange, allRange,
+ import PostgREST.Request.ApiRequest       (Action (..),
+                                            ApiRequest (..),
+                                            InvokeMethod (..),
++                                           Mutation (..),
+                                            Payload (..))
+ 
+ import PostgREST.Request.Preferences
+@@ -313,13 +314,13 @@ updateNode f (targetNodeName:remainingPath, a) (Right (Node rootNode forest)) =
+     findNode :: Maybe ReadRequest
+     findNode = find (\(Node (_,(nodeName,_,alias,_,_, _)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
+ 
+-mutateRequest :: Schema -> TableName -> ApiRequest -> [FieldName] -> ReadRequest -> Either Error MutateRequest
+-mutateRequest schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
+-  case iAction of
+-    ActionCreate ->
++mutateRequest :: Mutation -> Schema -> TableName -> ApiRequest -> [FieldName] -> ReadRequest -> Either Error MutateRequest
++mutateRequest mutation schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestError $
++  case mutation of
++    MutationCreate ->
+       Right $ Insert qi iColumns body ((,) <$> iPreferResolution <*> Just confCols) [] returnings
+-    ActionUpdate -> Right $ Update qi iColumns body combinedLogic returnings
+-    ActionSingleUpsert ->
++    MutationUpdate -> Right $ Update qi iColumns body combinedLogic returnings
++    MutationSingleUpsert ->
+         if null qsLogic &&
+            qsFilterFields == S.fromList pkCols &&
+            not (null (S.fromList pkCols)) &&
+@@ -329,8 +330,7 @@ mutateRequest schema tName ApiRequest{..} pkCols readReq = mapLeft ApiRequestErr
+           then Right $ Insert qi iColumns body (Just (MergeDuplicates, pkCols)) combinedLogic returnings
+         else
+           Left InvalidFilters
+-    ActionDelete -> Right $ Delete qi combinedLogic returnings
+-    _            -> Left UnsupportedVerb
++    MutationDelete -> Right $ Delete qi combinedLogic returnings
+   where
+     confCols = fromMaybe pkCols qsOnConflict
+     QueryParams.QueryParams{..} = iQueryParams
+diff --git a/src/PostgREST/Request/Types.hs b/src/PostgREST/Request/Types.hs
+index 38a58b45..a4241711 100644
+--- a/src/PostgREST/Request/Types.hs
++++ b/src/PostgREST/Request/Types.hs
+@@ -59,19 +59,18 @@ import Protolude
+ 
+ data ApiRequestError
+   = ActionInappropriate
+-  | InvalidRange
+-  | InvalidBody ByteString
+-  | ParseRequestError Text Text
+-  | QueryParamError QPError
+-  | NoRelBetween Text Text Text
+   | AmbiguousRelBetween Text Text [Relationship]
+   | AmbiguousRpc [ProcDescription]
+-  | NoRpc Text Text [Text] Bool ContentType Bool
+-  | InvalidFilters
+-  | UnacceptableSchema [Text]
+   | ContentTypeError [ByteString]
+-  | UnsupportedVerb                -- Unreachable?
++  | InvalidBody ByteString
++  | InvalidFilters
++  | InvalidRange
++  | NoRelBetween Text Text Text
++  | NoRpc Text Text [Text] Bool ContentType Bool
+   | NotEmbedded Text
++  | ParseRequestError Text Text
++  | QueryParamError QPError
++  | UnacceptableSchema [Text]
+ 
+ data QPError = QPError Text Text
+ 

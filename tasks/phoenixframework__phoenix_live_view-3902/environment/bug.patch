@@ -1,0 +1,177 @@
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index e926e4b5..b162504b 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -1149,10 +1149,7 @@ defmodule Phoenix.Component do
+   end
+ 
+   def __render_slot__(changed, entry, argument) when is_map(entry) do
+-    case entry.inner_block do
+-      %Phoenix.LiveView.Rendered{} = rendered -> rendered
+-      fun -> fun.(changed, argument)
+-    end
++    entry.inner_block.(changed, argument)
+   end
+ 
+   defp call_inner_block!(entry, changed, argument) do
+@@ -1161,10 +1158,7 @@ defmodule Phoenix.Component do
+       raise RuntimeError, message
+     end
+ 
+-    case entry.inner_block do
+-      %Phoenix.LiveView.Rendered{} = rendered -> rendered
+-      fun -> fun.(changed, argument)
+-    end
++    entry.inner_block.(changed, argument)
+   end
+ 
+   @doc """
+diff --git a/lib/phoenix_live_view/engine.ex b/lib/phoenix_live_view/engine.ex
+index c30319fc..b4bfa7a3 100644
+--- a/lib/phoenix_live_view/engine.ex
++++ b/lib/phoenix_live_view/engine.ex
+@@ -399,28 +399,14 @@ defmodule Phoenix.LiveView.Engine do
+ 
+       root = Keyword.get(opts, :root, meta[:root])
+ 
+-      dynamic =
+-        if dynamic == [] do
+-          quote do
+-            fn _ ->
+-              _ = unquote(@assigns_var)
+-              []
+-            end
+-          end
+-        else
+-          quote do
+-            fn track_changes? ->
+-              changed = unquote(changed)
+-              vars_changed = if track_changes?, do: vars_changed
+-              unquote({:__block__, [], block})
+-              unquote(dynamic)
+-            end
+-          end
+-        end
+-
+       {:ok,
+        quote do
+-         dynamic = unquote(dynamic)
++         dynamic = fn track_changes? ->
++           changed = unquote(changed)
++           vars_changed = if track_changes?, do: vars_changed
++           unquote({:__block__, [], block})
++           unquote(dynamic)
++         end
+ 
+          %Phoenix.LiveView.Rendered{
+            static: unquote(static),
+@@ -912,26 +898,7 @@ defmodule Phoenix.LiveView.Engine do
+        ) do
+     with {call, meta, [^key, [do: block]]} <- inner_block,
+          :inner_block <- extract_call(call) do
+-      inner_block =
+-        case block do
+-          [
+-            {:->, _,
+-             [
+-               [{:_, _, _}],
+-               {:__block__, [live_rendered: true] ++ _meta, [{:safe, _}]} = static_block
+-             ]}
+-          ] ->
+-            # This is an optimization that removes the extra anonymous function from
+-            # the TagEngine's build_component_clauses function used for slots.
+-            # We can do this when the slot does not contain any dynamics, which also helps
+-            # to prevent uncovered lines when rendering a component with only a named slot.
+-            # In that case, the component still has an inner_block, but it only consists of
+-            # whitespace.
+-            maybe_block_to_rendered(static_block, vars, caller)
+-
+-          _ ->
+-            {call, meta, [key, [do: maybe_block_to_rendered(block, vars, caller)]]}
+-        end
++      inner_block = {call, meta, [key, [do: maybe_block_to_rendered(block, vars, caller)]]}
+ 
+       {:%{}, map_meta, [__slot__: key, inner_block: inner_block] ++ attrs}
+     else
+@@ -1353,6 +1320,17 @@ defmodule Phoenix.LiveView.Engine do
+     quote line: line, do: Phoenix.HTML.Safe.List.to_iodata(unquote(literal))
+   end
+ 
++  # Calls to attributes escape is always safe
++  defp to_safe(
++         {{:., _, [Phoenix.LiveView.TagEngine, :attributes_escape]}, _, [_]} = safe,
++         line,
++         _extra_clauses?
++       ) do
++    quote line: line do
++      elem(unquote(safe), 1)
++    end
++  end
++
+   defp to_safe(expr, line, false) do
+     quote line: line, do: unquote(__MODULE__).safe_to_iodata(unquote(expr))
+   end
+diff --git a/lib/phoenix_live_view/tag_engine.ex b/lib/phoenix_live_view/tag_engine.ex
+index cd7e737a..3c84a20c 100644
+--- a/lib/phoenix_live_view/tag_engine.ex
++++ b/lib/phoenix_live_view/tag_engine.ex
+@@ -140,7 +140,6 @@ defmodule Phoenix.LiveView.TagEngine do
+   for more information.
+   """
+   defmacro inner_block(name, do: do_block) do
+-    # TODO: Remove the catch-all clause, it is no longer used
+     case do_block do
+       [{:->, meta, _} | _] ->
+         inner_fun = {:fn, meta, do_block}
+diff --git a/test/phoenix_live_view/engine_test.exs b/test/phoenix_live_view/engine_test.exs
+index ca1eb1fc..4f40e4ff 100644
+--- a/test/phoenix_live_view/engine_test.exs
++++ b/test/phoenix_live_view/engine_test.exs
+@@ -948,47 +948,6 @@ defmodule Phoenix.LiveView.EngineTest do
+     end
+   end
+ 
+-  describe "slots" do
+-    import Phoenix.Component, only: [sigil_H: 2]
+-
+-    defp component(assigns) do
+-      %{inner_block: [%{inner_block: slot}]} = assigns
+-      throw(slot)
+-    end
+-
+-    test "slots with no dynamics represented as rendered struct" do
+-      try do
+-        assigns = %{}
+-
+-        %Phoenix.LiveView.Rendered{dynamic: dynamic} =
+-          ~H"<.component>No dynamics</.component>"
+-
+-        dynamic.(true)
+-      catch
+-        slot ->
+-          assert %Phoenix.LiveView.Rendered{} = slot
+-      else
+-        _ -> flunk("Should have caught")
+-      end
+-    end
+-
+-    test "slots with dynamics are represented as function" do
+-      try do
+-        assigns = %{}
+-
+-        %Phoenix.LiveView.Rendered{dynamic: dynamic} =
+-          ~H"<.component>{1234}</.component>"
+-
+-        dynamic.(true)
+-      catch
+-        slot ->
+-          assert is_function(slot)
+-      else
+-        _ -> flunk("Should have caught")
+-      end
+-    end
+-  end
+-
+   defp eval(string, assigns \\ %{}, binding \\ []) do
+     EEx.eval_string(string, [assigns: assigns] ++ binding, file: __ENV__.file, engine: Engine)
+   end

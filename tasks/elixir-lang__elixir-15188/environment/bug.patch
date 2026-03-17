@@ -1,0 +1,166 @@
+diff --git a/lib/mix/lib/mix/dep.ex b/lib/mix/lib/mix/dep.ex
+index f7b698bde..96acd4e4f 100644
+--- a/lib/mix/lib/mix/dep.ex
++++ b/lib/mix/lib/mix/dep.ex
+@@ -338,10 +338,6 @@ def format_status(%Mix.Dep{status: :compile}) do
+     "the dependency build is outdated, please run \"#{mix_env_var()}mix deps.compile\""
+   end
+ 
+-  def format_status(%Mix.Dep{status: :envoutdated}) do
+-    "the dependency compile environment is outdated, please run \"#{mix_env_var()}mix deps.compile\""
+-  end
+-
+   def format_status(%Mix.Dep{app: app, status: {:divergedreq, vsn, other}} = dep) do
+     "the dependency #{app} #{vsn}\n" <>
+       dep_status(dep) <>
+@@ -509,20 +505,11 @@ def diverged?(%Mix.Dep{}), do: false
+   @doc """
+   Returns `true` if the dependency is compilable.
+   """
+-  def compilable?(%Mix.Dep{status: :envoutdated}), do: true
+-  def compilable?(dep), do: force_compilable?(dep)
+-
+-  @doc """
+-  Returns `true` if the dependency is force compilable.
+-
+-  This is a subset of compilable. This is used in `deps.compile` to
+-  clean the build path before compiling.
+-  """
+-  def force_compilable?(%Mix.Dep{status: {:vsnlock, _}}), do: true
+-  def force_compilable?(%Mix.Dep{status: {:noappfile, {_, _}}}), do: true
+-  def force_compilable?(%Mix.Dep{status: {:scmlock, _}}), do: true
+-  def force_compilable?(%Mix.Dep{status: :compile}), do: true
+-  def force_compilable?(_), do: false
++  def compilable?(%Mix.Dep{status: {:vsnlock, _}}), do: true
++  def compilable?(%Mix.Dep{status: {:noappfile, {_, _}}}), do: true
++  def compilable?(%Mix.Dep{status: {:scmlock, _}}), do: true
++  def compilable?(%Mix.Dep{status: :compile}), do: true
++  def compilable?(_), do: false
+ 
+   @doc """
+   Formats a dependency for printing.
+diff --git a/lib/mix/lib/mix/dep/loader.ex b/lib/mix/lib/mix/dep/loader.ex
+index 7b576a528..6b34b32fb 100644
+--- a/lib/mix/lib/mix/dep/loader.ex
++++ b/lib/mix/lib/mix/dep/loader.ex
+@@ -444,7 +444,7 @@ defp app_status(app_path, app, req) do
+   defp compile_env_status(vsn, properties) do
+     with [_ | _] = compile_env <- properties[:compile_env],
+          false <- Config.Provider.valid_compile_env?(compile_env) do
+-      :envoutdated
++      :compile
+     else
+       _ -> {:ok, vsn, properties}
+     end
+diff --git a/lib/mix/lib/mix/tasks/compile.app.ex b/lib/mix/lib/mix/tasks/compile.app.ex
+index 8a4b99d61..391973130 100644
+--- a/lib/mix/lib/mix/tasks/compile.app.ex
++++ b/lib/mix/lib/mix/tasks/compile.app.ex
+@@ -161,13 +161,10 @@ def run(args) do
+       |> max(Mix.Utils.last_modified(compile_path))
+ 
+     current_properties = current_app_properties(target)
+-    current_compile_env = Mix.ProjectStack.compile_env(nil)
+ 
+     {changed?, modules} =
+       cond do
+-        opts[:force] || new_mtime > Mix.Utils.last_modified(target) ||
+-            (current_compile_env != nil and
+-               current_compile_env != Keyword.get(current_properties, :compile_env, [])) ->
++        opts[:force] || new_mtime > Mix.Utils.last_modified(target) ->
+           {true, nil}
+ 
+         Keyword.get(config, :reliable_dir_mtime, fn -> not match?({:win32, _}, :os.type()) end) ->
+@@ -187,7 +184,7 @@ def run(args) do
+         ]
+         |> merge_project_application(project)
+         |> handle_extra_applications(config)
+-        |> add_compile_env(current_compile_env, current_properties)
++        |> add_compile_env(current_properties)
+         |> add_modules(modules, compile_path)
+ 
+       contents =
+@@ -392,12 +389,12 @@ defp typed_app?(app) when is_atom(app), do: true
+   defp typed_app?({app, type}) when is_atom(app) and type in [:required, :optional], do: true
+   defp typed_app?(_), do: false
+ 
+-  defp add_compile_env(properties, current_compile_env, current_properties) do
++  defp add_compile_env(properties, current_properties) do
+     # If someone calls compile.elixir and then compile.app across two
+     # separate OS calls, then the compile_env won't be properly reflected.
+     # This is ok because compile_env is not used for correctness. It is
+     # simply to catch possible errors early.
+-    case current_compile_env do
++    case Mix.ProjectStack.compile_env(nil) do
+       nil -> Keyword.take(current_properties, [:compile_env]) ++ properties
+       [] -> properties
+       compile_env -> Keyword.put(properties, :compile_env, compile_env)
+diff --git a/lib/mix/lib/mix/tasks/deps.compile.ex b/lib/mix/lib/mix/tasks/deps.compile.ex
+index 0e0f7ab51..6ba31899d 100644
+--- a/lib/mix/lib/mix/tasks/deps.compile.ex
++++ b/lib/mix/lib/mix/tasks/deps.compile.ex
+@@ -125,7 +125,7 @@ def compile_single(%Mix.Dep{} = dep, force?, config) do
+ 
+     # If a dependency was marked as fetched or with an out of date lock
+     # or missing the app file, we always compile it from scratch.
+-    if force? or Mix.Dep.force_compilable?(dep) do
++    if force? or Mix.Dep.compilable?(dep) do
+       File.rm_rf!(Path.join([Mix.Project.build_path(), "lib", Atom.to_string(dep.app)]))
+     end
+ 
+diff --git a/lib/mix/test/fixtures/deps_status/custom/raw_repo/lib/raw_repo.ex b/lib/mix/test/fixtures/deps_status/custom/raw_repo/lib/raw_repo.ex
+index 08e5484b8..b893d48bc 100644
+--- a/lib/mix/test/fixtures/deps_status/custom/raw_repo/lib/raw_repo.ex
++++ b/lib/mix/test/fixtures/deps_status/custom/raw_repo/lib/raw_repo.ex
+@@ -1,4 +1,4 @@
+-Application.compile_env(:anyapp, :anything)
++Application.compile_env(:raw_repo, :compile_env)
+ 
+ defmodule RawRepo do
+   def hello do
+diff --git a/lib/mix/test/mix/tasks/deps_test.exs b/lib/mix/test/mix/tasks/deps_test.exs
+index f09a00bc3..6e9c32144 100644
+--- a/lib/mix/test/mix/tasks/deps_test.exs
++++ b/lib/mix/test/mix/tasks/deps_test.exs
+@@ -837,15 +837,8 @@ test "checks if dependencies are using old scm version" do
+ 
+   test "checks if compile env changed" do
+     in_fixture("deps_status", fn ->
+-      # Write another file, it should not be recompiled upon compiled env change.
+-      File.write!("custom/raw_repo/lib/foo.ex", """
+-      defmodule RawRepo.Foo do
+-      end
+-      """)
+-
+       Mix.Project.push(RawRepoDepApp)
+       Mix.Tasks.Deps.Loadpaths.run([])
+-      assert_receive {:mix_shell, :info, ["Compiling 2 files (.ex)"]}
+       assert_receive {:mix_shell, :info, ["Generated raw_repo app"]}
+       assert Application.spec(:raw_repo, :vsn)
+ 
+@@ -853,7 +846,7 @@ defmodule RawRepo.Foo do
+ 
+       File.write!("config/config.exs", """
+       import Config
+-      config :anyapp, :anything, :anyvalue
++      config :raw_repo, :compile_env, :new_value
+       """)
+ 
+       Application.unload(:raw_repo)
+@@ -866,15 +859,10 @@ defmodule RawRepo.Foo do
+       Mix.Tasks.Deps.run([])
+ 
+       assert_receive {:mix_shell, :info,
+-                      [
+-                        "  the dependency compile environment is outdated, please run \"mix deps.compile\""
+-                      ]}
+-
+-      Mix.shell().flush()
++                      ["  the dependency build is outdated, please run \"mix deps.compile\""]}
+ 
+       Mix.Tasks.Deps.Loadpaths.run([])
+ 
+-      assert_receive {:mix_shell, :info, ["Compiling 1 file (.ex)"]}
+       assert_receive {:mix_shell, :info, ["Generated raw_repo app"]}
+       assert Application.spec(:raw_repo, :vsn)
+     end)

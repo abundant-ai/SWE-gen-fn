@@ -1,0 +1,148 @@
+diff --git a/lib/ecto/query.ex b/lib/ecto/query.ex
+index 8239140a..1a52be65 100644
+--- a/lib/ecto/query.ex
++++ b/lib/ecto/query.ex
+@@ -948,6 +948,36 @@ defmodule Ecto.Query do
+   a value that implements the `Ecto.Queryable` protocol
+   and the second argument the expression.
+ 
++  ## Hints
++
++  The `hints` keyword can be used to specify query hints:
++
++      from p in Post,
++        hints: ["USE INDEX FOO"],
++        where: p.title == "title"
++
++  It can also be used as a general mechanism for adding statements that
++  come after the `from` clause. For example, it can be used to enable
++  table sampling:
++
++      from p in Post,
++        hints: "TABLESAMPLE SYSTEM(1)"
++
++  `from` hints must be a (list of) compile-time strings or unsafe fragments. An unsafe
++  fragment can be used to specify dynamic hints:
++
++      sample = "SYSTEM_ROWS(1)"
++
++      from p in Post,
++        hints: ["TABLESAMPLE", unsafe_fragment(^sample)]
++
++  > ### Unsafe Fragments {: .warning}
++  >
++  > The output of `unsafe_fragment/1` will be injected directly into the
++  > resulting SQL statement without being escaped. For this reason, input
++  > from uncontrolled sources, such as user input, should **never** be used.
++  > Otherwise, it could lead to harmful SQL injection attacks.
++
+   ## Keywords examples
+ 
+       # `in` expression
+@@ -957,7 +987,7 @@ defmodule Ecto.Query do
+       from(City, limit: 1)
+ 
+       # Fragment with user-defined function and predefined columns
+-      from(f in fragment("my_table_valued_function(arg)"), select: f.x))
++      from(f in fragment("my_table_valued_function(arg)"), select: f.x)
+ 
+       # Fragment with built-in function and undefined columns
+       from(f in fragment("select generate_series(?::integer, ?::integer) as x", ^0, ^10), select: f.x)
+@@ -1281,7 +1311,7 @@ defmodule Ecto.Query do
+ 
+   ## Hints
+ 
+-  `from` and `join` also support index hints, as found in databases such as
++  `join` also supports table hints, as found in databases such as
+   [MySQL](https://dev.mysql.com/doc/refman/8.0/en/index-hints.html),
+   [MSSQL](https://docs.microsoft.com/en-us/sql/t-sql/queries/hints-transact-sql-table?view=sql-server-2017) and
+   [Clickhouse](https://clickhouse.tech/docs/en/sql-reference/statements/select/sample/).
+@@ -1297,12 +1327,7 @@ defmodule Ecto.Query do
+   Keep in mind you want to use hints rarely, so don't forget to read the database
+   disclaimers about such functionality.
+ 
+-  Hints must be static compile-time strings when they are specified as (list of) strings.
+-  Certain Ecto adapters may also accept dynamic hints using the tuple form:
+-
+-      from e in Event,
+-        hints: [sample: sample_threshold()],
+-        select: e
++  Join hints must be static compile-time strings when they are specified as (list of) strings.
+ 
+   ## Array joins
+ 
+diff --git a/lib/ecto/query/builder/from.ex b/lib/ecto/query/builder/from.ex
+index e76b29bd..d4e59491 100644
+--- a/lib/ecto/query/builder/from.ex
++++ b/lib/ecto/query/builder/from.ex
+@@ -60,8 +60,8 @@ defmodule Ecto.Query.Builder.From do
+         escape_source(other, env)
+     end
+   end
+-  
+-  @typep hints :: [String.t() | {atom, term}]
++
++  @typep hints :: [String.t() | Macro.t()]
+ 
+   @doc """
+   Builds a quoted expression.
+@@ -73,12 +73,7 @@ defmodule Ecto.Query.Builder.From do
+   @spec build(Macro.t(), Macro.Env.t(), atom, {:ok, String.t | nil} | nil, hints) ::
+           {Macro.t(), Keyword.t(), non_neg_integer | nil}
+   def build(query, env, as, prefix, hints) do
+-    unless Enum.all?(hints, &is_valid_hint/1) do
+-      Builder.error!(
+-        "`hints` must be a compile time string, list of strings, a tuple, or a list of tuples " <>
+-          "got: `#{Macro.to_string(hints)}`"
+-      )
+-    end
++    hints = Enum.map(hints, &hint!(&1))
+ 
+     prefix = case prefix do
+       nil -> nil
+@@ -145,6 +140,34 @@ defmodule Ecto.Query.Builder.From do
+   def prefix!(prefix) when is_binary(prefix) or is_nil(prefix), do: prefix
+   def prefix!(prefix), do: raise("`prefix` must be a string, got: #{inspect(prefix)}")
+ 
++  @doc """
++  Validates hints at compile time and runtime
++  """
++  def hint!(hint) when is_binary(hint), do: hint
++
++  def hint!({:unsafe_fragment, _, [fragment]}) do
++    case fragment do
++      {:^, _, [value]} ->
++        quote do: Ecto.Query.Builder.From.hint!(unquote(value))
++
++      hint when is_binary(hint) ->
++        hint
++
++      other ->
++        Builder.error!(
++          "`hints` must be a compile time string, unsafe fragment of the form `unsafe_fragment(^...)`, " <>
++            "or list containing either, got: `#{Macro.to_string(other)}`"
++        )
++    end
++  end
++
++  def hint!(other) do
++    Builder.error!(
++      "`hints` must be a compile time string, unsafe fragment of the form `unsafe_fragment(^...)`, " <>
++        "or list containing either, got: `#{Macro.to_string(other)}`"
++    )
++  end
++
+   @doc """
+   The callback applied by `build/2` to build the query.
+   """
+@@ -194,10 +217,6 @@ defmodule Ecto.Query.Builder.From do
+   defp maybe_apply_hints(query, []), do: query
+   defp maybe_apply_hints(query, hints), do: update_in(query.from.hints, &(&1 ++ hints))
+ 
+-  defp is_valid_hint(hint) when is_binary(hint), do: true
+-  defp is_valid_hint({_key, _val}), do: true
+-  defp is_valid_hint(_), do: false
+-
+   defp check_binds(query, count) do
+     if count > 1 and count > Builder.count_binds(query) do
+       Builder.error!(

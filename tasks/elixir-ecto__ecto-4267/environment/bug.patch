@@ -1,0 +1,278 @@
+diff --git a/lib/ecto/query.ex b/lib/ecto/query.ex
+index 311efdb1..1a52be65 100644
+--- a/lib/ecto/query.ex
++++ b/lib/ecto/query.ex
+@@ -736,7 +736,7 @@ defmodule Ecto.Query do
+ 
+       windows: [ordered_names: [order_by: e.name]]
+ 
+-  It works exactly as the keyword query version of `order_by/3`.
++  It works exactly as the keyword query version of `order_by/4`.
+ 
+   ### :frame
+ 
+@@ -1809,12 +1809,20 @@ defmodule Ecto.Query do
+   "nulls first" or "nulls last" is specific to each database implementation.
+ 
+   `order_by` may be invoked or listed in a query many times. New expressions
+-  are appended to the existing ones.
++  can be appended or preprended to the existing ones. The behaviour is controlled
++  through the `:mode` option. By default, new expressions are appended.
+ 
+   `order_by` also accepts a list of atoms where each atom refers to a field in
+   source or a keyword list where the direction is given as key and the field
+   to order as value.
+ 
++  ## Options
++
++    * `:mode` - where to place the order expression relative to the
++      ones that already exist. Can be `:append`, to place it after the
++      current orderings, or `:prepend`, to place it before the current
++      orderings. Defaults to `:append`
++
+   ## Keywords examples
+ 
+       from(c in City, order_by: c.name, order_by: c.population)
+@@ -1863,15 +1871,8 @@ defmodule Ecto.Query do
+       City |> order_by(^order_by_param) # Keyword list
+ 
+   """
+-  defmacro order_by(query, binding \\ [], expr) do
+-    Builder.OrderBy.build(query, binding, expr, :append, __CALLER__)
+-  end
+-
+-  @doc """
+-  Same as `order_by/3` except new expressions will be prepended to existing ones.
+-  """
+-  defmacro prepend_order_by(query, binding \\ [], expr) do
+-    Builder.OrderBy.build(query, binding, expr, :prepend, __CALLER__)
++  defmacro order_by(query, binding \\ [], expr, opts \\ []) do
++    Builder.OrderBy.build(query, binding, expr, opts, __CALLER__)
+   end
+ 
+   @doc """
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index a9a14b8e..dac1fa49 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -768,7 +768,7 @@ defmodule Ecto.Query.API do
+   referencing it outside of select statements.
+ 
+   This comes in handy when, for instance, you would like to use the calculated
+-  value in `Ecto.Query.group_by/3` or `Ecto.Query.order_by/3`:
++  value in `Ecto.Query.group_by/3` or `Ecto.Query.order_by/4`:
+ 
+       from p in Post,
+         select: %{
+diff --git a/lib/ecto/query/builder/order_by.ex b/lib/ecto/query/builder/order_by.ex
+index 5d863344..f46b5f35 100644
+--- a/lib/ecto/query/builder/order_by.ex
++++ b/lib/ecto/query/builder/order_by.ex
+@@ -14,6 +14,9 @@ defmodule Ecto.Query.Builder.OrderBy do
+     :desc_nulls_first
+   ]
+ 
++  @modes [:append, :prepend]
++  @default_mode :append
++
+   @doc """
+   Returns `true` if term is a valid order_by direction; otherwise returns `false`.
+ 
+@@ -128,6 +131,23 @@ defmodule Ecto.Query.Builder.OrderBy do
+ 
+   defp to_field(field), do: {{:., [], [{:&, [], [0]}, field]}, [], []}
+ 
++  @doc """
++  Called at runtime to verify the ordering mode
++  """
++  def mode!(order_opts) do
++    case order_opts[:mode] do
++      nil ->
++        @default_mode
++
++      mode when mode in @modes ->
++        mode
++
++      other ->
++        raise ArgumentError,
++              "expected `:mode` to be `:append` or `:prepend`, got: #{inspect(other)}"
++    end
++  end
++
+   @doc """
+   Shared between order_by and distinct.
+   """
+@@ -148,10 +168,11 @@ defmodule Ecto.Query.Builder.OrderBy do
+   @doc """
+   Called at runtime to assemble order_by.
+   """
+-  def order_by!(query, exprs, op, file, line) do
++  def order_by!(query, exprs, order_opts, file, line) do
++    mode = mode!(order_opts)
+     {expr, params} = order_by_or_distinct!(:order_by, query, exprs, [])
+     expr = %Ecto.Query.QueryExpr{expr: expr, params: Enum.reverse(params), line: line, file: file}
+-    apply(query, expr, op)
++    apply(query, expr, mode)
+   end
+ 
+   defp dynamic_or_field!(kind, %Ecto.Query.DynamicExpr{} = dynamic, query, {params, count}) do
+@@ -176,35 +197,36 @@ defmodule Ecto.Query.Builder.OrderBy do
+   If possible, it does all calculations at compile time to avoid
+   runtime work.
+   """
+-  @spec build(Macro.t, [Macro.t], Macro.t, :append | :prepend, Macro.Env.t) :: Macro.t
+-  def build(query, _binding, {:^, _, [var]}, op, env) do
++  @spec build(Macro.t, [Macro.t], Macro.t, Macro.t, Macro.Env.t) :: Macro.t
++  def build(query, _binding, {:^, _, [var]}, order_opts, env) do
+     quote do
+-      Ecto.Query.Builder.OrderBy.order_by!(unquote(query), unquote(var), unquote(op), unquote(env.file), unquote(env.line))
++      Ecto.Query.Builder.OrderBy.order_by!(unquote(query), unquote(var), unquote(order_opts), unquote(env.file), unquote(env.line))
+     end
+   end
+ 
+-  def build(query, binding, expr, op, env) do
++  def build(query, binding, expr, order_opts, env) do
+     {query, binding} = Builder.escape_binding(query, binding, env)
+     {expr, {params, _acc}} = escape(:order_by, expr, {[], %{}}, binding, env)
+     params = Builder.escape_params(params)
++    mode = quote do: Ecto.Query.Builder.OrderBy.mode!(unquote(order_opts))
+ 
+     order_by = quote do: %Ecto.Query.QueryExpr{
+                            expr: unquote(expr),
+                            params: unquote(params),
+                            file: unquote(env.file),
+                            line: unquote(env.line)}
+-    Builder.apply_query(query, __MODULE__, [order_by, op], env)
++    Builder.apply_query(query, __MODULE__, [order_by, mode], env)
+   end
+ 
+   @doc """
+   The callback applied by `build/4` to build the query.
+   """
+   @spec apply(Ecto.Queryable.t, term, term) :: Ecto.Query.t
+-  def apply(%Ecto.Query{order_bys: orders} = query, expr, op) do
+-    %{query | order_bys: update_order_bys(orders, expr, op)}
++  def apply(%Ecto.Query{order_bys: orders} = query, expr, mode) do
++    %{query | order_bys: update_order_bys(orders, expr, mode)}
+   end
+-  def apply(query, expr, op) do
+-    apply(Ecto.Queryable.to_query(query), expr, op)
++  def apply(query, expr, mode) do
++    apply(Ecto.Queryable.to_query(query), expr, mode)
+   end
+ 
+   @doc """
+diff --git a/lib/ecto/repo/preloader.ex b/lib/ecto/repo/preloader.ex
+index fd8ed695..8ca2e28e 100644
+--- a/lib/ecto/repo/preloader.ex
++++ b/lib/ecto/repo/preloader.ex
+@@ -340,7 +340,7 @@ defmodule Ecto.Repo.Preloader do
+   defp add_preload_order([], query), do: query
+ 
+   defp add_preload_order(order, query) when is_list(order) do
+-    Ecto.Query.prepend_order_by(query, [q], ^order)
++    Ecto.Query.order_by(query, [q], ^order, mode: :prepend)
+   end
+ 
+   defp add_preload_order({m, f, a}, query) do
+diff --git a/lib/ecto/schema.ex b/lib/ecto/schema.ex
+index d846c3e4..a47dd1c0 100644
+--- a/lib/ecto/schema.ex
++++ b/lib/ecto/schema.ex
+@@ -831,7 +831,7 @@ defmodule Ecto.Schema do
+       For example, if you set `Post.has_many :comments, preload_order: [asc: :content]`,
+       whenever the `:comments` associations is preloaded,
+       the comments will be order by the `:content` field.
+-      See `Ecto.Query.order_by/3` for more examples.
++      See `Ecto.Query.order_by/4` for more examples.
+ 
+   ## Examples
+ 
+@@ -1371,7 +1371,7 @@ defmodule Ecto.Schema do
+ 
+     * `:preload_order` - Sets the default `order_by` when preloading the association.
+       It may be a keyword list/list of fields or an MFA tuple, such as `{Mod, fun, []}`.
+-      Both cases must resolve to a valid `order_by` expression. See `Ecto.Query.order_by/3`
++      Both cases must resolve to a valid `order_by` expression. See `Ecto.Query.order_by/4`
+       to learn more about about ordering expressions.
+       See the [preload order](#many_to_many/3-preload-order) section below to learn how
+       this option can be utilized
+diff --git a/test/ecto/query/builder/order_by_test.exs b/test/ecto/query/builder/order_by_test.exs
+index 81656994..333c6a05 100644
+--- a/test/ecto/query/builder/order_by_test.exs
++++ b/test/ecto/query/builder/order_by_test.exs
+@@ -89,14 +89,34 @@ defmodule Ecto.Query.Builder.OrderByTest do
+       end
+     end
+ 
+-    test "prepend_order_by" do
++    test "accepts :mode option" do
+       query = order_by("q", [q], [:title])
+-      %{order_bys: order_bys} = prepend_order_by(query, [q], [:prepend])
++      opts = [mode: :prepend]
++      %{order_bys: prepend_order_bys} = order_by(query, [q], [:prepend], opts)
++      %{order_bys: append_order_bys} = order_by(query, [q], [:append], mode: :append)
++      %{order_bys: default_order_bys} = order_by(query, [q], [:append])
+ 
+       assert [
+                %{expr: [asc: {{:., _, [_, :prepend]}, _, _}]},
+                %{expr: [asc: {{:., _, [_, :title]}, _, _}]}
+-             ] = order_bys
++             ] = prepend_order_bys
++
++      assert [
++               %{expr: [asc: {{:., _, [_, :title]}, _, _}]},
++               %{expr: [asc: {{:., _, [_, :append]}, _, _}]}
++             ] = append_order_bys
++
++      assert [
++               %{expr: [asc: {{:., _, [_, :title]}, _, _}]},
++               %{expr: [asc: {{:., _, [_, :append]}, _, _}]}
++             ] = default_order_bys
++
++
++      error_msg = "expected `:mode` to be `:append` or `:prepend`, got: :invalid"
++
++      assert_raise ArgumentError, error_msg, fn ->
++        order_by(query, [q], [:invalid], mode: :invalid)
++      end
+     end
+   end
+ 
+@@ -110,6 +130,36 @@ defmodule Ecto.Query.Builder.OrderByTest do
+       assert order_by("q", [q], [{^dir, ^key}]).order_bys == order_by("q", [q], [desc: q.title]).order_bys
+     end
+ 
++    test "accepts :mode option" do
++      query = order_by("q", [q], [:title])
++      opts = [mode: :prepend]
++      %{order_bys: prepend_order_bys} = order_by(query, [q], ^[:prepend], opts)
++      %{order_bys: append_order_bys} = order_by(query, [q], ^[:append], mode: :append)
++      %{order_bys: default_order_bys} = order_by(query, [q], ^[:append])
++
++      assert [
++               %{expr: [asc: {{:., _, [_, :prepend]}, _, _}]},
++               %{expr: [asc: {{:., _, [_, :title]}, _, _}]}
++             ] = prepend_order_bys
++
++      assert [
++               %{expr: [asc: {{:., _, [_, :title]}, _, _}]},
++               %{expr: [asc: {{:., _, [_, :append]}, _, _}]}
++             ] = append_order_bys
++
++      assert [
++               %{expr: [asc: {{:., _, [_, :title]}, _, _}]},
++               %{expr: [asc: {{:., _, [_, :append]}, _, _}]}
++             ] = default_order_bys
++
++
++      error_msg = "expected `:mode` to be `:append` or `:prepend`, got: :invalid"
++
++      assert_raise ArgumentError, error_msg, fn ->
++        order_by(query, [q], ^[:invalid], mode: :invalid)
++      end
++    end
++
+     test "supports dynamic expressions" do
+       order_by = [
+         asc: dynamic([p], p.foo == ^1 and p.bar == ^"bar"),

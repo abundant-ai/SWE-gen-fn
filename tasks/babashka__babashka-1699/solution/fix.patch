@@ -1,0 +1,136 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 951f4142..9769e745 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -15,6 +15,10 @@ A preview of the next release can be installed from
+ - Partially Fix [#1695](https://github.com/babashka/babashka/issues/1695): `--repl` arg handling should consume only one arg (itself) ([@bobisageek](https://github.com/bobisageek))
+ - Partially Fix [#1695](https://github.com/babashka/babashka/issues/1695): make `*command-line-args*` value available in the REPL ([@bobisageek](https://github.com/bobisageek))
+ - Fix [#1686](https://github.com/babashka/babashka/issues/1686): do not fetch dependencies/invoke java for `version`, `help`, and `describe` options ([@bobisageek](https://github.com/bobisageek))
++- [#1696](https://github.com/babashka/babashka/issues/1696): add `clojure.lang.DynamicClassLoader` constructors ([@bobisageek](https://github.com/bobisageek))
++- [#1696](https://github.com/babashka/babashka/issues/1696): add `clojure.core/*source-path*` (points to the same sci var as `*file*`) ([@bobisageek](https://github.com/bobisageek))
++- [#1696](https://github.com/babashka/babashka/issues/1696): add `clojure.main/with-read-known` ([@bobisageek](https://github.com/bobisageek))
++- [#1696](https://github.com/babashka/babashka/issues/1696): add `clojure.core.server/repl-read` ([@bobisageek](https://github.com/bobisageek))
+ 
+ ## 1.3.190 (2024-04-17)
+ 
+diff --git a/src/babashka/impl/classes.clj b/src/babashka/impl/classes.clj
+index 4a0889d7..80d9b127 100644
+--- a/src/babashka/impl/classes.clj
++++ b/src/babashka/impl/classes.clj
+@@ -561,6 +561,7 @@
+           ~@(when features/yaml? '[org.yaml.snakeyaml.error.YAMLException])
+           ~@(when features/hsqldb? '[org.hsqldb.jdbcDriver])]
+     :constructors [clojure.lang.Delay
++                   clojure.lang.DynamicClassLoader
+                    clojure.lang.LineNumberingPushbackReader
+                    java.io.EOFException]
+     :methods [borkdude.graal.LockFix] ;; support for locking
+diff --git a/src/babashka/impl/clojure/core.clj b/src/babashka/impl/clojure/core.clj
+index b887715f..fb39383d 100644
+--- a/src/babashka/impl/clojure/core.clj
++++ b/src/babashka/impl/clojure/core.clj
+@@ -167,6 +167,7 @@
+    '*math-context* math-context
+    '*compiler-options* compiler-options
+    '*compile-path* compile-path
++   '*source-path* sci/file
+    'with-precision (sci/copy-var with-precision clojure-core-ns)
+    '-with-precision (sci/copy-var -with-precision clojure-core-ns)
+    ;; STM
+diff --git a/src/babashka/impl/clojure/main.clj b/src/babashka/impl/clojure/main.clj
+index 83f0c38a..af89f966 100644
+--- a/src/babashka/impl/clojure/main.clj
++++ b/src/babashka/impl/clojure/main.clj
+@@ -55,6 +55,13 @@ by default when a new command-line REPL is started."} repl-requires
+   '[[clojure.repl :refer (source apropos pst dir doc find-doc)]
+     [clojure.pprint :refer (pp pprint)]])
+ 
++(defmacro with-read-known
++  "Evaluates body with *read-eval* set to a \"known\" value,
++   i.e. substituting true for :unknown if necessary."
++  [& body]
++  `(binding [*read-eval* (if (= :unknown *read-eval*) true *read-eval*)]
++     ~@body))
++
+ (defn repl
+   "Generic, reusable, read-eval-print loop. By default, reads from *in*,
+   writes to *out*, and prints exception summaries to *err*. If you use the
+diff --git a/src/babashka/impl/repl.clj b/src/babashka/impl/repl.clj
+index 86fd58e6..289ba1ec 100644
+--- a/src/babashka/impl/repl.clj
++++ b/src/babashka/impl/repl.clj
+@@ -46,6 +46,16 @@
+     (when-not (= c \newline)
+       (r/unread s c))))
+ 
++(defn repl-read [sci-ctx in-stream _request-prompt request-exit]
++  (if (nil? (r/peek-char in-stream))
++    request-exit
++    (let [v (parser/parse-next sci-ctx in-stream)]
++      (skip-if-eol in-stream)
++      (if (or (identical? :repl/quit v)
++            (identical? :repl/exit v))
++        request-exit
++        v))))
++
+ (defn repl
+   "REPL with predefined hooks for attachable socket server."
+   ([sci-ctx] (repl sci-ctx nil))
+@@ -68,15 +78,8 @@
+                       (sio/println))
+                     (eval-form sci-ctx `(apply require (quote ~m/repl-requires)))))
+         :read (or read
+-                  (fn [_request-prompt request-exit]
+-                    (if (nil? (r/peek-char in))
+-                      request-exit
+-                      (let [v (parser/parse-next sci-ctx in)]
+-                        (skip-if-eol in)
+-                        (if (or (identical? :repl/quit v)
+-                                (identical? :repl/exit v))
+-                          request-exit
+-                          v)))))
++                (fn [request-prompt request-exit]
++                     (repl-read sci-ctx in request-prompt request-exit)))
+         :eval (or eval
+                   (fn [expr]
+                     (sci/with-bindings {sci/file "<repl>"
+diff --git a/src/babashka/impl/server.clj b/src/babashka/impl/server.clj
+index 78af54c7..a1e9fdd0 100644
+--- a/src/babashka/impl/server.clj
++++ b/src/babashka/impl/server.clj
+@@ -1,6 +1,7 @@
+ (ns babashka.impl.server
+   (:require [babashka.impl.clojure.core.server :as server]
+             [babashka.impl.common :as common]
++            [babashka.impl.repl :as repl]
+             [babashka.impl.socket-repl :as socket-repl]
+             [sci.core :as sci]))
+ 
+@@ -17,9 +18,14 @@
+   (fn [& args]
+     (apply server/start-server (common/ctx) args)))
+ 
++(def repl-read
++  (fn [& args]
++    (apply repl/repl-read (common/ctx) @sci/in args)))
++
+ (def clojure-core-server-namespace
+   {'repl (sci/copy-var socket-repl/repl sns)
+    'prepl (sci/copy-var prepl sns)
+    'io-prepl (sci/copy-var io-prepl sns)
+    'start-server (sci/copy-var start-server sns)
+-   'stop-server (sci/copy-var server/stop-server sns)})
++   'stop-server (sci/copy-var server/stop-server sns)
++   'repl-read (sci/copy-var repl-read sns)})
+diff --git a/src/babashka/main.clj b/src/babashka/main.clj
+index e310c1fc..750d2f56 100644
+--- a/src/babashka/main.clj
++++ b/src/babashka/main.clj
+@@ -385,6 +385,7 @@ Use bb run --help to show this help output.
+                                           (repl/start-repl! (common/ctx) opts))) {:ns clojure-main-ns})
+                    'with-bindings (sci/copy-var clojure-main/with-bindings clojure-main-ns)
+                    'repl-caught (sci/copy-var repl/repl-caught clojure-main-ns)
++                   'with-read-known (sci/copy-var clojure-main/with-read-known clojure-main-ns)
+                    'main main-var}
+     'clojure.test t/clojure-test-namespace
+     'clojure.math math-namespace

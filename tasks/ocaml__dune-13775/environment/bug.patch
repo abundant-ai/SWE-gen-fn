@@ -1,0 +1,348 @@
+diff --git a/otherlibs/stdune/src/option.ml b/otherlibs/stdune/src/option.ml
+index 4c999be9c..93ecc45e6 100644
+--- a/otherlibs/stdune/src/option.ml
++++ b/otherlibs/stdune/src/option.ml
+@@ -97,8 +97,6 @@ let try_with f =
+ ;;
+ 
+ module List = struct
+-  open O
+-
+   let all =
+     let rec loop acc = function
+       | [] -> Some (List.rev acc)
+@@ -118,14 +116,6 @@ module List = struct
+     in
+     loop [] xs
+   ;;
+-
+-  let concat_map =
+-    let rec loop f acc = function
+-      | [] -> Some (List.rev acc)
+-      | x :: xs -> f x >>= fun ys -> loop f (List.rev_append ys acc) xs
+-    in
+-    fun xs ~f -> loop f [] xs
+-  ;;
+ end
+ 
+ let hash f = function
+diff --git a/otherlibs/stdune/src/option.mli b/otherlibs/stdune/src/option.mli
+index fe63fd470..bd6a0c48c 100644
+--- a/otherlibs/stdune/src/option.mli
++++ b/otherlibs/stdune/src/option.mli
+@@ -39,9 +39,6 @@ module List : sig
+ 
+   (** Like [all (List.map t ~f)] but short-circuits on the first [None]. *)
+   val traverse : 'a list -> f:('a -> 'b option) -> 'b list option
+-
+-  (** Like [all (List.concat_map t ~f)] but short-circuits on the first [None]. *)
+-  val concat_map : 'a list -> f:('a -> 'b list option) -> 'b list option
+ end
+ 
+ val merge : 'a t -> 'a t -> f:('a -> 'a -> 'a) -> 'a t
+diff --git a/src/dune_lang/slang.ml b/src/dune_lang/slang.ml
+index 590eaaaf0..6636b3baa 100644
+--- a/src/dune_lang/slang.ml
++++ b/src/dune_lang/slang.ml
+@@ -273,9 +273,6 @@ let rec simplify = function
+   | Literal sw -> Literal sw
+   | Form (loc, form) ->
+     (match form with
+-     (* CR-someday Alizter: This does multiple passes: exists, filter, then
+-        simplify recursively. Simplify and filter out Nil in a single pass
+-        instead. *)
+      | Concat with_nil when List.exists with_nil ~f:is_nil ->
+        simplify (Form (loc, Concat (List.filter with_nil ~f:(Fun.negate is_nil))))
+      | Concat [] -> Literal (String_with_vars.make_text ~quoted:true loc "")
+@@ -338,70 +335,23 @@ let rec simplify = function
+         | Form (_, Blang (Const _)) as value -> value
+         | value -> Form (loc, Catch_undefined_var { value; fallback = simplify fallback }))
+      | And_absorb_undefined_var blangs ->
+-       (match
+-          simplify_blangs
+-            blangs
+-            ~flatten_nested:(function
+-              | Blang.Expr (Form (_, And_absorb_undefined_var blangs)) -> Some blangs
+-              | _ -> None)
+-            ~identity:true
+-        with
+-        | None -> Form (loc, Blang (Const false))
+-        | Some [] -> Form (loc, Blang (Const true))
+-        | Some [ b ] -> Form (loc, Blang b)
+-        | Some blangs -> Form (loc, And_absorb_undefined_var blangs))
++       let blangs : blang list =
++         List.concat_map blangs ~f:(fun blang ->
++           match simplify_blang blang with
++           | Expr (Form (_, And_absorb_undefined_var blangs)) -> blangs
++           | blang -> [ blang ])
++       in
++       Form (loc, And_absorb_undefined_var blangs)
+      | Or_absorb_undefined_var blangs ->
+-       (match
+-          simplify_blangs
+-            blangs
+-            ~flatten_nested:(function
+-              | Blang.Expr (Form (_, Or_absorb_undefined_var blangs)) -> Some blangs
+-              | _ -> None)
+-            ~identity:false
+-        with
+-        | None -> Form (loc, Blang (Const true))
+-        | Some [] -> Form (loc, Blang (Const false))
+-        | Some [ b ] -> Form (loc, Blang b)
+-        | Some blangs -> Form (loc, Or_absorb_undefined_var blangs))
++       let blangs : blang list =
++         List.concat_map blangs ~f:(fun (blang : blang) ->
++           match simplify_blang blang with
++           | Expr (Form (_, Or_absorb_undefined_var blangs)) -> blangs
++           | blang -> [ blang ])
++       in
++       Form (loc, Or_absorb_undefined_var (List.map blangs ~f:simplify_blang))
+      | Blang b -> Form (loc, Blang (simplify_blang b)))
+ 
+-(* Simplify a list of blangs for And/Or-like operations.
+-
+-   This function simplifies each blang, flattens nested same-kind operations
+-   (e.g., And within And), applies boolean absorption/identity rules, and
+-   removes duplicates:
+-
+-   - [flatten_nested] detects nested same-kind operations and extracts their
+-     children for flattening. For example, when simplifying [And(a, And(b, c))],
+-     the caller provides a [flatten_nested] that returns [Some [b; c]] for the
+-     inner And, resulting in a flat [And(a, b, c)]. Returns [None] for blangs
+-     that should not be flattened.
+-
+-   - [Const (not identity)] is the absorbing element: if any element simplifies
+-     to this value, the entire expression is dominated and we short-circuit.
+-     (For And: false absorbs. For Or: true absorbs.)
+-
+-   - [Const identity] is the identity element and is filtered out.
+-     (For And: true is identity. For Or: false is identity.)
+-
+-   - Duplicate blangs (compared via [blang_equal]) are removed, keeping only
+-     the first occurrence.
+-
+-   Returns [None] if dominated by the absorbing element, or [Some blangs] with
+-   the simplified list (identity elements removed, flattened, and deduplicated). *)
+-and simplify_blangs blangs ~flatten_nested ~identity =
+-  Option.List.concat_map blangs ~f:(fun blang ->
+-    let simplified = simplify_blang blang in
+-    Option.value (flatten_nested simplified) ~default:[ simplified ]
+-    |> Option.List.concat_map ~f:(function
+-      | Blang.Const b when b <> identity -> None
+-      | Blang.Const _ -> Some []
+-      | b -> Some [ b ]))
+-  |> Option.map ~f:(fun blangs ->
+-    List.fold_left blangs ~init:[] ~f:(fun acc b ->
+-      if List.exists acc ~f:(blang_equal b) then acc else b :: acc)
+-    |> List.rev)
+-
+ and simplify_blang = function
+   | Const b -> Const b
+   | Expr (Literal s) as expr ->
+@@ -430,31 +380,59 @@ and simplify_blang = function
+      | Not blang -> blang
+      | blang -> Not blang)
+   | And blangs ->
+-    (match
+-       simplify_blangs
+-         blangs
+-         ~flatten_nested:(function
+-           | And xs -> Some xs
+-           | _ -> None)
+-         ~identity:true
+-     with
+-     | None -> Const false
+-     | Some [] -> Const true
+-     | Some [ b ] -> b
+-     | Some blangs -> And blangs)
++    let blangs =
++      List.concat_map blangs ~f:(fun blang ->
++        match simplify_blang blang with
++        | And xs -> xs
++        | blang -> [ blang ])
++    in
++    if
++      List.exists blangs ~f:(function
++        | Blang.Const false -> true
++        | _ -> false)
++    then Const false
++    else (
++      let blangs =
++        List.filter blangs ~f:(function
++          | Blang.Const true -> false
++          | _ -> true)
++      in
++      let blangs =
++        List.fold_left blangs ~init:[] ~f:(fun acc b ->
++          if List.exists acc ~f:(blang_equal b) then acc else b :: acc)
++        |> List.rev
++      in
++      match blangs with
++      | [] -> Const true
++      | [ b ] -> b
++      | blangs -> And blangs)
+   | Or blangs ->
+-    (match
+-       simplify_blangs
+-         blangs
+-         ~flatten_nested:(function
+-           | Or xs -> Some xs
+-           | _ -> None)
+-         ~identity:false
+-     with
+-     | None -> Const true
+-     | Some [] -> Const false
+-     | Some [ b ] -> b
+-     | Some blangs -> Or blangs)
++    let blangs =
++      List.concat_map blangs ~f:(fun blang ->
++        match simplify_blang blang with
++        | Or xs -> xs
++        | blang -> [ blang ])
++    in
++    if
++      List.exists blangs ~f:(function
++        | Blang.Const true -> true
++        | _ -> false)
++    then Const true
++    else (
++      let blangs =
++        List.filter blangs ~f:(function
++          | Blang.Const false -> false
++          | _ -> true)
++      in
++      let blangs =
++        List.fold_left blangs ~init:[] ~f:(fun acc b ->
++          if List.exists acc ~f:(blang_equal b) then acc else b :: acc)
++        |> List.rev
++      in
++      match blangs with
++      | [] -> Const false
++      | [ b ] -> b
++      | blangs -> Or blangs)
+ ;;
+ 
+ module Blang = struct
+diff --git a/test/blackbox-tests/test-cases/pkg/run-converted-opam-commands.t b/test/blackbox-tests/test-cases/pkg/run-converted-opam-commands.t
+index 9fee9443f..79d2e6f77 100644
+--- a/test/blackbox-tests/test-cases/pkg/run-converted-opam-commands.t
++++ b/test/blackbox-tests/test-cases/pkg/run-converted-opam-commands.t
+@@ -102,9 +102,9 @@ Generate a mock opam repository
+   $ build_single_package error1
+   Solution for dune.lock:
+   - error1.0.0.1
+-  File "dune.lock/error1.0.0.1.pkg", line 6, characters 28-41:
+-  6 |    (or_absorb_undefined_var %{pkg-self:a} %{pkg-self:b} %{pkg-self:c})
+-                                  ^^^^^^^^^^^^^
++  File "dune.lock/error1.0.0.1.pkg", line 7, characters 4-17:
++  7 |     %{pkg-self:a}
++          ^^^^^^^^^^^^^
+   Error: Undefined package variable "a"
+   [1]
+   $ build_single_package error2
+diff --git a/test/expect-tests/dune_lang/slang_tests.ml b/test/expect-tests/dune_lang/slang_tests.ml
+index 4ec2a300c..8e8d571ba 100644
+--- a/test/expect-tests/dune_lang/slang_tests.ml
++++ b/test/expect-tests/dune_lang/slang_tests.ml
+@@ -395,30 +395,45 @@ let%expect_test "has_undefined_var const" =
+ 
+ (* Slang: And_absorb_undefined_var *)
+ 
++(* CR-soon Alizter: and_absorb_undefined_var should simplify to [Blang (Const true)] *)
+ let%expect_test "and_absorb empty" =
+   print_slang (Slang.and_absorb_undefined_var []);
+-  [%expect {| Blang (Const true) |}]
++  [%expect {| And_absorb_undefined_var |}]
+ ;;
+ 
++(* CR-soon Alizter: and_absorb_undefined_var should unwrap singleton *)
+ let%expect_test "and_absorb singleton" =
+   print_slang (Slang.and_absorb_undefined_var [ expr (pform "x") ]);
+-  [%expect {| Blang (Expr (Literal (template "%{pkg-self:x}"))) |}]
++  [%expect {| And_absorb_undefined_var (Expr (Literal (template "%{pkg-self:x}"))) |}]
+ ;;
+ 
++(* CR-soon Alizter: and_absorb_undefined_var should filter true *)
+ let%expect_test "and_absorb filters true" =
+   print_slang (Slang.and_absorb_undefined_var [ const true; expr (pform "x") ]);
+-  [%expect {| Blang (Expr (Literal (template "%{pkg-self:x}"))) |}]
++  [%expect
++    {|
++    And_absorb_undefined_var
++      (Const true, Expr (Literal (template "%{pkg-self:x}")))
++    |}]
+ ;;
+ 
++(* CR-soon Alizter: and_absorb_undefined_var should short-circuit on false *)
+ let%expect_test "and_absorb false short-circuits" =
+   print_slang
+     (Slang.and_absorb_undefined_var [ expr (pform "x"); const false; expr (pform "y") ]);
+-  [%expect {| Blang (Const false) |}]
++  [%expect
++    {|
++    And_absorb_undefined_var
++      (Expr (Literal (template "%{pkg-self:x}")),
++       Const false,
++       Expr (Literal (template "%{pkg-self:y}")))
++    |}]
+ ;;
+ 
++(* CR-soon Alizter: and_absorb_undefined_var should simplify to [Blang (Const true)] *)
+ let%expect_test "and_absorb all true" =
+   print_slang (Slang.and_absorb_undefined_var [ const true; const true ]);
+-  [%expect {| Blang (Const true) |}]
++  [%expect {| And_absorb_undefined_var (Const true, Const true) |}]
+ ;;
+ 
+ let%expect_test "and_absorb flattens" =
+@@ -438,30 +453,45 @@ let%expect_test "and_absorb flattens" =
+ 
+ (* Slang: Or_absorb_undefined_var *)
+ 
++(* CR-soon Alizter: or_absorb_undefined_var should simplify to [Blang (Const false)] *)
+ let%expect_test "or_absorb empty" =
+   print_slang (Slang.or_absorb_undefined_var []);
+-  [%expect {| Blang (Const false) |}]
++  [%expect {| Or_absorb_undefined_var |}]
+ ;;
+ 
++(* CR-soon Alizter: or_absorb_undefined_var should unwrap singleton *)
+ let%expect_test "or_absorb singleton" =
+   print_slang (Slang.or_absorb_undefined_var [ expr (pform "x") ]);
+-  [%expect {| Blang (Expr (Literal (template "%{pkg-self:x}"))) |}]
++  [%expect {| Or_absorb_undefined_var (Expr (Literal (template "%{pkg-self:x}"))) |}]
+ ;;
+ 
++(* CR-soon Alizter: or_absorb_undefined_var should filter false *)
+ let%expect_test "or_absorb filters false" =
+   print_slang (Slang.or_absorb_undefined_var [ const false; expr (pform "x") ]);
+-  [%expect {| Blang (Expr (Literal (template "%{pkg-self:x}"))) |}]
++  [%expect
++    {|
++    Or_absorb_undefined_var
++      (Const false, Expr (Literal (template "%{pkg-self:x}")))
++    |}]
+ ;;
+ 
++(* CR-soon Alizter: or_absorb_undefined_var should short-circuit on true *)
+ let%expect_test "or_absorb true short-circuits" =
+   print_slang
+     (Slang.or_absorb_undefined_var [ expr (pform "x"); const true; expr (pform "y") ]);
+-  [%expect {| Blang (Const true) |}]
++  [%expect
++    {|
++    Or_absorb_undefined_var
++      (Expr (Literal (template "%{pkg-self:x}")),
++       Const true,
++       Expr (Literal (template "%{pkg-self:y}")))
++    |}]
+ ;;
+ 
++(* CR-soon Alizter: or_absorb_undefined_var should simplify to [Blang (Const false)] *)
+ let%expect_test "or_absorb all false" =
+   print_slang (Slang.or_absorb_undefined_var [ const false; const false ]);
+-  [%expect {| Blang (Const false) |}]
++  [%expect {| Or_absorb_undefined_var (Const false, Const false) |}]
+ ;;
+ 
+ let%expect_test "or_absorb flattens" =

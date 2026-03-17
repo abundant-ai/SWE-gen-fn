@@ -1,0 +1,9 @@
+WebSocket upgrade requests that fail validation in the underlying WebSockAdapter currently crash/raise and surface as server-side errors without a clear HTTP response for the client. In particular, when a client makes an HTTP request to a Phoenix websocket endpoint without performing a proper websocket upgrade (for example, missing the required websocket upgrade semantics where the `connection` header must contain `upgrade`), the server should not raise an unhandled `WebSockAdapter.UpgradeError`.
+
+Instead, Phoenix should catch upgrade failures coming from WebSockAdapter and respond to the client with an HTTP 400 status code and an explanatory response body that includes the upgrade failure reason. For example, making a plain HTTP GET request to a websocket endpoint (the same URL a websocket client would use, but over `http://.../websocket`) should return status `400`, and the response body should contain the message indicating the cause, such as `"'connection' header must contain 'upgrade'"`.
+
+Expected behavior: invalid websocket upgrade requests are handled gracefully; Phoenix returns an HTTP 400 response and includes the underlying upgrade error message in the response body so operators can correlate failures to specific clients.
+
+Actual behavior: invalid upgrade requests can result in `WebSockAdapter.UpgradeError` being raised/unhandled, producing noisy server errors and not returning a clear 400 response to the client.
+
+Implement handling so that when the websocket transport upgrade path encounters `WebSockAdapter.UpgradeError`, Phoenix returns a 400 response (not 500) and surfaces the error reason in the response body.

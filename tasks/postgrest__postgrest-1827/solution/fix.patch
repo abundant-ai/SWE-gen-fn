@@ -1,0 +1,703 @@
+diff --git a/default.nix b/default.nix
+index 84e1d53c..662c89c8 100644
+--- a/default.nix
++++ b/default.nix
+@@ -102,45 +102,35 @@ rec {
+       )
+     );
+ 
+-  # Docker images and loading script.
+-  docker =
+-    pkgs.callPackage nix/tools/docker { postgrest = postgrestStatic; };
+-
+   env =
+     postgrest.env;
+ 
+-  # Utility for updating the pinned version of Nixpkgs.
+-  nixpkgsTools =
+-    pkgs.callPackage nix/tools/nixpkgstools.nix { };
+-
+-  withTools =
+-    pkgs.callPackage nix/tools/withtools.nix { inherit postgresqlVersions; };
+-
+-  # Scripts for running tests.
+-  tests =
+-    pkgs.callPackage nix/tools/tests.nix {
+-      inherit postgrest devCabalOptions withTools;
+-      ghc = pkgs.haskell.compiler."${compiler}";
+-      hpc-codecov = pkgs.haskell.packages."${compiler}".hpc-codecov;
+-    };
+-
+-  # Script for running memory tests.
+-  memory =
+-    pkgs.callPackage nix/tools/memory.nix { inherit postgrestProfiled withTools; };
+-
+-  # Linting and styling tools.
+-  style =
+-    pkgs.callPackage nix/tools/style.nix { };
+-
+   # Tooling for analyzing Haskell imports and exports.
+   hsie =
+     pkgs.callPackage nix/hsie {
+       ghcWithPackages = pkgs.haskell.packages."${compiler}".ghcWithPackages;
+     };
+ 
++  ### Tools
++
++  cabalTools =
++    pkgs.callPackage nix/tools/cabalTools.nix { inherit devCabalOptions postgrest; };
++
+   # Development tools.
+-  devtools =
+-    pkgs.callPackage nix/tools/devtools.nix { inherit tests style devCabalOptions hsie; };
++  devTools =
++    pkgs.callPackage nix/tools/devTools.nix { inherit tests style devCabalOptions hsie; };
++
++  # Docker images and loading script.
++  docker =
++    pkgs.callPackage nix/tools/docker { postgrest = postgrestStatic; };
++
++  # Script for running memory tests.
++  memory =
++    pkgs.callPackage nix/tools/memory.nix { inherit postgrestProfiled withTools; };
++
++  # Utility for updating the pinned version of Nixpkgs.
++  nixpkgsTools =
++    pkgs.callPackage nix/tools/nixpkgsTools.nix { };
+ 
+   # Scripts for publishing new releases.
+   release =
+@@ -148,4 +138,19 @@ rec {
+       inherit docker;
+       postgrest = postgrestStatic;
+     };
++
++  # Linting and styling tools.
++  style =
++    pkgs.callPackage nix/tools/style.nix { };
++
++  # Scripts for running tests.
++  tests =
++    pkgs.callPackage nix/tools/tests.nix {
++      inherit postgrest devCabalOptions withTools;
++      ghc = pkgs.haskell.compiler."${compiler}";
++      hpc-codecov = pkgs.haskell.packages."${compiler}".hpc-codecov;
++    };
++
++  withTools =
++    pkgs.callPackage nix/tools/withTools.nix { inherit postgresqlVersions; };
+ }
+diff --git a/nix/overlays/checked-shell-script/checked-shell-script.nix b/nix/overlays/checked-shell-script/checked-shell-script.nix
+index 26e526f6..ae0af139 100644
+--- a/nix/overlays/checked-shell-script/checked-shell-script.nix
++++ b/nix/overlays/checked-shell-script/checked-shell-script.nix
+@@ -3,6 +3,7 @@
+ # to be used in a path for example.
+ { argbash
+ , bash_5
++, coreutils
+ , git
+ , lib
+ , runCommand
+@@ -77,14 +78,13 @@ let
+       text =
+         ''
+           #!${bash_5}/bin/bash
+-          set -euo pipefail
+-
+           source ${argsParser}
++          set -euo pipefail
+         ''
+ 
+         + lib.optionalString redirectTixFiles ''
+           # storing tix files in a temporary throw away directory avoids mix/tix conflicts after changes
+-          hpctixdir=$(mktemp -d)
++          hpctixdir=$(${coreutils}/bin/mktemp -d)
+           export HPCTIXFILE="$hpctixdir"/postgrest.tix
+           trap 'rm -rf $hpctixdir' EXIT
+         ''
+@@ -100,7 +100,8 @@ let
+         ''
+ 
+         + lib.optionalString withTmpDir ''
+-          tmpdir="$(mktemp -d)"
++          mkdir -p "''${TMPDIR:-/tmp}/postgrest"
++          tmpdir="$(${coreutils}/bin/mktemp -d --tmpdir postgrest/${name}-XXX)"
+ 
+           # we keep the tmpdir when an error occurs for debugging
+           trap 'echo Temporary directory kept at: $tmpdir' ERR
+diff --git a/nix/tools/cabalTools.nix b/nix/tools/cabalTools.nix
+new file mode 100644
+index 00000000..210b4502
+--- /dev/null
++++ b/nix/tools/cabalTools.nix
+@@ -0,0 +1,57 @@
++{ buildToolbox
++, cabal-install
++, checkedShellScript
++, devCabalOptions
++, postgrest
++}:
++let
++  build =
++    checkedShellScript
++      {
++        name = "postgrest-build";
++        docs = "Build PostgREST interactively using cabal-install.";
++        args = [ "ARG_LEFTOVERS([Cabal arguments])" ];
++        inRootDir = true;
++        withEnv = postgrest.env;
++      }
++      ''
++        exec ${cabal-install}/bin/cabal v2-build ${devCabalOptions} "''${_arg_leftovers[@]}"
++      '';
++
++  clean =
++    checkedShellScript
++      {
++        name = "postgrest-clean";
++        docs = "Clean the PostgREST project, including all cabal-install artifacts.";
++        inRootDir = true;
++      }
++      ''
++        # clean old coverage data, too
++        rm -rf .hpc coverage
++        exec ${cabal-install}/bin/cabal v2-clean
++      '';
++
++  run =
++    checkedShellScript
++      {
++        name = "postgrest-run";
++        docs = "Run PostgREST after buidling it interactively with cabal-install";
++        args = [ "ARG_LEFTOVERS([PostgREST arguments])" ];
++        inRootDir = true;
++        withEnv = postgrest.env;
++      }
++      ''
++        exec ${cabal-install}/bin/cabal v2-run ${devCabalOptions} --verbose=0 -- \
++          postgrest "''${_arg_leftovers[@]}"
++      '';
++
++in
++buildToolbox
++{
++  name = "postgrest-cabal";
++  tools = [
++    build
++    clean
++    run
++  ];
++}
+diff --git a/nix/tools/devTools.nix b/nix/tools/devTools.nix
+new file mode 100644
+index 00000000..a6d9364e
+--- /dev/null
++++ b/nix/tools/devTools.nix
+@@ -0,0 +1,151 @@
++{ buildToolbox
++, cabal-install
++, cachix
++, checkedShellScript
++, devCabalOptions
++, entr
++, graphviz
++, hsie
++, nix
++, silver-searcher
++, style
++, tests
++}:
++let
++  watch =
++    checkedShellScript
++      {
++        name = "postgrest-watch";
++        docs =
++          ''
++            Watch the project for changes and reinvoke the given command.
++
++            Example:
++              postgrest-watch postgrest-test-io
++          '';
++        args =
++          [
++            "ARG_POSITIONAL_SINGLE([command], [Command to run])"
++            "ARG_LEFTOVERS([command arguments])"
++          ];
++        addCommandCompletion = true;
++        redirectTixFiles = false; # will be done by sub-command
++        inRootDir = true;
++      }
++      ''
++        while true; do
++          (! ${silver-searcher}/bin/ag -l . | ${entr}/bin/entr -dr "$_arg_command" "''${_arg_leftovers[@]}")
++        done
++      '';
++
++  pushCachix =
++    checkedShellScript
++      {
++        name = "postgrest-push-cachix";
++        docs = ''
++          Push all build artifacts to cachix.
++
++          Requires authentication with `cachix authtoken ...`.
++        '';
++        inRootDir = true;
++      }
++      ''
++        ${nix}/bin/nix-instantiate \
++          | while read -r drv; do
++              ${nix}/bin/nix-store -qR --include-outputs "$drv"
++            done \
++          | ${cachix}/bin/cachix push postgrest
++      '';
++
++  check =
++    checkedShellScript
++      {
++        name = "postgrest-check";
++        docs =
++          ''
++            Run most checks that will also run on CI.
++
++            This currently excludes the memory tests, as those are particularly
++            expensive.
++          '';
++        inRootDir = true;
++      }
++      ''
++        ${tests}/bin/postgrest-with-all ${tests}/bin/postgrest-test-spec
++        ${tests}/bin/postgrest-test-spec-idempotence
++        ${tests}/bin/postgrest-test-io
++        ${style}/bin/postgrest-lint
++        ${style}/bin/postgrest-style-check
++      '';
++
++  dumpMinimalImports =
++    checkedShellScript
++      {
++        name = "postgrest-dump-minimal-imports";
++        docs = "Dump minimal imports into given directory.";
++        args = [ "ARG_POSITIONAL_SINGLE([dumpdir], [Output directory])" ];
++        inRootDir = true;
++        withTmpDir = true;
++      }
++      ''
++        mkdir -p "$_arg_dumpdir"
++        ${cabal-install}/bin/cabal v2-build ${devCabalOptions} \
++          --builddir="$tmpdir" \
++          --ghc-option=-ddump-minimal-imports \
++          --ghc-option=-dumpdir="$_arg_dumpdir" \
++          1>&2
++
++        # Fix OverloadedRecordFields imports
++        # shellcheck disable=SC2016
++        sed -E 's/\$sel:.*://g' -i "$_arg_dumpdir"/*
++      '';
++
++  hsieMinimalImports =
++    checkedShellScript
++      {
++        name = "postgrest-hsie-minimal-imports";
++        docs = "Run hsie with a provided dump of minimal imports.";
++        args = [ "ARG_LEFTOVERS([hsie arguments])" ];
++        withTmpDir = true;
++      }
++      ''
++        ${dumpMinimalImports} "$tmpdir"
++        ${hsie} "$tmpdir" "''${_arg_leftovers[@]}"
++      '';
++
++  hsieGraphModules =
++    checkedShellScript
++      {
++        name = "postgrest-hsie-graph-modules";
++        docs = "Create a PNG graph of modules imported within the codebase.";
++        args = [ "ARG_POSITIONAL_SINGLE([outfile], [Output filename])" ];
++      }
++      ''
++        ${hsie} graph-modules main src | ${graphviz}/bin/dot -Tpng -o "$_arg_outfile"
++      '';
++
++  hsieGraphSymbols =
++    checkedShellScript
++      {
++        name = "postgrest-hsie-graph-symbols";
++        docs = "Create a PNG graph of symbols imported within the codebase.";
++        args = [ "ARG_POSITIONAL_SINGLE([outfile], [Output filename])" ];
++      }
++      ''
++        ${hsieMinimalImports} graph-symbols | ${graphviz}/bin/dot -Tpng -o "$_arg_outfile"
++      '';
++
++in
++buildToolbox
++{
++  name = "postgrest-dev";
++  tools = [
++    watch
++    pushCachix
++    check
++    dumpMinimalImports
++    hsieMinimalImports
++    hsieGraphModules
++    hsieGraphSymbols
++  ];
++}
+diff --git a/nix/tools/nixpkgsTools.nix b/nix/tools/nixpkgsTools.nix
+new file mode 100644
+index 00000000..faab6bfc
+--- /dev/null
++++ b/nix/tools/nixpkgsTools.nix
+@@ -0,0 +1,53 @@
++{ buildToolbox
++, checkedShellScript
++, curl
++, jq
++, nix
++}:
++# Utility script for pinning the latest unstable version of Nixpkgs.
++
++# Instead of pinning Nixpkgs based on the huge Git repository, we reference a
++# specific tarball that only contains the source of the revision that we want
++# to pin.
++let
++  name =
++    "postgrest-nixpkgs-upgrade";
++
++  refUrl =
++    https://api.github.com/repos/nixos/nixpkgs/git/ref/heads/nixpkgs-unstable;
++
++  githubV3Header =
++    "Accept: application/vnd.github.v3+json";
++
++  tarballUrlBase =
++    https://github.com/nixos/nixpkgs/archive/;
++
++  upgrade =
++    checkedShellScript
++      {
++        inherit name;
++        docs = "Pin the newest unstable version of Nixpkgs.";
++        inRootDir = true;
++      }
++      ''
++        commitHash="$(${curl}/bin/curl "${refUrl}" -H "${githubV3Header}" | ${jq}/bin/jq -r .object.sha)"
++        tarballUrl="${tarballUrlBase}$commitHash.tar.gz"
++        tarballHash="$(${nix}/bin/nix-prefetch-url --unpack "$tarballUrl")"
++        currentDate="$(date --iso)"
++
++        cat > nix/nixpkgs-version.nix << EOF
++        # Pinned version of Nixpkgs, generated with ${name}.
++        {
++          date = "$currentDate";
++          rev = "$commitHash";
++          tarballHash = "$tarballHash";
++        }
++        EOF
++      '';
++
++in
++buildToolbox
++{
++  name = "postgrest-nixpkgs";
++  tools = [ upgrade ];
++}
+diff --git a/nix/tools/style.nix b/nix/tools/style.nix
+index 1ea78ffa..ed354d96 100644
+--- a/nix/tools/style.nix
++++ b/nix/tools/style.nix
+@@ -57,7 +57,7 @@ let
+           | xargs ${hlint}/bin/hlint -X QuasiQuotes -X NoPatternSynonyms
+ 
+         # Lint bash scripts
+-        ${shellcheck}/bin/shellcheck test/create_test_db test/memory-tests.sh test/with_tmp_db
++        ${shellcheck}/bin/shellcheck test/create_test_db test/memory-tests.sh
+       '';
+ 
+ in
+diff --git a/nix/tools/tests.nix b/nix/tools/tests.nix
+index 67c8b6bf..1e46bb1e 100644
+--- a/nix/tools/tests.nix
++++ b/nix/tools/tests.nix
+@@ -7,6 +7,7 @@
+ , gnugrep
+ , haskell
+ , hpc-codecov
++, jq
+ , postgrest
+ , python3
+ , runtimeShell
+@@ -74,6 +75,8 @@ let
+         withEnv = postgrest.env;
+       }
+       ''
++        export PATH="${jq}/bin:$PATH"
++        
+         ${withTools.latest} \
+             ${cabal-install}/bin/cabal v2-run ${devCabalOptions} --verbose=0 -- \
+             postgrest --dump-schema \
+@@ -99,7 +102,7 @@ let
+         rm -rf coverage/*
+ 
+         # build once before running all the tests
+-        ${cabal-install}/bin/cabal v2-build ${devCabalOptions} --enable-tests all
++        ${cabal-install}/bin/cabal v2-build ${devCabalOptions} exe:postgrest lib:postgrest test:spec test:spec-querycost
+ 
+         # collect all tests
+         HPCTIXFILE="$tmpdir"/io.tix \
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+new file mode 100644
+index 00000000..c74ce322
+--- /dev/null
++++ b/nix/tools/withTools.nix
+@@ -0,0 +1,138 @@
++{ bashCompletion
++, buildToolbox
++, checkedShellScript
++, lib
++, postgresqlVersions
++, writeTextFile
++}:
++let
++  withTmpDb =
++    { name, postgresql }:
++    checkedShellScript
++      {
++        name = "postgrest-with-${name}";
++        docs = "Run the given command in a temporary database with ${name}";
++        args =
++          [
++            "ARG_OPTIONAL_SINGLE([fixtures], [f], [SQL file to load fixtures from], [test/fixtures/load.sql])"
++            "ARG_POSITIONAL_SINGLE([command], [Command to run])"
++            "ARG_LEFTOVERS([command arguments])"
++            "ARG_USE_ENV([PGUSER], [postgrest_test_authenticator], [Authenticator PG role])"
++            "ARG_USE_ENV([PGDATABASE], [postgres], [PG database name])"
++            "ARG_USE_ENV([PGRST_DB_SCHEMAS], [test], [Schema to expose])"
++            "ARG_USE_ENV([PGRST_DB_ANON_ROLE], [postgrest_test_anonymous], [Anonymous PG role])"
++          ];
++        addCommandCompletion = true;
++        inRootDir = true;
++        redirectTixFiles = false;
++        withTmpDir = true;
++      }
++      ''
++        # avoid starting multiple layers of withTmpDb
++        if test -v PGRST_DB_URI; then
++          exec "$@"
++        fi
++        
++        export PATH=${postgresql}/bin:"$PATH"
++        setuplog="$tmpdir/setup.log"
++
++        log () {
++          echo "$1" >> "$setuplog"
++        }
++
++        mkdir -p "$tmpdir"/{db,socket}
++        # remove data dir, even if we keep tmpdir - no need to upload it to artifacts
++        trap 'rm -rf $tmpdir/db' EXIT
++
++        export PGDATA="$tmpdir/db"
++        export PGHOST="$tmpdir/socket"
++        export PGUSER
++        export PGDATABASE
++        export PGRST_DB_URI="postgresql:///$PGDATABASE?host=$PGHOST&user=$PGUSER"
++        export PGRST_DB_SCHEMAS
++        export PGRST_DB_ANON_ROLE
++
++        log "Initializing database cluster..."
++        # We try to make the database cluster as independent as possible from the host
++        # by specifying the timezone, locale and encoding.
++        PGTZ=UTC initdb --no-locale --encoding=UTF8 --nosync -U "$PGUSER" --auth=trust \
++          >> "$setuplog"
++
++        log "Starting the database cluster..."
++        # Instead of listening on a local port, we will listen on a unix domain socket.
++        pg_ctl -l "$tmpdir/db.log" start -o "-F -c listen_addresses=\"\" -k $PGHOST" \
++          >> "$setuplog"
++
++        log "Waiting for the database cluster to be ready..."
++        # Waiting is required for older versions of Postgres (< 10).
++        until pg_isready >> "$setuplog"; do
++          sleep 0.1
++        done
++
++        stop () {
++          log "Stopping the database cluster..."
++          pg_ctl stop -m i >> "$setuplog"
++        }
++        trap stop EXIT
++
++        log "Loading fixtures..."
++        psql -v ON_ERROR_STOP=1 -f "$_arg_fixtures" >> "$setuplog"
++
++        log "Done. Running command..."
++        ("$_arg_command" "''${_arg_leftovers[@]}")
++      '';
++
++  # Helper script for running a command against all PostgreSQL versions.
++  withAll =
++    let
++      runners =
++        builtins.map
++          (pg:
++            ''
++              cat << EOF
++
++              Running against ${pg.name}...
++
++              EOF
++
++              trap 'echo "Failed on ${pg.name}"' exit
++
++              (${withTmpDb pg} "$_arg_command" "''${_arg_leftovers[@]}")
++
++              trap "" exit
++
++              cat << EOF
++
++              Done running against ${pg.name}.
++
++              EOF
++            '')
++          postgresqlVersions;
++    in
++    checkedShellScript
++      {
++        name = "postgrest-with-all";
++        docs = "Run command against all supported PostgreSQL versions.";
++        args =
++          [
++            "ARG_POSITIONAL_SINGLE([command], [Command to run])"
++            "ARG_LEFTOVERS([command arguments])"
++          ];
++        addCommandCompletion = true;
++        inRootDir = true;
++      }
++      (lib.concatStringsSep "\n\n" runners);
++
++  # Create a `postgrest-with-postgresql-` for each PostgreSQL version
++  withVersions = builtins.map withTmpDb postgresqlVersions;
++
++in
++buildToolbox
++{
++  name = "postgrest-with";
++  tools = [ withAll ] ++ withVersions;
++  extra = {
++    # make withTools.latest available for other nix files
++    latest = withTmpDb (builtins.head postgresqlVersions);
++  };
++}
+diff --git a/nix/tools/withtools.nix b/nix/tools/withtools.nix
+deleted file mode 100644
+index c3ee30e6..00000000
+--- a/nix/tools/withtools.nix
++++ /dev/null
+@@ -1,89 +0,0 @@
+-{ bashCompletion
+-, buildToolbox
+-, checkedShellScript
+-, lib
+-, postgresqlVersions
+-, writeTextFile
+-}:
+-let
+-  # Wrap the `test/with_tmp_db` script with the required dependencies from Nix.
+-  withTmpDb =
+-    { name, postgresql }:
+-    checkedShellScript
+-      {
+-        name = "postgrest-with-${name}";
+-        docs = "Run the given command in a temporary database with ${name}";
+-        args =
+-          [
+-            "ARG_POSITIONAL_SINGLE([command], [Command to run])"
+-            "ARG_LEFTOVERS([command arguments])"
+-          ];
+-        addCommandCompletion = true;
+-        inRootDir = true;
+-        redirectTixFiles = false;
+-      }
+-      ''
+-        # avoid starting multiple layers of with_tmp_db
+-        if test ! -v PGRST_DB_URI; then
+-          export PATH=${postgresql}/bin:"$PATH"
+-
+-          exec ${../../test/with_tmp_db} "$_arg_command" "''${_arg_leftovers[@]}"
+-        else
+-          "$@"
+-        fi
+-      '';
+-
+-  # Helper script for running a command against all PostgreSQL versions.
+-  withAll =
+-    let
+-      runners =
+-        builtins.map
+-          (pg:
+-            ''
+-              cat << EOF
+-
+-              Running against ${pg.name}...
+-
+-              EOF
+-
+-              trap 'echo "Failed on ${pg.name}"' exit
+-
+-              (${withTmpDb pg} "$_arg_command" "''${_arg_leftovers[@]}")
+-
+-              trap "" exit
+-
+-              cat << EOF
+-
+-              Done running against ${pg.name}.
+-
+-              EOF
+-            '')
+-          postgresqlVersions;
+-    in
+-    checkedShellScript
+-      {
+-        name = "postgrest-with-all";
+-        docs = "Run command against all supported PostgreSQL versions.";
+-        args =
+-          [
+-            "ARG_POSITIONAL_SINGLE([command], [Command to run])"
+-            "ARG_LEFTOVERS([command arguments])"
+-          ];
+-        addCommandCompletion = true;
+-        inRootDir = true;
+-      }
+-      (lib.concatStringsSep "\n\n" runners);
+-
+-  # Create a `postgrest-with-postgresql-` for each PostgreSQL version
+-  withVersions = builtins.map withTmpDb postgresqlVersions;
+-
+-in
+-buildToolbox
+-{
+-  name = "postgrest-withtools";
+-  tools = [ withAll ] ++ withVersions;
+-  extra = {
+-    # make withTools.latest available for other nix files
+-    latest = withTmpDb (builtins.head postgresqlVersions);
+-  };
+-}
+diff --git a/shell.nix b/shell.nix
+index 13c4c813..bedab0cc 100644
+--- a/shell.nix
++++ b/shell.nix
+@@ -25,7 +25,8 @@ let
+ 
+   toolboxes =
+     [
+-      postgrest.devtools
++      postgrest.cabalTools
++      postgrest.devTools
+       postgrest.nixpkgsTools
+       postgrest.style
+       postgrest.tests

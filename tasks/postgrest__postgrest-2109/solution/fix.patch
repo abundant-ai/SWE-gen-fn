@@ -1,0 +1,191 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 682a6437..04716db4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,8 +7,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Added
+ 
+- - #1933, Add a minimal health check endpoint on an admin port at the `<host>:<admin_server_port>/health` endpoint - @steve-chavez
++ - #1933, #2109, Add a minimal health check endpoint - @steve-chavez
+    + For enabling this, the `admin-server-port` config must be set explictly
++   + The check is at the `<host>:<admin_server_port>/live` endpoint. A 200 OK status will be returned if postgrest is alive, otherwise a 503 will be returned.
++   + A `<host>:<admin_server_port>/ready` endpoint is available for checking a correct internal state(the database connection plus the schema cache). 200 OK = ready, 503 = not ready.
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index c8bbf98b..db17b124 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -35,6 +35,7 @@ library
+                       NoImplicitPrelude
+   hs-source-dirs:     src
+   exposed-modules:    PostgREST.App
++                      PostgREST.Admin
+                       PostgREST.AppState
+                       PostgREST.Auth
+                       PostgREST.CLI
+@@ -96,6 +97,7 @@ library
+                     , lens                      >= 4.14 && < 5.1
+                     , lens-aeson                >= 1.0.1 && < 1.2
+                     , mtl                       >= 2.2.2 && < 2.3
++                    , network                   >= 2.6 && < 3.2
+                     , network-uri               >= 2.6.1 && < 2.8
+                     , optparse-applicative      >= 0.13 && < 0.17
+                     , parsec                    >= 3.1.11 && < 3.2
+@@ -133,7 +135,6 @@ library
+     build-depends:
+       unix
+       , directory >= 1.2.6 && < 1.4
+-      , network   >= 2.6 && < 3.2
+     exposed-modules:
+       PostgREST.Unix
+ 
+diff --git a/src/PostgREST/Admin.hs b/src/PostgREST/Admin.hs
+new file mode 100644
+index 00000000..a10f2a35
+--- /dev/null
++++ b/src/PostgREST/Admin.hs
+@@ -0,0 +1,56 @@
++module PostgREST.Admin
++  ( postgrestAdmin
++  ) where
++
++import qualified Data.Text as T
++
++import Network.Socket
++import Network.Socket.ByteString
++
++import qualified Network.HTTP.Types.Status as HTTP
++import qualified Network.Wai               as Wai
++
++import qualified Hasql.Pool    as SQL
++import qualified Hasql.Session as SQL
++
++import qualified PostgREST.AppState as AppState
++import           PostgREST.Config   (AppConfig (..))
++
++import Protolude
++
++-- | PostgREST admin application
++postgrestAdmin :: AppState.AppState -> AppConfig -> Wai.Application
++postgrestAdmin appState appConfig req respond  = do
++  isMainAppReachable <- isRight <$> reachMainApp appConfig
++
++  case Wai.pathInfo req of
++    ["ready"] ->
++      if configDbChannelEnabled appConfig then do
++        listenerOn <- AppState.getIsListenerOn appState
++        respond $ Wai.responseLBS (if listenerOn && isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
++      else do
++        result <- SQL.use (AppState.getPool appState) $ SQL.sql "SELECT 1"
++        respond $ Wai.responseLBS (if isRight result && isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
++    ["live"] ->
++      respond $ Wai.responseLBS (if isMainAppReachable then HTTP.status200 else HTTP.status503) [] mempty
++    _ ->
++      respond $ Wai.responseLBS HTTP.status404 [] mempty
++
++-- Try to connect to the main app socket
++-- Note that it doesn't even send a valid HTTP request, we just want to check that the main app is accepting connections
++reachMainApp :: AppConfig -> IO (Either IOException ())
++reachMainApp appConfig =
++  try . withSocketsDo $ bracket open close sendEmpty
++  where
++    open = case configServerUnixSocket appConfig of
++      Just path ->  do
++        sock <- socket AF_UNIX Stream 0
++        connect sock $ SockAddrUnix path
++        return sock
++      Nothing -> do
++        let hints = defaultHints { addrSocketType = Stream }
++        addr:_ <- getAddrInfo (Just hints) (Just . T.unpack $ configServerHost appConfig) (Just . show $ configServerPort appConfig)
++        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
++        connect sock $ addrAddress addr
++        return sock
++    sendEmpty sock = void $ send sock mempty
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index faf43ae7..62dfd7ac 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -32,8 +32,7 @@ import qualified Data.HashMap.Strict             as M
+ import qualified Data.Set                        as S
+ import qualified Hasql.DynamicStatements.Snippet as SQL (Snippet)
+ import qualified Hasql.Pool                      as SQL
+-import qualified Hasql.Session                   as SQL (sql)
+-import qualified Hasql.Transaction               as SQL hiding (sql)
++import qualified Hasql.Transaction               as SQL
+ import qualified Hasql.Transaction.Sessions      as SQL
+ import qualified Network.HTTP.Types.Header       as HTTP
+ import qualified Network.HTTP.Types.Status       as HTTP
+@@ -41,6 +40,7 @@ import qualified Network.HTTP.Types.URI          as HTTP
+ import qualified Network.Wai                     as Wai
+ import qualified Network.Wai.Handler.Warp        as Warp
+ 
++import qualified PostgREST.Admin                    as Admin
+ import qualified PostgREST.AppState                 as AppState
+ import qualified PostgREST.Auth                     as Auth
+ import qualified PostgREST.DbStructure              as DbStructure
+@@ -88,7 +88,6 @@ import qualified PostgREST.DbStructure.Proc as Proc
+ 
+ import Protolude hiding (Handler)
+ 
+-
+ data RequestContext = RequestContext
+   { ctxConfig      :: AppConfig
+   , ctxDbStructure :: DbStructure
+@@ -114,7 +113,7 @@ run installHandlers maybeRunWithSocket appState = do
+   when configDbChannelEnabled $ listener appState
+ 
+   let app = postgrest configLogLevel appState (connectionWorker appState)
+-      adminApp = postgrestAdmin appState configDbChannelEnabled
++      adminApp = Admin.postgrestAdmin appState conf
+ 
+   whenJust configAdminServerPort $ \adminPort -> do
+     AppState.logWithZTime appState $ "Admin server listening on port " <> show adminPort
+@@ -144,19 +143,6 @@ serverSettings AppConfig{..} =
+     & setPort configServerPort
+     & setServerName ("postgrest/" <> prettyVersion)
+ 
+--- | PostgREST admin application
+-postgrestAdmin :: AppState.AppState -> Bool -> Wai.Application
+-postgrestAdmin appState configDbChannelEnabled req respond  =
+-  case Wai.pathInfo req of
+-    ["health"] ->
+-      if configDbChannelEnabled then do
+-        listenerOn <- AppState.getIsListenerOn appState
+-        respond $ Wai.responseLBS (if listenerOn then HTTP.status200 else HTTP.status503) [] mempty
+-      else do
+-        result <- SQL.use (AppState.getPool appState) $ SQL.sql "SELECT 1"
+-        respond $ Wai.responseLBS (if isRight result then HTTP.status200 else HTTP.status503) [] mempty
+-    _ -> respond $ Wai.responseLBS HTTP.status404 [] mempty
+-
+ -- | PostgREST application
+ postgrest :: LogLevel -> AppState.AppState -> IO () -> Wai.Application
+ postgrest logLev appState connWorker =
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 47eeaa12..d6163b9d 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -55,7 +55,7 @@ data AppState = AppState
+   , stateIsWorkerOn   :: IORef Bool
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+   , stateListener     :: MVar ()
+-  -- | State of the LISTEN channel, used for health checks
++  -- | State of the LISTEN channel, used for the admin server checks
+   , stateIsListenerOn :: IORef Bool
+   -- | Config that can change at runtime
+   , stateConf         :: IORef AppConfig
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 2f80c1bd..6f83d1d3 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -199,7 +199,7 @@ exampleConfigFile =
+       |## when none is provided, 660 is applied by default
+       |# server-unix-socket-mode = "660"
+       |
+-      |## admin server for health checks, it's disabled by default unless a port is specified
++      |## admin server used for checks, it's disabled by default unless a port is specified
+       |# admin-server-port = 3001
+       |
+       |## determine if the OpenAPI output should follow or ignore role privileges or be disabled entirely

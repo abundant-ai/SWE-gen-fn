@@ -1,0 +1,584 @@
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 20a5bdb0..6dd0134b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -60,6 +60,7 @@ import PostgREST.DbStructure             (DbStructure (..),
+ import PostgREST.DbStructure.Identifiers (FieldName,
+                                           QualifiedIdentifier (..),
+                                           Schema)
++import PostgREST.DbStructure.PgVersion   (PgVersion (..))
+ import PostgREST.DbStructure.Proc        (ProcDescription (..),
+                                           ProcVolatility (..))
+ import PostgREST.DbStructure.Table       (Table (..))
+@@ -89,6 +90,7 @@ data RequestContext = RequestContext
+   { ctxConfig      :: AppConfig
+   , ctxDbStructure :: DbStructure
+   , ctxApiRequest  :: ApiRequest
++  , ctxPgVersion   :: PgVersion
+   }
+ 
+ type Handler = ExceptT Error
+@@ -138,11 +140,12 @@ postgrest logLev appState connWorker =
+       time <- AppState.getTime appState
+       conf <- AppState.getConfig appState
+       maybeDbStructure <- AppState.getDbStructure appState
++      pgVer <- AppState.getPgVersion appState
+ 
+       let
+         eitherResponse :: IO (Either Error Wai.Response)
+         eitherResponse =
+-          runExceptT $ postgrestResponse conf maybeDbStructure (AppState.getPool appState) time req
++          runExceptT $ postgrestResponse conf maybeDbStructure pgVer (AppState.getPool appState) time req
+ 
+       response <- either Error.errorResponseFor identity <$> eitherResponse
+ 
+@@ -156,11 +159,12 @@ postgrest logLev appState connWorker =
+ postgrestResponse
+   :: AppConfig
+   -> Maybe DbStructure
++  -> PgVersion
+   -> SQL.Pool
+   -> UTCTime
+   -> Wai.Request
+   -> Handler IO Wai.Response
+-postgrestResponse conf maybeDbStructure pool time req = do
++postgrestResponse conf maybeDbStructure pgVer pool time req = do
+   body <- lift $ Wai.strictRequestBody req
+ 
+   dbStructure <-
+@@ -179,7 +183,7 @@ postgrestResponse conf maybeDbStructure pool time req = do
+ 
+   let
+     handleReq apiReq =
+-      handleRequest $ RequestContext conf dbStructure apiReq
++      handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+   runDbHandler pool (txMode apiRequest) jwtClaims .
+     Middleware.optionalRollback conf apiRequest $
+@@ -197,7 +201,7 @@ runDbHandler pool mode jwtClaims handler = do
+   liftEither resp
+ 
+ handleRequest :: RequestContext -> DbHandler Wai.Response
+-handleRequest context@(RequestContext _ _ ApiRequest{..}) =
++handleRequest context@(RequestContext _ _ ApiRequest{..} _) =
+   case (iAction, iTarget) of
+     (ActionRead headersOnly, TargetIdent identifier) ->
+       handleRead headersOnly identifier context
+@@ -242,7 +246,7 @@ handleRead headersOnly identifier context@RequestContext{..} = do
+         (shouldCount iPreferCount)
+         (iAcceptContentType == CTTextCSV)
+         bField
+-        (pgVersion ctxDbStructure)
++        ctxPgVersion
+         configDbPreparedStatements
+ 
+   total <- readTotal ctxConfig ctxApiRequest tableTotal countQuery
+@@ -316,7 +320,7 @@ handleCreate identifier@QualifiedIdentifier{..} context@RequestContext{..} = do
+       response HTTP.status201 headers mempty
+ 
+ handleUpdate :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleUpdate identifier context@(RequestContext _ _ ApiRequest{..}) = do
++handleUpdate identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   WriteQueryResult{..} <- writeQuery identifier False mempty context
+ 
+   let
+@@ -338,7 +342,7 @@ handleUpdate identifier context@(RequestContext _ _ ApiRequest{..}) = do
+       response status [contentRangeHeader] mempty
+ 
+ handleSingleUpsert :: QualifiedIdentifier -> RequestContext-> DbHandler Wai.Response
+-handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..}) = do
++handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   when (iTopLevelRange /= RangeQuery.allRange) $
+     throwError Error.PutRangeNotAllowedError
+ 
+@@ -362,7 +366,7 @@ handleSingleUpsert identifier context@(RequestContext _ _ ApiRequest{..}) = do
+       response HTTP.status204 (contentTypeHeaders context) mempty
+ 
+ handleDelete :: QualifiedIdentifier -> RequestContext -> DbHandler Wai.Response
+-handleDelete identifier context@(RequestContext _ _ ApiRequest{..}) = do
++handleDelete identifier context@(RequestContext _ _ ApiRequest{..} _) = do
+   WriteQueryResult{..} <- writeQuery identifier False mempty context
+ 
+   let
+@@ -439,7 +443,7 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+         (iAcceptContentType == CTTextCSV)
+         (iPreferParameters == Just MultipleObjects)
+         bField
+-        (pgVersion ctxDbStructure)
++        ctxPgVersion
+         (configDbPreparedStatements ctxConfig)
+ 
+   response <- liftEither $ gucResponse <$> gucStatus <*> gucHeaders
+@@ -454,7 +458,7 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       (if invMethod == InvHead then mempty else toS body)
+ 
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+-handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest) = do
++handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest _) = do
+   body <-
+     lift $
+       OpenAPI.encode conf dbStructure
+@@ -516,7 +520,7 @@ writeQuery identifier@QualifiedIdentifier{..} isInsert pkCols context@RequestCon
+         (iAcceptContentType ctxApiRequest == CTTextCSV)
+         (iPreferRepresentation ctxApiRequest)
+         pkCols
+-        (pgVersion ctxDbStructure)
++        ctxPgVersion
+         (configDbPreparedStatements ctxConfig)
+ 
+   liftEither $ WriteQueryResult queryTotal fields body <$> gucStatus <*> gucHeaders
+@@ -554,7 +558,7 @@ returnsScalar (TargetProc proc _) = Proc.procReturnsScalar proc
+ returnsScalar _                   = False
+ 
+ readRequest :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m ReadRequest
+-readRequest QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest) =
++readRequest QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
+   liftEither $
+     ReqBuilder.readRequest qiSchema qiName configDbMaxRows
+       (dbRelationships dbStructure)
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 897f4898..f00496bc 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -16,6 +16,8 @@ module PostgREST.AppState
+   , putIsWorkerOn
+   , putPgVersion
+   , releasePool
++  , signalListener
++  , waitListener
+   ) where
+ 
+ import qualified Hasql.Pool as P
+@@ -28,7 +30,8 @@ import Data.Time.Clock    (UTCTime, getCurrentTime)
+ 
+ import PostgREST.Config                (AppConfig (..))
+ import PostgREST.DbStructure           (DbStructure)
+-import PostgREST.DbStructure.PgVersion (PgVersion (..))
++import PostgREST.DbStructure.PgVersion (PgVersion (..),
++                                        minimumPgVersion)
+ 
+ import Protolude      hiding (toS)
+ import Protolude.Conv (toS)
+@@ -36,13 +39,13 @@ import Protolude.Conv (toS)
+ 
+ data AppState = AppState
+   { statePool         :: P.Pool -- | Connection pool, either a 'Connection' or a 'ConnectionError'
+-  -- | Used to sync the listener(NOTIFY reload) with the connectionWorker. No
+-  -- connection for the listener at first. Only used if dbChannelEnabled=true.
+-  , statePgVersion    :: MVar PgVersion
++  , statePgVersion    :: IORef PgVersion
+   -- | No schema cache at the start. Will be filled in by the connectionWorker
+   , stateDbStructure  :: IORef (Maybe DbStructure)
+   -- | Helper ref to make sure just one connectionWorker can run at a time
+   , stateIsWorkerOn   :: IORef Bool
++  -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
++  , stateListener     :: MVar ()
+   -- | Config that can change at runtime
+   , stateConf         :: IORef AppConfig
+   , stateGetTime      :: IO UTCTime
+@@ -57,9 +60,11 @@ init conf = do
+ initWithPool :: P.Pool -> AppConfig -> IO AppState
+ initWithPool newPool conf =
+   AppState newPool
+-    <$> newEmptyMVar
++    -- assume we're in a supported version when starting, this will be corrected on a later step
++    <$> newIORef minimumPgVersion
+     <*> newIORef Nothing
+     <*> newIORef False
++    <*> newEmptyMVar
+     <*> newIORef conf
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
+     <*> myThreadId
+@@ -74,14 +79,11 @@ getPool = statePool
+ releasePool :: AppState -> IO ()
+ releasePool AppState{..} = P.release statePool >> throwTo stateMainThreadId UserInterrupt
+ 
+--- | As this IO action uses `takeMVar` internally, it will only return once
+--- `statePgVersion` has been set using `putPgVersion`. This is currently used
+--- to syncronize workers.
+ getPgVersion :: AppState -> IO PgVersion
+-getPgVersion = takeMVar . statePgVersion
++getPgVersion = readIORef . statePgVersion
+ 
+ putPgVersion :: AppState -> PgVersion -> IO ()
+-putPgVersion appState pgVer = void $ tryPutMVar (statePgVersion appState) pgVer
++putPgVersion = atomicWriteIORef . statePgVersion
+ 
+ getDbStructure :: AppState -> IO (Maybe DbStructure)
+ getDbStructure = readIORef . stateDbStructure
+@@ -107,3 +109,14 @@ getTime = stateGetTime
+ 
+ getMainThreadId :: AppState -> ThreadId
+ getMainThreadId = stateMainThreadId
++
++-- | As this IO action uses `takeMVar` internally, it will only return once
++-- `stateListener` has been set using `signalListener`. This is currently used
++-- to syncronize workers.
++waitListener :: AppState -> IO ()
++waitListener = takeMVar . stateListener
++
++-- tryPutMVar doesn't lock the thread. It should always succeed since
++-- the connectionWorker is the only mvar producer.
++signalListener :: AppState -> IO ()
++signalListener appState = void $ tryPutMVar (stateListener appState) ()
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 84a9611c..4f000991 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -20,7 +20,7 @@ import Text.Heredoc (str)
+ 
+ import PostgREST.AppState    (AppState)
+ import PostgREST.Config      (AppConfig (..))
+-import PostgREST.DbStructure (getDbStructure, getPgVersion)
++import PostgREST.DbStructure (getDbStructure)
+ import PostgREST.Version     (prettyVersion)
+ import PostgREST.Workers     (reReadConfig)
+ 
+@@ -54,13 +54,11 @@ dumpSchema :: AppState -> IO LBS.ByteString
+ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
+-    P.use (AppState.getPool appState) $ do
+-      pgVersion <- getPgVersion
++    P.use (AppState.getPool appState) $
+       HT.transaction HT.ReadCommitted HT.Read $
+         getDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
+-          pgVersion
+           configDbPreparedStatements
+   P.release $ AppState.getPool appState
+   case result of
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index feb1b602..b1cd37a3 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -51,7 +51,6 @@ import PostgREST.DbStructure.Proc         (PgArg (..), PgType (..),
+                                            ProcVolatility (..),
+                                            ProcsMap, RetType (..))
+ import PostgREST.DbStructure.Relationship (Cardinality (..),
+-                                           ForeignKey (..),
+                                            Junction (..),
+                                            PrimaryKey (..),
+                                            Relationship (..))
+@@ -68,7 +67,6 @@ data DbStructure = DbStructure
+   , dbRelationships :: [Relationship]
+   , dbPrimaryKeys   :: [PrimaryKey]
+   , dbProcs         :: ProcsMap
+-  , pgVersion       :: PgVersion
+   }
+   deriving (Generic, JSON.ToJSON)
+ 
+@@ -87,8 +85,8 @@ type ViewColumn = Column
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
+-getDbStructure :: [Schema] -> [Schema] -> PgVersion -> Bool -> HT.Transaction DbStructure
+-getDbStructure schemas extraSearchPath pgVer prepared = do
++getDbStructure :: [Schema] -> [Schema] -> Bool -> HT.Transaction DbStructure
++getDbStructure schemas extraSearchPath prepared = do
+   HT.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+   tabs    <- HT.statement mempty $ allTables prepared
+   cols    <- HT.statement schemas $ allColumns tabs prepared
+@@ -98,16 +96,14 @@ getDbStructure schemas extraSearchPath pgVer prepared = do
+   procs   <- HT.statement schemas $ allProcs prepared
+ 
+   let rels = addO2MRels . addM2MRels $ addViewM2ORels srcCols m2oRels
+-      cols' = addForeignKeys rels cols
+       keys' = addViewPrimaryKeys srcCols keys
+ 
+   return $ removeInternal schemas $ DbStructure {
+       dbTables = tabs
+-    , dbColumns = cols'
++    , dbColumns = cols
+     , dbRelationships = rels
+     , dbPrimaryKeys = keys'
+     , dbProcs = procs
+-    , pgVersion = pgVer
+     }
+ 
+ -- | Remove db objects that belong to an internal schema(not exposed through the API) from the DbStructure.
+@@ -121,7 +117,6 @@ removeInternal schemas dbStruct =
+                                       not (hasInternalJunction x)) $ dbRelationships dbStruct
+     , dbPrimaryKeys   = filter (\x -> tableSchema (pkTable x) `elem` schemas) $ dbPrimaryKeys dbStruct
+     , dbProcs         = dbProcs dbStruct -- procs are only obtained from the exposed schemas, no need to filter them.
+-    , pgVersion       = pgVersion dbStruct
+     }
+   where
+     hasInternalJunction rel = case relCardinality rel of
+@@ -379,20 +374,6 @@ accessibleTables =
+       )
+     order by relname |]
+ 
+-addForeignKeys :: [Relationship] -> [Column] -> [Column]
+-addForeignKeys rels = map addFk
+-  where
+-    addFk col = col { colFK = fk col }
+-    fk col = find (lookupFn col) rels >>= relToFk col
+-    lookupFn :: Column -> Relationship -> Bool
+-    lookupFn c rel = case rel of
+-      Relationship{relColumns=cs, relCardinality=M2O _} -> c `elem` cs
+-      _                                                 -> False
+-    relToFk col Relationship{relColumns=cols, relForeignColumns=colsF} = do
+-      pos <- L.elemIndex col cols
+-      colF <- atMay colsF pos
+-      return $ ForeignKey colF
+-
+ {-
+ Adds Views M2O Relationships based on SourceColumns found, the logic is as follows:
+ 
+@@ -675,7 +656,7 @@ columnFromRow :: [Table] ->
+                  -> Maybe Column
+ columnFromRow tabs (s, t, n, desc, nul, typ, l, d, e) = buildColumn <$> table
+   where
+-    buildColumn tbl = Column tbl n desc nul typ l d (parseEnum e) Nothing
++    buildColumn tbl = Column tbl n desc nul typ l d (parseEnum e)
+     table = find (\tbl -> tableSchema tbl == s && tableName tbl == t) tabs
+     parseEnum :: Maybe Text -> [Text]
+     parseEnum = maybe [] (split (==','))
+diff --git a/src/PostgREST/DbStructure/Relationship.hs b/src/PostgREST/DbStructure/Relationship.hs
+index 2c8f9d0b..f765bb79 100644
+--- a/src/PostgREST/DbStructure/Relationship.hs
++++ b/src/PostgREST/DbStructure/Relationship.hs
+@@ -3,7 +3,6 @@
+ 
+ module PostgREST.DbStructure.Relationship
+   ( Cardinality(..)
+-  , ForeignKey(..)
+   , PrimaryKey(..)
+   , Relationship(..)
+   , Junction(..)
+@@ -12,8 +11,7 @@ module PostgREST.DbStructure.Relationship
+ 
+ import qualified Data.Aeson as JSON
+ 
+-import PostgREST.DbStructure.Table (Column (..), ForeignKey (..),
+-                                    Table (..))
++import PostgREST.DbStructure.Table (Column (..), Table (..))
+ 
+ import Protolude
+ 
+diff --git a/src/PostgREST/DbStructure/Table.hs b/src/PostgREST/DbStructure/Table.hs
+index 973e1fbf..2dab546d 100644
+--- a/src/PostgREST/DbStructure/Table.hs
++++ b/src/PostgREST/DbStructure/Table.hs
+@@ -3,7 +3,6 @@
+ 
+ module PostgREST.DbStructure.Table
+   ( Column(..)
+-  , ForeignKey(..)
+   , Table(..)
+   , tableQi
+   ) where
+@@ -34,10 +33,6 @@ instance Eq Table where
+ tableQi :: Table -> QualifiedIdentifier
+ tableQi Table{tableSchema=s, tableName=n} = QualifiedIdentifier s n
+ 
+-newtype ForeignKey = ForeignKey
+-  { fkCol :: Column }
+-  deriving (Eq, Ord, Generic, JSON.ToJSON)
+-
+ data Column = Column
+   { colTable       :: Table
+   , colName        :: FieldName
+@@ -47,7 +42,6 @@ data Column = Column
+   , colMaxLen      :: Maybe Int32
+   , colDefault     :: Maybe Text
+   , colEnum        :: [Text]
+-  , colFK          :: Maybe ForeignKey
+   }
+   deriving (Ord, Generic, JSON.ToJSON)
+ 
+diff --git a/src/PostgREST/OpenAPI.hs b/src/PostgREST/OpenAPI.hs
+index d8239162..a93f61a1 100644
+--- a/src/PostgREST/OpenAPI.hs
++++ b/src/PostgREST/OpenAPI.hs
+@@ -2,6 +2,8 @@
+ Module      : PostgREST.OpenAPI
+ Description : Generates the OpenAPI output
+ -}
++{-# LANGUAGE LambdaCase      #-}
++{-# LANGUAGE NamedFieldPuns  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.OpenAPI (encode) where
+ 
+@@ -27,10 +29,10 @@ import PostgREST.DbStructure              (DbStructure (..),
+                                            tableCols, tablePKCols)
+ import PostgREST.DbStructure.Proc         (PgArg (..),
+                                            ProcDescription (..))
+-import PostgREST.DbStructure.Relationship (PrimaryKey (..))
+-import PostgREST.DbStructure.Table        (Column (..),
+-                                           ForeignKey (..),
+-                                           Table (..))
++import PostgREST.DbStructure.Relationship (Cardinality (..),
++                                           PrimaryKey (..),
++                                           Relationship (..))
++import PostgREST.DbStructure.Table        (Column (..), Table (..))
+ import PostgREST.Version                  (docsVersion, prettyVersion)
+ 
+ import PostgREST.ContentType
+@@ -42,6 +44,7 @@ encode :: AppConfig -> DbStructure -> [Table] -> Maybe Text -> HashMap.HashMap k
+ encode conf dbStructure tables schemaDescription procs =
+   JSON.encode $
+     postgrestSpec
++      (dbRelationships dbStructure)
+       (concat $ HashMap.elems procs)
+       (openApiTableInfo dbStructure <$> tables)
+       (proxyUri conf)
+@@ -64,27 +67,38 @@ toSwaggerType "real"              = SwaggerNumber
+ toSwaggerType "double precision"  = SwaggerNumber
+ toSwaggerType _                   = SwaggerString
+ 
+-makeTableDef :: [PrimaryKey] -> (Table, [Column], [Text]) -> (Text, Schema)
+-makeTableDef pks (t, cs, _) =
++makeTableDef :: [Relationship] -> [PrimaryKey] -> (Table, [Column], [Text]) -> (Text, Schema)
++makeTableDef rels pks (t, cs, _) =
+   let tn = tableName t in
+       (tn, (mempty :: Schema)
+         & description .~ tableDescription t
+         & type_ ?~ SwaggerObject
+-        & properties .~ fromList (fmap (makeProperty pks) cs)
++        & properties .~ fromList (fmap (makeProperty rels pks) cs)
+         & required .~ fmap colName (filter (not . colNullable) cs))
+ 
+-makeProperty :: [PrimaryKey] -> Column -> (Text, Referenced Schema)
+-makeProperty pks c = (colName c, Inline s)
++makeProperty :: [Relationship] -> [PrimaryKey] -> Column -> (Text, Referenced Schema)
++makeProperty rels pks c = (colName c, Inline s)
+   where
+     e = if null $ colEnum c then Nothing else JSON.decode $ JSON.encode $ colEnum c
+-    fk ForeignKey{fkCol=Column{colTable=Table{tableName=a}, colName=b}} =
+-      T.intercalate "" ["This is a Foreign Key to `", a, ".", b, "`.<fk table='", a, "' column='", b, "'/>"]
++    fk :: Maybe Text
++    fk =
++      let
++        -- Finds the relationship that has a single column foreign key
++        rel = find (\case
++          Relationship{relColumns, relCardinality=M2O _} -> [c] == relColumns
++          _                                                 -> False
++          ) rels
++        fCol = colName <$> (headMay =<< (relForeignColumns <$> rel))
++        fTbl = tableName . relForeignTable <$> rel
++        fTblCol = (,) <$> fTbl <*> fCol
++      in
++        (\(a, b) -> T.intercalate "" ["This is a Foreign Key to `", a, ".", b, "`.<fk table='", a, "' column='", b, "'/>"]) <$> fTblCol
+     pk :: Bool
+     pk = any (\p -> pkTable p == colTable c && pkName p == colName c) pks
+     n = catMaybes
+       [ Just "Note:"
+       , if pk then Just "This is a Primary Key.<pk/>" else Nothing
+-      , fk <$> colFK c
++      , fk
+       ]
+     d =
+       if length n > 1 then
+@@ -294,8 +308,8 @@ escapeHostName "*6" = "0.0.0.0"
+ escapeHostName "!6" = "0.0.0.0"
+ escapeHostName h    = h
+ 
+-postgrestSpec :: [ProcDescription] -> [(Table, [Column], [Text])] -> (Text, Text, Integer, Text) -> Maybe Text -> [PrimaryKey] -> Swagger
+-postgrestSpec pds ti (s, h, p, b) sd pks = (mempty :: Swagger)
++postgrestSpec :: [Relationship] -> [ProcDescription] -> [(Table, [Column], [Text])] -> (Text, Text, Integer, Text) -> Maybe Text -> [PrimaryKey] -> Swagger
++postgrestSpec rels pds ti (s, h, p, b) sd pks = (mempty :: Swagger)
+   & basePath ?~ T.unpack b
+   & schemes ?~ [s']
+   & info .~ ((mempty :: Info)
+@@ -306,7 +320,7 @@ postgrestSpec pds ti (s, h, p, b) sd pks = (mempty :: Swagger)
+     & description ?~ "PostgREST Documentation"
+     & url .~ URL ("https://postgrest.org/en/" <> docsVersion <> "/api.html"))
+   & host .~ h'
+-  & definitions .~ fromList (makeTableDef pks <$> ti)
++  & definitions .~ fromList (makeTableDef rels pks <$> ti)
+   & parameters .~ fromList (makeParamDefs ti)
+   & paths .~ makePathItems pds ti
+   & produces .~ makeMimeList [CTApplicationJSON, CTSingularJSON, CTTextCSV]
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 6e876a22..6ca2af73 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -77,16 +77,15 @@ connectionWorker appState = do
+           -- Unreachable because connectionStatus will keep trying to connect
+           return ()
+         Connected actualPgVersion -> do
+-          when configDbChannelEnabled $
+-            -- tryPutMVar doesn't lock the thread. It should always succeed since
+-            -- the worker is the only mvar producer.
+-            AppState.putPgVersion appState actualPgVersion
+           -- Procede with initialization
++          AppState.putPgVersion appState actualPgVersion
++          when configDbChannelEnabled $
++            AppState.signalListener appState
+           putStrLn ("Connection successful" :: Text)
+           -- this could be fail because the connection drops, but the
+           -- loadSchemaCache will pick the error and retry again
+           when configDbConfig $ reReadConfig False appState
+-          scStatus <- loadSchemaCache appState actualPgVersion
++          scStatus <- loadSchemaCache appState
+           case scStatus of
+             SCLoaded ->
+               -- do nothing and proceed if the load was successful
+@@ -148,12 +147,12 @@ connectionStatus pool =
+       return itShould
+ 
+ -- | Load the DbStructure by using a connection from the pool.
+-loadSchemaCache :: AppState -> PgVersion -> IO SCacheStatus
+-loadSchemaCache appState actualPgVersion = do
++loadSchemaCache :: AppState -> IO SCacheStatus
++loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   result <-
+     P.use (AppState.getPool appState) . HT.transaction HT.ReadCommitted HT.Read $
+-      getDbStructure (toList configDbSchemas) configDbExtraSearchPath actualPgVersion configDbPreparedStatements
++      getDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
+   case result of
+     Left e -> do
+       let
+@@ -185,9 +184,12 @@ listener appState = do
+   AppConfig{..} <- AppState.getConfig appState
+   let dbChannel = toS configDbChannel
+ 
+-  -- AppState.getPgVersion makes the thread wait until the pgVersion has been
+-  -- set by the connectionWorker
+-  actualPgVersion <- AppState.getPgVersion appState
++  -- The listener has to wait for a signal from the connectionWorker.
++  -- This is because when the connection to the db is lost, the listener also
++  -- tries to recover the connection, but not with the same pace as the connectionWorker.
++  -- Not waiting makes stdout quickly fill with connection retries messages from the listener.
++  AppState.waitListener appState
++
+   -- forkFinally allows to detect if the thread dies
+   void . flip forkFinally (handleFinally dbChannel) $ do
+     dbOrError <- C.acquire $ toS configDbUri
+@@ -195,7 +197,7 @@ listener appState = do
+       Right db -> do
+         putStrLn $ "Listening for notifications on the " <> dbChannel <> " channel"
+         N.listen db $ N.toPgIdentifier dbChannel
+-        N.waitForNotifications (handleNotification actualPgVersion) db
++        N.waitForNotifications handleNotification db
+       _ ->
+         die $ "Could not listen for notifications on the " <> dbChannel <> " channel"
+   where
+@@ -207,17 +209,17 @@ listener appState = do
+       -- retry the listener
+       listener appState
+ 
+-    handleNotification actualPgVersion _ msg
+-      | BS.null msg            = scLoader actualPgVersion -- reload the schema cache
+-      | msg == "reload schema" = scLoader actualPgVersion -- reload the schema cache
++    handleNotification _ msg
++      | BS.null msg            = scLoader -- reload the schema cache
++      | msg == "reload schema" = scLoader -- reload the schema cache
+       | msg == "reload config" = reReadConfig False appState -- reload the config
+       | otherwise              = pure () -- Do nothing if anything else than an empty message is sent
+ 
+-    scLoader actualPgVersion =
++    scLoader =
+       -- It's not necessary to check the loadSchemaCache success
+       -- here. If the connection drops, the thread will die and
+-      -- proceed to recover below.
+-      void $ loadSchemaCache appState actualPgVersion
++      -- proceed to recover.
++      void $ loadSchemaCache appState
+ 
+ -- | Re-reads the config plus config options from the db
+ reReadConfig :: Bool -> AppState -> IO ()

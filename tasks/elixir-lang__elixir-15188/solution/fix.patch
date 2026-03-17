@@ -1,0 +1,110 @@
+diff --git a/lib/mix/lib/mix/dep.ex b/lib/mix/lib/mix/dep.ex
+index 96acd4e4f..f7b698bde 100644
+--- a/lib/mix/lib/mix/dep.ex
++++ b/lib/mix/lib/mix/dep.ex
+@@ -338,6 +338,10 @@ def format_status(%Mix.Dep{status: :compile}) do
+     "the dependency build is outdated, please run \"#{mix_env_var()}mix deps.compile\""
+   end
+ 
++  def format_status(%Mix.Dep{status: :envoutdated}) do
++    "the dependency compile environment is outdated, please run \"#{mix_env_var()}mix deps.compile\""
++  end
++
+   def format_status(%Mix.Dep{app: app, status: {:divergedreq, vsn, other}} = dep) do
+     "the dependency #{app} #{vsn}\n" <>
+       dep_status(dep) <>
+@@ -505,11 +509,20 @@ def diverged?(%Mix.Dep{}), do: false
+   @doc """
+   Returns `true` if the dependency is compilable.
+   """
+-  def compilable?(%Mix.Dep{status: {:vsnlock, _}}), do: true
+-  def compilable?(%Mix.Dep{status: {:noappfile, {_, _}}}), do: true
+-  def compilable?(%Mix.Dep{status: {:scmlock, _}}), do: true
+-  def compilable?(%Mix.Dep{status: :compile}), do: true
+-  def compilable?(_), do: false
++  def compilable?(%Mix.Dep{status: :envoutdated}), do: true
++  def compilable?(dep), do: force_compilable?(dep)
++
++  @doc """
++  Returns `true` if the dependency is force compilable.
++
++  This is a subset of compilable. This is used in `deps.compile` to
++  clean the build path before compiling.
++  """
++  def force_compilable?(%Mix.Dep{status: {:vsnlock, _}}), do: true
++  def force_compilable?(%Mix.Dep{status: {:noappfile, {_, _}}}), do: true
++  def force_compilable?(%Mix.Dep{status: {:scmlock, _}}), do: true
++  def force_compilable?(%Mix.Dep{status: :compile}), do: true
++  def force_compilable?(_), do: false
+ 
+   @doc """
+   Formats a dependency for printing.
+diff --git a/lib/mix/lib/mix/dep/loader.ex b/lib/mix/lib/mix/dep/loader.ex
+index 6b34b32fb..7b576a528 100644
+--- a/lib/mix/lib/mix/dep/loader.ex
++++ b/lib/mix/lib/mix/dep/loader.ex
+@@ -444,7 +444,7 @@ defp app_status(app_path, app, req) do
+   defp compile_env_status(vsn, properties) do
+     with [_ | _] = compile_env <- properties[:compile_env],
+          false <- Config.Provider.valid_compile_env?(compile_env) do
+-      :compile
++      :envoutdated
+     else
+       _ -> {:ok, vsn, properties}
+     end
+diff --git a/lib/mix/lib/mix/tasks/compile.app.ex b/lib/mix/lib/mix/tasks/compile.app.ex
+index 391973130..8a4b99d61 100644
+--- a/lib/mix/lib/mix/tasks/compile.app.ex
++++ b/lib/mix/lib/mix/tasks/compile.app.ex
+@@ -161,10 +161,13 @@ def run(args) do
+       |> max(Mix.Utils.last_modified(compile_path))
+ 
+     current_properties = current_app_properties(target)
++    current_compile_env = Mix.ProjectStack.compile_env(nil)
+ 
+     {changed?, modules} =
+       cond do
+-        opts[:force] || new_mtime > Mix.Utils.last_modified(target) ->
++        opts[:force] || new_mtime > Mix.Utils.last_modified(target) ||
++            (current_compile_env != nil and
++               current_compile_env != Keyword.get(current_properties, :compile_env, [])) ->
+           {true, nil}
+ 
+         Keyword.get(config, :reliable_dir_mtime, fn -> not match?({:win32, _}, :os.type()) end) ->
+@@ -184,7 +187,7 @@ def run(args) do
+         ]
+         |> merge_project_application(project)
+         |> handle_extra_applications(config)
+-        |> add_compile_env(current_properties)
++        |> add_compile_env(current_compile_env, current_properties)
+         |> add_modules(modules, compile_path)
+ 
+       contents =
+@@ -389,12 +392,12 @@ defp typed_app?(app) when is_atom(app), do: true
+   defp typed_app?({app, type}) when is_atom(app) and type in [:required, :optional], do: true
+   defp typed_app?(_), do: false
+ 
+-  defp add_compile_env(properties, current_properties) do
++  defp add_compile_env(properties, current_compile_env, current_properties) do
+     # If someone calls compile.elixir and then compile.app across two
+     # separate OS calls, then the compile_env won't be properly reflected.
+     # This is ok because compile_env is not used for correctness. It is
+     # simply to catch possible errors early.
+-    case Mix.ProjectStack.compile_env(nil) do
++    case current_compile_env do
+       nil -> Keyword.take(current_properties, [:compile_env]) ++ properties
+       [] -> properties
+       compile_env -> Keyword.put(properties, :compile_env, compile_env)
+diff --git a/lib/mix/lib/mix/tasks/deps.compile.ex b/lib/mix/lib/mix/tasks/deps.compile.ex
+index 6ba31899d..0e0f7ab51 100644
+--- a/lib/mix/lib/mix/tasks/deps.compile.ex
++++ b/lib/mix/lib/mix/tasks/deps.compile.ex
+@@ -125,7 +125,7 @@ def compile_single(%Mix.Dep{} = dep, force?, config) do
+ 
+     # If a dependency was marked as fetched or with an out of date lock
+     # or missing the app file, we always compile it from scratch.
+-    if force? or Mix.Dep.compilable?(dep) do
++    if force? or Mix.Dep.force_compilable?(dep) do
+       File.rm_rf!(Path.join([Mix.Project.build_path(), "lib", Atom.to_string(dep.app)]))
+     end
+ 

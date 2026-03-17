@@ -1,0 +1,212 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dbbfb335..d7a44082 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,7 +18,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + This is enabled by adding `!inner` to the embedded resource, e.g. `/projects?select=*,clients!inner(*)&clients.id=eq.12`
+    + This behavior can be enabled by default with the `db-embed-default-join='inner'` config option, which saves the need for specifying `!inner` on every request. In this case, you can go back to the previous behavior per request by specifying `!left`  on the embedded resource, e.g `/projects?select=*,clients!left(*)&clients.id=eq.12`
+ - #1988, Allow specifying `unknown` for the `is` operator - @steve-chavez
+-- #2031, Improve error message for ambiguous embedding and add a relevant hint that includes unambiguous embedding suggestions - @laurenceisla
+ 
+ ### Fixed
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index bf676eb7..cfd9b0c0 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -97,8 +97,8 @@ instance JSON.ToJSON ApiRequestError where
+     "hint"    .= ("If a new foreign key between these entities was created in the database, try reloading the schema cache." :: Text),
+     "message" .= ("Could not find a relationship between " <> parent <> " and " <> child <> " in the schema cache" :: Text)]
+   toJSON (AmbiguousRelBetween parent child rels) = JSON.object [
+-    "hint"    .= ("Try changing '" <> child <> "' to one of the following: " <> relHint rels <> ". Find the desired relationship in the 'details' key." :: Text),
+-    "message" .= ("Could not embed because more than one relationship was found for '" <> parent <> "' and '" <> child <> "'" :: Text),
++    "hint"    .= ("By following the 'details' key, disambiguate the request by changing the url to /origin?select=relationship(*) or /origin?select=target!relationship(*)" :: Text),
++    "message" .= ("More than one relationship was found for " <> parent <> " and " <> child :: Text),
+     "details" .= (compressedRel <$> rels) ]
+   toJSON (AmbiguousRpc procs)  = JSON.object [
+     "hint"    .= ("Try renaming the parameters or the function itself in the database so function overloading can be resolved" :: Text),
+@@ -129,31 +129,23 @@ compressedRel Relationship{..} =
+     fmtTbl Table{..} = tableSchema <> "." <> tableName
+     fmtEls els = "[" <> T.intercalate ", " els <> "]"
+   in
+-  JSON.object $
+-    ("embedding" .= (tableName relTable <> " with " <> tableName relForeignTable :: Text))
+-    : case relCardinality of
+-        M2M Junction{..} -> [
+-            "cardinality" .= ("many-to-many" :: Text)
+-          , "relationship" .= (fmtTbl junTable <> fmtEls [junConstraint1] <> fmtEls [junConstraint2])
+-          ]
+-        M2O cons -> [
+-            "cardinality" .= ("many-to-one" :: Text)
+-          , "relationship" .= (cons <> fmtEls (colName <$> relColumns) <> fmtEls (colName <$> relForeignColumns))
+-          ]
+-        O2M cons -> [
+-            "cardinality" .= ("one-to-many" :: Text)
+-          , "relationship" .= (cons <> fmtEls (colName <$> relColumns) <> fmtEls (colName <$> relForeignColumns))
+-          ]
+-
+-relHint :: [Relationship] -> Text
+-relHint rels = T.intercalate ", " (hintList <$> rels)
+-  where
+-    hintList Relationship{..} =
+-      let buildHint rel = "'" <> tableName relForeignTable <> "!" <> rel <> "'" in
+-      case relCardinality of
+-        M2M Junction{..} -> buildHint (tableName junTable)
+-        M2O cons         -> buildHint cons
+-        O2M cons         -> buildHint cons
++  JSON.object $ [
++    "origin"      .= fmtTbl relTable
++  , "target"      .= fmtTbl relForeignTable
++  ] ++
++  case relCardinality of
++    M2M Junction{..} -> [
++        "cardinality" .= ("m2m" :: Text)
++      , "relationship" .= (fmtTbl junTable <> fmtEls [junConstraint1] <> fmtEls [junConstraint2])
++      ]
++    M2O cons -> [
++        "cardinality" .= ("m2o" :: Text)
++      , "relationship" .= (cons <> fmtEls (colName <$> relColumns) <> fmtEls (colName <$> relForeignColumns))
++      ]
++    O2M cons -> [
++        "cardinality" .= ("o2m" :: Text)
++      , "relationship" .= (cons <> fmtEls (colName <$> relColumns) <> fmtEls (colName <$> relForeignColumns))
++      ]
+ 
+ data PgError = PgError Authenticated SQL.UsageError
+ type Authenticated = Bool
+diff --git a/test/Feature/EmbedDisambiguationSpec.hs b/test/Feature/EmbedDisambiguationSpec.hs
+index 44bfa608..f3fa405c 100644
+--- a/test/Feature/EmbedDisambiguationSpec.hs
++++ b/test/Feature/EmbedDisambiguationSpec.hs
+@@ -19,18 +19,20 @@ spec =
+             {
+               "details": [
+                 {
+-                    "cardinality": "many-to-one",
++                    "cardinality": "m2o",
+                     "relationship": "message_sender_fkey[sender][id]",
+-                    "embedding": "message with person"
++                    "origin": "test.message",
++                    "target": "test.person"
+                 },
+                 {
+-                    "cardinality": "many-to-one",
++                    "cardinality": "m2o",
+                     "relationship": "message_sender_fkey[sender][id]",
+-                    "embedding": "message with person_detail"
++                    "origin": "test.message",
++                    "target": "test.person_detail"
+                 }
+               ],
+-              "hint": "Try changing 'sender' to one of the following: 'person!message_sender_fkey', 'person_detail!message_sender_fkey'. Find the desired relationship in the 'details' key.",
+-              "message": "Could not embed because more than one relationship was found for 'message' and 'sender'"
++              "hint": "By following the 'details' key, disambiguate the request by changing the url to /origin?select=relationship(*) or /origin?select=target!relationship(*)",
++              "message": "More than one relationship was found for message and sender"
+             }
+           |]
+           { matchStatus  = 300
+@@ -43,23 +45,26 @@ spec =
+             {
+               "details": [
+                 {
+-                  "cardinality": "many-to-one",
++                  "cardinality": "m2o",
+                   "relationship": "main_project[main_project_id][big_project_id]",
+-                  "embedding": "sites with big_projects"
++                  "origin": "test.sites",
++                  "target": "test.big_projects"
+                 },
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.jobs[jobs_site_id_fkey][jobs_big_project_id_fkey]",
+-                  "embedding": "sites with big_projects"
++                  "origin": "test.sites",
++                  "target": "test.big_projects"
+                 },
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.main_jobs[jobs_site_id_fkey][jobs_big_project_id_fkey]",
+-                  "embedding": "sites with big_projects"
++                  "origin": "test.sites",
++                  "target": "test.big_projects"
+                 }
+               ],
+-              "hint": "Try changing 'big_projects' to one of the following: 'big_projects!main_project', 'big_projects!jobs', 'big_projects!main_jobs'. Find the desired relationship in the 'details' key.",
+-              "message": "Could not embed because more than one relationship was found for 'sites' and 'big_projects'"
++              "hint": "By following the 'details' key, disambiguate the request by changing the url to /origin?select=relationship(*) or /origin?select=target!relationship(*)",
++              "message": "More than one relationship was found for sites and big_projects"
+             }
+           |]
+           { matchStatus  = 300
+@@ -72,18 +77,20 @@ spec =
+             {
+               "details": [
+                 {
+-                    "cardinality": "many-to-one",
++                    "cardinality": "m2o",
+                     "relationship": "agents_department_id_fkey[department_id][id]",
+-                    "embedding": "agents with departments"
++                    "origin": "test.agents",
++                    "target": "test.departments"
+                 },
+                 {
+-                    "cardinality": "one-to-many",
++                    "cardinality": "o2m",
+                     "relationship": "departments_head_id_fkey[id][head_id]",
+-                    "embedding": "agents with departments"
++                    "origin": "test.agents",
++                    "target": "test.departments"
+                 }
+               ],
+-              "hint": "Try changing 'departments' to one of the following: 'departments!agents_department_id_fkey', 'departments!departments_head_id_fkey'. Find the desired relationship in the 'details' key.",
+-              "message": "Could not embed because more than one relationship was found for 'agents' and 'departments'"
++              "hint": "By following the 'details' key, disambiguate the request by changing the url to /origin?select=relationship(*) or /origin?select=target!relationship(*)",
++              "message": "More than one relationship was found for agents and departments"
+             }
+            |]
+           { matchStatus  = 300
+@@ -99,28 +106,32 @@ spec =
+             {
+               "details": [
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.whatev_jobs[whatev_jobs_site_id_1_fkey][whatev_jobs_project_id_1_fkey]",
+-                  "embedding": "whatev_sites with whatev_projects"
++                  "origin": "test.whatev_sites",
++                  "target": "test.whatev_projects"
+                 },
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.whatev_jobs[whatev_jobs_site_id_1_fkey][whatev_jobs_project_id_2_fkey]",
+-                  "embedding": "whatev_sites with whatev_projects"
++                  "origin": "test.whatev_sites",
++                  "target": "test.whatev_projects"
+                 },
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.whatev_jobs[whatev_jobs_site_id_2_fkey][whatev_jobs_project_id_1_fkey]",
+-                  "embedding": "whatev_sites with whatev_projects"
++                  "origin": "test.whatev_sites",
++                  "target": "test.whatev_projects"
+                 },
+                 {
+-                  "cardinality": "many-to-many",
++                  "cardinality": "m2m",
+                   "relationship": "test.whatev_jobs[whatev_jobs_site_id_2_fkey][whatev_jobs_project_id_2_fkey]",
+-                  "embedding": "whatev_sites with whatev_projects"
++                  "origin": "test.whatev_sites",
++                  "target": "test.whatev_projects"
+                 }
+               ],
+-              "hint": "Try changing 'whatev_projects' to one of the following: 'whatev_projects!whatev_jobs', 'whatev_projects!whatev_jobs', 'whatev_projects!whatev_jobs', 'whatev_projects!whatev_jobs'. Find the desired relationship in the 'details' key.",
+-              "message": "Could not embed because more than one relationship was found for 'whatev_sites' and 'whatev_projects'"
++              "hint": "By following the 'details' key, disambiguate the request by changing the url to /origin?select=relationship(*) or /origin?select=target!relationship(*)",
++              "message": "More than one relationship was found for whatev_sites and whatev_projects"
+             }
+           |]
+           { matchStatus  = 300

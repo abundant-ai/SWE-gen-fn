@@ -1,0 +1,128 @@
+diff --git a/ChangeLog.md b/ChangeLog.md
+index b36affcc3..67c21680a 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -21,6 +21,10 @@ Behavior changes:
+   character in Stack's 'programs' path, as GHC 9.4.1 and later do not work if
+   there is a space in the path to the `ghc` executable. S-8432 now presents as a
+   warning and not an error.
++* Stack respects the `--no-run-tests` and `--no-run-benchmarks` flags when
++  determining build actions. Previously Stack respected the flags when executing
++  the run test suites or run benchmarks actions for each targeted project
++  package.
+ 
+ Other enhancements:
+ 
+diff --git a/src/Stack/Build/Execute.hs b/src/Stack/Build/Execute.hs
+index 1df18efe1..9aca5c869 100644
+--- a/src/Stack/Build/Execute.hs
++++ b/src/Stack/Build/Execute.hs
+@@ -367,8 +367,18 @@ executePlan' :: HasEnvConfig env
+              -> ExecuteEnv
+              -> RIO env ()
+ executePlan' installedMap0 targets plan ee = do
++  config <- view configL
+   let !buildOpts = ee.buildOpts
+       !testOpts = buildOpts.testOpts
++      !benchmarkOpts = buildOpts.benchmarkOpts
++      runTests = testOpts.runTests
++      runBenchmarks = benchmarkOpts.runBenchmarks
++      noNotifyIfNoRunTests = not config.notifyIfNoRunTests
++      noNotifyIfNoRunBenchmarks = not config.notifyIfNoRunBenchmarks
++      hasTests = not . Set.null . testComponents . taskComponents
++      hasBenches = not . Set.null . benchComponents . taskComponents
++      tests = Map.elems $ Map.filter hasTests plan.finals
++      benches = Map.elems $ Map.filter hasBenches plan.finals
+   when testOpts.coverage deleteHpcReports
+   cv <- view actualCompilerVersionL
+   whenJust (nonEmpty $ Map.toList plan.unregisterLocal) $ \ids -> do
+@@ -400,6 +410,24 @@ executePlan' installedMap0 targets plan ee = do
+         buildOpts.keepGoing
+   terminal <- view terminalL
+   terminalWidth <- view termWidthL
++  unless (noNotifyIfNoRunTests || runTests || null tests) $
++    prettyInfo $
++      fillSep
++        [ flow "All test running disabled by"
++        , style Shell "--no-run-tests"
++        , flow "flag. To mute this message in future, set"
++        , style Shell (flow "notify-if-no-run-tests: false")
++        , flow "in Stack's configuration."
++        ]
++  unless (noNotifyIfNoRunBenchmarks || runBenchmarks || null benches) $
++    prettyInfo $
++      fillSep
++        [ flow "All benchmark running disabled by"
++        , style Shell "--no-run-benchmarks"
++        , flow "flag. To mute this message in future, set"
++        , style Shell (flow "notify-if-no-run-benchmarks: false")
++        , flow "in Stack's configuration."
++        ]
+   errs <- liftIO $ runActions threads keepGoing actions $
+     \doneVar actionsVar -> do
+       let total = length actions
+@@ -564,8 +592,9 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+             , concurrency = ConcurrencyAllowed
+             }
+       ) $
+-      -- These are the "final" actions - running tests and benchmarks.
+-      ( if Set.null tests
++      -- These are the "final" actions - running test suites and benchmarks,
++      -- unless --no-run-tests or --no-run-benchmarks is enabled.
++      ( if Set.null tests || not runTests
+           then id
+           else (:) Action
+             { actionId = ActionId pkgId ATRunTests
+@@ -578,7 +607,7 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+             , concurrency = ConcurrencyAllowed
+             }
+       ) $
+-      ( if Set.null benches
++      ( if Set.null benches || not runBenchmarks
+           then id
+           else (:) Action
+             { actionId = ActionId pkgId ATRunBenchmarks
+@@ -615,6 +644,8 @@ toActions installedMap mtestLock runInBase ee (mbuild, mfinal) =
+   bopts = ee.buildOpts
+   topts = bopts.testOpts
+   beopts = bopts.benchmarkOpts
++  runTests = topts.runTests
++  runBenchmarks = beopts.runBenchmarks
+ 
+ taskComponents :: Task -> Set NamedComponent
+ taskComponents task =
+diff --git a/src/Stack/Build/ExecutePackage.hs b/src/Stack/Build/ExecutePackage.hs
+index f8e070c2b..0ab79dc14 100644
+--- a/src/Stack/Build/ExecutePackage.hs
++++ b/src/Stack/Build/ExecutePackage.hs
+@@ -997,6 +997,9 @@ singleTest topts testsToRun ac ee task installedMap = do
+                       pure True
+                 TSUnknown -> pure True
+           else do
++            -- This should never be reached, because the action should have been
++            -- filtered out in Stack.Build.Execute.toActions. However, we leave
++            -- it as is, for now. The alternative would be to throw a Stack bug.
+             notifyIfNoRunTests <- view $ configL . to (.notifyIfNoRunTests)
+             when notifyIfNoRunTests $
+               announce "Test running disabled by --no-run-tests flag."
+@@ -1267,6 +1270,9 @@ singleBench beopts benchesToRun ac ee task installedMap = do
+         if beopts.runBenchmarks
+           then pure True
+           else do
++            -- This should never be reached, because the action should have been
++            -- filtered out in Stack.Build.Execute.toActions. However, we leave
++            -- it as is, for now. The alternative would be to throw a Stack bug.
+             notifyIfNoRunBenchmarks <-
+               view $ configL . to (.notifyIfNoRunBenchmarks)
+             when notifyIfNoRunBenchmarks $
+diff --git a/tests/integration/tests/3959-order-of-flags/Main.hs b/tests/integration/tests/3959-order-of-flags/Main.hs
+index 650bf9246..4825c0405 100644
+--- a/tests/integration/tests/3959-order-of-flags/Main.hs
++++ b/tests/integration/tests/3959-order-of-flags/Main.hs
+@@ -17,5 +17,5 @@ checkFlagsAfterCommand = stackCheckStderr ["build", "--test", "--no-run-tests"]
+ 
+ checker :: String -> IO ()
+ checker output = do
+-  let testsAreDisabled = any (\ln -> "Test running disabled by" `isInfixOf` ln) (lines output)
++  let testsAreDisabled = any (\ln -> "All test running disabled by" `isInfixOf` ln) (lines output)
+   unless testsAreDisabled $ fail "Tests should not be run"

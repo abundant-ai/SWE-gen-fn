@@ -1,0 +1,342 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7faa5ec9..ed9c6f07 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,9 +7,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Added
+ 
+- - #1933, Add a minimal health check endpoint on an admin port at the `<host>:<admin_server_port>/health` endpoint - @steve-chavez
+-   + For enabling this, the `admin-server-port` config must be set explictly
+-
+ ### Fixed
+ 
+  - #2020, Execute deferred constraint triggers when using `Prefer: tx=rollback` - @wolfgangwalther
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index faf43ae7..89a75bbe 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -30,10 +30,9 @@ import qualified Data.ByteString.Char8           as BS
+ import qualified Data.ByteString.Lazy            as LBS
+ import qualified Data.HashMap.Strict             as M
+ import qualified Data.Set                        as S
+-import qualified Hasql.DynamicStatements.Snippet as SQL (Snippet)
++import qualified Hasql.DynamicStatements.Snippet as SQL
+ import qualified Hasql.Pool                      as SQL
+-import qualified Hasql.Session                   as SQL (sql)
+-import qualified Hasql.Transaction               as SQL hiding (sql)
++import qualified Hasql.Transaction               as SQL
+ import qualified Hasql.Transaction.Sessions      as SQL
+ import qualified Network.HTTP.Types.Header       as HTTP
+ import qualified Network.HTTP.Types.Status       as HTTP
+@@ -114,11 +113,6 @@ run installHandlers maybeRunWithSocket appState = do
+   when configDbChannelEnabled $ listener appState
+ 
+   let app = postgrest configLogLevel appState (connectionWorker appState)
+-      adminApp = postgrestAdmin appState configDbChannelEnabled
+-
+-  whenJust configAdminServerPort $ \adminPort -> do
+-    AppState.logWithZTime appState $ "Admin server listening on port " <> show adminPort
+-    void . forkIO $ Warp.runSettings (serverSettings conf & setPort adminPort) adminApp
+ 
+   case configServerUnixSocket of
+     Just socket ->
+@@ -133,9 +127,6 @@ run installHandlers maybeRunWithSocket appState = do
+       do
+         AppState.logWithZTime appState $ "Listening on port " <> show configServerPort
+         Warp.runSettings (serverSettings conf) app
+-  where
+-    whenJust :: Applicative m => Maybe a -> (a -> m ()) -> m ()
+-    whenJust mg f = maybe (pure ()) f mg
+ 
+ serverSettings :: AppConfig -> Warp.Settings
+ serverSettings AppConfig{..} =
+@@ -144,19 +135,6 @@ serverSettings AppConfig{..} =
+     & setPort configServerPort
+     & setServerName ("postgrest/" <> prettyVersion)
+ 
+--- | PostgREST admin application
+-postgrestAdmin :: AppState.AppState -> Bool -> Wai.Application
+-postgrestAdmin appState configDbChannelEnabled req respond  =
+-  case Wai.pathInfo req of
+-    ["health"] ->
+-      if configDbChannelEnabled then do
+-        listenerOn <- AppState.getIsListenerOn appState
+-        respond $ Wai.responseLBS (if listenerOn then HTTP.status200 else HTTP.status503) [] mempty
+-      else do
+-        result <- SQL.use (AppState.getPool appState) $ SQL.sql "SELECT 1"
+-        respond $ Wai.responseLBS (if isRight result then HTTP.status200 else HTTP.status503) [] mempty
+-    _ -> respond $ Wai.responseLBS HTTP.status404 [] mempty
+-
+ -- | PostgREST application
+ postgrest :: LogLevel -> AppState.AppState -> IO () -> Wai.Application
+ postgrest logLev appState connWorker =
+diff --git a/src/PostgREST/AppState.hs b/src/PostgREST/AppState.hs
+index 47eeaa12..77819f2e 100644
+--- a/src/PostgREST/AppState.hs
++++ b/src/PostgREST/AppState.hs
+@@ -4,7 +4,6 @@ module PostgREST.AppState
+   ( AppState
+   , getConfig
+   , getDbStructure
+-  , getIsListenerOn
+   , getIsWorkerOn
+   , getJsonDbS
+   , getMainThreadId
+@@ -17,7 +16,6 @@ module PostgREST.AppState
+   , logWithZTime
+   , putConfig
+   , putDbStructure
+-  , putIsListenerOn
+   , putIsWorkerOn
+   , putJsonDbS
+   , putPgVersion
+@@ -55,8 +53,6 @@ data AppState = AppState
+   , stateIsWorkerOn   :: IORef Bool
+   -- | Binary semaphore used to sync the listener(NOTIFY reload) with the connectionWorker.
+   , stateListener     :: MVar ()
+-  -- | State of the LISTEN channel, used for health checks
+-  , stateIsListenerOn :: IORef Bool
+   -- | Config that can change at runtime
+   , stateConf         :: IORef AppConfig
+   -- | Time used for verifying JWT expiration
+@@ -82,7 +78,6 @@ initWithPool newPool conf =
+     <*> newIORef mempty
+     <*> newIORef False
+     <*> newEmptyMVar
+-    <*> newIORef False
+     <*> newIORef conf
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
+     <*> mkAutoUpdate defaultUpdateSettings { updateAction = getZonedTime }
+@@ -158,9 +153,3 @@ waitListener = takeMVar . stateListener
+ -- the connectionWorker is the only mvar producer.
+ signalListener :: AppState -> IO ()
+ signalListener appState = void $ tryPutMVar (stateListener appState) ()
+-
+-getIsListenerOn :: AppState -> IO Bool
+-getIsListenerOn = readIORef . stateIsListenerOn
+-
+-putIsListenerOn :: AppState -> Bool -> IO ()
+-putIsListenerOn = atomicWriteIORef . stateIsListenerOn
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 2f80c1bd..6cd604df 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -199,9 +199,6 @@ exampleConfigFile =
+       |## when none is provided, 660 is applied by default
+       |# server-unix-socket-mode = "660"
+       |
+-      |## admin server for health checks, it's disabled by default unless a port is specified
+-      |# admin-server-port = 3001
+-      |
+       |## determine if the OpenAPI output should follow or ignore role privileges or be disabled entirely
+       |## admitted values: follow-privileges, ignore-privileges, disabled
+       |openapi-mode = "follow-privileges"
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 1f315e69..d5d63cd9 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -93,7 +93,6 @@ data AppConfig = AppConfig
+   , configServerPort            :: Int
+   , configServerUnixSocket      :: Maybe FilePath
+   , configServerUnixSocketMode  :: FileMode
+-  , configAdminServerPort       :: Maybe Int
+   }
+ 
+ data LogLevel = LogCrit | LogError | LogWarn | LogInfo
+@@ -148,7 +147,6 @@ toText conf =
+       ,("server-port",                   show . configServerPort)
+       ,("server-unix-socket",        q . maybe mempty T.pack . configServerUnixSocket)
+       ,("server-unix-socket-mode",   q . T.pack . showSocketMode)
+-      ,("admin-server-port",             maybe "\"\"" show . configAdminServerPort)
+       ]
+ 
+     -- quote all app.settings
+@@ -244,7 +242,6 @@ parser optPath env dbSettings =
+     <*> (fromMaybe 3000 <$> optInt "server-port")
+     <*> (fmap T.unpack <$> optString "server-unix-socket")
+     <*> parseSocketFileMode "server-unix-socket-mode"
+-    <*> optInt "admin-server-port"
+   where
+     parseAppSettings :: C.Key -> C.Parser C.Config [(Text, Text)]
+     parseAppSettings key = addFromEnv . fmap (fmap coerceText) <$> C.subassocs key C.value
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 5fdd3bca..9f716e38 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -200,7 +200,6 @@ listener appState = do
+     case dbOrError of
+       Right db -> do
+         AppState.logWithZTime appState $ "Listening for notifications on the " <> dbChannel <> " channel"
+-        AppState.putIsListenerOn appState True
+         SQL.listen db $ SQL.toPgIdentifier dbChannel
+         SQL.waitForNotifications handleNotification db
+       _ ->
+@@ -209,7 +208,6 @@ listener appState = do
+     handleFinally dbChannel _ = do
+       -- if the thread dies, we try to recover
+       AppState.logWithZTime appState $ "Retrying listening for notifications on the " <> dbChannel <> " channel.."
+-      AppState.putIsListenerOn appState False
+       -- assume the pool connection was also lost, call the connection worker
+       connectionWorker appState
+       -- retry the listener
+diff --git a/test/SpecHelper.hs b/test/SpecHelper.hs
+index 30429574..f9411f8f 100644
+--- a/test/SpecHelper.hs
++++ b/test/SpecHelper.hs
+@@ -106,7 +106,6 @@ _baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configServerUnixSocketMode  = 432
+   , configDbTxAllowOverride     = True
+   , configDbTxRollbackAll       = True
+-  , configAdminServerPort       = Nothing
+   }
+ 
+ testCfg :: Text -> AppConfig
+diff --git a/test/io-tests/configs/expected/aliases.config b/test/io-tests/configs/expected/aliases.config
+index 4ca5c65b..24d89f46 100644
+--- a/test/io-tests/configs/expected/aliases.config
++++ b/test/io-tests/configs/expected/aliases.config
+@@ -25,4 +25,3 @@ server-host = "!4"
+ server-port = 3000
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+-admin-server-port = ""
+diff --git a/test/io-tests/configs/expected/boolean-numeric.config b/test/io-tests/configs/expected/boolean-numeric.config
+index 3be0ecc9..819368bb 100644
+--- a/test/io-tests/configs/expected/boolean-numeric.config
++++ b/test/io-tests/configs/expected/boolean-numeric.config
+@@ -25,4 +25,3 @@ server-host = "!4"
+ server-port = 3000
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+-admin-server-port = ""
+diff --git a/test/io-tests/configs/expected/boolean-string.config b/test/io-tests/configs/expected/boolean-string.config
+index 3be0ecc9..819368bb 100644
+--- a/test/io-tests/configs/expected/boolean-string.config
++++ b/test/io-tests/configs/expected/boolean-string.config
+@@ -25,4 +25,3 @@ server-host = "!4"
+ server-port = 3000
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+-admin-server-port = ""
+diff --git a/test/io-tests/configs/expected/defaults.config b/test/io-tests/configs/expected/defaults.config
+index a90007d7..14b97dee 100644
+--- a/test/io-tests/configs/expected/defaults.config
++++ b/test/io-tests/configs/expected/defaults.config
+@@ -25,4 +25,3 @@ server-host = "!4"
+ server-port = 3000
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+-admin-server-port = ""
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+index 9e13dc33..ff5ec967 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -25,6 +25,5 @@ server-host = "0.0.0.0"
+ server-port = 80
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+-admin-server-port = 3001
+ app.settings.test = "test"
+ app.settings.test2 = "test"
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db.config b/test/io-tests/configs/expected/no-defaults-with-db.config
+index 890c577f..4159b6b4 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db.config
+@@ -25,6 +25,5 @@ server-host = "0.0.0.0"
+ server-port = 80
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+-admin-server-port = 3001
+ app.settings.test = "test"
+ app.settings.test2 = "test"
+diff --git a/test/io-tests/configs/expected/no-defaults.config b/test/io-tests/configs/expected/no-defaults.config
+index c438a5f6..e782643f 100644
+--- a/test/io-tests/configs/expected/no-defaults.config
++++ b/test/io-tests/configs/expected/no-defaults.config
+@@ -25,6 +25,5 @@ server-host = "0.0.0.0"
+ server-port = 80
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+-admin-server-port = 3001
+ app.settings.test = "test"
+ app.settings.test2 = "test"
+diff --git a/test/io-tests/configs/expected/types.config b/test/io-tests/configs/expected/types.config
+index 1d91f505..f77e97cc 100644
+--- a/test/io-tests/configs/expected/types.config
++++ b/test/io-tests/configs/expected/types.config
+@@ -25,5 +25,4 @@ server-host = "!4"
+ server-port = 3000
+ server-unix-socket = ""
+ server-unix-socket-mode = "660"
+-admin-server-port = ""
+ app.settings.test = "Bool False"
+diff --git a/test/io-tests/configs/no-defaults-env.yaml b/test/io-tests/configs/no-defaults-env.yaml
+index bc7790da..27bbe2c8 100644
+--- a/test/io-tests/configs/no-defaults-env.yaml
++++ b/test/io-tests/configs/no-defaults-env.yaml
+@@ -28,4 +28,3 @@ PGRST_SERVER_HOST: 0.0.0.0
+ PGRST_SERVER_PORT: 80
+ PGRST_SERVER_UNIX_SOCKET: /tmp/pgrst_io_test.sock
+ PGRST_SERVER_UNIX_SOCKET_MODE: 777
+-PGRST_ADMIN_SERVER_PORT: 3001
+diff --git a/test/io-tests/configs/no-defaults.config b/test/io-tests/configs/no-defaults.config
+index 65153f1e..8284a74c 100644
+--- a/test/io-tests/configs/no-defaults.config
++++ b/test/io-tests/configs/no-defaults.config
+@@ -25,6 +25,5 @@ server-host = "0.0.0.0"
+ server-port = 80
+ server-unix-socket = "/tmp/pgrst_io_test.sock"
+ server-unix-socket-mode = "777"
+-admin-server-port = 3001
+ app.settings.test = "test"
+ app.settings.test2 = "test"
+diff --git a/test/io-tests/test_io.py b/test/io-tests/test_io.py
+index 50d6cd83..94ff66a9 100644
+--- a/test/io-tests/test_io.py
++++ b/test/io-tests/test_io.py
+@@ -729,44 +729,3 @@ def test_db_prepared_statements_disable(defaultenv):
+     with run(env=env) as postgrest:
+         response = postgrest.session.post("/rpc/uses_prepared_statements")
+         assert response.text == "false"
+-
+-
+-def test_admin_healthy_w_channel(defaultenv):
+-    "Should get a success response from the admin server health endpoint when the LISTEN channel is enabled"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_ADMIN_SERVER_PORT": "3001",
+-        "PGRST_DB_CHANNEL_ENABLED": "true",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = requests.get(f"http://localhost:{env['PGRST_ADMIN_SERVER_PORT']}/health")
+-        assert response.status_code == 200
+-
+-
+-def test_admin_healthy_wo_channel(defaultenv):
+-    "Should get a success response from the admin server health endpoint when the LISTEN channel is disabled"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_ADMIN_SERVER_PORT": "3001",
+-        "PGRST_DB_CHANNEL_ENABLED": "false",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = requests.get(f"http://localhost:{env['PGRST_ADMIN_SERVER_PORT']}/health")
+-        assert response.status_code == 200
+-
+-
+-def test_admin_not_found(defaultenv):
+-    "Should get a not found from the admin server"
+-
+-    env = {
+-        **defaultenv,
+-        "PGRST_ADMIN_SERVER_PORT": "3001",
+-    }
+-
+-    with run(env=env) as postgrest:
+-        response = requests.get(f"http://localhost:{env['PGRST_ADMIN_SERVER_PORT']}/notfound")
+-        assert response.status_code == 404

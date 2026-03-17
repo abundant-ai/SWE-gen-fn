@@ -1,0 +1,677 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index de41d1c7..27893bf0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -30,7 +30,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #1857, Make GUC names for headers, cookies and jwt claims compatible with PostgreSQL v14 - @laurenceisla, @robertsosinski
+    + Getting the value for a header GUC on PostgreSQL 14 is done using `current_setting('request.headers')::json->>'name-of-header'` and in a similar way for `request.cookies` and `request.jwt.claims`
+    + PostgreSQL versions below 14 can opt in to the new JSON GUCs by setting the `db-use-legacy-gucs` config option to false (true by default)
+- - #1783, Partitions (created using `PARTITION OF`) are no longer included in the schema cache. - @laurenceisla
+ 
+ ## [8.0.0] - 2021-07-25
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 922306d9..e828ccc1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -462,12 +462,12 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       (if invMethod == InvHead then mempty else LBS.fromStrict body)
+ 
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+-handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest ctxPgVersion) = do
++handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest _) = do
+   body <-
+     lift $ case configOpenApiMode of
+       OAFollowPriv ->
+         OpenAPI.encode conf dbStructure
+-           <$> SQL.statement tSchema (DbStructure.accessibleTables ctxPgVersion configDbPreparedStatements)
++           <$> SQL.statement tSchema (DbStructure.accessibleTables configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+       OAIgnorePriv ->
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 95346e20..65d868d0 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -53,7 +53,6 @@ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+ dumpSchema :: AppState -> IO LBS.ByteString
+ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
+-  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) $
+@@ -61,7 +60,6 @@ dumpSchema appState = do
+         queryDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
+-          actualPgVersion
+           configDbPreparedStatements
+   SQL.release $ AppState.getPool appState
+   case result of
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 87b48c8c..5fbb88a8 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -41,7 +41,6 @@ import Data.Set                      as S (fromList)
+ import Data.Text                     (split)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+-import PostgREST.Config.PgVersion         (PgVersion, pgVersion100)
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..),
+                                            Schema, TableName)
+ import PostgREST.DbStructure.Proc         (PgType (..),
+@@ -83,10 +82,10 @@ type ViewColumn = Column
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
+-queryDbStructure :: [Schema] -> [Schema] -> PgVersion -> Bool -> SQL.Transaction DbStructure
+-queryDbStructure schemas extraSearchPath pgVer prepared = do
++queryDbStructure :: [Schema] -> [Schema] -> Bool -> SQL.Transaction DbStructure
++queryDbStructure schemas extraSearchPath prepared = do
+   SQL.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+-  tabs    <- SQL.statement mempty $ allTables pgVer prepared
++  tabs    <- SQL.statement mempty $ allTables prepared
+   cols    <- SQL.statement schemas $ allColumns tabs prepared
+   srcCols <- SQL.statement (schemas, extraSearchPath) $ pfkSourceColumns cols prepared
+   m2oRels <- SQL.statement mempty $ allM2ORels tabs cols prepared
+@@ -312,8 +311,8 @@ schemaDescription =
+       where
+         n.nspname = $1 |]
+ 
+-accessibleTables :: PgVersion -> Bool -> SQL.Statement Schema [Table]
+-accessibleTables pgVer =
++accessibleTables :: Bool -> SQL.Statement Schema [Table]
++accessibleTables =
+   SQL.Statement sql (param HE.text) decodeTables
+  where
+   sql = [q|
+@@ -351,8 +350,7 @@ accessibleTables pgVer =
+       left join pg_catalog.pg_description as d on d.objoid = c.oid and d.objsubid = 0
+     where
+       c.relkind in ('v','r','m','f','p')
+-      and n.nspname = $1 |]
+-      <> relIsNotPartition pgVer <> [q|
++      and n.nspname = $1
+       and (
+         pg_has_role(c.relowner, 'USAGE')
+         or has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+@@ -447,8 +445,8 @@ addViewPrimaryKeys srcCols = concatMap (\pk ->
+                 filter (\(col, _) -> colTable col == pkTable pk && colName col == pkName pk) srcCols in
+   pk : viewPks)
+ 
+-allTables :: PgVersion -> Bool -> SQL.Statement () [Table]
+-allTables pgVer =
++allTables :: Bool -> SQL.Statement () [Table]
++allTables =
+   SQL.Statement sql HE.noParams decodeTables
+  where
+   sql = [q|
+@@ -486,13 +484,9 @@ allTables pgVer =
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     LEFT JOIN pg_catalog.pg_description as d on d.objoid = c.oid and d.objsubid = 0
+     WHERE c.relkind IN ('v','r','m','f','p')
+-      AND n.nspname NOT IN ('pg_catalog', 'information_schema') |]
+-      <> relIsNotPartition pgVer <> [q|
++      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+     ORDER BY table_schema, table_name |]
+ 
+-relIsNotPartition :: PgVersion -> SqlQuery
+-relIsNotPartition pgVer = if pgVer >= pgVersion100 then " AND not c.relispartition " else mempty
+-
+ allColumns :: [Table] -> Bool -> SQL.Statement [Schema] [Column]
+ allColumns tabs =
+  SQL.Statement sql (arrayParam HE.text) (decodeColumns tabs)
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 9f716e38..0144ef54 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -152,11 +152,10 @@ connectionStatus appState =
+ loadSchemaCache :: AppState -> IO SCacheStatus
+ loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
+-  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) . transaction SQL.ReadCommitted SQL.Read $
+-      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath actualPgVersion configDbPreparedStatements
++      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
+   case result of
+     Left e -> do
+       let
+diff --git a/test/Feature/InsertSpec.hs b/test/Feature/InsertSpec.hs
+index b05dd806..992d7bea 100644
+--- a/test/Feature/InsertSpec.hs
++++ b/test/Feature/InsertSpec.hs
+@@ -122,10 +122,10 @@ spec actualPgVersion = do
+ 
+       when (actualPgVersion >= pgVersion110) $
+         it "should not throw and return location header for partitioned tables when selecting without PK" $
+-          request methodPost "/car_models" [("Prefer", "return=headers-only")]
+-            [json|{"name":"Enzo","year":2021}|] `shouldRespondWith` ""
++          request methodPost "/partitioned_a" [("Prefer", "return=headers-only")]
++            [json|{"id":5,"name":"first"}|] `shouldRespondWith` ""
+             { matchStatus  = 201
+-            , matchHeaders = [ "Location" <:> "/car_models?name=eq.Enzo&year=eq.2021"
++            , matchHeaders = [ "Location" <:> "/partitioned_a?id=eq.5&name=eq.first"
+                              , "Content-Range" <:> "*/*" ]
+             }
+ 
+diff --git a/test/Feature/OpenApiSpec.hs b/test/Feature/OpenApiSpec.hs
+index e594bb04..4779b642 100644
+--- a/test/Feature/OpenApiSpec.hs
++++ b/test/Feature/OpenApiSpec.hs
+@@ -204,11 +204,11 @@ spec actualPgVersion = describe "OpenAPI" $ do
+       it "includes partitioned table properties" $ do
+         r <- simpleBody <$> get "/"
+ 
+-        let method s = key "paths" . key "/car_models" . key s
++        let method s = key "paths" . key "/partitioned_a" . key s
+             getSummary = r ^? method "get" . key "summary"
+             getDescription = r ^? method "get" . key "description"
+-            getParameterName = r ^? method "get" . key "parameters" . nth 0 . key "$ref"
+-            getParameterYear = r ^? method "get" . key "parameters" . nth 1 . key "$ref"
++            getParameterId = r ^? method "get" . key "parameters" . nth 0 . key "$ref"
++            getParameterName = r ^? method "get" . key "parameters" . nth 1 . key "$ref"
+             getParameterRef = r ^? method "get" . key "parameters" . nth 2 . key "$ref"
+ 
+         liftIO $ do
+@@ -217,12 +217,12 @@ spec actualPgVersion = describe "OpenAPI" $ do
+ 
+           getDescription `shouldBe` Just "A test for partitioned tables"
+ 
+-          getParameterName `shouldBe` Just "#/parameters/rowFilter.car_models.name"
++          getParameterId `shouldBe` Just "#/parameters/rowFilter.partitioned_a.id"
+ 
+-          getParameterYear `shouldBe` Just "#/parameters/rowFilter.car_models.year"
++          getParameterName `shouldBe` Just "#/parameters/rowFilter.partitioned_a.name"
+ 
+           when (actualPgVersion >= pgVersion110) $
+-            getParameterRef `shouldBe` Just "#/parameters/rowFilter.car_models.car_brand_name"
++            getParameterRef `shouldBe` Just "#/parameters/rowFilter.partitioned_a.id_ref"
+ 
+   describe "Materialized view" $
+ 
+diff --git a/test/Feature/OptionsSpec.hs b/test/Feature/OptionsSpec.hs
+index e6bf9e35..63c2d291 100644
+--- a/test/Feature/OptionsSpec.hs
++++ b/test/Feature/OptionsSpec.hs
+@@ -25,7 +25,7 @@ spec actualPgVersion = describe "Allow header" $ do
+   when (actualPgVersion >= pgVersion100) $
+     context "a partitioned table" $ do
+       it "includes read/write verbs for writeable partitioned tables" $ do
+-        r <- request methodOptions "/car_models" [] ""
++        r <- request methodOptions "/partitioned_a" [] ""
+         liftIO $
+           simpleHeaders r `shouldSatisfy`
+             matchHeader "Allow" (
+diff --git a/test/Feature/QuerySpec.hs b/test/Feature/QuerySpec.hs
+index 52272ae0..33b67830 100644
+--- a/test/Feature/QuerySpec.hs
++++ b/test/Feature/QuerySpec.hs
+@@ -399,96 +399,78 @@ spec actualPgVersion = do
+     when (actualPgVersion >= pgVersion110) $ do
+       describe "partitioned tables embedding" $ do
+         it "can request a table as parent from a partitioned table" $
+-          get "/car_models?name=in.(DeLorean,Murcielago)&select=name,year,car_brands(name)&order=name.asc" `shouldRespondWith`
++          get "/partitioned_a?id=in.(1,2)&select=id,name,reference_from_partitioned(id)&order=id.asc" `shouldRespondWith`
+             [json|
+-              [{"name":"DeLorean","year":1981,"car_brands":{"name":"DMC"}},
+-               {"name":"Murcielago","year":2001,"car_brands":{"name":"Lamborghini"}}] |]
++              [{"id":1,"name":"first","reference_from_partitioned":{"id":1}},
++               {"id":2,"name":"first","reference_from_partitioned":null}] |]
+             { matchHeaders = [matchContentTypeJson] }
+ 
+         it "can request partitioned tables as children from a table" $
+-          get "/car_brands?select=name,car_models(name,year)&order=name.asc&car_models.order=name.asc" `shouldRespondWith`
++          get "/reference_from_partitioned?select=id,partitioned_a(id,name)&order=id.asc" `shouldRespondWith`
+             [json|
+-              [{"name":"DMC","car_models":[{"name":"DeLorean","year":1981}]},
+-               {"name":"Ferrari","car_models":[{"name":"F310-B","year":1997}]},
+-               {"name":"Lamborghini","car_models":[{"name":"Murcielago","year":2001},{"name":"Veneno","year":2013}]}] |]
++              [{"id":1,"partitioned_a":[{"id":1,"name":"first"}]},
++               {"id":2,"partitioned_a":[]}] |]
+             { matchHeaders = [matchContentTypeJson] }
+ 
+         when (actualPgVersion >= pgVersion121) $ do
+           it "can request tables as children from a partitioned table" $
+-            get "/car_models?name=in.(DeLorean,F310-B)&select=name,year,car_racers(name)&order=name.asc" `shouldRespondWith`
++            get "/partitioned_a?id=in.(1,2)&select=id,name,reference_to_partitioned(id)&order=id.asc" `shouldRespondWith`
+               [json|
+-                [{"name":"DeLorean","year":1981,"car_racers":[]},
+-                 {"name":"F310-B","year":1997,"car_racers":[{"name":"Michael Schumacher"}]}] |]
++                [{"id":1,"name":"first","reference_to_partitioned":[]},
++                 {"id":2,"name":"first","reference_to_partitioned":[{"id":2}]}] |]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+           it "can request a partitioned table as parent from a table" $
+-            get "/car_racers?select=name,car_models(name,year)&order=name.asc" `shouldRespondWith`
++            get "/reference_to_partitioned?select=id,partitioned_a(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                [{"name":"Alain Prost","car_models":null},
+-                 {"name":"Michael Schumacher","car_models":{"name":"F310-B","year":1997}}] |]
++                [{"id":1,"partitioned_a":null},
++                 {"id":2,"partitioned_a":{"id":2,"name":"first"}}] |]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+           it "can request partitioned tables as children from a partitioned table" $
+-            get "/car_models?name=in.(DeLorean,Murcielago,Veneno)&select=name,year,car_model_sales(date,quantity)&order=name.asc" `shouldRespondWith`
++            get "/partitioned_a?id=in.(1,2,4)&select=id,name,partitioned_b(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                [{"name":"DeLorean","year":1981,"car_model_sales":[{"date":"2021-01-14","quantity":7},{"date":"2021-01-15","quantity":9}]},
+-                 {"name":"Murcielago","year":2001,"car_model_sales":[{"date":"2021-02-11","quantity":1},{"date":"2021-02-12","quantity":3}]},
+-                 {"name":"Veneno","year":2013,"car_model_sales":[]}] |]
++                [{"id":1,"name":"first","partitioned_b":[]},
++                 {"id":2,"name":"first","partitioned_b":[{"id":2,"name":"first_b"}]},
++                 {"id":4,"name":"second","partitioned_b":[{"id":4,"name":"second_b"}]}] |]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+           it "can request a partitioned table as parent from a partitioned table" $ do
+-            get "/car_model_sales?date=in.(2021-01-15,2021-02-11)&select=date,quantity,car_models(name,year)&order=date.asc" `shouldRespondWith`
++            get "/partitioned_b?id=in.(2,4)&select=id,name,partitioned_a(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                [{"date":"2021-01-15","quantity":9,"car_models":{"name":"DeLorean","year":1981}},
+-                 {"date":"2021-02-11","quantity":1,"car_models":{"name":"Murcielago","year":2001}}] |]
++                [{"id":2,"name":"first_b","partitioned_a":{"id":2,"name":"first"}},
++                 {"id":4,"name":"second_b","partitioned_a":{"id":4,"name":"second"}}] |]
+               { matchHeaders = [matchContentTypeJson] }
+ 
+-          it "can request many to many relationships between partitioned tables ignoring the intermediate table partitions" $
+-            get "/car_models?select=name,year,car_dealers(name,city)&order=name.asc&limit=4" `shouldRespondWith`
++          it "can request partitions as children from a partitioned table" $
++            get "/partitioned_a?id=in.(1,2,4)&select=id,name,first_partition_b(id)&order=id.asc" `shouldRespondWith`
+               [json|
+-                [{"name":"DeLorean","year":1981,"car_dealers":[{"name":"Springfield Cars S.A.","city":"Springfield"}]},
+-                 {"name":"F310-B","year":1997,"car_dealers":[]},
+-                 {"name":"Murcielago","year":2001,"car_dealers":[{"name":"The Best Deals S.A.","city":"Franklin"}]},
+-                 {"name":"Veneno","year":2013,"car_dealers":[]}] |]
+-              { matchStatus  = 200
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-          it "cannot request partitions as children from a partitioned table" $
+-            get "/car_models?id=in.(1,2,4)&select=id,name,car_model_sales_202101(id)&order=id.asc" `shouldRespondWith`
+-              [json|
+-                {"hint":"If a new foreign key between these entities was created in the database, try reloading the schema cache.",
+-                 "message":"Could not find a relationship between car_models and car_model_sales_202101 in the schema cache"} |]
+-              { matchStatus  = 400
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-          it "cannot request a partitioned table as parent from a partition" $
+-            get "/car_model_sales_202101?select=id,name,car_models(id,name)&order=id.asc" `shouldRespondWith`
++                [{"id":1,"name":"first","first_partition_b":[]},
++                 {"id":2,"name":"first","first_partition_b":[{"id":2}]},
++                 {"id":4,"name":"second","first_partition_b":[]}] |]
++              { matchHeaders = [matchContentTypeJson] }
++
++          it "can request a partitioned table as parent from a partition" $
++            get "/first_partition_b?select=id,name,partitioned_a(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                {"hint":"If a new foreign key between these entities was created in the database, try reloading the schema cache.",
+-                 "message":"Could not find a relationship between car_model_sales_202101 and car_models in the schema cache"} |]
+-              { matchStatus  = 400
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-          it "cannot request a partition as parent from a partitioned table" $
+-            get "/car_model_sales?id=in.(1,3,4)&select=id,name,car_models_default(id,name)&order=id.asc" `shouldRespondWith`
++                [{"id":1,"name":"first_b","partitioned_a":null},
++                 {"id":2,"name":"first_b","partitioned_a":{"id":2,"name":"first"}}] |]
++              { matchHeaders = [matchContentTypeJson] }
++
++          it "can request a partition as parent from a partitioned table" $
++            get "/partitioned_b?id=in.(1,3,4)&select=id,name,second_partition_a(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                {"hint":"If a new foreign key between these entities was created in the database, try reloading the schema cache.",
+-                 "message":"Could not find a relationship between car_model_sales and car_models_default in the schema cache"} |]
+-              { matchStatus  = 400
+-              , matchHeaders = [matchContentTypeJson]
+-              }
+-
+-          it "cannot request partitioned tables as children from a partition" $
+-            get "/car_models_default?select=id,name,car_model_sales(id,name)&order=id.asc" `shouldRespondWith`
++                [{"id":1,"name":"first_b","second_partition_a":null},
++                 {"id":3,"name":"second_b","second_partition_a":null},
++                 {"id":4,"name":"second_b","second_partition_a":{"id":4,"name":"second"}}] |]
++              { matchHeaders = [matchContentTypeJson] }
++
++          it "can request partitioned tables as children from a partition" $
++            get "/second_partition_a?select=id,name,partitioned_b(id,name)&order=id.asc" `shouldRespondWith`
+               [json|
+-                {"hint":"If a new foreign key between these entities was created in the database, try reloading the schema cache.",
+-                 "message":"Could not find a relationship between car_models_default and car_model_sales in the schema cache"} |]
+-              { matchStatus  = 400
+-              , matchHeaders = [matchContentTypeJson]
+-              }
++                [{"id":3,"name":"second","partitioned_b":[]},
++                 {"id":4,"name":"second","partitioned_b":[{"id":4,"name":"second_b"}]}] |]
++              { matchHeaders = [matchContentTypeJson] }
+ 
+     describe "view embedding" $ do
+       it "can detect fk relations through views to tables in the public schema" $
+diff --git a/test/Feature/UpsertSpec.hs b/test/Feature/UpsertSpec.hs
+index e1962f4c..5e9e6586 100644
+--- a/test/Feature/UpsertSpec.hs
++++ b/test/Feature/UpsertSpec.hs
+@@ -47,13 +47,13 @@ spec actualPgVersion =
+ 
+         when (actualPgVersion >= pgVersion110) $
+           it "INSERTs and UPDATEs rows on composite pk conflict for partitioned tables" $
+-            request methodPost "/car_models" [("Prefer", "return=representation"), ("Prefer", "resolution=merge-duplicates")]
++            request methodPost "/partitioned_a" [("Prefer", "return=representation"), ("Prefer", "resolution=merge-duplicates")]
+               [json| [
+-                { "name": "Murcielago", "year": 2001, "car_brand_name": null},
+-                { "name": "Roma", "year": 2021, "car_brand_name": "Ferrari" }
++                { "id": 4, "name": "second", "id_ref": 2},
++                { "id": 6, "name": "first", "id_ref": 1 }
+               ]|] `shouldRespondWith` [json| [
+-                { "name": "Murcielago", "year": 2001, "car_brand_name": null},
+-                { "name": "Roma", "year": 2021, "car_brand_name": "Ferrari" }
++                { "id": 4, "name": "second", "id_ref": 2 },
++                { "id": 6, "name": "first", "id_ref": 1 }
+               ]|]
+               { matchStatus = 201
+               , matchHeaders = ["Preference-Applied" <:> "resolution=merge-duplicates", matchContentTypeJson]
+@@ -117,12 +117,12 @@ spec actualPgVersion =
+ 
+         when (actualPgVersion >= pgVersion110) $
+           it "INSERTs and ignores rows on composite pk conflict for partitioned tables" $
+-            request methodPost "/car_models" [("Prefer", "return=representation"), ("Prefer", "resolution=ignore-duplicates")]
++            request methodPost "/partitioned_a" [("Prefer", "return=representation"), ("Prefer", "resolution=ignore-duplicates")]
+               [json| [
+-                { "name": "Murcielago", "year": 2001, "car_brand_name": "Ferrari" },
+-                { "name": "Huracán", "year": 2021, "car_brand_name": "Lamborghini" }
++                { "id": 4, "name": "second", "id_ref": 1 },
++                { "id": 7, "name": "second", "id_ref": 2 }
+               ]|] `shouldRespondWith` [json| [
+-                { "name": "Huracán", "year": 2021, "car_brand_name": "Lamborghini" }
++                { "id": 7, "name": "second", "id_ref": 2 }
+               ]|]
+               { matchStatus = 201
+               , matchHeaders = ["Preference-Applied" <:> "resolution=ignore-duplicates", matchContentTypeJson]
+@@ -296,15 +296,15 @@ spec actualPgVersion =
+         when (actualPgVersion >= pgVersion110) $
+           it "succeeds on a partitioned table with composite pk" $ do
+             -- assert that the next request will indeed be an insert
+-            get "/car_models?name=eq.Supra&year=eq.2021"
++            get "/partitioned_a?id=eq.8&name=eq.first"
+               `shouldRespondWith`
+                 [json|[]|]
+ 
+-            request methodPut "/car_models?name=eq.Supra&year=eq.2021"
++            request methodPut "/partitioned_a?id=eq.8&name=eq.first"
+                 [("Prefer", "return=representation")]
+-                [json| [ { "name": "Supra", "year": 2021 } ]|]
++                [json| [ { "id": 8, "name": "first" } ]|]
+               `shouldRespondWith`
+-                [json| [ { "name": "Supra", "year": 2021, "car_brand_name": null } ]|]
++                [json| [ { "id": 8, "name": "first", "id_ref": null } ]|]
+ 
+         it "succeeds if the table has only PK cols and no other cols" $ do
+           -- assert that the next request will indeed be an insert
+@@ -360,15 +360,15 @@ spec actualPgVersion =
+         when (actualPgVersion >= pgVersion110) $
+           it "succeeds on a partitioned table with composite pk" $ do
+             -- assert that the next request will indeed be an update
+-            get "/car_models?name=eq.DeLorean&year=eq.1981"
++            get "/partitioned_a?id=eq.2&name=eq.first"
+               `shouldRespondWith`
+-                [json| [ { "name": "DeLorean", "year": 1981, "car_brand_name": "DMC" } ]|]
++                [json| [ { "id": 2, "name": "first", "id_ref": null } ]|]
+ 
+-            request methodPut "/car_models?name=eq.DeLorean&year=eq.1981"
++            request methodPut "/partitioned_a?id=eq.2&name=eq.first"
+                 [("Prefer", "return=representation")]
+-                [json| [ { "name": "DeLorean", "year": 1981, "car_brand_name": null } ]|]
++                [json| [ { "id": 2, "name": "first", "id_ref": 1 } ]|]
+               `shouldRespondWith`
+-                [json| [ { "name": "DeLorean", "year": 1981, "car_brand_name": null } ]|]
++                [json| [ { "id": 2, "name": "first", "id_ref": 1 } ]|]
+ 
+         it "succeeds if the table has only PK cols and no other cols" $ do
+           -- assert that the next request will indeed be an update
+diff --git a/test/Main.hs b/test/Main.hs
+index 85d714c4..7bbc34f8 100644
+--- a/test/Main.hs
++++ b/test/Main.hs
+@@ -69,7 +69,6 @@ main = do
+     loadDbStructure pool
+       (configDbSchemas $ testCfg testDbConn)
+       (configDbExtraSearchPath $ testCfg testDbConn)
+-      actualPgVersion
+ 
+   let
+     -- For tests that run with the same refDbStructure
+@@ -89,7 +88,6 @@ main = do
+         loadDbStructure pool
+           (configDbSchemas config)
+           (configDbExtraSearchPath config)
+-          actualPgVersion
+       appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putDbStructure appState customDbStructure
+@@ -239,5 +237,5 @@ main = do
+       describe "Feature.RollbackForcedSpec" Feature.RollbackSpec.forced
+ 
+   where
+-    loadDbStructure pool schemas extraSearchPath actualPgVersion =
+-      either (panic.show) id <$> P.use pool (HT.transaction HT.ReadCommitted HT.Read $ queryDbStructure (toList schemas) extraSearchPath actualPgVersion True)
++    loadDbStructure pool schemas extraSearchPath =
++      either (panic.show) id <$> P.use pool (HT.transaction HT.ReadCommitted HT.Read $ queryDbStructure (toList schemas) extraSearchPath True)
+diff --git a/test/fixtures/data.sql b/test/fixtures/data.sql
+index d44f9e07..6573b11f 100644
+--- a/test/fixtures/data.sql
++++ b/test/fixtures/data.sql
+@@ -670,37 +670,26 @@ INSERT INTO private.personnages (film_id, role_id, character) VALUES (12,1,'méc
+ 
+ DO $do$BEGIN
+   IF (SELECT current_setting('server_version_num')::INT >= 100000) THEN
+-    INSERT INTO test.car_models(name, year) VALUES ('DeLorean',1981);
+-    INSERT INTO test.car_models(name, year) VALUES ('F310-B',1997);
+-    INSERT INTO test.car_models(name, year) VALUES ('Veneno',2013);
+-    INSERT INTO test.car_models(name, year) VALUES ('Murcielago',2001);
++    INSERT INTO test.partitioned_a(id, name) VALUES (1,'first');
++    INSERT INTO test.partitioned_a(id, name) VALUES (2,'first');
++    INSERT INTO test.partitioned_a(id, name) VALUES (3,'second');
++    INSERT INTO test.partitioned_a(id, name) VALUES (4,'second');
+   END IF;
+ 
+   IF (SELECT current_setting('server_version_num')::INT >= 110000) THEN
+-    INSERT INTO test.car_brands(name) VALUES ('DMC');
+-    INSERT INTO test.car_brands(name) VALUES ('Ferrari');
+-    INSERT INTO test.car_brands(name) VALUES ('Lamborghini');
+-
+-    UPDATE test.car_models SET car_brand_name = 'DMC' WHERE name = 'DeLorean';
+-    UPDATE test.car_models SET car_brand_name = 'Ferrari' WHERE name = 'F310-B';
+-    UPDATE test.car_models SET car_brand_name = 'Lamborghini' WHERE name = 'Veneno';
+-    UPDATE test.car_models SET car_brand_name = 'Lamborghini' WHERE name = 'Murcielago';
++    INSERT INTO test.reference_from_partitioned(id) VALUES (1),(2);
++
++    UPDATE test.partitioned_a SET id_ref = 1 WHERE id = 1;
+   END IF;
+ 
+   IF (SELECT current_setting('server_version_num')::INT >= 120000) THEN
+-    INSERT INTO test.car_model_sales(date, quantity, car_model_name, car_model_year) VALUES ('2021-01-14',7,'DeLorean',1981);
+-    INSERT INTO test.car_model_sales(date, quantity, car_model_name, car_model_year) VALUES ('2021-01-15',9,'DeLorean',1981);
+-    INSERT INTO test.car_model_sales(date, quantity, car_model_name, car_model_year) VALUES ('2021-02-11',1,'Murcielago',2001);
+-    INSERT INTO test.car_model_sales(date, quantity, car_model_name, car_model_year) VALUES ('2021-02-12',3,'Murcielago',2001);
+-
+-    INSERT INTO test.car_racers(name) VALUES ('Alain Prost');
+-    INSERT INTO test.car_racers(name, car_model_name, car_model_year) VALUES ('Michael Schumacher', 'F310-B', 1997);
+-
+-    INSERT INTO test.car_dealers(name,city) VALUES ('Springfield Cars S.A.','Springfield');
+-    INSERT INTO test.car_dealers(name,city) VALUES ('The Best Deals S.A.','Franklin');
++    INSERT INTO test.partitioned_b(id, name) VALUES (1,'first_b');
++    INSERT INTO test.partitioned_b(id, name, id_a, name_a) VALUES (2,'first_b', 2, 'first');
++    INSERT INTO test.partitioned_b(id, name) VALUES (3,'second_b');
++    INSERT INTO test.partitioned_b(id, name, id_a, name_a) VALUES (4,'second_b', 4, 'second');
+ 
+-    INSERT INTO test.car_models_car_dealers(car_model_name, car_model_year, car_dealer_name, car_dealer_city, quantity) VALUES ('DeLorean',1981,'Springfield Cars S.A.','Springfield',15);
+-    INSERT INTO test.car_models_car_dealers(car_model_name, car_model_year, car_dealer_name, car_dealer_city, quantity) VALUES ('Murcielago',2001,'The Best Deals S.A.','Franklin',2);
++    INSERT INTO test.reference_to_partitioned(id) VALUES (1);
++    INSERT INTO test.reference_to_partitioned(id, id_a, name_a) VALUES (2, 2, 'first');
+   END IF;
+ END$do$;
+ 
+diff --git a/test/fixtures/privileges.sql b/test/fixtures/privileges.sql
+index df5311e8..1a73cd45 100644
+--- a/test/fixtures/privileges.sql
++++ b/test/fixtures/privileges.sql
+@@ -192,25 +192,19 @@ GRANT USAGE ON SCHEMA test TO postgrest_test_default_role;
+ 
+ DO $do$BEGIN
+   IF (SELECT current_setting('server_version_num')::INT >= 100000) THEN
+-    GRANT ALL ON TABLE test.car_models TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_models_2021 TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_models_default TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.partitioned_a TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.first_partition_a TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.second_partition_a TO postgrest_test_anonymous;
+   END IF;
+ 
+   IF (SELECT current_setting('server_version_num')::INT >= 110000) THEN
+-    GRANT ALL ON TABLE test.car_brands TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.reference_from_partitioned TO postgrest_test_anonymous;
+   END IF;
+ 
+   IF (SELECT current_setting('server_version_num')::INT >= 120000) THEN
+-    GRANT ALL ON TABLE test.car_model_sales TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_model_sales_202101 TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_model_sales_default TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_racers TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_dealers TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_dealers_springfield TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_dealers_default TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_models_car_dealers TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_models_car_dealers_10to20 TO postgrest_test_anonymous;
+-    GRANT ALL ON TABLE test.car_models_car_dealers_default TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.partitioned_b TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.first_partition_b TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.second_partition_b TO postgrest_test_anonymous;
++    GRANT ALL ON TABLE test.reference_to_partitioned TO postgrest_test_anonymous;
+   END IF;
+ END$do$;
+\ No newline at end of file
+diff --git a/test/fixtures/schema.sql b/test/fixtures/schema.sql
+index fe60d9e9..dcf1364a 100644
+--- a/test/fixtures/schema.sql
++++ b/test/fixtures/schema.sql
+@@ -2245,83 +2245,56 @@ create table private.rollen (
+ do $do$begin
+     -- partitioned tables using the PARTITION syntax are supported from pg v10
+     if (select current_setting('server_version_num')::int >= 100000) then
+-      create table test.car_models(
+-        name varchar(64) not null,
+-        year int not null
+-      ) partition by list (year);
++      create table test.partitioned_a(
++        id int not null,
++        name varchar(64) not null
++      ) partition by list (name);
+ 
+-      comment on table test.car_models is
++      comment on table test.partitioned_a is
+       $$A partitioned table
+ 
+ A test for partitioned tables$$;
+ 
+-      create table test.car_models_2021 partition of test.car_models
+-        for values in (2021);
+-      create table test.car_models_default partition of test.car_models
+-        for values in (1981,1997,2001,2013);
++      create table test.first_partition_a partition of test.partitioned_a
++        for values in ('first');
++
++      create table test.second_partition_a partition of test.partitioned_a
++        for values in ('second');
+     end if;
+ 
+     -- primary keys for partitioned tables are supported from pg v11
+     if (select current_setting('server_version_num')::int >= 110000) then
+-      create table test.car_brands (
+-        name varchar(64) primary key
++      create table test.reference_from_partitioned (
++        id int primary key
+       );
+ 
+-      alter table test.car_models add primary key (name, year);
+-      alter table test.car_models add column car_brand_name varchar(64) references test.car_brands(name);
++      alter table test.partitioned_a add primary key (id, name);
++      alter table test.partitioned_a add column id_ref int references test.reference_from_partitioned(id);
+     end if;
+ 
+     -- foreign keys referencing partitioned tables are supported from pg v12
+     if (select current_setting('server_version_num')::int >= 120000) then
+-      create table test.car_model_sales(
+-        date varchar(64) not null,
+-        quantity int not null,
+-        car_model_name varchar(64),
+-        car_model_year int,
+-        primary key (date, car_model_name, car_model_year),
+-        foreign key (car_model_name, car_model_year) references test.car_models (name, year)
+-      ) partition by range (date);
+-
+-      create table test.car_model_sales_202101 partition of test.car_model_sales
+-        for values from ('2021-01-01') to ('2021-01-31');
+-
+-      create table test.car_model_sales_default partition of test.car_model_sales
+-        default;
+-
+-      create table test.car_racers (
+-        name varchar(64) not null primary key,
+-        car_model_name varchar(64),
+-        car_model_year int,
+-        foreign key (car_model_name, car_model_year) references test.car_models (name, year)
+-      );
+-
+-      create table test.car_dealers (
++      create table test.partitioned_b(
++        id int not null,
+         name varchar(64) not null,
+-        city varchar(64) not null,
+-        primary key (name, city)
+-      ) partition by list (city);
+-
+-      create table test.car_dealers_springfield partition of test.car_dealers
+-        for values in ('Springfield');
+-
+-      create table test.car_dealers_default partition of test.car_dealers
+-        default;
+-
+-      create table test.car_models_car_dealers (
+-        car_model_name varchar(64) not null,
+-        car_model_year int not null,
+-        car_dealer_name varchar(64) not null,
+-        car_dealer_city varchar(64) not null,
+-        quantity int not null,
+-        foreign key (car_model_name, car_model_year) references test.car_models (name, year),
+-        foreign key (car_dealer_name, car_dealer_city) references test.car_dealers (name, city)
+-      ) partition by range (quantity);
+-
+-      create table test.car_models_car_dealers_10to20 partition of test.car_models_car_dealers
+-        for values from (10) to (20);
+-
+-      create table test.car_models_car_dealers_default partition of test.car_models_car_dealers
+-        default;
++        id_a int,
++        name_a varchar(64),
++        primary key (id, name),
++        foreign key (id_a, name_a) references test.partitioned_a (id, name)
++      ) partition by list (name);
++
++      create table test.first_partition_b partition of test.partitioned_b
++        for values in ('first_b');
++
++      create table test.second_partition_b partition of test.partitioned_b
++        for values in ('second_b');
++
++      create table test.reference_to_partitioned (
++        id int not null primary key,
++        id_a int,
++        name_a varchar(64),
++        foreign key (id_a, name_a) references test.partitioned_a (id, name)
++      );
+     end if;
+ end$do$;
+ 

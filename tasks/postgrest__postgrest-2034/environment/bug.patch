@@ -1,0 +1,429 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 878eebd9..d7a44082 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,7 +14,9 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + Enables uploading bytea to a function with `Content-Type: application/octet-stream`
+    + Enables uploading raw text to a function with `Content-Type: text/plain`
+ - #1938, Allow escaping inside double quotes with a backslash, e.g. `?col=in.("Double\"Quote")`, `?col=in.("Back\\slash")` - @steve-chavez
+-- #1075, Allow filtering top-level resource based on embedded resources filters. This is enabled by adding `!inner` to the embedded resource, e.g. `/projects?select=*,clients!inner(*)&clients.id=eq.12`- @steve-chavez, @Iced-Sun
++- #1075, Allow filtering top-level resource based on embedded resources filters - @steve-chavez, @Iced-Sun
++   + This is enabled by adding `!inner` to the embedded resource, e.g. `/projects?select=*,clients!inner(*)&clients.id=eq.12`
++   + This behavior can be enabled by default with the `db-embed-default-join='inner'` config option, which saves the need for specifying `!inner` on every request. In this case, you can go back to the previous behavior per request by specifying `!left`  on the embedded resource, e.g `/projects?select=*,clients!left(*)&clients.id=eq.12`
+ - #1988, Allow specifying `unknown` for the `is` operator - @steve-chavez
+ 
+ ### Fixed
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 0d503db9..922306d9 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -572,7 +572,7 @@ returnsScalar _                   = False
+ readRequest :: Monad m => QualifiedIdentifier -> RequestContext -> Handler m ReadRequest
+ readRequest QualifiedIdentifier{..} (RequestContext AppConfig{..} dbStructure apiRequest _) =
+   liftEither $
+-    ReqBuilder.readRequest qiSchema qiName configDbMaxRows
++    ReqBuilder.readRequest qiSchema qiName configDbMaxRows configDbEmbedDefaultJoin
+       (dbRelationships dbStructure)
+       apiRequest
+ 
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 6cd604df..95346e20 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -168,6 +168,10 @@ exampleConfigFile =
+       |## Enable in-database configuration
+       |db-config = true
+       |
++      |## Determines the default join type when resource embedding
++      |## Admitted values: left, inner
++      |db-embed-default-join = "left"
++      |
+       |## Determine if GUC request settings for headers, cookies and jwt claims use the legacy names (string with dashes, invalid starting from PostgreSQL v14) with text values instead of the new names (string without dashes, valid on all PostgreSQL versions) with json values.
+       |## For PostgreSQL v14 and up, this setting will be ignored.
+       |db-use-legacy-gucs = true
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 6f8c19ab..e5131eeb 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -57,6 +57,7 @@ import PostgREST.Config.Proxy            (Proxy (..),
+                                           isMalformedProxyUri, toURI)
+ import PostgREST.DbStructure.Identifiers (QualifiedIdentifier, dumpQi,
+                                           toQi)
++import PostgREST.Request.Types           (JoinType (..))
+ 
+ import Protolude hiding (Proxy, toList)
+ 
+@@ -78,6 +79,7 @@ data AppConfig = AppConfig
+   , configDbTxAllowOverride     :: Bool
+   , configDbTxRollbackAll       :: Bool
+   , configDbUri                 :: Text
++  , configDbEmbedDefaultJoin    :: JoinType
+   , configDbUseLegacyGucs       :: Bool
+   , configFilePath              :: Maybe FilePath
+   , configJWKS                  :: Maybe JWKSet
+@@ -134,6 +136,7 @@ toText conf =
+       ,("db-config",                 q . T.toLower . show . configDbConfig)
+       ,("db-tx-end",                 q . showTxEnd)
+       ,("db-uri",                    q . configDbUri)
++      ,("db-embed-default-join",     q . dumpJoin . configDbEmbedDefaultJoin)
+       ,("db-use-legacy-gucs",            T.toLower . show . configDbUseLegacyGucs)
+       ,("jwt-aud",                       T.decodeUtf8 . LBS.toStrict . JSON.encode . maybe "" toJSON . configJwtAudience)
+       ,("jwt-role-claim-key",        q . T.intercalate mempty . fmap dumpJSPath . configJwtRoleClaimKey)
+@@ -167,6 +170,9 @@ toText conf =
+         secret = fromMaybe mempty $ configJwtSecret c
+     showSocketMode c = showOct (configServerUnixSocketMode c) mempty
+ 
++    dumpJoin JTInner = "inner"
++    dumpJoin JTLeft  = "left"
++
+ -- This class is needed for the polymorphism of overrideFromDbOrEnvironment
+ -- because C.required and C.optional have different signatures
+ class JustIfMaybe a b where
+@@ -225,6 +231,7 @@ parser optPath env dbSettings =
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+     <*> reqString "db-uri"
++    <*> parseEmbedDefaultJoin "db-embed-default-join"
+     <*> (fromMaybe True <$> optBool "db-use-legacy-gucs")
+     <*> pure optPath
+     <*> pure Nothing
+@@ -308,6 +315,14 @@ parser optPath env dbSettings =
+         Just "rollback-allow-override" -> pure $ f (True,       True)
+         Just _                         -> fail "Invalid transaction termination. Check your configuration."
+ 
++    parseEmbedDefaultJoin :: C.Key -> C.Parser C.Config JoinType
++    parseEmbedDefaultJoin k =
++      optString k >>= \case
++        Nothing      -> pure JTLeft
++        Just "left"  -> pure JTLeft
++        Just "inner" -> pure JTInner
++        Just _       -> fail "Invalid db-embed-default-join. Check your configuration."
++
+     parseRoleClaimKey :: C.Key -> C.Key -> C.Parser C.Config JSPath
+     parseRoleClaimKey k al =
+       optWithAlias (optString k) (optString al) >>= \case
+diff --git a/src/PostgREST/Query/QueryBuilder.hs b/src/PostgREST/Query/QueryBuilder.hs
+index f25797ae..09ed04e9 100644
+--- a/src/PostgREST/Query/QueryBuilder.hs
++++ b/src/PostgREST/Query/QueryBuilder.hs
+@@ -50,18 +50,18 @@ readRequestToQuery (Node (Select colSelects mainQi tblAlias implJoins logicFores
+     (joins, selects) = foldr getJoinsSelects ([],[]) forest
+ 
+ getJoinsSelects :: ReadRequest -> ([SQL.Snippet], [SQL.Snippet]) -> ([SQL.Snippet], [SQL.Snippet])
+-getJoinsSelects rr@(Node (_, (name, Just Relationship{relCardinality=card,relTable=Table{tableName=table}}, alias, _, joinType, _)) _) (joins,selects) =
++getJoinsSelects rr@(Node (_, (name, Just Relationship{relCardinality=card,relTable=Table{tableName=table}}, alias, _, Just joinType, _)) _) (joins,selects) =
+   let subquery = readRequestToQuery rr in
+   case card of
+     M2O _ ->
+       let aliasOrName = fromMaybe name alias
+           localTableName = pgFmtIdent $ table <> "_" <> aliasOrName
+           sel = SQL.sql ("row_to_json(" <> localTableName <> ".*) AS " <> pgFmtIdent aliasOrName)
+-          joi = (if joinType == Just JTInner then " INNER" else " LEFT")
++          joi = (if joinType == JTInner then " INNER" else " LEFT")
+             <> " JOIN LATERAL( " <> subquery <> " ) AS " <> SQL.sql localTableName <> " ON TRUE " in
+       (joi:joins,sel:selects)
+     _ -> case joinType of
+-      Just JTInner ->
++      JTInner ->
+         let aliasOrName = fromMaybe name alias
+             locTblName = table <> "_" <> aliasOrName
+             localTableName = pgFmtIdent locTblName
+@@ -72,13 +72,13 @@ getJoinsSelects rr@(Node (_, (name, Just Relationship{relCardinality=card,relTab
+                     "FROM (" <> subquery <> " ) AS " <> SQL.sql internalTableName <>
+                   ") AS " <> SQL.sql localTableName <> " ON " <> SQL.sql localTableName <> "IS NOT NULL" in
+         (joi:joins,sel:selects)
+-      _ ->
++      JTLeft ->
+         let sel = "COALESCE (("
+                <> "SELECT json_agg(" <> SQL.sql (pgFmtIdent table) <> ".*) "
+                <> "FROM (" <> subquery <> ") " <> SQL.sql (pgFmtIdent table) <> " "
+                <> "), '[]') AS " <> SQL.sql (pgFmtIdent (fromMaybe name alias)) in
+         (joins,sel:selects)
+-getJoinsSelects (Node (_, (_, Nothing, _, _, _, _)) _) _ = ([], [])
++getJoinsSelects _ _ = ([], [])
+ 
+ mutateRequestToQuery :: MutateRequest -> SQL.Snippet
+ mutateRequestToQuery (Insert mainQi iCols body onConflct putConditions returnings) =
+diff --git a/src/PostgREST/Request/DbRequestBuilder.hs b/src/PostgREST/Request/DbRequestBuilder.hs
+index 35af9962..ebfd1079 100644
+--- a/src/PostgREST/Request/DbRequestBuilder.hs
++++ b/src/PostgREST/Request/DbRequestBuilder.hs
+@@ -61,11 +61,11 @@ import Protolude hiding (from)
+ -- | Builds the ReadRequest tree on a number of stages.
+ -- | Adds filters, order, limits on its respective nodes.
+ -- | Adds joins conditions obtained from resource embedding.
+-readRequest :: Schema -> TableName -> Maybe Integer -> [Relationship] -> ApiRequest -> Either Error ReadRequest
+-readRequest schema rootTableName maxRows allRels apiRequest  =
++readRequest :: Schema -> TableName -> Maybe Integer -> JoinType -> [Relationship] -> ApiRequest -> Either Error ReadRequest
++readRequest schema rootTableName maxRows defJoinType allRels apiRequest  =
+   mapLeft ApiRequestError $
+   treeRestrictRange maxRows =<<
+-  augmentRequestWithJoin schema rootRels =<<
++  augmentRequestWithJoin schema rootRels defJoinType =<<
+   (addFiltersOrdersRanges apiRequest . initReadRequest rootName =<< pRequestSelect sel)
+   where
+     sel = fromMaybe "*" $ iSelect apiRequest -- default to all columns requested (SELECT *) for a non existent ?select querystring param
+@@ -119,17 +119,17 @@ treeRestrictRange maxRows request = pure $ nodeRestrictRange maxRows <$> request
+     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
+     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
+ 
+-augmentRequestWithJoin :: Schema -> [Relationship] -> ReadRequest -> Either ApiRequestError ReadRequest
+-augmentRequestWithJoin schema allRels request =
+-  addRels schema allRels Nothing request
++augmentRequestWithJoin :: Schema -> [Relationship] -> JoinType -> ReadRequest -> Either ApiRequestError ReadRequest
++augmentRequestWithJoin schema allRels defJoinType request =
++  addRels schema allRels Nothing defJoinType request
+   >>= addJoinConditions Nothing
+ 
+-addRels :: Schema -> [Relationship] -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+-addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
++addRels :: Schema -> [Relationship] -> Maybe ReadRequest -> JoinType -> ReadRequest -> Either ApiRequestError ReadRequest
++addRels schema allRels parentNode defJoinType (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, joinType, depth)) forest) =
+   case parentNode of
+     Just (Node (Select{from=parentNodeQi}, _) _) ->
+       let newFrom r = if qiName tbl == nodeName then tableQi (relForeignTable r) else tbl
+-          newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType, depth))) <$> rel
++          newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, hint, joinType <|> Just defJoinType, depth))) <$> rel
+           rel = findRel schema allRels (qiName parentNodeQi) nodeName hint
+       in
+       Node <$> newReadNode <*> (updateForest . hush $ Node <$> newReadNode <*> pure forest)
+@@ -138,7 +138,7 @@ addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, a
+       Node rn <$> updateForest (Just $ Node rn forest)
+   where
+     updateForest :: Maybe ReadRequest -> Either ApiRequestError [ReadRequest]
+-    updateForest rq = addRels schema allRels rq `traverse` forest
++    updateForest rq = addRels schema allRels rq defJoinType `traverse` forest
+ 
+ -- Finds a relationship between an origin and a target in the request:
+ -- /origin?select=target(*) If more than one relationship is found then the
+diff --git a/test/Feature/EmbedInnerJoinSpec.hs b/test/Feature/EmbedInnerJoinSpec.hs
+index 47c5c7a9..4f5a9473 100644
+--- a/test/Feature/EmbedInnerJoinSpec.hs
++++ b/test/Feature/EmbedInnerJoinSpec.hs
+@@ -240,7 +240,38 @@ spec =
+         ]|]
+         { matchHeaders = [matchContentTypeJson] }
+ 
+-    it "can use default left join behavior explicitly" $
++notDefaultConfig :: SpecWith ((), Application)
++notDefaultConfig =
++  describe "Embedding with a default inner join(db-embed-default-join = 'inner')" $ do
++    it "works on many-to-one relationships" $
++      get "/tasks?select=id,projects(id,clients(id))&projects.clients.id=eq.1" `shouldRespondWith`
++        [json|[
++          {"id":1,"projects":{"id":1,"clients":{"id":1}}},
++          {"id":2,"projects":{"id":1,"clients":{"id":1}}},
++          {"id":3,"projects":{"id":2,"clients":{"id":1}}},
++          {"id":4,"projects":{"id":2,"clients":{"id":1}}}]|]
++        { matchHeaders = [matchContentTypeJson] }
++
++    it "works on one-to-many relationships" $
++      get "/entities?select=id,child_entities(id,grandchild_entities(id))&child_entities.grandchild_entities.id=in.(1,5)"
++        `shouldRespondWith`
++        [json|[
++          {
++            "id": 1,
++            "child_entities": [
++              { "id": 1, "grandchild_entities": [ { "id": 1 } ] },
++              { "id": 2, "grandchild_entities": [ { "id": 5 } ] }]
++          }
++        ]|]
++        { matchHeaders = [matchContentTypeJson] }
++
++    it "works on many-to-many relationships" $
++      get "/products?select=id,suppliers(id,trade_unions(id))&suppliers.trade_unions.id=eq.3"
++        `shouldRespondWith`
++        [json|[{"id":1,"suppliers":[{"id":2,"trade_unions":[{"id":3}]}]}] |]
++        { matchHeaders = [matchContentTypeJson] }
++
++    it "can restore default left join behavior" $
+       get "/projects?select=id,clients!left(id)" `shouldRespondWith`
+         [json|[
+           {"id":1,"clients":{"id":1}}, {"id":2,"clients":{"id":1}},
+diff --git a/test/Main.hs b/test/Main.hs
+index c5b4b84e..85d714c4 100644
+--- a/test/Main.hs
++++ b/test/Main.hs
+@@ -99,6 +99,7 @@ main = do
+ 
+   let withApp              = app testCfg
+       maxRowsApp           = app testMaxRowsCfg
++      embedInnerJoinApp    = app testEmbedInnerJoinCfg
+       disabledOpenApi      = app testDisabledOpenApiCfg
+       proxyApp             = app testProxyCfg
+       noJwtApp             = app testCfgNoJWT
+@@ -218,6 +219,10 @@ main = do
+     parallel $ before testCfgLegacyGucsApp $
+       describe "Feature.LegacyGucsSpec" Feature.LegacyGucsSpec.spec
+ 
++    -- this test runs with db-embed-default-join = inner
++    before embedInnerJoinApp $
++      describe "Feature.EmbedInnerJoinSpecNotDefaultConfig" Feature.EmbedInnerJoinSpec.notDefaultConfig
++
+     -- Note: the rollback tests can not run in parallel, because they test persistance and
+     -- this results in race conditions
+ 
+diff --git a/test/SpecHelper.hs b/test/SpecHelper.hs
+index f1346756..39ab5a6f 100644
+--- a/test/SpecHelper.hs
++++ b/test/SpecHelper.hs
+@@ -28,6 +28,7 @@ import PostgREST.Config                  (AppConfig (..),
+                                           OpenAPIMode (..),
+                                           parseSecret)
+ import PostgREST.DbStructure.Identifiers (QualifiedIdentifier (..))
++import PostgREST.Request.Types           (JoinType (..))
+ import Protolude                         hiding (toS)
+ import Protolude.Conv                    (toS)
+ 
+@@ -89,6 +90,7 @@ _baseCfg = let secret = Just $ encodeUtf8 "reallyreallyreallyreallyverysafe" in
+   , configDbSchemas             = fromList ["test"]
+   , configDbConfig              = False
+   , configDbUri                 = mempty
++  , configDbEmbedDefaultJoin    = JTLeft
+   , configDbUseLegacyGucs       = True
+   , configFilePath              = Nothing
+   , configJWKS                  = parseSecret <$> secret
+@@ -126,6 +128,9 @@ testUnicodeCfg testDbConn = (testCfg testDbConn) { configDbSchemas = fromList ["
+ testMaxRowsCfg :: Text -> AppConfig
+ testMaxRowsCfg testDbConn = (testCfg testDbConn) { configDbMaxRows = Just 2 }
+ 
++testEmbedInnerJoinCfg :: Text -> AppConfig
++testEmbedInnerJoinCfg testDbConn = (testCfg testDbConn) { configDbEmbedDefaultJoin = JTInner }
++
+ testDisabledOpenApiCfg :: Text -> AppConfig
+ testDisabledOpenApiCfg testDbConn = (testCfg testDbConn) { configOpenApiMode = OADisabled }
+ 
+diff --git a/test/io-tests/configs/expected/aliases.config b/test/io-tests/configs/expected/aliases.config
+index b8cd55fd..59ab960a 100644
+--- a/test/io-tests/configs/expected/aliases.config
++++ b/test/io-tests/configs/expected/aliases.config
+@@ -12,6 +12,7 @@ db-schemas = "provided_through_alias"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
++db-embed-default-join = "left"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"aliased\""
+diff --git a/test/io-tests/configs/expected/boolean-numeric.config b/test/io-tests/configs/expected/boolean-numeric.config
+index cc67e089..da5c9e70 100644
+--- a/test/io-tests/configs/expected/boolean-numeric.config
++++ b/test/io-tests/configs/expected/boolean-numeric.config
+@@ -12,6 +12,7 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
++db-embed-default-join = "left"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io-tests/configs/expected/boolean-string.config b/test/io-tests/configs/expected/boolean-string.config
+index cc67e089..da5c9e70 100644
+--- a/test/io-tests/configs/expected/boolean-string.config
++++ b/test/io-tests/configs/expected/boolean-string.config
+@@ -12,6 +12,7 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
++db-embed-default-join = "left"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io-tests/configs/expected/defaults.config b/test/io-tests/configs/expected/defaults.config
+index 792b60e0..25508c7b 100644
+--- a/test/io-tests/configs/expected/defaults.config
++++ b/test/io-tests/configs/expected/defaults.config
+@@ -12,6 +12,7 @@ db-schemas = "required"
+ db-config = "false"
+ db-tx-end = "commit"
+ db-uri = "required"
++db-embed-default-join = "left"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+index f40efe77..f26c0cdb 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db-other-authenticator.config
+@@ -12,6 +12,7 @@ db-schemas = "test,other_tenant1,other_tenant2"
+ db-config = "true"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "<REPLACED_WITH_DB_URI>"
++db-embed-default-join = "inner"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://otherexample.org"
+ jwt-role-claim-key = ".\"other\".\"role\""
+diff --git a/test/io-tests/configs/expected/no-defaults-with-db.config b/test/io-tests/configs/expected/no-defaults-with-db.config
+index 82850fca..90814363 100644
+--- a/test/io-tests/configs/expected/no-defaults-with-db.config
++++ b/test/io-tests/configs/expected/no-defaults-with-db.config
+@@ -12,6 +12,7 @@ db-schemas = "test,tenant1,tenant2"
+ db-config = "true"
+ db-tx-end = "commit-allow-override"
+ db-uri = "<REPLACED_WITH_DB_URI>"
++db-embed-default-join = "inner"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://example.org"
+ jwt-role-claim-key = ".\"a\".\"role\""
+diff --git a/test/io-tests/configs/expected/no-defaults.config b/test/io-tests/configs/expected/no-defaults.config
+index 8723c036..fb3bcab9 100644
+--- a/test/io-tests/configs/expected/no-defaults.config
++++ b/test/io-tests/configs/expected/no-defaults.config
+@@ -12,6 +12,7 @@ db-schemas = "multi,tenant,setup"
+ db-config = "false"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
++db-embed-default-join = "inner"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".\"user\"[0].\"real-role\""
+diff --git a/test/io-tests/configs/expected/types.config b/test/io-tests/configs/expected/types.config
+index b2b85898..1d3b6c22 100644
+--- a/test/io-tests/configs/expected/types.config
++++ b/test/io-tests/configs/expected/types.config
+@@ -12,6 +12,7 @@ db-schemas = "required"
+ db-config = "true"
+ db-tx-end = "commit"
+ db-uri = "required"
++db-embed-default-join = "left"
+ db-use-legacy-gucs = true
+ jwt-aud = ""
+ jwt-role-claim-key = ".\"role\""
+diff --git a/test/io-tests/configs/no-defaults.config b/test/io-tests/configs/no-defaults.config
+index 01cd53a7..f09deff3 100644
+--- a/test/io-tests/configs/no-defaults.config
++++ b/test/io-tests/configs/no-defaults.config
+@@ -12,6 +12,7 @@ db-schemas = "multi,   tenant,setup"
+ db-config = "false"
+ db-tx-end = "rollback-allow-override"
+ db-uri = "tmp_db"
++db-embed-default-join = "inner"
+ db-use-legacy-gucs = false
+ jwt-aud = "https://postgrest.org"
+ jwt-role-claim-key = ".user[0].\"real-role\""
+diff --git a/test/io-tests/test_io.py b/test/io-tests/test_io.py
+index 94ff66a9..6ee92fd1 100644
+--- a/test/io-tests/test_io.py
++++ b/test/io-tests/test_io.py
+@@ -440,6 +440,21 @@ def test_invalid_openapi_mode(invalidopenapimodes, defaultenv):
+                 print(line)
+ 
+ 
++@pytest.mark.parametrize("invalidjointypes", FIXTURES["invalidjointypes"])
++def test_invalid_db_embed_default_join(invalidjointypes, defaultenv):
++    "Given an invalid db-embed-default-join, Postgrest should exit with a non-zero exit code."
++    env = {
++        **defaultenv,
++        "PGRST_DB_EMBED_DEFAULT_JOIN": invalidjointypes,
++    }
++
++    with pytest.raises(PostgrestError):
++        dump = dumpconfig(CONFIGSDIR / "defaults.config", env=env)
++        for line in dump.split("\n"):
++            if line.startswith("db-embed-default-join"):
++                print(line)
++
++
+ def test_iat_claim(defaultenv):
+     """
+     A claim with an 'iat' (issued at) attribute should be successful.

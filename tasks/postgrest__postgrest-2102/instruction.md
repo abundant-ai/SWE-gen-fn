@@ -1,0 +1,9 @@
+PostgREST fails to load/inspect certain database schemas when a view uses `XMLTABLE` and has at least one column with a `DEFAULT`, specifically when the first `XMLTABLE` column has no default but a later column does. In this situation, the internal recursive view parsing used to derive view source columns (the query/functionality referred to as `pfkSourceColumns`) attempts to parse PostgreSQL’s `pg_node_tree` by first converting the node tree representation into JSON.
+
+Currently, that JSON conversion/parsing breaks for node trees where the `:coldefexprs` list begins with `<>` (PostgreSQL’s node-tree representation of a NULL/default-missing entry) followed by a real default expression, e.g. a structure like `:coldefexprs (<> {CONST ...})`. A preprocessing step that “protects node lists from the greedy regex” assumes lists start with either `((` or `({`, but for this case the list starts with `(<`, which causes the subsequent JSON parsing to fail.
+
+As a result, schema cache building / view introspection fails for such views, and endpoints depending on those views won’t work.
+
+Fix the node-tree-to-JSON parsing pipeline used by recursive view parsing so that `<>` entries inside node lists are handled correctly before any list-protection/regex steps that assume list prefixes. In particular, when `<>` appears as a list element representing a null expression (e.g. within `:coldefexprs`), it must be converted/normalized early into an empty/NULL-equivalent JSON array element so that the list is treated like a normal `((` list and JSON parsing succeeds.
+
+After the fix, PostgREST should be able to successfully introspect views containing `XMLTABLE` where later columns have `DEFAULT` values even if earlier columns do not, and recursive view parsing should correctly return the source columns without errors.

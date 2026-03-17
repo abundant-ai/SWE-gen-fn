@@ -1,0 +1,268 @@
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index 84715886..8f24a273 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -421,31 +421,6 @@ defmodule Ecto.Query.API do
+   > Because literals are made part of the query, each interpolated
+   > literal will generate a separate query, with its own cache.
+ 
+-  ## Splicing
+-
+-  Sometimes you may need to interpolate a variable number of arguments
+-  into the same fragment. For example, when overriding Ecto's default
+-  `where` behaviour for Postgres:
+-
+-      from p in Post, where: fragment("? in (?, ?)", p.id, val1, val2)
+-
+-  The example above will only work if you know the number of arguments
+-  upfront. If it can vary, the above will not work.
+-
+-  You can address this by telling Ecto to splice a list argument into
+-  the fragment:
+-
+-      from p in Post, where: fragment("? in (?)", p.id, splice(^val_list))
+-
+-  This will let Ecto know it should expand the values of the list into
+-  separate fragment arguments. For example:
+-
+-      from p in Post, where: fragment("? in (?)", p.id, splice(^[1, 2, 3]))
+-
+-  would be expanded into
+-
+-      from p in Post, where: fragment("? in (?,?,?)", p.id, ^1, ^2, ^3)
+-
+   ## Defining custom functions using macros and fragment
+ 
+   You can add a custom Ecto query function using macros.  For example
+@@ -478,17 +453,6 @@ defmodule Ecto.Query.API do
+   """
+   def fragment(fragments), do: doc! [fragments]
+ 
+-  @doc """
+-  Allows a list argument to be spliced into a fragment.
+-
+-      from p in Post, where: fragment("? in (?)", p.id, splice(^[1, 2, 3]))
+-
+-  The example above will be transformed at runtime into the following:
+-
+-      from p in Post, where: fragment("? in (?,?,?)", p.id, ^1, ^2, ^3)
+-  """
+-  def splice(list), do: doc! [list]
+-
+   @doc """
+   Allows a field to be dynamically accessed.
+ 
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index f74e2672..54709086 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -74,8 +74,8 @@ defmodule Ecto.Query.Builder do
+   with `^index` in the query where index is a number indexing into the
+   map.
+   """
+-  @spec escape(Macro.t, quoted_type | {:in, quoted_type} | {:out, quoted_type} | {:splice, quoted_type},
+-               {list, acc}, Keyword.t, Macro.Env.t | {Macro.Env.t, fun}) :: {Macro.t, {list, acc}}
++  @spec escape(Macro.t, quoted_type | {:in, quoted_type} | {:out, quoted_type}, {list, acc},
++               Keyword.t, Macro.Env.t | {Macro.Env.t, fun}) :: {Macro.t, {list, acc}}
+   def escape(expr, type, params_acc, vars, env)
+ 
+   # var.x - where var is bound
+@@ -694,20 +694,6 @@ defmodule Ecto.Query.Builder do
+     end
+   end
+ 
+-  defp escape_fragment({:splice, _meta, [splice]}, params_acc, vars, env) do
+-    case splice do
+-      {:^, _, [value]} = expr ->
+-        checked = quote do: Ecto.Query.Builder.splice!(unquote(value))
+-        length = quote do: length(unquote(checked))
+-        {expr, params_acc} = escape(expr, {:splice, :any}, params_acc, vars, env)
+-        escaped =  {:{}, [], [:splice, [], [expr, length]]}
+-        {escaped, params_acc}
+-
+-      _ ->
+-        error! "splice/1 in fragment expects an interpolated value, such as splice(^value), got `#{Macro.to_string(splice)}`"
+-    end
+-  end
+-
+   defp escape_fragment(expr, params_acc, vars, env) do
+     escape(expr, :any, params_acc, vars, env)
+   end
+@@ -1098,18 +1084,6 @@ defmodule Ecto.Query.Builder do
+     end
+   end
+ 
+-  @doc """
+-  Called by escaper at runtime to verify splice in fragments.
+-  """
+-  def splice!(value) do
+-    if is_list(value) do
+-      value
+-    else
+-      raise ArgumentError,
+-            "splice(^value) expects `value` to be a list, got `#{inspect(value)}`"
+-    end
+-  end
+-
+   @doc """
+   Called by escaper at runtime to verify that value is a valid interval.
+   """
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 6f816d55..bee99244 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -785,14 +785,13 @@ defmodule Ecto.Query.Planner do
+ 
+       {v, type}, {acc, cacheable?} ->
+         case cast_param(kind, query, expr, v, type, adapter) do
+-          {cast_v, {:in, dump_v}} -> {split_variadic_params(cast_v, dump_v, acc), false}
+-          {cast_v, {:splice, dump_v}} -> {split_variadic_params(cast_v, dump_v, acc), cacheable?}
++          {cast_v, {:in, dump_v}} -> {split_in_params(cast_v, dump_v, acc), false}
+           cast_v_and_dump_v -> {[cast_v_and_dump_v | acc], cacheable?}
+         end
+     end
+   end
+ 
+-  defp split_variadic_params(cast_v, dump_v, acc) do
++  defp split_in_params(cast_v, dump_v, acc) do
+     Enum.zip(cast_v, dump_v) |> Enum.reverse(acc)
+   end
+ 
+@@ -1249,11 +1248,6 @@ defmodule Ecto.Query.Planner do
+     {{quantifier, meta, [subquery]}, acc}
+   end
+ 
+-  defp prewalk({:splice, splice_meta, [{:^, meta, [_]}, length]}, _kind, _query, _expr, acc, _adapter) do
+-    param = {:^, meta, [acc, length]}
+-    {{:splice, splice_meta, [param]}, acc + length}
+-  end
+-
+   defp prewalk({{:., dot_meta, [left, field]}, meta, []},
+                kind, query, expr, acc, _adapter) do
+     {ix, ix_expr, ix_query} = get_ix!(left, kind, query)
+diff --git a/lib/ecto/type.ex b/lib/ecto/type.ex
+index 991b9ebc..9173a97e 100644
+--- a/lib/ecto/type.ex
++++ b/lib/ecto/type.ex
+@@ -211,7 +211,6 @@ defmodule Ecto.Type do
+     utc_datetime_usec naive_datetime_usec time_usec
+   )a
+   @composite ~w(array map maybe in param)a
+-  @variadic ~w(in splice)a
+ 
+   @doc """
+   Returns the underlying schema type for the custom type.
+@@ -508,9 +507,9 @@ defmodule Ecto.Type do
+     end
+   end
+ 
+-  def dump({qual, type}, value, dumper) when qual in @variadic do
++  def dump({:in, type}, value, dumper) do
+     case dump({:array, type}, value, dumper) do
+-      {:ok, value} -> {:ok, {qual, value}}
++      {:ok, value} -> {:ok, {:in, value}}
+       :error -> :error
+     end
+   end
+@@ -796,7 +795,7 @@ defmodule Ecto.Type do
+   defp cast_fun(:utc_datetime_usec), do: &maybe_pad_usec(cast_utc_datetime(&1))
+   defp cast_fun({:param, :any_datetime}), do: &cast_any_datetime(&1)
+   defp cast_fun({:parameterized, mod, params}), do: &mod.cast(&1, params)
+-  defp cast_fun({qual, type}) when qual in @variadic, do: cast_fun({:array, type})
++  defp cast_fun({:in, type}), do: cast_fun({:array, type})
+ 
+   defp cast_fun({:array, {:parameterized, _, _} = type}) do
+     fun = cast_fun(type)
+diff --git a/test/ecto/query/planner_test.exs b/test/ecto/query/planner_test.exs
+index 63497413..0f804d45 100644
+--- a/test/ecto/query/planner_test.exs
++++ b/test/ecto/query/planner_test.exs
+@@ -1354,24 +1354,6 @@ defmodule Ecto.Query.PlannerTest do
+     assert query.group_bys == []
+   end
+ 
+-  test "normalize: fragment with splicing" do
+-    two = 2
+-    three = 3
+-
+-    {query, cast_params, dump_params, _} =
+-      from(c in Comment)
+-      |> where([c], c.id in fragment("(?, ?, ?)", ^1, splice(^[two, three, 4]), ^5))
+-      |> normalize_with_params()
+-
+-    assert cast_params == [1, 2, 3, 4, 5]
+-    assert dump_params == [1, 2, 3, 4, 5]
+-
+-    {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
+-    assert [_, _, _, {:expr, {:splice, _, [{:^, _, [start_ix, length]}]}}, _, _, _] = parts
+-    assert start_ix == 1
+-    assert length == 3
+-  end
+-
+   describe "normalize: CTEs" do
+     test "single-level" do
+       %{with_ctes: with_expr} =
+diff --git a/test/ecto/query_test.exs b/test/ecto/query_test.exs
+index d1bbdbef..df90e37d 100644
+--- a/test/ecto/query_test.exs
++++ b/test/ecto/query_test.exs
+@@ -780,10 +780,10 @@ defmodule Ecto.QueryTest do
+ 
+       excluded_left_lateral_query = exclude(left_lateral_query, :left_lateral_join)
+       assert excluded_left_lateral_query.joins == base.joins
+-
++      
+       excluded_array_query = exclude(array_query, :array_join)
+       assert excluded_array_query.joins == base.joins
+-
++      
+       excluded_left_array_query = exclude(left_array_query, :left_array_join)
+       assert excluded_left_array_query.joins == base.joins
+     end
+@@ -868,13 +868,13 @@ defmodule Ecto.QueryTest do
+       assert map_size(excluded_left_lateral_join_query.aliases) == original_aliases_number - 1
+       refute Map.has_key?(excluded_left_lateral_join_query.aliases, :blogs_ll)
+       assert Map.has_key?(excluded_left_lateral_join_query.aliases, :base)
+-
++      
+       excluded_array_join_query = exclude(query, :array_join)
+       assert length(excluded_array_join_query.joins) == original_joins_number - 1
+       assert map_size(excluded_array_join_query.aliases) == original_aliases_number - 1
+       refute Map.has_key?(excluded_array_join_query.aliases, :blogs_a)
+       assert Map.has_key?(excluded_array_join_query.aliases, :base)
+-
++      
+       excluded_left_array_join_query = exclude(query, :left_array_join)
+       assert length(excluded_left_array_join_query.joins) == original_joins_number - 1
+       assert map_size(excluded_left_array_join_query.aliases) == original_aliases_number - 1
+@@ -991,30 +991,6 @@ defmodule Ecto.QueryTest do
+       end
+     end
+ 
+-    test "supports list splicing" do
+-      two = 2
+-      three = 3
+-
+-      query =
+-        from p in "posts", where: p.id in fragment("(?, ?, ?)", ^1, splice(^[two, three, 4]), ^5)
+-
+-      assert {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
+-
+-      assert [
+-               raw: "(",
+-               expr: {:^, _, [0]},
+-               raw: ", ",
+-               expr: {:splice, _, [{:^, _, [1]}, 3]},
+-               raw: ", ",
+-               expr: {:^, _, [2]},
+-               raw: ")"
+-             ] = parts
+-
+-      assert_raise ArgumentError, "splice(^value) expects `value` to be a list, got `234`", fn ->
+-        from p in "posts", where: p.id in fragment("(?)", splice(^234))
+-      end
+-    end
+-
+     test "keeps UTF-8 encoding" do
+       assert inspect(from p in "posts", where: fragment("héllò")) ==
+              ~s[#Ecto.Query<from p0 in \"posts\", where: fragment("héllò")>]

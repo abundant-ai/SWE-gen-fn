@@ -1,0 +1,588 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 14a2e1de..784cd863 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + For enabling this, the `admin-server-port` config must be set explictly
+    + A `<host>:<admin_server_port>/live` endpoint is available for checking if postgrest is running on its port/socket. 200 OK = alive, 503 = dead.
+    + A `<host>:<admin_server_port>/ready` endpoint is available for checking a correct internal state(the database connection plus the schema cache). 200 OK = ready, 503 = not ready.
++ - #1988, Add the current user to the request log on stdout - @DavidLindbom, @wolfgangwalther
+ 
+ ### Fixed
+ 
+diff --git a/postgrest.cabal b/postgrest.cabal
+index bc8405df..5841a587 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -45,6 +45,7 @@ library
+                       PostgREST.Config.PgVersion
+                       PostgREST.Config.Proxy
+                       PostgREST.ContentType
++                      PostgREST.Cors
+                       PostgREST.DbStructure
+                       PostgREST.DbStructure.Identifiers
+                       PostgREST.DbStructure.Proc
+@@ -52,6 +53,7 @@ library
+                       PostgREST.DbStructure.Table
+                       PostgREST.Error
+                       PostgREST.GucHeader
++                      PostgREST.Logger
+                       PostgREST.Middleware
+                       PostgREST.OpenAPI
+                       PostgREST.Query.QueryBuilder
+@@ -106,6 +108,7 @@ library
+                     , text                      >= 1.2.2 && < 1.3
+                     , time                      >= 1.6 && < 1.11
+                     , unordered-containers      >= 0.2.8 && < 0.3
++                    , vault                     >= 0.3.1.5 && < 0.4
+                     , vector                    >= 0.11 && < 0.13
+                     , wai                       >= 3.2.1 && < 3.3
+                     , wai-cors                  >= 0.2.5 && < 0.3
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 7d36b31f..9e0ddb9c 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -20,8 +20,8 @@ module PostgREST.App
+ import Control.Monad.Except     (liftEither)
+ import Data.Either.Combinators  (mapLeft)
+ import Data.List                (union)
++import Data.Maybe               (fromJust)
+ import Data.String              (IsString (..))
+-import Data.Time.Clock          (UTCTime)
+ import Network.Wai.Handler.Warp (defaultSettings, setHost, setPort,
+                                  setServerName)
+ import System.Posix.Types       (FileMode)
+@@ -43,8 +43,10 @@ import qualified Network.Wai.Handler.Warp        as Warp
+ import qualified PostgREST.Admin                    as Admin
+ import qualified PostgREST.AppState                 as AppState
+ import qualified PostgREST.Auth                     as Auth
++import qualified PostgREST.Cors                     as Cors
+ import qualified PostgREST.DbStructure              as DbStructure
+ import qualified PostgREST.Error                    as Error
++import qualified PostgREST.Logger                   as Logger
+ import qualified PostgREST.Middleware               as Middleware
+ import qualified PostgREST.OpenAPI                  as OpenAPI
+ import qualified PostgREST.Query.QueryBuilder       as QueryBuilder
+@@ -54,6 +56,7 @@ import qualified PostgREST.Request.ApiRequest       as ApiRequest
+ import qualified PostgREST.Request.DbRequestBuilder as ReqBuilder
+ 
+ import PostgREST.AppState                (AppState)
++import PostgREST.Auth                    (AuthResult (..))
+ import PostgREST.Config                  (AppConfig (..),
+                                           LogLevel (..),
+                                           OpenAPIMode (..))
+@@ -146,28 +149,33 @@ serverSettings AppConfig{..} =
+ 
+ -- | PostgREST application
+ postgrest :: LogLevel -> AppState.AppState -> IO () -> Wai.Application
+-postgrest logLev appState connWorker =
+-  Middleware.pgrstMiddleware logLev $
+-    \req respond -> do
+-      time <- AppState.getTime appState
+-      conf <- AppState.getConfig appState
+-      maybeDbStructure <- AppState.getDbStructure appState
+-      pgVer <- AppState.getPgVersion appState
+-      jsonDbS <- AppState.getJsonDbS appState
+-
+-      let
+-        eitherResponse :: IO (Either Error Wai.Response)
+-        eitherResponse =
+-          runExceptT $ postgrestResponse conf maybeDbStructure jsonDbS pgVer (AppState.getPool appState) time req
+-
+-      response <- either Error.errorResponseFor identity <$> eitherResponse
+-      -- Launch the connWorker when the connection is down.  The postgrest
+-      -- function can respond successfully (with a stale schema cache) before
+-      -- the connWorker is done.
+-      let isPGAway = Wai.responseStatus response == HTTP.status503
+-      when isPGAway connWorker
+-      resp <- addRetryHint isPGAway appState response
+-      respond resp
++postgrest logLevel appState connWorker =
++  Cors.middleware .
++  Auth.middleware appState .
++  Logger.middleware logLevel $
++    -- fromJust can be used, because the auth middleware will **always** add
++    -- some AuthResult to the vault.
++    \req respond -> case fromJust $ Auth.getResult req of
++      Left err -> respond $ Error.errorResponseFor err
++      Right authResult -> do
++        conf <- AppState.getConfig appState
++        maybeDbStructure <- AppState.getDbStructure appState
++        pgVer <- AppState.getPgVersion appState
++        jsonDbS <- AppState.getJsonDbS appState
++
++        let
++          eitherResponse :: IO (Either Error Wai.Response)
++          eitherResponse =
++            runExceptT $ postgrestResponse conf maybeDbStructure jsonDbS pgVer (AppState.getPool appState) authResult req
++
++        response <- either Error.errorResponseFor identity <$> eitherResponse
++        -- Launch the connWorker when the connection is down.  The postgrest
++        -- function can respond successfully (with a stale schema cache) before
++        -- the connWorker is done.
++        let isPGAway = Wai.responseStatus response == HTTP.status503
++        when isPGAway connWorker
++        resp <- addRetryHint isPGAway appState response
++        respond resp
+ 
+ addRetryHint :: Bool -> AppState -> Wai.Response -> IO Wai.Response
+ addRetryHint shouldAdd appState response = do
+@@ -181,10 +189,10 @@ postgrestResponse
+   -> ByteString
+   -> PgVersion
+   -> SQL.Pool
+-  -> UTCTime
++  -> AuthResult
+   -> Wai.Request
+   -> Handler IO Wai.Response
+-postgrestResponse conf maybeDbStructure jsonDbS pgVer pool time req = do
++postgrestResponse conf@AppConfig{..} maybeDbStructure jsonDbS pgVer pool AuthResult{..} req = do
+   body <- lift $ Wai.strictRequestBody req
+ 
+   dbStructure <-
+@@ -194,30 +202,25 @@ postgrestResponse conf maybeDbStructure jsonDbS pgVer pool time req = do
+       Nothing ->
+         throwError Error.NoSchemaCacheError
+ 
+-  apiRequest@ApiRequest{..} <-
++  apiRequest <-
+     liftEither . mapLeft Error.ApiRequestError $
+       ApiRequest.userApiRequest conf dbStructure req body
+ 
+-  -- The JWT must be checked before touching the db
+-  jwtClaims <- Auth.jwtClaims conf (toUtf8Lazy iJWT) time
+-
+-  let
+-    handleReq apiReq =
+-      handleRequest $ RequestContext conf dbStructure apiReq pgVer
++  let handleReq apiReq = handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+-  runDbHandler pool (txMode apiRequest) jwtClaims (configDbPreparedStatements conf) .
++  runDbHandler pool (txMode apiRequest) (authRole /= configDbAnonRole) configDbPreparedStatements .
+     Middleware.optionalRollback conf apiRequest $
+-      Middleware.runPgLocals conf jwtClaims handleReq apiRequest jsonDbS pgVer
++      Middleware.runPgLocals conf authClaims authRole handleReq apiRequest jsonDbS pgVer
+ 
+-runDbHandler :: SQL.Pool -> SQL.Mode -> Auth.JWTClaims -> Bool -> DbHandler a -> Handler IO a
+-runDbHandler pool mode jwtClaims prepared handler = do
++runDbHandler :: SQL.Pool -> SQL.Mode -> Bool -> Bool -> DbHandler a -> Handler IO a
++runDbHandler pool mode authenticated prepared handler = do
+   dbResp <-
+     let transaction = if prepared then SQL.transaction else SQL.unpreparedTransaction in
+     lift . SQL.use pool . transaction SQL.ReadCommitted mode $ runExceptT handler
+ 
+   resp <-
+     liftEither . mapLeft Error.PgErr $
+-      mapLeft (Error.PgError $ Auth.containsRole jwtClaims) dbResp
++      mapLeft (Error.PgError authenticated) dbResp
+ 
+   liftEither resp
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 7ffac3b8..0b148269 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -12,40 +12,54 @@ very simple authentication system inside the PostgreSQL database.
+ -}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Auth
+-  ( containsRole
+-  , jwtClaims
+-  , JWTClaims
++  ( AuthResult (..)
++  , getResult
++  , getRole
++  , middleware
+   ) where
+ 
+-import qualified Crypto.JWT          as JWT
+-import qualified Data.Aeson          as JSON
+-import qualified Data.HashMap.Strict as M
+-import qualified Data.Vector         as V
++import qualified Crypto.JWT                      as JWT
++import qualified Data.Aeson                      as JSON
++import qualified Data.Aeson.Types                as JSON
++import qualified Data.ByteString.Lazy.Char8      as LBS
++import qualified Data.HashMap.Strict             as M
++import qualified Data.Text.Encoding              as T
++import qualified Data.Vault.Lazy                 as Vault
++import qualified Data.Vector                     as V
++import qualified Network.HTTP.Types.Header       as HTTP
++import qualified Network.Wai                     as Wai
++import qualified Network.Wai.Middleware.HttpAuth as Wai
+ 
+ import Control.Lens            (set)
+ import Control.Monad.Except    (liftEither)
+-import Data.Either.Combinators (mapLeft)
++import Data.Either.Combinators (mapLeft, mapRight)
++import Data.List               (lookup)
+ import Data.Time.Clock         (UTCTime)
++import System.IO.Unsafe        (unsafePerformIO)
+ 
+-import PostgREST.Config (AppConfig (..), JSPath, JSPathExp (..))
+-import PostgREST.Error  (Error (..))
++import PostgREST.AppState (AppState, getConfig, getTime)
++import PostgREST.Config   (AppConfig (..), JSPath, JSPathExp (..))
++import PostgREST.Error    (Error (..))
+ 
+ import Protolude
+ 
+ 
+-type JWTClaims = M.HashMap Text JSON.Value
++data AuthResult = AuthResult
++  { authClaims :: M.HashMap Text JSON.Value
++  , authRole   :: Text
++  }
+ 
+ -- | Receives the JWT secret and audience (from config) and a JWT and returns a
+--- map of JWT claims.
+-jwtClaims :: Monad m =>
+-  AppConfig -> LByteString -> UTCTime -> ExceptT Error m JWTClaims
+-jwtClaims _ "" _ = return M.empty
+-jwtClaims AppConfig{..} payload time = do
++-- JSON object of JWT claims.
++parseToken :: Monad m =>
++  AppConfig -> LByteString -> UTCTime -> ExceptT Error m JSON.Value
++parseToken _ "" _ = return JSON.emptyObject
++parseToken AppConfig{..} token time = do
+   secret <- liftEither . maybeToRight JwtTokenMissing $ configJWKS
+   eitherClaims <-
+     lift . runExceptT $
+-      JWT.verifyClaimsAt validation secret time =<< JWT.decodeCompact payload
+-  liftEither . mapLeft jwtClaimsError $ claimsMap configJwtRoleClaimKey <$> eitherClaims
++      JWT.verifyClaimsAt validation secret time =<< JWT.decodeCompact token
++  liftEither . mapLeft jwtClaimsError $ JSON.toJSON <$> eitherClaims
+   where
+     validation =
+       JWT.defaultJWTValidationSettings audienceCheck & set JWT.allowedSkew 1
+@@ -57,19 +71,15 @@ jwtClaims AppConfig{..} payload time = do
+     jwtClaimsError JWT.JWTExpired = JwtTokenInvalid "JWT expired"
+     jwtClaimsError e              = JwtTokenInvalid $ show e
+ 
+--- | Turn JWT ClaimSet into something easier to work with.
+---
+--- Also, here the jspath is applied to put the "role" in the map.
+-claimsMap :: JSPath -> JWT.ClaimsSet -> JWTClaims
+-claimsMap jspath claims =
+-  case JSON.toJSON claims of
+-    val@(JSON.Object o) ->
+-      M.delete "role" o `M.union` role val
+-    _ ->
+-      M.empty
++parseClaims :: AppConfig -> JSON.Value -> AuthResult
++parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) =
++  AuthResult
++  { authClaims = mclaims & M.insert "role" (JSON.toJSON role)
++  , authRole = role
++  }
+   where
+-    role value =
+-      maybe M.empty (M.singleton "role") $ walkJSPath (Just value) jspath
++    -- role defaults to anon if not specified in jwt
++    role = maybe configDbAnonRole unquoted (walkJSPath (Just jclaims) configJwtRoleClaimKey)
+ 
+     walkJSPath :: Maybe JSON.Value -> JSPath -> Maybe JSON.Value
+     walkJSPath x                      []                = x
+@@ -77,6 +87,33 @@ claimsMap jspath claims =
+     walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
+     walkJSPath _                      _                 = Nothing
+ 
+--- | Whether a response from jwtClaims contains a role claim
+-containsRole :: JWTClaims -> Bool
+-containsRole = M.member "role"
++    unquoted :: JSON.Value -> Text
++    unquoted (JSON.String t) = t
++    unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
++-- impossible case - just added to please -Wincomplete-patterns
++parseClaims _ _ = AuthResult { authClaims = M.empty, authRole = mempty }
++
++-- | Validate authorization header.
++--   Parse and store JWT claims for future use in the request.
++middleware :: AppState -> Wai.Middleware
++middleware appState app req respond = do
++  conf <- getConfig appState
++  time <- getTime appState
++
++  let token = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
++  claims <- runExceptT $ parseToken conf (LBS.fromStrict token) time
++
++  let
++    authResult = mapRight (parseClaims conf) claims
++    req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
++  app req' respond
++
++authResultKey :: Vault.Key (Either Error AuthResult)
++authResultKey = unsafePerformIO Vault.newKey
++{-# NOINLINE authResultKey #-}
++
++getResult :: Wai.Request -> Maybe (Either Error AuthResult)
++getResult = Vault.lookup authResultKey . Wai.vault
++
++getRole :: Wai.Request -> Maybe Text
++getRole req = authRole <$> (rightToMaybe =<< getResult req)
+diff --git a/src/PostgREST/Cors.hs b/src/PostgREST/Cors.hs
+new file mode 100644
+index 00000000..df38f1d9
+--- /dev/null
++++ b/src/PostgREST/Cors.hs
+@@ -0,0 +1,42 @@
++{-|
++Module      : PostgREST.Cors
++Description : Wai Middleware to set cors policy.
++-}
++module PostgREST.Cors (middleware) where
++
++import qualified Data.ByteString.Char8       as BS
++import qualified Data.CaseInsensitive        as CI
++import qualified Network.Wai                 as Wai
++import qualified Network.Wai.Middleware.Cors as Wai
++
++import Data.List (lookup)
++
++import Protolude
++
++middleware :: Wai.Middleware
++middleware = Wai.cors corsPolicy
++
++-- | CORS policy to be used in by Wai Cors middleware
++corsPolicy :: Wai.Request -> Maybe Wai.CorsResourcePolicy
++corsPolicy req = case lookup "origin" headers of
++  Just origin ->
++    Just Wai.CorsResourcePolicy
++    { Wai.corsOrigins = Just ([origin], True)
++    , Wai.corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
++    , Wai.corsRequestHeaders = "Authorization" : accHeaders
++    , Wai.corsExposedHeaders = Just
++      [ "Content-Encoding", "Content-Location", "Content-Range", "Content-Type"
++      , "Date", "Location", "Server", "Transfer-Encoding", "Range-Unit"]
++    , Wai.corsMaxAge = Just $ 60*60*24
++    , Wai.corsVaryOrigin = False
++    , Wai.corsRequireOrigin = False
++    , Wai.corsIgnoreFailures = True
++    }
++  Nothing -> Nothing
++  where
++    headers = Wai.requestHeaders req
++    accHeaders = case lookup "access-control-request-headers" headers of
++      Just hdrs -> map (CI.mk . BS.strip) $ BS.split ',' hdrs
++       -- Impossible case, Middleware.Cors will not evaluate this when
++       -- the Access-Control-Request-Headers header is not set.
++      Nothing   -> []
+diff --git a/src/PostgREST/Logger.hs b/src/PostgREST/Logger.hs
+new file mode 100644
+index 00000000..b5bac1cd
+--- /dev/null
++++ b/src/PostgREST/Logger.hs
+@@ -0,0 +1,30 @@
++{-|
++Module      : PostgREST.Logger
++Description : Wai Middleware to log requests to stdout.
++-}
++module PostgREST.Logger (middleware) where
++
++import qualified Network.Wai                          as Wai
++import qualified Network.Wai.Middleware.RequestLogger as Wai
++
++import Network.HTTP.Types.Status (status400, status500)
++import System.IO.Unsafe          (unsafePerformIO)
++
++import qualified PostgREST.Auth   as Auth
++import           PostgREST.Config (LogLevel (..))
++
++import Protolude
++
++middleware :: LogLevel -> Wai.Middleware
++middleware logLevel = case logLevel of
++  LogInfo  -> requestLogger (const True)
++  LogWarn  -> requestLogger (>= status400)
++  LogError -> requestLogger (>= status500)
++  LogCrit  -> requestLogger (const False)
++  where
++    requestLogger filterStatus = unsafePerformIO $ Wai.mkRequestLogger Wai.defaultRequestLoggerSettings
++      { Wai.outputFormat = Wai.ApacheWithSettings $
++          Wai.defaultApacheSettings
++            & Wai.setApacheRequestFilter (\_ res -> filterStatus $ Wai.responseStatus res)
++            & Wai.setApacheUserGetter (fmap encodeUtf8 . Auth.getRole)
++      }
+diff --git a/src/PostgREST/Middleware.hs b/src/PostgREST/Middleware.hs
+index aeafe536..a32ee080 100644
+--- a/src/PostgREST/Middleware.hs
++++ b/src/PostgREST/Middleware.hs
+@@ -6,35 +6,26 @@ Description : Sets CORS policy. Also the PostgreSQL GUCs, role, search_path and
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Middleware
+   ( runPgLocals
+-  , pgrstMiddleware
+   , optionalRollback
+   ) where
+ 
+-import qualified Data.Aeson                           as JSON
+-import qualified Data.ByteString.Char8                as BS
+-import qualified Data.ByteString.Lazy.Char8           as LBS
+-import qualified Data.CaseInsensitive                 as CI
+-import qualified Data.HashMap.Strict                  as M
+-import qualified Data.Text                            as T
+-import qualified Data.Text.Encoding                   as T
+-import qualified Hasql.Decoders                       as HD
+-import qualified Hasql.DynamicStatements.Snippet      as SQL hiding
+-                                                             (sql)
+-import qualified Hasql.DynamicStatements.Statement    as SQL
+-import qualified Hasql.Transaction                    as SQL
+-import qualified Network.Wai                          as Wai
+-import qualified Network.Wai.Middleware.Cors          as Wai
+-import qualified Network.Wai.Middleware.RequestLogger as Wai
++import qualified Data.Aeson                        as JSON
++import qualified Data.ByteString.Lazy.Char8        as LBS
++import qualified Data.HashMap.Strict               as M
++import qualified Data.Text                         as T
++import qualified Data.Text.Encoding                as T
++import qualified Hasql.Decoders                    as HD
++import qualified Hasql.DynamicStatements.Snippet   as SQL hiding (sql)
++import qualified Hasql.DynamicStatements.Statement as SQL
++import qualified Hasql.Transaction                 as SQL
++import qualified Network.Wai                       as Wai
++
+ 
+ import Control.Arrow ((***))
+ 
+-import Data.List                 (lookup)
+-import Data.Scientific           (FPFormat (..), formatScientific,
+-                                  isInteger)
+-import Network.HTTP.Types.Status (status400, status500)
+-import System.IO.Unsafe          (unsafePerformIO)
++import Data.Scientific (FPFormat (..), formatScientific, isInteger)
+ 
+-import PostgREST.Config             (AppConfig (..), LogLevel (..))
++import PostgREST.Config             (AppConfig (..))
+ import PostgREST.Config.PgVersion   (PgVersion (..), pgVersion140)
+ import PostgREST.Error              (Error, errorResponseFor)
+ import PostgREST.GucHeader          (addHeadersIfNotIncluded)
+@@ -47,10 +38,10 @@ import PostgREST.Request.Preferences
+ import Protolude
+ 
+ -- | Runs local(transaction scoped) GUCs for every request, plus the pre-request function
+-runPgLocals :: AppConfig   -> M.HashMap Text JSON.Value ->
++runPgLocals :: AppConfig   -> M.HashMap Text JSON.Value -> Text ->
+                (ApiRequest -> ExceptT Error SQL.Transaction Wai.Response) ->
+                ApiRequest  -> ByteString -> PgVersion -> ExceptT Error SQL.Transaction Wai.Response
+-runPgLocals conf claims app req jsonDbS actualPgVersion = do
++runPgLocals conf claims role app req jsonDbS actualPgVersion = do
+   lift $ SQL.statement mempty $ SQL.dynamicallyParameterized
+     ("select " <> intercalateSnippet ", " (searchPathSql : roleSql ++ claimsSql ++ [methodSql, pathSql] ++ headersSql ++ cookiesSql ++ appSettingsSql ++ specSql))
+     HD.noResult (configDbPreparedStatements conf)
+@@ -65,13 +56,10 @@ runPgLocals conf claims app req jsonDbS actualPgVersion = do
+     cookiesSql = if usesLegacyGucs
+                    then setConfigLocal "request.cookie." <$> iCookies req
+                    else setConfigLocalJson "request.cookies" (iCookies req)
+-    claimsWithRole =
+-      let anon = JSON.String . toS $ configDbAnonRole conf in -- role claim defaults to anon if not specified in jwt
+-      M.union claims (M.singleton "role" anon)
+     claimsSql = if usesLegacyGucs
+-                  then setConfigLocal "request.jwt.claim." <$> [(toUtf8 c, toUtf8 $ unquoted v) | (c,v) <- M.toList claimsWithRole]
+-                  else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claimsWithRole)]
+-    roleSql = maybeToList $ (\x -> setConfigLocal mempty ("role", toUtf8 $ unquoted x)) <$> M.lookup "role" claimsWithRole
++                  then setConfigLocal "request.jwt.claim." <$> [(toUtf8 c, toUtf8 $ unquoted v) | (c,v) <- M.toList claims]
++                  else [setConfigLocal mempty ("request.jwt.claims", LBS.toStrict $ JSON.encode claims)]
++    roleSql = [setConfigLocal mempty ("role", toUtf8 role)]
+     appSettingsSql = setConfigLocal mempty <$> (join bimap toUtf8 <$> configAppSettings conf)
+     searchPathSql =
+       let schemas = T.intercalate ", " (iSchema req : configDbExtraSearchPath conf) in
+@@ -89,49 +77,6 @@ runPgLocals conf claims app req jsonDbS actualPgVersion = do
+     unquoted (JSON.Bool b) = show b
+     unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
+ 
+-pgrstMiddleware :: LogLevel -> Wai.Middleware
+-pgrstMiddleware logLevel =
+-    logger logLevel
+-  . Wai.cors corsPolicy
+-
+-logger :: LogLevel -> Wai.Middleware
+-logger logLevel = case logLevel of
+-  LogInfo  -> requestLogger (const True)
+-  LogWarn  -> requestLogger (>= status400)
+-  LogError -> requestLogger (>= status500)
+-  LogCrit  -> requestLogger (const False)
+-  where
+-    requestLogger filterStatus = unsafePerformIO $ Wai.mkRequestLogger Wai.defaultRequestLoggerSettings
+-      { Wai.outputFormat = Wai.ApacheWithSettings $
+-          Wai.defaultApacheSettings
+-            & Wai.setApacheRequestFilter (\_ res -> filterStatus $ Wai.responseStatus res)
+-      }
+-
+--- | CORS policy to be used in by Wai Cors middleware
+-corsPolicy :: Wai.Request -> Maybe Wai.CorsResourcePolicy
+-corsPolicy req = case lookup "origin" headers of
+-  Just origin ->
+-    Just Wai.CorsResourcePolicy
+-    { Wai.corsOrigins = Just ([origin], True)
+-    , Wai.corsMethods = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
+-    , Wai.corsRequestHeaders = "Authorization" : accHeaders
+-    , Wai.corsExposedHeaders = Just
+-      [ "Content-Encoding", "Content-Location", "Content-Range", "Content-Type"
+-      , "Date", "Location", "Server", "Transfer-Encoding", "Range-Unit"]
+-    , Wai.corsMaxAge = Just $ 60*60*24
+-    , Wai.corsVaryOrigin = False
+-    , Wai.corsRequireOrigin = False
+-    , Wai.corsIgnoreFailures = True
+-    }
+-  Nothing -> Nothing
+-  where
+-    headers = Wai.requestHeaders req
+-    accHeaders = case lookup "access-control-request-headers" headers of
+-      Just hdrs -> map (CI.mk . BS.strip) $ BS.split ',' hdrs
+-       -- Impossible case, Middleware.Cors will not evaluate this when
+-       -- the Access-Control-Request-Headers header is not set.
+-      Nothing   -> []
+-
+ -- | Set a transaction to eventually roll back if requested and set respective
+ -- headers on the response.
+ optionalRollback
+diff --git a/src/PostgREST/Request/ApiRequest.hs b/src/PostgREST/Request/ApiRequest.hs
+index 2dc9bfe8..953a0035 100644
+--- a/src/PostgREST/Request/ApiRequest.hs
++++ b/src/PostgREST/Request/ApiRequest.hs
+@@ -25,7 +25,6 @@ import qualified Data.HashMap.Strict   as M
+ import qualified Data.List             as L
+ import qualified Data.List.NonEmpty    as NonEmptyList
+ import qualified Data.Set              as S
+-import qualified Data.Text             as T
+ import qualified Data.Text.Encoding    as T
+ import qualified Data.Vector           as V
+ 
+@@ -34,7 +33,7 @@ import Data.Aeson.Types          (emptyArray, emptyObject)
+ import Data.List                 (lookup, union)
+ import Data.Maybe                (fromJust)
+ import Data.Ranged.Ranges        (emptyRange, rangeIntersection)
+-import Network.HTTP.Types.Header (hAuthorization, hCookie)
++import Network.HTTP.Types.Header (hCookie)
+ import Network.HTTP.Types.URI    (parseSimpleQuery)
+ import Network.Wai               (Request (..))
+ import Network.Wai.Parse         (parseHttpAccept)
+@@ -157,7 +156,6 @@ data ApiRequest = ApiRequest {
+   , iPreferTransaction    :: Maybe PreferTransaction          -- ^ Whether the clients wants to commit or rollback the transaction
+   , iQueryParams          :: QueryParams.QueryParams
+   , iColumns              :: S.Set FieldName                  -- ^ parsed colums from &columns parameter and payload
+-  , iJWT                  :: Text                             -- ^ JSON Web Token
+   , iHeaders              :: [(ByteString, ByteString)]       -- ^ HTTP request headers
+   , iCookies              :: [(ByteString, ByteString)]       -- ^ Request Cookies
+   , iPath                 :: ByteString                       -- ^ Raw request path
+@@ -195,7 +193,6 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+       , iPreferTransaction = preferTransaction
+       , iQueryParams = queryparams
+       , iColumns = payloadColumns
+-      , iJWT = tokenStr
+       , iHeaders = [ (CI.foldedCase k, v) | (k,v) <- hdrs, k /= hCookie]
+       , iCookies = maybe [] parseCookies $ lookupHeader "Cookie"
+       , iPath = rawPathInfo req
+@@ -324,11 +321,6 @@ apiRequest conf@AppConfig{..} dbStructure req reqBody queryparams@QueryParams{..
+   hdrs            = requestHeaders req
+   lookupHeader    = flip lookup hdrs
+   Preferences.Preferences{..} = Preferences.fromHeaders hdrs
+-  auth = fromMaybe "" $ lookupHeader hAuthorization
+-  tokenStr = case T.split (== ' ') (T.decodeUtf8 auth) of
+-    ("Bearer" : t : _) -> t
+-    ("bearer" : t : _) -> t
+-    _                  -> ""
+   headerRange = rangeRequested hdrs
+ 
+   ranges = M.insert "limit" (rangeIntersection headerRange (fromMaybe allRange (M.lookup "limit" qsRanges))) qsRanges

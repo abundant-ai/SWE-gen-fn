@@ -1,0 +1,397 @@
+diff --git a/lib/ecto/changeset.ex b/lib/ecto/changeset.ex
+index 47dc2421..bcc7f00d 100644
+--- a/lib/ecto/changeset.ex
++++ b/lib/ecto/changeset.ex
+@@ -1047,19 +1047,24 @@ defmodule Ecto.Changeset do
+ 
+   For embeds, this guarantees the embeds will be rewritten in the given order.
+   However, for associations, this is not enough. You will have to add a
+-  `field :position, :integer` to the schema and add a with function of arity 3
+-  to add the position to your children changeset. For example, you could implement:
+-
+-      defp child_changeset(child, _changes, position) do
+-        child
+-        |> put_change(:position, position)
+-      end
+-
+-  And by passing it to `:with`, it will be called with the final position of the
+-  item:
++  `field :position, :integer` to the schema and then do a post-processing
++  of the association, something like this:
+ 
+       changeset
+-      |> cast_assoc(:children, sort_param: ..., with: &child_changeset/3)
++      |> cast_assoc(:children, sort_param: ...)
++      |> copy_children_positions()
++
++      defp copy_children_positions(changeset) do
++        if children = Ecto.Changeset.get_change(changeset, :children) do
++          children
++          |> Enum.with_index(fn child, index ->
++            Ecto.Changeset.put_change(child, :position, index)
++          end)
++          |> then(&Ecto.Changeset.put_change(changeset, :children, &1))
++        else
++          changeset
++        end
++      end
+ 
+   These parameters can be powerful in certain UIs as it allows you to decouple
+   the sorting and replacement of the data from its representation.
+@@ -1076,11 +1081,9 @@ defmodule Ecto.Changeset do
+       repository if there is a change, defaults to `true`
+ 
+     * `:with` - the function to build the changeset from params. Defaults to the
+-      `changeset/2` function of the associated module. It can be an anonymous
++      `changeset/2` function of the associated module. It must be an anonymous
+       function that expects two arguments, a changeset to be modified and its
+-      parameters. For associations with cardinality `:many`, functions with arity
+-      3 are accepted, and the third argument will be the position of the associated
+-      element in the list, or `nil`, if the changeset is being replaced.
++      parameters
+ 
+     * `:drop_param` - the parameter name which keeps a list of indexes to drop
+       from the relation parameters
+@@ -1123,9 +1126,7 @@ defmodule Ecto.Changeset do
+     * `:with` - the function to build the changeset from params. Defaults to the
+       `changeset/2` function of the associated module. It must be an anonymous
+       function that expects two arguments, a changeset to be modified and its
+-      parameters. For associations with cardinality `:many`, functions with arity
+-      3 are accepted, and the third argument will be the position of the associated
+-      element in the list, or `nil`, if the changeset is being replaced.
++      parameters
+ 
+     * `:drop_param` - the parameter name which keeps a list of indexes to drop
+       from the relation parameters
+@@ -1264,7 +1265,7 @@ defmodule Ecto.Changeset do
+ 
+                 1. implement the #{type}.changeset/2 function
+                 2. pass the :with option to cast_#{type}/3 with an anonymous
+-                   function
++                   function.
+ 
+               When using an inline embed, the :with option must be given
+               """
+diff --git a/lib/ecto/changeset/relation.ex b/lib/ecto/changeset/relation.ex
+index 092a24a3..5e84a1e5 100644
+--- a/lib/ecto/changeset/relation.ex
++++ b/lib/ecto/changeset/relation.ex
+@@ -105,7 +105,7 @@ defmodule Ecto.Changeset.Relation do
+ 
+   def cast(%{related: mod} = relation, owner, params, current, on_cast) do
+     pks = mod.__schema__(:primary_key)
+-    fun = &do_cast(relation, owner, &1, &2, &3, &4, on_cast)
++    fun = &do_cast(relation, owner, &1, &2, &3, on_cast)
+     data_pk = data_pk(pks)
+     param_pk = param_pk(mod, pks)
+ 
+@@ -114,7 +114,7 @@ defmodule Ecto.Changeset.Relation do
+     end
+   end
+ 
+-  defp do_cast(meta, owner, params, struct, allowed_actions, idx, {module, fun, args})
++  defp do_cast(meta, owner, params, struct, allowed_actions, {module, fun, args})
+        when is_atom(module) and is_atom(fun) and is_list(args) do
+     IO.warn "passing a MFA to :with in cast_assoc/cast_embed is deprecated, please pass an anonymous function instead"
+ 
+@@ -122,42 +122,27 @@ defmodule Ecto.Changeset.Relation do
+       apply(module, fun, [changeset, attrs | args])
+     end
+ 
+-    do_cast(meta, owner, params, struct, allowed_actions, idx, on_cast)
++    do_cast(meta, owner, params, struct, allowed_actions, on_cast)
+   end
+ 
+-  defp do_cast(relation, owner, params, nil = _struct, allowed_actions, idx, on_cast) do
++  defp do_cast(meta, owner, params, nil = _struct, allowed_actions, on_cast) do
+     {:ok,
+-      relation
+-      |> apply_on_cast(on_cast, relation.__struct__.build(relation, owner), params, idx)
++      on_cast.(meta.__struct__.build(meta, owner), params)
+       |> put_new_action(:insert)
+       |> check_action!(allowed_actions)}
+   end
+ 
+-  defp do_cast(relation, _owner, nil = _params, current, _allowed_actions, _idx, _on_cast) do
++  defp do_cast(relation, _owner, nil = _params, current, _allowed_actions, _on_cast) do
+     on_replace(relation, current)
+   end
+ 
+-  defp do_cast(relation, _owner, params, struct, allowed_actions, idx, on_cast) do
++  defp do_cast(_meta, _owner, params, struct, allowed_actions, on_cast) do
+     {:ok,
+-      relation
+-      |> apply_on_cast(on_cast, struct, params, idx)
++      on_cast.(struct, params)
+       |> put_new_action(:update)
+       |> check_action!(allowed_actions)}
+   end
+ 
+-  defp apply_on_cast(%{cardinality: :many}, on_cast, struct, params, idx) when is_function(on_cast, 3) do
+-    on_cast.(struct, params, idx)
+-  end
+-
+-  defp apply_on_cast(%{cardinality: :one, field: field}, on_cast, _struct, _params, _idx) when is_function(on_cast, 3) do
+-    raise ArgumentError, "invalid :with function for relation #{inspect(field)} " <>
+-      "of cardinality one. Expected a function of arity 2"
+-  end
+-
+-  defp apply_on_cast(_relation, on_cast, struct, params, _idx) when is_function(on_cast, 2) do
+-    on_cast.(struct, params)
+-  end
+-
+   @doc """
+   Wraps related structs in changesets.
+   """
+@@ -171,13 +156,13 @@ defmodule Ecto.Changeset.Relation do
+   def change(%{related: mod} = relation, value, current) do
+     get_pks = data_pk(mod.__schema__(:primary_key))
+     with :error <- cast_or_change(relation, value, current, get_pks, get_pks,
+-                                  &do_change(relation, &1, &2, &3, &4)) do
++                                  &do_change(relation, &1, &2, &3)) do
+       {:error, {"is invalid", [type: expected_type(relation)]}}
+     end
+   end
+ 
+   # This may be an insert or an update, get all fields.
+-  defp do_change(relation, %{__struct__: _} = changeset_or_struct, nil, _allowed_actions, _idx) do
++  defp do_change(relation, %{__struct__: _} = changeset_or_struct, nil, _allowed_actions) do
+     changeset = Changeset.change(changeset_or_struct)
+     {:ok,
+      changeset
+@@ -185,11 +170,11 @@ defmodule Ecto.Changeset.Relation do
+      |> put_new_action(action_from_changeset(changeset, nil))}
+   end
+ 
+-  defp do_change(relation, nil, current, _allowed_actions, _idx) do
++  defp do_change(relation, nil, current, _allowed_actions) do
+     on_replace(relation, current)
+   end
+ 
+-  defp do_change(relation, %Changeset{} = changeset, _current, allowed_actions, _idx) do
++  defp do_change(relation, %Changeset{} = changeset, _current, allowed_actions) do
+     {:ok,
+      changeset
+      |> assert_changeset_struct!(relation)
+@@ -197,7 +182,7 @@ defmodule Ecto.Changeset.Relation do
+      |> check_action!(allowed_actions)}
+   end
+ 
+-  defp do_change(_relation, %{__struct__: _} = struct, _current, allowed_actions, _idx) do
++  defp do_change(_relation, %{__struct__: _} = struct, _current, allowed_actions) do
+     {:ok,
+      struct
+      |> Ecto.Changeset.change
+@@ -205,11 +190,11 @@ defmodule Ecto.Changeset.Relation do
+      |> check_action!(allowed_actions)}
+   end
+ 
+-  defp do_change(relation, changes, current, allowed_actions, idx)
++  defp do_change(relation, changes, current, allowed_actions)
+       when is_list(changes) or is_map(changes) do
+     changeset = Ecto.Changeset.change(current || relation.__struct__.build(relation, nil), changes)
+     changeset = put_new_action(changeset, action_from_changeset(changeset, current))
+-    do_change(relation, changeset, current, allowed_actions, idx)
++    do_change(relation, changeset, current, allowed_actions)
+   end
+ 
+   defp action_from_changeset(%{data: %{__meta__: %{state: state}}}, _current) do
+@@ -310,7 +295,7 @@ defmodule Ecto.Changeset.Relation do
+     {current_pks, current_map} = process_current(current, current_pks_fun, relation)
+     %{unique: unique, ordered: ordered} = relation
+     ordered = if ordered, do: current_pks, else: []
+-    map_changes(value, new_pks_fun, fun, current_map, [], true, true, unique && %{}, 0, ordered)
++    map_changes(value, new_pks_fun, fun, current_map, [], true, true, unique && %{}, ordered)
+   end
+ 
+   defp cast_or_change(_, _, _, _, _, _), do: :error
+@@ -340,7 +325,7 @@ defmodule Ecto.Changeset.Relation do
+   end
+ 
+   defp single_change(new, current, fun, allowed_actions, skippable?) do
+-    case fun.(new, current, allowed_actions, nil) do
++    case fun.(new, current, allowed_actions) do
+       {:ok, %{action: :ignore}} ->
+         :ignore
+       {:ok, changeset} ->
+@@ -356,15 +341,15 @@ defmodule Ecto.Changeset.Relation do
+ 
+   # map changes
+ 
+-  defp map_changes([changes | rest], new_pks, fun, current, acc, valid?, skip?, unique, idx, ordered)
++  defp map_changes([changes | rest], new_pks, fun, current, acc, valid?, skip?, unique, ordered)
+       when is_map(changes) or is_list(changes) do
+     pk_values = new_pks.(changes)
+     {struct, current, allowed_actions} = pop_current(current, pk_values)
+ 
+-    case fun.(changes, struct, allowed_actions, idx) do
++    case fun.(changes, struct, allowed_actions) do
+       {:ok, %{action: :ignore}} ->
+         ordered = pop_ordered(pk_values, ordered)
+-        map_changes(rest, new_pks, fun, current, acc, valid?, skip?, unique, idx + 1, ordered)
++        map_changes(rest, new_pks, fun, current, acc, valid?, skip?, unique, ordered)
+       {:ok, changeset} ->
+         changeset = maybe_add_error_on_pk(changeset, pk_values, unique)
+         acc = [changeset | acc]
+@@ -372,19 +357,19 @@ defmodule Ecto.Changeset.Relation do
+         skip? = (struct != nil) and skip? and skip?(changeset)
+         unique = unique && Map.put(unique, pk_values, true)
+         ordered = pop_ordered(pk_values, ordered)
+-        map_changes(rest, new_pks, fun, current, acc, valid?, skip?, unique, idx + 1, ordered)
++        map_changes(rest, new_pks, fun, current, acc, valid?, skip?, unique, ordered)
+       :error ->
+         :error
+     end
+   end
+ 
+-  defp map_changes([], _new_pks, fun, current, acc, valid?, skip?, _unique, _idx, ordered) do
++  defp map_changes([], _new_pks, fun, current, acc, valid?, skip?, _unique, ordered) do
+     current_structs = Enum.map(current, &elem(&1, 1))
+     skip? = skip? and ordered == []
+     reduce_delete_changesets(current_structs, fun, Enum.reverse(acc), valid?, skip?)
+   end
+ 
+-  defp map_changes(_params, _new_pks, _fun, _current, _acc, _valid?, _skip?, _unique, _idx, _ordered) do
++  defp map_changes(_params, _new_pks, _fun, _current, _acc, _valid?, _skip?, _unique, _ordered) do
+     :error
+   end
+ 
+@@ -414,7 +399,7 @@ defmodule Ecto.Changeset.Relation do
+   end
+ 
+   defp reduce_delete_changesets([struct | rest], fun, acc, valid?, _skip?) do
+-    case fun.(nil, struct, [:update, :delete], nil) do
++    case fun.(nil, struct, [:update, :delete]) do
+       {:ok, changeset} ->
+         valid? = valid? and changeset.valid?
+         reduce_delete_changesets(rest, fun, [changeset | acc], valid?, false)
+diff --git a/test/ecto/changeset/embedded_test.exs b/test/ecto/changeset/embedded_test.exs
+index 5a586eb9..bdb7a0ce 100644
+--- a/test/ecto/changeset/embedded_test.exs
++++ b/test/ecto/changeset/embedded_test.exs
+@@ -39,7 +39,6 @@ defmodule Ecto.Changeset.EmbeddedTest do
+ 
+     schema "posts" do
+       field :title, :string
+-      field :position, :integer
+     end
+ 
+     def changeset(schema, params) do
+@@ -48,13 +47,6 @@ defmodule Ecto.Changeset.EmbeddedTest do
+       |> validate_length(:title, min: 3)
+     end
+ 
+-    def changeset_with_position(schema, params, position) do
+-      cast(schema, params, ~w(title)a)
+-      |> validate_required(:title)
+-      |> validate_length(:title, min: 3)
+-      |> put_change(:position, position)
+-    end
+-
+     def optional_changeset(schema, params) do
+       cast(schema, params, ~w(title)a)
+     end
+@@ -87,12 +79,6 @@ defmodule Ecto.Changeset.EmbeddedTest do
+       changeset(schema, params)
+       |> Map.put(:action, Map.get(params, :action, :update))
+     end
+-
+-    def changeset_with_position(schema, params, _position) do
+-      cast(schema, params, ~w(name id)a)
+-      |> validate_required(:name)
+-      |> validate_length(:name, min: 3)
+-    end
+   end
+ 
+   defmodule Nested do
+@@ -631,19 +617,15 @@ defmodule Ecto.Changeset.EmbeddedTest do
+     refute changeset.valid?
+   end
+ 
+-  test "argument error when casting embeds_one with arity 3 function" do
+-    assert_raise(ArgumentError, ~r/invalid \:with function for relation \:profile/, fn ->
+-      params = %{"profile" => %{"name" => "John"}}
+-      cast(%Author{}, params, :profile, with: &Profile.changeset_with_position/3)
+-    end)
+-  end
+-
+-  test "sends index when casting embeds_many with arity 3 function" do
+-    changeset = cast(%Author{}, %{"posts" => [%{"title" => "hello"}, %{"title" => "bye"}]},
+-      :posts, with: &Post.changeset_with_position/3)
+-    [post, post2] = changeset.changes.posts
+-    assert post.changes == %{title: "hello", position: 0}
+-    assert post2.changes == %{title: "bye", position: 1}
++  test "cast inline embeds_many with valid params" do
++    changeset = cast(%Author{}, %{"inline_posts" => [%{"title" => "hello"}]},
++      :inline_posts, with: &Post.changeset/2)
++    [post] = changeset.changes.inline_posts
++    assert post.changes == %{title: "hello"}
++    assert post.errors == []
++    assert post.action  == :insert
++    assert post.valid?
++    assert changeset.valid?
+   end
+ 
+   ## Others
+diff --git a/test/ecto/changeset/has_assoc_test.exs b/test/ecto/changeset/has_assoc_test.exs
+index c2ecfedc..a7fdf572 100644
+--- a/test/ecto/changeset/has_assoc_test.exs
++++ b/test/ecto/changeset/has_assoc_test.exs
+@@ -14,7 +14,6 @@ defmodule Ecto.Changeset.HasAssocTest do
+ 
+     schema "posts" do
+       field :title, :string
+-      field :position, :integer
+       belongs_to :author, Author
+     end
+ 
+@@ -24,13 +23,6 @@ defmodule Ecto.Changeset.HasAssocTest do
+       |> Changeset.validate_length(:title, min: 3)
+     end
+ 
+-    def changeset_with_position(schema, params, position) do
+-      Changeset.cast(schema, params, ~w(title author_id)a)
+-      |> Changeset.validate_required(:title)
+-      |> Changeset.validate_length(:title, min: 3)
+-      |> Changeset.put_change(:position, position)
+-    end
+-
+     def set_action(schema, params) do
+       changeset(schema, params)
+       |> Map.put(:action, Map.get(params, :action, :update))
+@@ -81,7 +73,7 @@ defmodule Ecto.Changeset.HasAssocTest do
+     def optional_changeset(schema, params) do
+       Changeset.cast(schema, params, ~w(name)a)
+     end
+-
++    
+     def failing_changeset(schema, params, error_string) do
+       Changeset.cast(schema, params, ~w(name)a)
+       |> Changeset.add_error(:name, error_string)
+@@ -471,26 +463,6 @@ defmodule Ecto.Changeset.HasAssocTest do
+     refute changeset.valid?
+   end
+ 
+-  test "cast has_many with sort_param, drop param and arity-3 with" do
+-    posts = %{1 => %{"title" => "one"}, 2 => %{"title" => "two"}, 3 => %{"title" => "three"}}
+-    opts = [sort_param: :sort, drop_param: :drop, with: &Post.changeset_with_position/3]
+-
+-    changeset = cast(%Author{}, %{"posts" => posts}, :posts, opts)
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(one two three)
+-
+-    changeset = cast(%Author{}, %{"posts" => posts, "drop" => [2]}, :posts, opts)
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1]
+-
+-    changeset = cast(%Author{}, %{"posts" => posts, "sort" => [2, 3, 1]}, :posts, opts)
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(two three one)
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1, 2]
+-
+-    changeset = cast(%Author{}, %{posts: posts, sort: [1, "new"], drop: [2, "new"]}, :posts, opts)
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+-    assert Enum.map(changeset.changes.posts, & &1.changes[:position]) == [0, 1]
+-  end
+-
+   test "cast has_many with invalid operation" do
+     params = %{"posts" => [%{"id" => 1, "title" => "new"}]}
+     assert_raise RuntimeError, ~r"cannot update related", fn ->

@@ -1,0 +1,124 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 26f18da7..e18e8c8d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -33,6 +33,11 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2135, Remove trigger functions from schema cache and OpenAPI output, because they can't be called directly anyway. - @wolfgangwalther
+  - #2145, Fix accessing json array fields with -> and ->> in ?select= and ?order=. - @wolfgangwalther
+ 
++### Changed
++
++ - #2001, Return 204 No Content without Content-Type for RPCs returning VOID - @wolfgangwalther
++   + Previously, those RPCs would return "null" as a body with Content-Type: application/json.
++
+ ## [9.0.0] - 2021-11-25
+ 
+ ### Added
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index e9728f53..6f527bd1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -469,9 +469,12 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       RangeQuery.rangeStatusHeader iTopLevelRange queryTotal tableTotal
+ 
+   failNotSingular iAcceptContentType queryTotal $
+-    response status
+-      (contentTypeHeaders context ++ [contentRange])
+-      (if invMethod == InvHead then mempty else LBS.fromStrict body)
++    if Proc.procReturnsVoid proc then
++      response HTTP.status204 [contentRange] mempty
++    else
++      response status
++        (contentTypeHeaders context ++ [contentRange])
++        (if invMethod == InvHead then mempty else LBS.fromStrict body)
+ 
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest ctxPgVersion) = do
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index ebb872ba..4c053995 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -202,6 +202,7 @@ decodeProcs =
+                   <$> column HD.text
+                   <*> column HD.text
+                   <*> column HD.bool
++                  <*> column HD.bool
+                   <*> column HD.bool)
+               <*> (parseVolatility <$> column HD.char)
+               <*> column HD.bool
+@@ -209,10 +210,11 @@ decodeProcs =
+     addKey :: ProcDescription -> (QualifiedIdentifier, ProcDescription)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+ 
+-    parseRetType :: Text -> Text -> Bool -> Bool -> RetType
+-    parseRetType schema name isSetOf isComposite
+-      | isSetOf   = SetOf pgType
+-      | otherwise = Single pgType
++    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> Maybe RetType
++    parseRetType schema name isSetOf isComposite isVoid
++      | isVoid    = Nothing
++      | isSetOf   = Just (SetOf pgType)
++      | otherwise = Just (Single pgType)
+       where
+         qi = QualifiedIdentifier schema name
+         pgType
+@@ -287,6 +289,7 @@ procsSqlQuery = [q|
+      -- if any TABLE, INOUT or OUT arguments present, treat as composite
+      or COALESCE(proargmodes::text[] && '{t,b,o}', false)
+     ) AS rettype_is_composite,
++    ('pg_catalog.void'::regtype = t.oid) AS rettype_is_void,
+     p.provolatile,
+     p.provariadic > 0 as hasvariadic
+   FROM pg_proc p
+diff --git a/src/PostgREST/DbStructure/Proc.hs b/src/PostgREST/DbStructure/Proc.hs
+index 12850161..3ec5817a 100644
+--- a/src/PostgREST/DbStructure/Proc.hs
++++ b/src/PostgREST/DbStructure/Proc.hs
+@@ -10,6 +10,7 @@ module PostgREST.DbStructure.Proc
+   , RetType(..)
+   , procReturnsScalar
+   , procReturnsSingle
++  , procReturnsVoid
+   , procTableName
+   ) where
+ 
+@@ -42,7 +43,7 @@ data ProcDescription = ProcDescription
+   , pdName        :: Text
+   , pdDescription :: Maybe Text
+   , pdParams      :: [ProcParam]
+-  , pdReturnType  :: RetType
++  , pdReturnType  :: Maybe RetType
+   , pdVolatility  :: ProcVolatility
+   , pdHasVariadic :: Bool
+   }
+@@ -69,17 +70,22 @@ type ProcsMap = M.HashMap QualifiedIdentifier [ProcDescription]
+ 
+ procReturnsScalar :: ProcDescription -> Bool
+ procReturnsScalar proc = case proc of
+-  ProcDescription{pdReturnType = (Single Scalar)} -> True
+-  ProcDescription{pdReturnType = (SetOf Scalar)}  -> True
+-  _                                               -> False
++  ProcDescription{pdReturnType = Just (Single Scalar)} -> True
++  ProcDescription{pdReturnType = Just (SetOf Scalar)}  -> True
++  _                                                    -> False
+ 
+ procReturnsSingle :: ProcDescription -> Bool
+ procReturnsSingle proc = case proc of
+-  ProcDescription{pdReturnType = (Single _)} -> True
+-  _                                          -> False
++  ProcDescription{pdReturnType = Just (Single _)} -> True
++  _                                               -> False
++
++procReturnsVoid :: ProcDescription -> Bool
++procReturnsVoid proc = case proc of
++  ProcDescription{pdReturnType = Nothing} -> True
++  _                                       -> False
+ 
+ procTableName :: ProcDescription -> Maybe TableName
+ procTableName proc = case pdReturnType proc of
+-  SetOf  (Composite qi) -> Just $ qiName qi
+-  Single (Composite qi) -> Just $ qiName qi
+-  _                     -> Nothing
++  Just (SetOf  (Composite qi)) -> Just $ qiName qi
++  Just (Single (Composite qi)) -> Just $ qiName qi
++  _                            -> Nothing

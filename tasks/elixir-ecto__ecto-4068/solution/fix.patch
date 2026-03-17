@@ -1,0 +1,113 @@
+diff --git a/lib/ecto/query/builder/cte.ex b/lib/ecto/query/builder/cte.ex
+index 18cd0121..e052a2b7 100644
+--- a/lib/ecto/query/builder/cte.ex
++++ b/lib/ecto/query/builder/cte.ex
+@@ -94,11 +94,19 @@ defmodule Ecto.Query.Builder.CTE do
+   end
+ 
+   @doc false
+-  def apply_cte(nil, name, with_query, materialized) do
+-    %Ecto.Query.WithExpr{queries: [{name, materialized, with_query}]}
++  def apply_cte(nil, name, with_query, materialized) when is_boolean(materialized) do
++    %Ecto.Query.WithExpr{queries: [{name, %{materialized: materialized}, with_query}]}
+   end
+ 
+-  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, materialized) do
+-    %{with_expr | queries: List.keystore(queries, name, 0, {name, materialized, with_query})}
++  def apply_cte(nil, name, with_query, _materialized)  do
++    %Ecto.Query.WithExpr{queries: [{name, %{}, with_query}]}
++  end
++
++  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, materialized) when is_boolean(materialized) do
++    %{with_expr | queries:  List.keystore(queries, name, 0, {name, %{materialized: materialized}, with_query})}
++  end
++
++  def apply_cte(%Ecto.Query.WithExpr{queries: queries} = with_expr, name, with_query, _materialized) do
++    %{with_expr | queries:  List.keystore(queries, name, 0, {name, %{}, with_query})}
+   end
+ end
+diff --git a/lib/ecto/query/inspect.ex b/lib/ecto/query/inspect.ex
+index bb9fbbb0..f7f326a9 100644
+--- a/lib/ecto/query/inspect.ex
++++ b/lib/ecto/query/inspect.ex
+@@ -53,13 +53,13 @@ defimpl Inspect, for: Ecto.Query do
+     case query.with_ctes do
+       %WithExpr{recursive: recursive, queries: [_ | _] = queries} ->
+         with_ctes =
+-          Enum.map(queries, fn {name, materialized, query} ->
++          Enum.map(queries, fn {name, cte_opts, query} ->
+             cte = case query do
+               %Ecto.Query{} -> __MODULE__.inspect(query, opts)
+               %Ecto.Query.QueryExpr{} -> expr(query, {})
+             end
+ 
+-            concat(["|> with_cte(\"" <> name <> "\", materialized: ", inspect(materialized), ", as: ", cte, ")"])
++            concat(["|> with_cte(\"" <> name <> "\", materialized: ", inspect(cte_opts[:materialized]), ", as: ", cte, ")"])
+           end)
+ 
+         result = if recursive, do: glue(result, "\n", "|> recursive_ctes(true)"), else: result
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 87dcecab..ab5627bc 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -755,13 +755,13 @@ defmodule Ecto.Query.Planner do
+     # In here we add each cte as its own entry in the cache key.
+     # We could group them to avoid multiple keys, but since they are uncommon, we keep it simple.
+     Enum.reduce queries, cache_and_params, fn
+-      {name, materialized, %Ecto.Query{} = query}, {cache, params} ->
++      {name, opts, %Ecto.Query{} = query}, {cache, params} ->
+         {_, params, inner_cache} = traverse_cache(query, :all, {[], params}, adapter)
+-        {merge_cache({key, name, materialized, inner_cache}, cache, inner_cache != :nocache), params}
++        {merge_cache({key, name, opts[:materialized], inner_cache}, cache, inner_cache != :nocache), params}
+ 
+-      {name, materialized, %Ecto.Query.QueryExpr{} = query_expr}, {cache, params} ->
++      {name, opts, %Ecto.Query.QueryExpr{} = query_expr}, {cache, params} ->
+         {params, cacheable?} = cast_and_merge_params(:with_cte, query, query_expr, params, adapter)
+-        {merge_cache({key, name, materialized, expr_to_cache(query_expr)}, cache, cacheable?), params}
++        {merge_cache({key, name, opts[:materialized], expr_to_cache(query_expr)}, cache, cacheable?), params}
+     end
+   end
+ 
+@@ -919,13 +919,13 @@ defmodule Ecto.Query.Planner do
+   defp plan_ctes(%Ecto.Query{with_ctes: %{queries: queries}} = query, adapter) do
+     queries =
+       Enum.map queries, fn
+-        {name, materialized, %Ecto.Query{} = cte_query} ->
++        {name, opts, %Ecto.Query{} = cte_query} ->
+           {planned_query, _params, _key} = cte_query |> attach_prefix(query) |> plan(:all, adapter)
+           planned_query = planned_query |> ensure_select(true)
+-          {name, materialized, planned_query}
++          {name, opts, planned_query}
+ 
+-        {name, materialized, other} ->
+-          {name, materialized, other}
++        {name, opts, other} ->
++          {name, opts, other}
+       end
+ 
+     put_in(query.with_ctes.queries, queries)
+@@ -1044,7 +1044,7 @@ defmodule Ecto.Query.Planner do
+ 
+     {queries, counter} =
+       Enum.reduce with_expr.queries, {[], counter}, fn
+-        {name, materialized, %Ecto.Query{} = inner_query}, {queries, counter} ->
++        {name, opts, %Ecto.Query{} = inner_query}, {queries, counter} ->
+           inner_query = put_in(inner_query.aliases[@parent_as], query)
+ 
+           # We don't want to use normalize_subquery_select because we are
+@@ -1059,12 +1059,12 @@ defmodule Ecto.Query.Planner do
+           inner_query = put_in(inner_query.select.fields, fields)
+           {_, inner_query} = pop_in(inner_query.aliases[@parent_as])
+ 
+-          {[{name, materialized, inner_query} | queries], counter}
++          {[{name, opts, inner_query} | queries], counter}
+ 
+-        {name, materialized, %QueryExpr{expr: {:fragment, _, _} = fragment} = query_expr}, {queries, counter} ->
++        {name, opts, %QueryExpr{expr: {:fragment, _, _} = fragment} = query_expr}, {queries, counter} ->
+           {fragment, counter} = prewalk_source(fragment, :with_cte, query, with_expr, counter, adapter)
+           query_expr = %{query_expr | expr: fragment}
+-          {[{name, materialized, query_expr} | queries], counter}
++          {[{name, opts, query_expr} | queries], counter}
+       end
+ 
+     {%{with_expr | queries: Enum.reverse(queries)}, counter}

@@ -1,0 +1,368 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 742a2e24..caaa0a28 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+    + A `<host>:<admin_server_port>/live` endpoint is available for checking if postgrest is running on its port/socket. 200 OK = alive, 503 = dead.
+    + A `<host>:<admin_server_port>/ready` endpoint is available for checking a correct internal state(the database connection plus the schema cache). 200 OK = ready, 503 = not ready.
+  - #1988, Add the current user to the request log on stdout - @DavidLindbom, @wolfgangwalther
++ - #1823, Add the ability to run postgrest without any configuration. @wolfgangwalther
++   + #1991, Add the ability to run without `db-uri` using libpq's PG environment variables to connect. @wolfgangwalther
++   + #1769, Add the ability to run without `db-schemas`, defaulting to `db-schemas=public`. @wolfgangwalther
++   + #1689, Add the ability to run without `db-anon-role` disabling anonymous access. @wolfgangwalther
+ 
+ ### Fixed
+ 
+diff --git a/main/Main.hs b/main/Main.hs
+index d9d39373..5d5e18a7 100644
+--- a/main/Main.hs
++++ b/main/Main.hs
+@@ -2,15 +2,11 @@
+ 
+ module Main (main) where
+ 
+-import qualified Data.Map.Strict as M
+-
+ import System.IO (BufferMode (..), hSetBuffering)
+ 
+ import qualified PostgREST.App as App
+ import qualified PostgREST.CLI as CLI
+ 
+-import PostgREST.Config (readPGRSTEnvironment)
+-
+ import Protolude
+ 
+ #ifndef mingw32_HOST_OS
+@@ -20,8 +16,7 @@ import qualified PostgREST.Unix as Unix
+ main :: IO ()
+ main = do
+   setBuffering
+-  hasPGRSTEnv <- not . M.null <$> readPGRSTEnvironment
+-  opts <- CLI.readCLIShowHelp hasPGRSTEnv
++  opts <- CLI.readCLIShowHelp
+   CLI.main installSignalHandlers runAppInSocket opts
+ 
+ installSignalHandlers :: App.SignalHandlerInstaller
+diff --git a/nix/tools/loadtest.nix b/nix/tools/loadtest.nix
+index c2c282b4..0f097a11 100644
+--- a/nix/tools/loadtest.nix
++++ b/nix/tools/loadtest.nix
+@@ -45,6 +45,11 @@ let
+         inRootDir = true;
+       }
+       ''
++        # previously required settings to make this work with older branches
++        export PGRST_DB_ANON_ROLE="postgrest_test_anonymous"
++        export PGRST_DB_URI="postgresql://"
++        export PGRST_DB_SCHEMAS="test"
++
+         export PGRST_DB_CONFIG="false"
+         export PGRST_DB_POOL="1"
+         export PGRST_DB_TX_END="rollback-allow-override"
+diff --git a/nix/tools/withTools.nix b/nix/tools/withTools.nix
+index 4e281a37..736ccb9b 100644
+--- a/nix/tools/withTools.nix
++++ b/nix/tools/withTools.nix
+@@ -25,7 +25,6 @@ let
+             "ARG_USE_ENV([PGUSER], [postgrest_test_authenticator], [Authenticator PG role])"
+             "ARG_USE_ENV([PGDATABASE], [postgres], [PG database name])"
+             "ARG_USE_ENV([PGRST_DB_SCHEMAS], [test], [Schema to expose])"
+-            "ARG_USE_ENV([PGRST_DB_ANON_ROLE], [postgrest_test_anonymous], [Anonymous PG role])"
+           ];
+         positionalCompletion = "_command";
+         inRootDir = true;
+@@ -35,7 +34,7 @@ let
+       }
+       ''
+         # avoid starting multiple layers of withTmpDb
+-        if test -v PGRST_DB_URI; then
++        if test -v PGHOST; then
+           exec "$_arg_command" "''${_arg_leftovers[@]}"
+         fi
+ 
+@@ -53,9 +52,7 @@ let
+         export PGHOST="$tmpdir/socket"
+         export PGUSER
+         export PGDATABASE
+-        export PGRST_DB_URI="postgresql:///$PGDATABASE?host=$PGHOST&user=$PGUSER"
+         export PGRST_DB_SCHEMAS
+-        export PGRST_DB_ANON_ROLE
+ 
+         log "Initializing database cluster..."
+         # We try to make the database cluster as independent as possible from the host
+diff --git a/postgrest.cabal b/postgrest.cabal
+index bf82f8fc..daeab955 100644
+--- a/postgrest.cabal
++++ b/postgrest.cabal
+@@ -185,6 +185,7 @@ test-suite spec
+                       Feature.JsonOperatorSpec
+                       Feature.LegacyGucsSpec
+                       Feature.MultipleSchemaSpec
++                      Feature.NoAnonSpec
+                       Feature.NoJwtSpec
+                       Feature.NonexistentSchemaSpec
+                       Feature.OpenApiSpec
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 9e0ddb9c..a100e26b 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -208,7 +208,7 @@ postgrestResponse conf@AppConfig{..} maybeDbStructure jsonDbS pgVer pool AuthRes
+ 
+   let handleReq apiReq = handleRequest $ RequestContext conf dbStructure apiReq pgVer
+ 
+-  runDbHandler pool (txMode apiRequest) (authRole /= configDbAnonRole) configDbPreparedStatements .
++  runDbHandler pool (txMode apiRequest) (Just authRole /= configDbAnonRole) configDbPreparedStatements .
+     Middleware.optionalRollback conf apiRequest $
+       Middleware.runPgLocals conf authClaims authRole handleReq apiRequest jsonDbS pgVer
+ 
+diff --git a/src/PostgREST/Auth.hs b/src/PostgREST/Auth.hs
+index 0b148269..093300d0 100644
+--- a/src/PostgREST/Auth.hs
++++ b/src/PostgREST/Auth.hs
+@@ -32,7 +32,7 @@ import qualified Network.Wai.Middleware.HttpAuth as Wai
+ 
+ import Control.Lens            (set)
+ import Control.Monad.Except    (liftEither)
+-import Data.Either.Combinators (mapLeft, mapRight)
++import Data.Either.Combinators (mapLeft)
+ import Data.List               (lookup)
+ import Data.Time.Clock         (UTCTime)
+ import System.IO.Unsafe        (unsafePerformIO)
+@@ -71,16 +71,17 @@ parseToken AppConfig{..} token time = do
+     jwtClaimsError JWT.JWTExpired = JwtTokenInvalid "JWT expired"
+     jwtClaimsError e              = JwtTokenInvalid $ show e
+ 
+-parseClaims :: AppConfig -> JSON.Value -> AuthResult
+-parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) =
+-  AuthResult
+-  { authClaims = mclaims & M.insert "role" (JSON.toJSON role)
+-  , authRole = role
+-  }
++parseClaims :: Monad m =>
++  AppConfig -> JSON.Value -> ExceptT Error m AuthResult
++parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) = do
++  -- role defaults to anon if not specified in jwt
++  role <- liftEither . maybeToRight JwtTokenRequired $
++    unquoted <$> walkJSPath (Just jclaims) configJwtRoleClaimKey <|> configDbAnonRole
++  return AuthResult
++           { authClaims = mclaims & M.insert "role" (JSON.toJSON role)
++           , authRole = role
++           }
+   where
+-    -- role defaults to anon if not specified in jwt
+-    role = maybe configDbAnonRole unquoted (walkJSPath (Just jclaims) configJwtRoleClaimKey)
+-
+     walkJSPath :: Maybe JSON.Value -> JSPath -> Maybe JSON.Value
+     walkJSPath x                      []                = x
+     walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (M.lookup key o) rest
+@@ -91,7 +92,7 @@ parseClaims AppConfig{..} jclaims@(JSON.Object mclaims) =
+     unquoted (JSON.String t) = t
+     unquoted v = T.decodeUtf8 . LBS.toStrict $ JSON.encode v
+ -- impossible case - just added to please -Wincomplete-patterns
+-parseClaims _ _ = AuthResult { authClaims = M.empty, authRole = mempty }
++parseClaims _ _ = return AuthResult { authClaims = M.empty, authRole = mempty }
+ 
+ -- | Validate authorization header.
+ --   Parse and store JWT claims for future use in the request.
+@@ -101,11 +102,11 @@ middleware appState app req respond = do
+   time <- getTime appState
+ 
+   let token = fromMaybe "" $ Wai.extractBearerAuth =<< lookup HTTP.hAuthorization (Wai.requestHeaders req)
+-  claims <- runExceptT $ parseToken conf (LBS.fromStrict token) time
++  authResult <- runExceptT $
++    parseToken conf (LBS.fromStrict token) time >>=
++    parseClaims conf
+ 
+-  let
+-    authResult = mapRight (parseClaims conf) claims
+-    req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
++  let req' = req { Wai.vault = Wai.vault req & Vault.insert authResultKey authResult }
+   app req' respond
+ 
+ authResultKey :: Vault.Key (Either Error AuthResult)
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 6f83d1d3..0a7a9bf0 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -82,12 +82,12 @@ data Command
+   | CmdDumpSchema
+ 
+ -- | Read command line interface options. Also prints help.
+-readCLIShowHelp :: Bool -> IO CLI
+-readCLIShowHelp hasEnvironment =
++readCLIShowHelp :: IO CLI
++readCLIShowHelp =
+   O.customExecParser prefs opts
+   where
+     prefs = O.prefs $ O.showHelpOnError <> O.showHelpOnEmpty
+-    opts = O.info parser $ O.fullDesc <> progDesc <> footer
++    opts = O.info parser $ O.fullDesc <> progDesc
+     parser = O.helper <*> exampleParser <*> cliParser
+ 
+     progDesc =
+@@ -96,11 +96,6 @@ readCLIShowHelp hasEnvironment =
+         <> BS.unpack prettyVersion
+         <> " / create a REST API to an existing Postgres database"
+ 
+-    footer =
+-      O.footer $
+-        "To run PostgREST, please pass the FILENAME argument"
+-        <> " or set PGRST_ environment variables."
+-
+     exampleParser =
+       O.infoOption exampleConfigFile $
+         O.long "example"
+@@ -111,12 +106,12 @@ readCLIShowHelp hasEnvironment =
+     cliParser =
+       CLI
+         <$> (dumpConfigFlag <|> dumpSchemaFlag)
+-        <*> optionalIf hasEnvironment configFileOption
++        <*> O.optional configFileOption
+ 
+     configFileOption =
+       O.strArgument $
+         O.metavar "FILENAME"
+-        <> O.help "Path to configuration file (optional with PGRST_ environment variables)"
++        <> O.help "Path to configuration file"
+ 
+     dumpConfigFlag =
+       O.flag CmdRun CmdDumpConfig $
+@@ -128,10 +123,6 @@ readCLIShowHelp hasEnvironment =
+         O.long "dump-schema"
+         <> O.help "Dump loaded schema as JSON and exit (for debugging, output structure is unstable)"
+ 
+-    optionalIf :: Alternative f => Bool -> f a -> f (Maybe a)
+-    optionalIf True  = O.optional
+-    optionalIf False = fmap Just
+-
+ exampleConfigFile :: [Char]
+ exampleConfigFile =
+   [str|### REQUIRED:
+diff --git a/src/PostgREST/Config.hs b/src/PostgREST/Config.hs
+index 1f315e69..278db164 100644
+--- a/src/PostgREST/Config.hs
++++ b/src/PostgREST/Config.hs
+@@ -63,7 +63,7 @@ import Protolude hiding (Proxy, toList)
+ 
+ data AppConfig = AppConfig
+   { configAppSettings           :: [(Text, Text)]
+-  , configDbAnonRole            :: Text
++  , configDbAnonRole            :: Maybe Text
+   , configDbChannel             :: Text
+   , configDbChannelEnabled      :: Bool
+   , configDbExtraSearchPath     :: [Text]
+@@ -121,7 +121,7 @@ toText conf =
+   where
+     -- apply conf to all pgrst settings
+     pgrstSettings = (\(k, v) -> (k, v conf)) <$>
+-      [("db-anon-role",              q . configDbAnonRole)
++      [("db-anon-role",              q . fromMaybe "" . configDbAnonRole)
+       ,("db-channel",                q . configDbChannel)
+       ,("db-channel-enabled",            T.toLower . show . configDbChannelEnabled)
+       ,("db-extra-search-path",      q . T.intercalate "," . configDbExtraSearchPath)
+@@ -207,7 +207,7 @@ parser :: Maybe FilePath -> Environment -> [(Text, Text)] -> C.Parser C.Config A
+ parser optPath env dbSettings =
+   AppConfig
+     <$> parseAppSettings "app.settings"
+-    <*> reqString "db-anon-role"
++    <*> optString "db-anon-role"
+     <*> (fromMaybe "pgrst" <$> optString "db-channel")
+     <*> (fromMaybe True <$> optBool "db-channel-enabled")
+     <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
+@@ -220,13 +220,12 @@ parser optPath env dbSettings =
+     <*> (fromMaybe True <$> optBool "db-prepared-statements")
+     <*> (fmap toQi <$> optWithAlias (optString "db-root-spec")
+                                     (optString "root-spec"))
+-    <*> (fromList . splitOnCommas <$> reqWithAlias (optValue "db-schemas")
+-                                                   (optValue "db-schema")
+-                                                   "missing key: either db-schemas or db-schema must be set")
++    <*> (fromList . maybe ["public"] splitOnCommas <$> optWithAlias (optValue "db-schemas")
++                                                                    (optValue "db-schema"))
+     <*> (fromMaybe True <$> optBool "db-config")
+     <*> parseTxEnd "db-tx-end" snd
+     <*> parseTxEnd "db-tx-end" fst
+-    <*> reqString "db-uri"
++    <*> (fromMaybe "postgresql://" <$> optString "db-uri")
+     <*> (fromMaybe True <$> optBool "db-use-legacy-gucs")
+     <*> pure optPath
+     <*> pure Nothing
+@@ -317,24 +316,12 @@ parser optPath env dbSettings =
+         Nothing  -> pure [JSPKey "role"]
+         Just rck -> either (fail . show) pure $ pRoleClaimKey rck
+ 
+-    reqWithAlias :: C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a) -> [Char] -> C.Parser C.Config a
+-    reqWithAlias orig alias err =
+-      orig >>= \case
+-        Just v  -> pure v
+-        Nothing ->
+-          alias >>= \case
+-            Just v  -> pure v
+-            Nothing -> fail err
+-
+     optWithAlias :: C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a) -> C.Parser C.Config (Maybe a)
+     optWithAlias orig alias =
+       orig >>= \case
+         Just v  -> pure $ Just v
+         Nothing -> alias
+ 
+-    reqString :: C.Key -> C.Parser C.Config Text
+-    reqString k = overrideFromDbOrEnvironment C.required k coerceText
+-
+     optString :: C.Key -> C.Parser C.Config (Maybe Text)
+     optString k = mfilter (/= "") <$> overrideFromDbOrEnvironment C.optional k coerceText
+ 
+@@ -362,7 +349,7 @@ parser optPath env dbSettings =
+           let dbSettingName = T.pack $ dashToUnderscore <$> toS key in
+           if dbSettingName `notElem` [
+             "server_host", "server_port", "server_unix_socket", "server_unix_socket_mode", "log_level",
+-            "db_anon_role", "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_timeout", "db_config"]
++            "db_uri", "db_channel_enabled", "db_channel", "db_pool", "db_pool_timeout", "db_config"]
+           then lookup dbSettingName dbSettings
+           else Nothing
+ 
+diff --git a/src/PostgREST/Error.hs b/src/PostgREST/Error.hs
+index a150e2be..c1de4544 100644
+--- a/src/PostgREST/Error.hs
++++ b/src/PostgREST/Error.hs
+@@ -274,6 +274,7 @@ data Error
+   | PutRangeNotAllowedError
+   | JwtTokenMissing
+   | JwtTokenInvalid Text
++  | JwtTokenRequired
+   | SingularityError Integer
+   | NotFound
+   | ApiRequestError ApiRequestError
+@@ -288,6 +289,7 @@ instance PgrstError Error where
+   status PutRangeNotAllowedError = HTTP.status400
+   status JwtTokenMissing         = HTTP.status500
+   status (JwtTokenInvalid _)     = HTTP.unauthorized401
++  status JwtTokenRequired        = HTTP.unauthorized401
+   status (SingularityError _)    = HTTP.status406
+   status NotFound                = HTTP.status404
+   status (PgErr err)             = status err
+@@ -295,6 +297,7 @@ instance PgrstError Error where
+ 
+   headers (SingularityError _)     = [ContentType.toHeader CTSingularJSON]
+   headers (JwtTokenInvalid m)      = [ContentType.toHeader CTApplicationJSON, invalidTokenHeader m]
++  headers JwtTokenRequired         = [ContentType.toHeader CTApplicationJSON, requiredTokenHeader]
+   headers (PgErr err)              = headers err
+   headers (ApiRequestError err)    = headers err
+   headers _                        = [ContentType.toHeader CTApplicationJSON]
+@@ -322,6 +325,8 @@ instance JSON.ToJSON Error where
+     "message" .= ("Server lacks JWT secret" :: Text)]
+   toJSON (JwtTokenInvalid message) = JSON.object [
+     "message" .= (message :: Text)]
++  toJSON JwtTokenRequired          = JSON.object [
++    "message" .= ("Anonymous access is disabled" :: Text)]
+   toJSON NotFound = JSON.object []
+   toJSON (PgErr err) = JSON.toJSON err
+   toJSON (ApiRequestError err) = JSON.toJSON err
+@@ -330,5 +335,8 @@ invalidTokenHeader :: Text -> Header
+ invalidTokenHeader m =
+   ("WWW-Authenticate", "Bearer error=\"invalid_token\", " <> "error_description=" <> encodeUtf8 (show m))
+ 
++requiredTokenHeader :: Header
++requiredTokenHeader = ("WWW-Authenticate", "Bearer")
++
+ singularityError :: (Integral a) => a -> Error
+ singularityError = SingularityError . toInteger

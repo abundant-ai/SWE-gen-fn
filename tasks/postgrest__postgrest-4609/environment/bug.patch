@@ -1,0 +1,183 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c8395447..9ff6622b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,12 +13,9 @@ All notable changes to this project will be documented in this file. From versio
+ - Optimize requests with `Prefer: count=exact` that do not use ranges or `db-max-rows` by @laurenceisla in #3957
+   + Removed unnecessary double count when building the `Content-Range`.
+ - Add config `client_error_verbosity` to customize error verbosity by @taimoorzaeem in #4088, #3980, #3824
+-- Add `Vary` header to responses by @develop7 in #4609
+ 
+ ### Changed
+ 
+-- All responses now include a `Vary` header by @develop7 in #4609
+-
+ - Log error when `db-schemas` config contains schema `pg_catalog` or `information_schema` by @taimoorzaeem in #4359
+   + Now fails at startup. Prior to this, it failed with `PGRST205` on requests related to these schemas.
+ 
+diff --git a/docs/postgrest.dict b/docs/postgrest.dict
+index 4f969e43..a890f85f 100644
+--- a/docs/postgrest.dict
++++ b/docs/postgrest.dict
+@@ -15,7 +15,6 @@ BOM
+ Bytea
+ Cardano
+ cd
+-CDNs
+ centric
+ CLI
+ CMS
+diff --git a/docs/references/api.rst b/docs/references/api.rst
+index 62d905bd..36a964b2 100644
+--- a/docs/references/api.rst
++++ b/docs/references/api.rst
+@@ -21,7 +21,6 @@ PostgREST exposes three database objects of a schema as resources: tables, views
+    api/aggregate_functions.rst
+    api/openapi.rst
+    api/preferences.rst
+-   api/vary_header.rst
+    api/*
+ 
+ .. raw:: html
+diff --git a/docs/references/api/vary_header.rst b/docs/references/api/vary_header.rst
+deleted file mode 100644
+index 41b564bc..00000000
+--- a/docs/references/api/vary_header.rst
++++ /dev/null
+@@ -1,16 +0,0 @@
+-.. _vary_header:
+-
+-Vary Header
+-===========
+-
+-In order to assist caching proxies and CDNs, PostgREST includes a ``Vary`` header of value
+-``Accept, Prefer, Range`` in its responses which should fit most of the bills. As any other
+-response header, it's available for override
+-by updating ``response.headers`` GUC variable accordingly, for example:
+-
+-.. code-block:: postgres
+-
+-   -- Override the Vary header to include Accept, Prefer and X-Test-Vary headers
+-   perform set_config('response.headers', '[{"Vary": "Accept, Prefer, X-Test-Vary"}]', true);
+-
+-In this case PostgREST will use provided value verbatim.
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index bbf6e070..72e9ba34 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -60,16 +60,15 @@ import PostgREST.SchemaCache          (SchemaCache (..))
+ import PostgREST.TimeIt               (timeItT)
+ import PostgREST.Version              (docsVersion, prettyVersion)
+ 
+-import qualified Data.ByteString.Char8     as BS
+-import qualified Data.List                 as L
+-import           Data.Streaming.Network    (bindPortTCP,
+-                                            bindRandomPortTCP)
+-import qualified Data.Text                 as T
+-import qualified Network.HTTP.Types        as HTTP
+-import qualified Network.HTTP.Types.Header as HTTP (hVary)
+-import qualified Network.Socket            as NS
+-import           PostgREST.Unix            (createAndBindDomainSocket)
+-import           Protolude                 hiding (Handler)
++import qualified Data.ByteString.Char8  as BS
++import qualified Data.List              as L
++import           Data.Streaming.Network (bindPortTCP,
++                                         bindRandomPortTCP)
++import qualified Data.Text              as T
++import qualified Network.HTTP.Types     as HTTP
++import qualified Network.Socket         as NS
++import           PostgREST.Unix         (createAndBindDomainSocket)
++import           Protolude              hiding (Handler)
+ 
+ type Handler = ExceptT Error
+ 
+@@ -209,17 +208,7 @@ postgrestResponse appState conf@AppConfig{..} maybeSchemaCache authResult@AuthRe
+ 
+   where
+     toWaiResponse :: ServerTiming -> Response.PgrstResponse -> Wai.Response
+-    toWaiResponse timing (Response.PgrstResponse st hdrs bod) =
+-      Wai.responseLBS st (hdrs ++ serverTimingHeaders timing ++ [varyHeader | not $ varyHeaderPresent hdrs]) bod
+-
+-    serverTimingHeaders :: ServerTiming -> [HTTP.Header]
+-    serverTimingHeaders timing = [serverTimingHeader timing | configServerTimingEnabled]
+-
+-    varyHeader :: HTTP.Header
+-    varyHeader = (HTTP.hVary, "Accept, Prefer, Range")
+-
+-    varyHeaderPresent :: [HTTP.Header] -> Bool
+-    varyHeaderPresent = any (\(h, _v) -> h == HTTP.hVary)
++    toWaiResponse timing (Response.PgrstResponse st hdrs bod) = Wai.responseLBS st (hdrs ++ ([serverTimingHeader timing | configServerTimingEnabled])) bod
+ 
+     withTiming :: Handler IO a -> Handler IO (Maybe Double, a)
+     withTiming f = if configServerTimingEnabled
+diff --git a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+index 7063ea43..61a871c8 100644
+--- a/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
++++ b/test/io/__snapshots__/test_cli/test_schema_cache_snapshot[dbRoutines].yaml
+@@ -196,23 +196,6 @@
+       pdSchema: public
+       pdVolatility: Volatile
+ 
+-- - qiName: custom_vary_hdr
+-    qiSchema: public
+-  - - pdDescription: null
+-      pdFuncSettings: []
+-      pdHasVariadic: false
+-      pdName: custom_vary_hdr
+-      pdParams: []
+-      pdReturnType:
+-        contents:
+-          contents:
+-            qiName: void
+-            qiSchema: pg_catalog
+-          tag: Scalar
+-        tag: Single
+-      pdSchema: public
+-      pdVolatility: Volatile
+-
+ - - qiName: get_postgres_version
+     qiSchema: public
+   - - pdDescription: null
+diff --git a/test/io/fixtures/schema.sql b/test/io/fixtures/schema.sql
+index 630fca3c..b84889d2 100644
+--- a/test/io/fixtures/schema.sql
++++ b/test/io/fixtures/schema.sql
+@@ -258,10 +258,3 @@ $_$ language sql;
+ create or replace function notify_pgrst() returns void as $$
+   notify pgrst;
+ $$ language sql;
+-
+-
+-create or replace function custom_vary_hdr() returns void as $$
+-  begin
+-    perform set_config('response.headers', '[{"Vary": "X-Test-Accept"}]', false);
+-  end
+-$$ language plpgsql;
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index be7923fd..9b3214b8 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -1811,23 +1811,3 @@ def test_client_error_verbosity_config(defaultenv):
+             "details": None,
+             "hint": "Perhaps you meant the table 'public.items'",
+         }
+-
+-
+-def test_vary_custom_header_set(defaultenv):
+-    "Test default Vary header value is overridden in pre-request database function"
+-
+-    env = {**defaultenv, "PGRST_DB_PRE_REQUEST": "custom_vary_hdr"}
+-
+-    with run(env=env) as postgrest:
+-        response = postgrest.session.get("/projects")
+-
+-        assert response.headers["Vary"] == "X-Test-Accept"
+-
+-
+-def test_vary_default_header_set(defaultenv):
+-    "Test default Vary header value matches default one"
+-
+-    with run(env=defaultenv) as postgrest:
+-        response = postgrest.session.get("/projects")
+-
+-        assert response.headers["Vary"] == "Accept, Prefer, Range"

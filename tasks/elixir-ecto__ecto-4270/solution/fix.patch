@@ -1,0 +1,564 @@
+diff --git a/integration_test/cases/repo.exs b/integration_test/cases/repo.exs
+index 21c388d2..4645377c 100644
+--- a/integration_test/cases/repo.exs
++++ b/integration_test/cases/repo.exs
+@@ -2174,4 +2174,80 @@ defmodule Ecto.Integration.RepoTest do
+       assert updated_second.public == false
+     end
+   end
++
++  describe "values list" do
++    @describetag :values_list
++
++    test "all" do
++      uuid_module = uuid_module(TestRepo.__adapter__())
++      uuid = uuid_module.generate()
++
++      # Without select
++      values = [%{bid: uuid, visits: 1}, %{bid: uuid, visits: 2}]
++      types = %{bid: uuid_module, visits: :integer}
++      query = from v in values(values, types)
++      assert TestRepo.all(query) == values
++
++      # With select
++      query = select(query, [v], {v, v.bid})
++      assert TestRepo.all(query) == Enum.map(values, &{&1, &1.bid})
++    end
++
++    test "all with join" do
++      uuid_module = uuid_module(TestRepo.__adapter__())
++      uuid = uuid_module.generate()
++
++      values1 = [%{bid: uuid, visits: 1}, %{bid: uuid, visits: 2}]
++      values2 = [%{bid: uuid, visits: 1}]
++      types = %{bid: uuid_module, visits: :integer}
++
++      query =
++        from v1 in values(values1, types),
++          join: v2 in values(values2, types),
++          on: v1.visits == v2.visits
++
++      assert TestRepo.all(query) == [%{bid: uuid, visits: 1}]
++    end
++
++    test "delete_all" do
++      uuid_module = uuid_module(TestRepo.__adapter__())
++      uuid = uuid_module.generate()
++
++      _p1 = TestRepo.insert!(%Post{bid: uuid, visits: 1})
++      p2 = TestRepo.insert!(%Post{bid: uuid, visits: 5})
++
++      values = [%{bid: uuid, visits: 1}, %{bid: nil, visits: 1}, %{bid: uuid, visits: 3}]
++      types = %{bid: uuid_module, visits: :integer}
++
++      query =
++        from p in Post,
++          join: v in values(values, types),
++          on: p.visits == v.visits
++
++      assert {1, _} = TestRepo.delete_all(query)
++      assert TestRepo.all(Post) == [p2]
++    end
++
++    test "update_all" do
++      uuid_module = uuid_module(TestRepo.__adapter__())
++      uuid = uuid_module.generate()
++
++      TestRepo.insert!(%Post{bid: uuid, visits: 1})
++
++      values = [%{bid: uuid, visits: 10}, %{bid: nil, visits: 2}]
++      types = %{bid: uuid_module, visits: :integer}
++
++      query =
++        from p in Post,
++          join: v in values(values, types),
++          on: p.bid == v.bid,
++          update: [set: [visits: v.visits]]
++
++      assert {1, _} = TestRepo.update_all(query, [])
++      assert [%{visits: 10}] = TestRepo.all(Post)
++    end
++
++    defp uuid_module(Ecto.Adapters.Tds), do: Tds.Ecto.UUID
++    defp uuid_module(_), do: Ecto.UUID
++  end
+ end
+diff --git a/lib/ecto/query.ex b/lib/ecto/query.ex
+index 311efdb1..d146e8cb 100644
+--- a/lib/ecto/query.ex
++++ b/lib/ecto/query.ex
+@@ -476,6 +476,59 @@ defmodule Ecto.Query do
+     defstruct [:tag, :type, :value]
+   end
+ 
++  defmodule Values do
++    @moduledoc false
++    defstruct [:types, :num_rows, :params]
++
++    def new(values_list, types) do
++      fields = fields(values_list)
++      types = types!(fields, types)
++      params = params!(values_list, types)
++      %__MODULE__{types: types, params: params, num_rows: length(values_list)}
++    end
++
++    defp fields(values_list) do
++      fields =
++        Enum.reduce(values_list, MapSet.new(), fn values, fields ->
++          Enum.reduce(values, fields, fn {field, _}, fields ->
++            MapSet.put(fields, field)
++          end)
++        end)
++
++      MapSet.to_list(fields)
++    end
++
++    defp types!(fields, types) do
++      Enum.map(fields, fn field->
++        case types do
++          %{^field => type} ->
++            {field, type}
++
++          _ ->
++            raise ArgumentError,
++                  "values/2 must declare the type for every field. " <>
++                    "The type was not given for field `#{field}`"
++        end
++      end)
++    end
++
++    defp params!(values_list, types) do
++      Enum.reduce(values_list, [], fn values, params ->
++        Enum.reduce(types, params, fn {field, type}, params ->
++          case values do
++            %{^field => value} ->
++              [{value, type} | params]
++
++            _ ->
++              raise ArgumentError,
++                    "each member of a values list must have the same fields. " <>
++                      "Missing field `#{field}` in #{inspect(values)}"
++          end
++        end)
++      end)
++    end
++  end
++
+   @type t :: %__MODULE__{}
+   @opaque dynamic_expr :: %DynamicExpr{}
+ 
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index a9a14b8e..3a66e2d5 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -502,6 +502,57 @@ defmodule Ecto.Query.API do
+   """
+   def splice(list), do: doc! [list]
+ 
++  @doc """
++  Creates a values list/constant table.
++
++  A values list can be used as a source in a query, both in `Ecto.Query.from/2`
++  and `Ecto.Query.join/5`.
++
++  The first argument is a list of maps representing the values of the constant table.
++  Each entry in the list must have exactly the same fields or an error is raised.
++
++  The second argument is a map of types corresponding to the fields in the first argument.
++  Each field must be given a type or an error is raised. Any type that can be specified in
++  a schema may be used.
++
++  ## Select example
++
++      values = [%{id: 1, text: "abc"}, %{id: 2, text: "xyz"}]
++      types = %{id: :integer, text: :string}
++
++      query =
++        from v1 in values(values, types),
++          join: v2 in values(values, types),
++          on: v1.id == v2.id
++
++      Repo.all(query)
++
++  ## Delete example
++      values = [%{id: 1, text: "abc"}, %{id: 2, text: "xyz"}]
++      types = %{id: :integer, text: :string}
++
++      query =
++        from p in Post,
++          join: v in values(values, types),
++          on: p.id == v.id,
++          where: p.counter == ^0
++
++      Repo.delete_all(query)
++
++  ## Update example
++      values = [%{id: 1, text: "abc"}, %{id: 2, text: "xyz"}]
++      types = %{id: :integer, text: :string}
++
++      query =
++        from p in Post,
++          join: v in values(values, types),
++          on: p.id == v.id,
++          update: [set: [text: v.text]]
++
++      Repo.update_all(query, [])
++  """
++  def values(values, types), do: doc! [values, types]
++
+   @doc """
+   Allows a field to be dynamically accessed.
+ 
+diff --git a/lib/ecto/query/builder/from.ex b/lib/ecto/query/builder/from.ex
+index 606ddb0b..ae16bf25 100644
+--- a/lib/ecto/query/builder/from.ex
++++ b/lib/ecto/query/builder/from.ex
+@@ -46,10 +46,17 @@ defmodule Ecto.Query.Builder.From do
+ 
+   defp escape_source(query, env) do
+     case Macro.expand_once(query, env) do
+-      {:fragment, _, _} = fragment->
++      {:fragment, _, _} = fragment ->
+         {fragment, {params, _acc}} = Builder.escape(fragment, :any, {[], %{}}, [], env)
+         {fragment, Builder.escape_params(params)}
+ 
++      {:values, _, [values_list, types]} ->
++        prelude = quote do: values = Ecto.Query.Values.new(unquote(values_list), unquote(types))
++        types = quote do: values.types
++        num_rows = quote do: values.num_rows
++        params = quote do: Ecto.Query.Builder.escape_params(values.params)
++        {{:{}, [], [:values, [], [types, num_rows]]}, prelude, params}
++
+       ^query ->
+         case query do
+           {left, right} -> {left, Macro.expand(right, env)}
+@@ -111,6 +118,18 @@ defmodule Ecto.Query.Builder.From do
+         {:ok, prefix} = prefix || {:ok, nil}
+         {query(prefix, fragment, params, as, hints, env.file, env.line), binds, 1}
+ 
++      {{:{}, _, [:values, _, _]} = values, prelude, params} ->
++        {:ok, prefix} = prefix || {:ok, nil}
++        query = query(prefix, values, params, as, hints, env.file, env.line)
++
++        quoted =
++          quote do
++            unquote(prelude)
++            unquote(query)
++          end
++
++        {quoted, binds, 1}
++
+       _other ->
+         quoted =
+           quote do
+diff --git a/lib/ecto/query/builder/join.ex b/lib/ecto/query/builder/join.ex
+index e0f1ce27..98875cec 100644
+--- a/lib/ecto/query/builder/join.ex
++++ b/lib/ecto/query/builder/join.ex
+@@ -15,57 +15,65 @@ defmodule Ecto.Query.Builder.Join do
+   ## Examples
+ 
+       iex> escape(quote(do: x in "foo"), [], __ENV__)
+-      {:x, {"foo", nil}, nil, []}
++      {:x, {"foo", nil}, nil, nil, []}
+ 
+       iex> escape(quote(do: "foo"), [], __ENV__)
+-      {:_, {"foo", nil}, nil, []}
++      {:_, {"foo", nil}, nil, nil, []}
+ 
+       iex> escape(quote(do: x in Sample), [], __ENV__)
+-      {:x, {nil, Sample}, nil, []}
++      {:x, {nil, Sample}, nil, nil, []}
+ 
+       iex> escape(quote(do: x in __MODULE__), [], __ENV__)
+-      {:x, {nil, __MODULE__}, nil, []}
++      {:x, {nil, __MODULE__}, nil, nil, []}
+ 
+       iex> escape(quote(do: x in {"foo", :sample}), [], __ENV__)
+-      {:x, {"foo", :sample}, nil, []}
++      {:x, {"foo", :sample}, nil, nil, []}
+ 
+       iex> escape(quote(do: x in {"foo", Sample}), [], __ENV__)
+-      {:x, {"foo", Sample}, nil, []}
++      {:x, {"foo", Sample}, nil, nil, []}
+ 
+       iex> escape(quote(do: x in {"foo", __MODULE__}), [], __ENV__)
+-      {:x, {"foo", __MODULE__}, nil, []}
++      {:x, {"foo", __MODULE__}, nil, nil, []}
+ 
+       iex> escape(quote(do: c in assoc(p, :comments)), [p: 0], __ENV__)
+-      {:c, nil, {0, :comments}, []}
++      {:c, nil, {0, :comments}, nil, []}
+ 
+       iex> escape(quote(do: x in fragment("foo")), [], __ENV__)
+-      {:x, {:{}, [], [:fragment, [], [raw: "foo"]]}, nil, []}
++      {:x, {:{}, [], [:fragment, [], [raw: "foo"]]}, nil, nil, []}
+ 
+   """
+   @spec escape(Macro.t, Keyword.t, Macro.Env.t) :: {atom, Macro.t | nil, Macro.t | nil, list}
+   def escape({:in, _, [{var, _, context}, expr]}, vars, env)
+       when is_atom(var) and is_atom(context) do
+-    {_, expr, assoc, params} = escape(expr, vars, env)
+-    {var, expr, assoc, params}
++    {_, expr, assoc, prelude, params} = escape(expr, vars, env)
++    {var, expr, assoc, prelude, params}
+   end
+ 
+   def escape({:subquery, _, [expr]}, _vars, _env) do
+-    {:_, quote(do: Ecto.Query.subquery(unquote(expr))), nil, []}
++    {:_, quote(do: Ecto.Query.subquery(unquote(expr))), nil, nil, []}
+   end
+ 
+   def escape({:subquery, _, [expr, opts]}, _vars, _env) do
+-    {:_, quote(do: Ecto.Query.subquery(unquote(expr), unquote(opts))), nil, []}
++    {:_, quote(do: Ecto.Query.subquery(unquote(expr), unquote(opts))), nil, nil, []}
+   end
+ 
+   def escape({:fragment, _, [_ | _]} = expr, vars, env) do
+     {expr, {params, _acc}} = Builder.escape(expr, :any, {[], %{}}, vars, env)
+-    {:_, expr, nil, params}
++    {:_, expr, nil, nil, params}
++  end
++
++  def escape({:values, _, [values_list, types]}, _vars, _env) do
++    prelude = quote do: values = Ecto.Query.Values.new(unquote(values_list), unquote(types))
++    types = quote do: values.types
++    num_rows = quote do: values.num_rows
++    params = quote do: values.params
++    {:_, {:{}, [], [:values, [], [types, num_rows]]}, nil, prelude, params}
+   end
+ 
+   def escape({string, schema} = join, _vars, env) when is_binary(string) do
+     case Macro.expand(schema, env) do
+       schema when is_atom(schema) ->
+-        {:_, {string, schema}, nil, []}
++        {:_, {string, schema}, nil, nil, []}
+ 
+       _ ->
+         Builder.error! "malformed join `#{Macro.to_string(join)}` in query expression"
+@@ -77,19 +85,19 @@ defmodule Ecto.Query.Builder.Join do
+     ensure_field!(field)
+     var   = Builder.find_var!(var, vars)
+     field = Builder.quoted_atom!(field, "field/2")
+-    {:_, nil, {var, field}, []}
++    {:_, nil, {var, field}, nil, []}
+   end
+ 
+   def escape({:^, _, [expr]}, _vars, _env) do
+-    {:_, quote(do: Ecto.Query.Builder.Join.join!(unquote(expr))), nil, []}
++    {:_, quote(do: Ecto.Query.Builder.Join.join!(unquote(expr))), nil, nil, []}
+   end
+ 
+   def escape(string, _vars, _env) when is_binary(string) do
+-    {:_, {string, nil}, nil, []}
++    {:_, {string, nil}, nil, nil, []}
+   end
+ 
+   def escape(schema, _vars, _env) when is_atom(schema) do
+-    {:_, {nil, schema}, nil, []}
++    {:_, {nil, schema}, nil, nil, []}
+   end
+ 
+   def escape(join, vars, env) do
+@@ -147,8 +155,8 @@ defmodule Ecto.Query.Builder.Join do
+     end
+ 
+     {query, binding} = Builder.escape_binding(query, binding, env)
+-    {join_bind, join_source, join_assoc, join_params} = escape(expr, binding, env)
+-    join_params = Builder.escape_params(join_params)
++    {join_bind, join_source, join_assoc, join_prelude, join_params} = escape(expr, binding, env)
++    join_params = escape_params(join_params)
+ 
+     join_qual = validate_qual(qual)
+     validate_bind(join_bind, binding)
+@@ -188,13 +196,22 @@ defmodule Ecto.Query.Builder.Join do
+     ]
+ 
+     on = ensure_on(on, join_assoc, join_qual, join_source, env)
+-    query = build_on(on, join, as, query, binding, count_bind, env)
++    query = build_on(on, join_prelude, join, as, query, binding, count_bind, env)
+     {query, binding, next_bind}
+   end
+ 
+-  def build_on({:^, _, [var]}, join, as, query, _binding, count_bind, env) do
++  defp escape_params(params) when is_list(params) do
++    Builder.escape_params(params)
++  end
++
++  defp escape_params(params) do
++    quote do: Builder.escape_params(unquote(params))
++  end
++
++  def build_on({:^, _, [var]}, join_prelude, join, as, query, _binding, count_bind, env) do
+     quote do
+       query = unquote(query)
++      unquote(join_prelude)
+ 
+       Ecto.Query.Builder.Join.join!(
+         query,
+@@ -208,7 +225,7 @@ defmodule Ecto.Query.Builder.Join do
+     end
+   end
+ 
+-  def build_on(on, join, as, query, binding, count_bind, env) do
++  def build_on(on, join_prelude, join, as, query, binding, count_bind, env) do
+     case Ecto.Query.Builder.Filter.escape(:on, on, count_bind, binding, env) do
+       {_on_expr, {_on_params, %{subqueries: [_ | _]}}} ->
+         raise ArgumentError, "invalid expression for join `:on`, subqueries aren't supported"
+@@ -218,6 +235,8 @@ defmodule Ecto.Query.Builder.Join do
+ 
+         join =
+           quote do
++            unquote(join_prelude)
++
+             %JoinExpr{
+               unquote_splicing(join),
+               on: %QueryExpr{
+diff --git a/lib/ecto/query/inspect.ex b/lib/ecto/query/inspect.ex
+index fbdf463c..6f4f136c 100644
+--- a/lib/ecto/query/inspect.ex
++++ b/lib/ecto/query/inspect.ex
+@@ -140,6 +140,11 @@ defimpl Inspect, for: Ecto.Query do
+   defp inspect_source(%{source: {nil, schema}}, _names), do: inspect(schema)
+   defp inspect_source(%{source: {:fragment, _, _} = source} = part, names), do: "#{expr(source, names, part)}"
+ 
++  defp inspect_source(%{source: {:values, _, [types, _]}}, _names) do
++    fields = Keyword.keys(types)
++    "values (#{Enum.join(fields, ", ")})"
++  end
++
+   defp inspect_source(%{source: {source, schema}}, _names) do
+     inspect(if source == schema.__schema__(:source), do: schema, else: {source, schema})
+   end
+@@ -379,6 +384,7 @@ defimpl Inspect, for: Ecto.Query do
+   defp from_sources({source, schema}), do: schema || source
+   defp from_sources(nil), do: "query"
+   defp from_sources({:fragment, _, _}), do: "fragment"
++  defp from_sources({:values, _, _}), do: "values"
+ 
+   defp join_sources(joins) do
+     joins
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 274294dd..dce2198a 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -234,9 +234,9 @@ defmodule Ecto.Query.Planner do
+     error!(query, "query must have a from expression")
+   end
+ 
+-  defp plan_from(%{from: %{source: {:fragment, _, _}}, preloads: preloads, assocs: assocs} = query, _adapter)
+-       when assocs != [] or preloads != [] do
+-    error!(query, "cannot preload associations with a fragment source")
++  defp plan_from(%{from: %{source: {kind, _, _}}, preloads: preloads, assocs: assocs} = query, _adapter)
++       when kind in [:fragment, :values] and (assocs != [] or preloads != []) do
++    error!(query, "cannot preload associations with a #{kind} source")
+   end
+ 
+   defp plan_from(%{from: from} = query, adapter) do
+@@ -259,11 +259,13 @@ defmodule Ecto.Query.Planner do
+        when is_binary(source) and is_atom(schema),
+        do: {expr, {source, schema, prefix || query.prefix}}
+ 
+-  defp plan_source(_query, %{source: {:fragment, _, _} = source, prefix: nil} = expr, _adapter),
++  defp plan_source(_query, %{source: {kind, _, _} = source, prefix: nil} = expr, _adapter)
++       when kind in [:fragment, :values],
+        do: {expr, source}
+ 
+-  defp plan_source(query, %{source: {:fragment, _, _}, prefix: prefix} = expr, _adapter),
+-       do: error!(query, expr, "cannot set prefix: #{inspect(prefix)} option for fragment sources")
++  defp plan_source(query, %{source: {kind, _, _}, prefix: prefix} = expr, _adapter)
++       when kind in [:fragment, :values],
++       do: error!(query, expr, "cannot set prefix: #{inspect(prefix)} option for #{kind} sources")
+ 
+   defp plan_subquery(subquery, query, prefix, adapter, source?) do
+     %{query: inner_query} = subquery
+@@ -836,8 +838,9 @@ defmodule Ecto.Query.Planner do
+     do: {{source, prefix}, params}
+   defp source_cache(%{source: {bin, schema}, prefix: prefix}, params),
+     do: {{bin, schema, schema.__schema__(:hash), prefix}, params}
+-  defp source_cache(%{source: {:fragment, _, _} = source, prefix: prefix}, params),
+-    do: {{source, prefix}, params}
++  defp source_cache(%{source: {kind, _, _} = source, prefix: prefix}, params)
++       when kind in [:fragment, :values],
++       do: {{source, prefix}, params}
+   defp source_cache(%{source: %Ecto.SubQuery{params: inner, cache: key}}, params),
+     do: {key, Enum.reverse(inner, params)}
+ 
+@@ -1156,6 +1159,12 @@ defmodule Ecto.Query.Planner do
+     {fragments, acc} = prewalk(fragments, kind, query, expr, acc, adapter)
+     {{:fragment, meta, fragments}, acc}
+   end
++  defp prewalk_source({:values, meta, [types, num_rows]}, _kind, _query, _expr, acc, _adapter) do
++    length = num_rows * length(types)
++    # Adapters will use the schema types to cast the values
++    schema_types = Enum.map(types, fn {field, type} -> {field, Ecto.Type.type(type)} end)
++    {{:values, meta, [schema_types, acc, num_rows]}, acc + length}
++  end
+   defp prewalk_source(%Ecto.SubQuery{query: inner_query} = subquery, kind, query, _expr, counter, adapter) do
+     try do
+       inner_query = put_in inner_query.aliases[@parent_as], query
+@@ -1696,6 +1705,12 @@ defmodule Ecto.Query.Planner do
+       {:error, {:fragment, _, _}} ->
+         {{:value, :map}, [{:&, [], [ix]}]}
+ 
++      {:error, {:values, _, [types, _]}} ->
++        fields = Keyword.keys(types)
++        dumper = types |> Enum.map(fn {field, type} -> {field, {field, type}} end) |> Enum.into(%{})
++        {types, fields} = select_dump(fields, dumper, ix, drop)
++        {{:source, :values, nil, types}, fields}
++
+       {:error, {_, nil, _}} ->
+         {{:value, :map}, [{:&, [], [ix]}]}
+ 
+@@ -1846,6 +1861,15 @@ defmodule Ecto.Query.Planner do
+       {:fragment, _, _} ->
+         :any
+ 
++      {:values, _, [types, _]} ->
++        case Keyword.fetch(types, field) do
++          {:ok, type} ->
++            type
++
++          :error ->
++            error! query, expr, "field `#{field}` in `#{kind}` does not exist in values list"
++        end
++
+       {_, schema, _} ->
+         type!(kind, query, expr, schema, field, allow_virtuals?)
+ 
+diff --git a/lib/ecto/repo/queryable.ex b/lib/ecto/repo/queryable.ex
+index ad5bc304..f4ef3ecd 100644
+--- a/lib/ecto/repo/queryable.ex
++++ b/lib/ecto/repo/queryable.ex
+@@ -292,6 +292,10 @@ defmodule Ecto.Repo.Queryable do
+     struct_load!(types, row, [], true, struct, adapter)
+   end
+ 
++  defp process(row, {:source, :values, _prefix, types}, _from, adapter) do
++    values_list_load!(types, row, [], true, adapter)
++  end
++
+   defp process(row, {:merge, left, right}, from, adapter) do
+     {left, row} = process(row, left, from, adapter)
+     {right, row} = process(row, right, from, adapter)
+@@ -426,6 +430,20 @@ defmodule Ecto.Repo.Queryable do
+     end
+   end
+ 
++  defp values_list_load!([{field, type} | types], [value | values], acc, all_nil?, adapter) do
++    all_nil? = all_nil? and value == nil
++    value = load!(type, value, field, nil, adapter)
++    values_list_load!(types, values, [{field, value} | acc], all_nil?, adapter)
++  end
++
++  defp values_list_load!([], values, _acc, true, _adapter) do
++    {nil, values}
++  end
++
++  defp values_list_load!([], values, acc, false, _adapter) do
++    {Map.new(acc), values}
++  end
++
+   defp to_map(nil, _fields) do
+     nil
+   end

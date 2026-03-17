@@ -1,0 +1,125 @@
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index b162504b..e926e4b5 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -1149,7 +1149,10 @@ defmodule Phoenix.Component do
+   end
+ 
+   def __render_slot__(changed, entry, argument) when is_map(entry) do
+-    entry.inner_block.(changed, argument)
++    case entry.inner_block do
++      %Phoenix.LiveView.Rendered{} = rendered -> rendered
++      fun -> fun.(changed, argument)
++    end
+   end
+ 
+   defp call_inner_block!(entry, changed, argument) do
+@@ -1158,7 +1161,10 @@ defmodule Phoenix.Component do
+       raise RuntimeError, message
+     end
+ 
+-    entry.inner_block.(changed, argument)
++    case entry.inner_block do
++      %Phoenix.LiveView.Rendered{} = rendered -> rendered
++      fun -> fun.(changed, argument)
++    end
+   end
+ 
+   @doc """
+diff --git a/lib/phoenix_live_view/engine.ex b/lib/phoenix_live_view/engine.ex
+index b4bfa7a3..c30319fc 100644
+--- a/lib/phoenix_live_view/engine.ex
++++ b/lib/phoenix_live_view/engine.ex
+@@ -399,14 +399,28 @@ defmodule Phoenix.LiveView.Engine do
+ 
+       root = Keyword.get(opts, :root, meta[:root])
+ 
++      dynamic =
++        if dynamic == [] do
++          quote do
++            fn _ ->
++              _ = unquote(@assigns_var)
++              []
++            end
++          end
++        else
++          quote do
++            fn track_changes? ->
++              changed = unquote(changed)
++              vars_changed = if track_changes?, do: vars_changed
++              unquote({:__block__, [], block})
++              unquote(dynamic)
++            end
++          end
++        end
++
+       {:ok,
+        quote do
+-         dynamic = fn track_changes? ->
+-           changed = unquote(changed)
+-           vars_changed = if track_changes?, do: vars_changed
+-           unquote({:__block__, [], block})
+-           unquote(dynamic)
+-         end
++         dynamic = unquote(dynamic)
+ 
+          %Phoenix.LiveView.Rendered{
+            static: unquote(static),
+@@ -898,7 +912,26 @@ defmodule Phoenix.LiveView.Engine do
+        ) do
+     with {call, meta, [^key, [do: block]]} <- inner_block,
+          :inner_block <- extract_call(call) do
+-      inner_block = {call, meta, [key, [do: maybe_block_to_rendered(block, vars, caller)]]}
++      inner_block =
++        case block do
++          [
++            {:->, _,
++             [
++               [{:_, _, _}],
++               {:__block__, [live_rendered: true] ++ _meta, [{:safe, _}]} = static_block
++             ]}
++          ] ->
++            # This is an optimization that removes the extra anonymous function from
++            # the TagEngine's build_component_clauses function used for slots.
++            # We can do this when the slot does not contain any dynamics, which also helps
++            # to prevent uncovered lines when rendering a component with only a named slot.
++            # In that case, the component still has an inner_block, but it only consists of
++            # whitespace.
++            maybe_block_to_rendered(static_block, vars, caller)
++
++          _ ->
++            {call, meta, [key, [do: maybe_block_to_rendered(block, vars, caller)]]}
++        end
+ 
+       {:%{}, map_meta, [__slot__: key, inner_block: inner_block] ++ attrs}
+     else
+@@ -1320,17 +1353,6 @@ defmodule Phoenix.LiveView.Engine do
+     quote line: line, do: Phoenix.HTML.Safe.List.to_iodata(unquote(literal))
+   end
+ 
+-  # Calls to attributes escape is always safe
+-  defp to_safe(
+-         {{:., _, [Phoenix.LiveView.TagEngine, :attributes_escape]}, _, [_]} = safe,
+-         line,
+-         _extra_clauses?
+-       ) do
+-    quote line: line do
+-      elem(unquote(safe), 1)
+-    end
+-  end
+-
+   defp to_safe(expr, line, false) do
+     quote line: line, do: unquote(__MODULE__).safe_to_iodata(unquote(expr))
+   end
+diff --git a/lib/phoenix_live_view/tag_engine.ex b/lib/phoenix_live_view/tag_engine.ex
+index 3c84a20c..cd7e737a 100644
+--- a/lib/phoenix_live_view/tag_engine.ex
++++ b/lib/phoenix_live_view/tag_engine.ex
+@@ -140,6 +140,7 @@ defmodule Phoenix.LiveView.TagEngine do
+   for more information.
+   """
+   defmacro inner_block(name, do: do_block) do
++    # TODO: Remove the catch-all clause, it is no longer used
+     case do_block do
+       [{:->, meta, _} | _] ->
+         inner_fun = {:fn, meta, do_block}

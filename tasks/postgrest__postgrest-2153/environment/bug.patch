@@ -1,0 +1,215 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 71a6439e..e18e8c8d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -31,9 +31,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2120, Fix reading database configuration properly when `=` is present in value - @wolfgangwalther
+  - #1771, Fix silently ignoring filter on a non-existent embedded resource - @steve-chavez
+  - #2135, Remove trigger functions from schema cache and OpenAPI output, because they can't be called directly anyway. - @wolfgangwalther
+- - #2101, Remove aggregates, procedures and window functions from the schema cache and OpenAPI output. - @wolfgangwalther
+  - #2145, Fix accessing json array fields with -> and ->> in ?select= and ?order=. - @wolfgangwalther
+- - #2153, Fix --dump-schema running with a wrong PG version. - @wolfgangwalther
+ 
+ ### Changed
+ 
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 2fc905e4..6f527bd1 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -483,7 +483,7 @@ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure
+       OAFollowPriv ->
+         OpenAPI.encode conf dbStructure
+            <$> SQL.statement tSchema (DbStructure.accessibleTables ctxPgVersion configDbPreparedStatements)
+-           <*> SQL.statement tSchema (DbStructure.accessibleProcs ctxPgVersion configDbPreparedStatements)
++           <*> SQL.statement tSchema (DbStructure.accessibleProcs configDbPreparedStatements)
+            <*> SQL.statement tSchema (DbStructure.schemaDescription configDbPreparedStatements)
+       OAIgnorePriv ->
+         OpenAPI.encode conf dbStructure
+diff --git a/src/PostgREST/CLI.hs b/src/PostgREST/CLI.hs
+index 86efbc3d..25cf05cd 100644
+--- a/src/PostgREST/CLI.hs
++++ b/src/PostgREST/CLI.hs
+@@ -53,6 +53,7 @@ main installSignalHandlers runAppWithSocket CLI{cliCommand, cliPath} = do
+ dumpSchema :: AppState -> IO LBS.ByteString
+ dumpSchema appState = do
+   AppConfig{..} <- AppState.getConfig appState
++  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) $
+@@ -60,6 +61,7 @@ dumpSchema appState = do
+         queryDbStructure
+           (toList configDbSchemas)
+           configDbExtraSearchPath
++          actualPgVersion
+           configDbPreparedStatements
+   SQL.release $ AppState.getPool appState
+   case result of
+diff --git a/src/PostgREST/Config/Database.hs b/src/PostgREST/Config/Database.hs
+index 9e439ac1..51c009de 100644
+--- a/src/PostgREST/Config/Database.hs
++++ b/src/PostgREST/Config/Database.hs
+@@ -1,8 +1,7 @@
+ {-# LANGUAGE QuasiQuotes #-}
+ 
+ module PostgREST.Config.Database
+-  ( pgVersionStatement
+-  , queryDbSettings
++  ( queryDbSettings
+   , queryPgVersion
+   ) where
+ 
+@@ -21,10 +20,7 @@ import Text.InterpolatedString.Perl6 (q)
+ import Protolude
+ 
+ queryPgVersion :: Session PgVersion
+-queryPgVersion = statement mempty pgVersionStatement
+-
+-pgVersionStatement :: SQL.Statement () PgVersion
+-pgVersionStatement = SQL.Statement sql HE.noParams versionRow False
++queryPgVersion = statement mempty $ SQL.Statement sql HE.noParams versionRow False
+   where
+     sql = "SELECT current_setting('server_version_num')::integer, current_setting('server_version')"
+     versionRow = HD.singleRow $ PgVersion <$> column HD.int4 <*> column HD.text
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index bfee86e0..4c053995 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -41,9 +41,7 @@ import Data.Set                      as S (fromList)
+ import Data.Text                     (split)
+ import Text.InterpolatedString.Perl6 (q)
+ 
+-import PostgREST.Config.Database          (pgVersionStatement)
+-import PostgREST.Config.PgVersion         (PgVersion, pgVersion100,
+-                                           pgVersion110)
++import PostgREST.Config.PgVersion         (PgVersion, pgVersion100)
+ import PostgREST.DbStructure.Identifiers  (QualifiedIdentifier (..),
+                                            Schema, TableName)
+ import PostgREST.DbStructure.Proc         (PgType (..),
+@@ -85,16 +83,15 @@ type ViewColumn = Column
+ -- | A SQL query that can be executed independently
+ type SqlQuery = ByteString
+ 
+-queryDbStructure :: [Schema] -> [Schema] -> Bool -> SQL.Transaction DbStructure
+-queryDbStructure schemas extraSearchPath prepared = do
++queryDbStructure :: [Schema] -> [Schema] -> PgVersion -> Bool -> SQL.Transaction DbStructure
++queryDbStructure schemas extraSearchPath pgVer prepared = do
+   SQL.sql "set local schema ''" -- This voids the search path. The following queries need this for getting the fully qualified name(schema.name) of every db object
+-  pgVer   <- SQL.statement mempty pgVersionStatement
+   tabs    <- SQL.statement mempty $ allTables pgVer prepared
+   cols    <- SQL.statement schemas $ allColumns tabs prepared
+   srcCols <- SQL.statement (schemas, extraSearchPath) $ pfkSourceColumns cols prepared
+   m2oRels <- SQL.statement mempty $ allM2ORels tabs cols prepared
+   keys    <- SQL.statement mempty $ allPrimaryKeys tabs prepared
+-  procs   <- SQL.statement schemas $ allProcs pgVer prepared
++  procs   <- SQL.statement schemas $ allProcs prepared
+ 
+   let rels = addO2MRels . addM2MRels $ addViewM2ORels srcCols m2oRels
+       keys' = addViewPrimaryKeys srcCols keys
+@@ -229,18 +226,18 @@ decodeProcs =
+                       | v == 's' = Stable
+                       | otherwise = Volatile -- only 'v' can happen here
+ 
+-allProcs :: PgVersion -> Bool -> SQL.Statement [Schema] ProcsMap
+-allProcs pgVer = SQL.Statement sql (arrayParam HE.text) decodeProcs
++allProcs :: Bool -> SQL.Statement [Schema] ProcsMap
++allProcs = SQL.Statement sql (arrayParam HE.text) decodeProcs
+   where
+-    sql = procsSqlQuery pgVer <> " AND pn.nspname = ANY($1)"
++    sql = procsSqlQuery <> " AND pn.nspname = ANY($1)"
+ 
+-accessibleProcs :: PgVersion -> Bool -> SQL.Statement Schema ProcsMap
+-accessibleProcs pgVer = SQL.Statement sql (param HE.text) decodeProcs
++accessibleProcs :: Bool -> SQL.Statement Schema ProcsMap
++accessibleProcs = SQL.Statement sql (param HE.text) decodeProcs
+   where
+-    sql = procsSqlQuery pgVer <> " AND pn.nspname = $1 AND has_function_privilege(p.oid, 'execute')"
++    sql = procsSqlQuery <> " AND pn.nspname = $1 AND has_function_privilege(p.oid, 'execute')"
+ 
+-procsSqlQuery :: PgVersion -> SqlQuery
+-procsSqlQuery pgVer = [q|
++procsSqlQuery :: SqlQuery
++procsSqlQuery = [q|
+  -- Recursively get the base types of domains
+   WITH
+   base_types AS (
+@@ -304,7 +301,7 @@ procsSqlQuery pgVer = [q|
+   LEFT JOIN pg_class comp ON comp.oid = t.typrelid
+   LEFT JOIN pg_catalog.pg_description as d ON d.objoid = p.oid
+   WHERE t.oid <> 'pg_catalog.trigger'::regtype
+-|] <> (if pgVer >= pgVersion110 then "AND prokind = 'f'" else "AND NOT (proisagg OR proiswindow)")
++|]
+ 
+ schemaDescription :: Bool -> SQL.Statement Schema (Maybe Text)
+ schemaDescription =
+diff --git a/src/PostgREST/Workers.hs b/src/PostgREST/Workers.hs
+index 9f059739..5cdc5fd0 100644
+--- a/src/PostgREST/Workers.hs
++++ b/src/PostgREST/Workers.hs
+@@ -153,10 +153,11 @@ connectionStatus appState =
+ loadSchemaCache :: AppState -> IO SCacheStatus
+ loadSchemaCache appState = do
+   AppConfig{..} <- AppState.getConfig appState
++  actualPgVersion <- AppState.getPgVersion appState
+   result <-
+     let transaction = if configDbPreparedStatements then SQL.transaction else SQL.unpreparedTransaction in
+     SQL.use (AppState.getPool appState) . transaction SQL.ReadCommitted SQL.Read $
+-      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath configDbPreparedStatements
++      queryDbStructure (toList configDbSchemas) configDbExtraSearchPath actualPgVersion configDbPreparedStatements
+   case result of
+     Left e -> do
+       let
+diff --git a/test/spec/Main.hs b/test/spec/Main.hs
+index b5ee37fb..93061404 100644
+--- a/test/spec/Main.hs
++++ b/test/spec/Main.hs
+@@ -67,6 +67,7 @@ main = do
+     loadDbStructure pool
+       (configDbSchemas testCfg)
+       (configDbExtraSearchPath testCfg)
++      actualPgVersion
+ 
+   let
+     -- For tests that run with the same refDbStructure
+@@ -84,6 +85,7 @@ main = do
+         loadDbStructure pool
+           (configDbSchemas config)
+           (configDbExtraSearchPath config)
++          actualPgVersion
+       appState <- AppState.initWithPool pool config
+       AppState.putPgVersion appState actualPgVersion
+       AppState.putDbStructure appState (Just customDbStructure)
+@@ -234,5 +236,5 @@ main = do
+       describe "Feature.RollbackForcedSpec" Feature.RollbackSpec.forced
+ 
+   where
+-    loadDbStructure pool schemas extraSearchPath =
+-      either (panic.show) id <$> P.use pool (HT.transaction HT.ReadCommitted HT.Read $ queryDbStructure (toList schemas) extraSearchPath True)
++    loadDbStructure pool schemas extraSearchPath actualPgVersion =
++      either (panic.show) id <$> P.use pool (HT.transaction HT.ReadCommitted HT.Read $ queryDbStructure (toList schemas) extraSearchPath actualPgVersion True)
+diff --git a/test/spec/fixtures/schema.sql b/test/spec/fixtures/schema.sql
+index e2565855..3c9428e5 100644
+--- a/test/spec/fixtures/schema.sql
++++ b/test/spec/fixtures/schema.sql
+@@ -2445,21 +2445,3 @@ create table test.arrays (
+   numbers int[],
+   numbers_mult int[][]
+ );
+-
+--- This procedure is to confirm that procedures don't show up in the OpenAPI output right now.
+--- Procedures are not supported, yet.
+-do $do$begin
+-  if (select current_setting('server_version_num')::int >= 110000) then
+-    CREATE PROCEDURE test.unsupported_proc ()
+-    LANGUAGE SQL AS '';
+-  end if;
+-end $do$;
+-
+-CREATE FUNCTION public.dummy(int) RETURNS int
+-LANGUAGE SQL AS $$ SELECT 1 $$;
+-
+--- This aggregate is to confirm that aggregates don't show up in the OpenAPI output.
+-CREATE AGGREGATE test.unsupported_agg (*) (
+-  SFUNC = public.dummy,
+-  STYPE = int
+-);

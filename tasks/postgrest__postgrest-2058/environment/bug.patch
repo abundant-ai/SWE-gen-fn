@@ -1,0 +1,279 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e18e8c8d..26f18da7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -33,11 +33,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+  - #2135, Remove trigger functions from schema cache and OpenAPI output, because they can't be called directly anyway. - @wolfgangwalther
+  - #2145, Fix accessing json array fields with -> and ->> in ?select= and ?order=. - @wolfgangwalther
+ 
+-### Changed
+-
+- - #2001, Return 204 No Content without Content-Type for RPCs returning VOID - @wolfgangwalther
+-   + Previously, those RPCs would return "null" as a body with Content-Type: application/json.
+-
+ ## [9.0.0] - 2021-11-25
+ 
+ ### Added
+diff --git a/src/PostgREST/App.hs b/src/PostgREST/App.hs
+index 6f527bd1..e9728f53 100644
+--- a/src/PostgREST/App.hs
++++ b/src/PostgREST/App.hs
+@@ -469,12 +469,9 @@ handleInvoke invMethod proc context@RequestContext{..} = do
+       RangeQuery.rangeStatusHeader iTopLevelRange queryTotal tableTotal
+ 
+   failNotSingular iAcceptContentType queryTotal $
+-    if Proc.procReturnsVoid proc then
+-      response HTTP.status204 [contentRange] mempty
+-    else
+-      response status
+-        (contentTypeHeaders context ++ [contentRange])
+-        (if invMethod == InvHead then mempty else LBS.fromStrict body)
++    response status
++      (contentTypeHeaders context ++ [contentRange])
++      (if invMethod == InvHead then mempty else LBS.fromStrict body)
+ 
+ handleOpenApi :: Bool -> Schema -> RequestContext -> DbHandler Wai.Response
+ handleOpenApi headersOnly tSchema (RequestContext conf@AppConfig{..} dbStructure apiRequest ctxPgVersion) = do
+diff --git a/src/PostgREST/DbStructure.hs b/src/PostgREST/DbStructure.hs
+index 4c053995..ebb872ba 100644
+--- a/src/PostgREST/DbStructure.hs
++++ b/src/PostgREST/DbStructure.hs
+@@ -202,7 +202,6 @@ decodeProcs =
+                   <$> column HD.text
+                   <*> column HD.text
+                   <*> column HD.bool
+-                  <*> column HD.bool
+                   <*> column HD.bool)
+               <*> (parseVolatility <$> column HD.char)
+               <*> column HD.bool
+@@ -210,11 +209,10 @@ decodeProcs =
+     addKey :: ProcDescription -> (QualifiedIdentifier, ProcDescription)
+     addKey pd = (QualifiedIdentifier (pdSchema pd) (pdName pd), pd)
+ 
+-    parseRetType :: Text -> Text -> Bool -> Bool -> Bool -> Maybe RetType
+-    parseRetType schema name isSetOf isComposite isVoid
+-      | isVoid    = Nothing
+-      | isSetOf   = Just (SetOf pgType)
+-      | otherwise = Just (Single pgType)
++    parseRetType :: Text -> Text -> Bool -> Bool -> RetType
++    parseRetType schema name isSetOf isComposite
++      | isSetOf   = SetOf pgType
++      | otherwise = Single pgType
+       where
+         qi = QualifiedIdentifier schema name
+         pgType
+@@ -289,7 +287,6 @@ procsSqlQuery = [q|
+      -- if any TABLE, INOUT or OUT arguments present, treat as composite
+      or COALESCE(proargmodes::text[] && '{t,b,o}', false)
+     ) AS rettype_is_composite,
+-    ('pg_catalog.void'::regtype = t.oid) AS rettype_is_void,
+     p.provolatile,
+     p.provariadic > 0 as hasvariadic
+   FROM pg_proc p
+diff --git a/src/PostgREST/DbStructure/Proc.hs b/src/PostgREST/DbStructure/Proc.hs
+index 3ec5817a..12850161 100644
+--- a/src/PostgREST/DbStructure/Proc.hs
++++ b/src/PostgREST/DbStructure/Proc.hs
+@@ -10,7 +10,6 @@ module PostgREST.DbStructure.Proc
+   , RetType(..)
+   , procReturnsScalar
+   , procReturnsSingle
+-  , procReturnsVoid
+   , procTableName
+   ) where
+ 
+@@ -43,7 +42,7 @@ data ProcDescription = ProcDescription
+   , pdName        :: Text
+   , pdDescription :: Maybe Text
+   , pdParams      :: [ProcParam]
+-  , pdReturnType  :: Maybe RetType
++  , pdReturnType  :: RetType
+   , pdVolatility  :: ProcVolatility
+   , pdHasVariadic :: Bool
+   }
+@@ -70,22 +69,17 @@ type ProcsMap = M.HashMap QualifiedIdentifier [ProcDescription]
+ 
+ procReturnsScalar :: ProcDescription -> Bool
+ procReturnsScalar proc = case proc of
+-  ProcDescription{pdReturnType = Just (Single Scalar)} -> True
+-  ProcDescription{pdReturnType = Just (SetOf Scalar)}  -> True
+-  _                                                    -> False
++  ProcDescription{pdReturnType = (Single Scalar)} -> True
++  ProcDescription{pdReturnType = (SetOf Scalar)}  -> True
++  _                                               -> False
+ 
+ procReturnsSingle :: ProcDescription -> Bool
+ procReturnsSingle proc = case proc of
+-  ProcDescription{pdReturnType = Just (Single _)} -> True
+-  _                                               -> False
+-
+-procReturnsVoid :: ProcDescription -> Bool
+-procReturnsVoid proc = case proc of
+-  ProcDescription{pdReturnType = Nothing} -> True
+-  _                                       -> False
++  ProcDescription{pdReturnType = (Single _)} -> True
++  _                                          -> False
+ 
+ procTableName :: ProcDescription -> Maybe TableName
+ procTableName proc = case pdReturnType proc of
+-  Just (SetOf  (Composite qi)) -> Just $ qiName qi
+-  Just (Single (Composite qi)) -> Just $ qiName qi
+-  _                            -> Nothing
++  SetOf  (Composite qi) -> Just $ qiName qi
++  Single (Composite qi) -> Just $ qiName qi
++  _                     -> Nothing
+diff --git a/test/io/test_io.py b/test/io/test_io.py
+index dd496f1c..a8a59279 100644
+--- a/test/io/test_io.py
++++ b/test/io/test_io.py
+@@ -630,7 +630,7 @@ def test_jwt_secret_external_file_reload(tmp_path, defaultenv):
+ 
+         # reload config and external file with NOTIFY
+         response = postgrest.session.post("/rpc/reload_pgrst_config")
+-        assert response.status_code == 204
++        assert response.status_code == 200
+         time.sleep(0.1)
+ 
+         response = postgrest.session.get("/authors_only", headers=headers)
+@@ -685,7 +685,7 @@ def test_db_schema_notify_reload(defaultenv):
+ 
+         # reset db-schemas config on the db
+         response = postgrest.session.post("/rpc/reset_db_schema_config")
+-        assert response.status_code == 204
++        assert response.status_code == 200
+ 
+ 
+ def test_max_rows_reload(defaultenv):
+@@ -714,7 +714,7 @@ def test_max_rows_reload(defaultenv):
+ 
+         # reset max-rows config on the db
+         response = postgrest.session.post("/rpc/reset_max_rows_config")
+-        assert response.status_code == 204
++        assert response.status_code == 200
+ 
+ 
+ def test_max_rows_notify_reload(defaultenv):
+@@ -744,7 +744,7 @@ def test_max_rows_notify_reload(defaultenv):
+ 
+         # reset max-rows config on the db
+         response = postgrest.session.post("/rpc/reset_max_rows_config")
+-        assert response.status_code == 204
++        assert response.status_code == 200
+ 
+ 
+ def test_invalid_role_claim_key_notify_reload(defaultenv):
+@@ -770,7 +770,7 @@ def test_invalid_role_claim_key_notify_reload(defaultenv):
+         assert "failed to parse role-claim-key value" in output.decode()
+ 
+         response = postgrest.session.post("/rpc/reset_invalid_role_claim_key")
+-        assert response.status_code == 204
++        assert response.status_code == 200
+ 
+ 
+ def test_db_prepared_statements_enable(defaultenv):
+@@ -835,7 +835,7 @@ def test_admin_ready_includes_schema_cache_state(defaultenv):
+         response = postgrest.session.post(
+             "/rpc/no_schema_cache_for_limited_authenticator"
+         )
+-        assert response.status_code == 204
++        assert response.status_code == 200
+ 
+         # force a reconnection so the new role setting is picked up
+         postgrest.process.send_signal(signal.SIGUSR1)
+diff --git a/test/spec/Feature/Query/InsertSpec.hs b/test/spec/Feature/Query/InsertSpec.hs
+index 3261af3a..ff3c4610 100644
+--- a/test/spec/Feature/Query/InsertSpec.hs
++++ b/test/spec/Feature/Query/InsertSpec.hs
+@@ -179,10 +179,7 @@ spec actualPgVersion = do
+               [("Prefer", "tx=commit")]
+               [json|{"name": "auto_incrementing_pk_id_seq", "value": 2}|]
+             `shouldRespondWith`
+-              ""
+-              { matchStatus = 204
+-              , matchHeaders = [ matchHeaderAbsent hContentType ]
+-              }
++              [json|""|]
+ 
+           request methodPost "/auto_incrementing_pk"
+               [("Prefer", "return=headers-only")]
+@@ -360,10 +357,7 @@ spec actualPgVersion = do
+             [("Prefer", "tx=commit")]
+             [json|{"name": "items2_id_seq", "value": 20}|]
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType ]
+-            }
++            [json|""|]
+ 
+         request methodPost "/items2"
+             [("Prefer", "return=representation")]
+@@ -378,10 +372,7 @@ spec actualPgVersion = do
+             [("Prefer", "tx=commit")]
+             [json|{"name": "items3_id_seq", "value": 20}|]
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType ]
+-            }
++            [json|""|]
+ 
+         request methodPost "/items3?select=id"
+             [("Prefer", "return=representation")]
+diff --git a/test/spec/Feature/Query/RpcSpec.hs b/test/spec/Feature/Query/RpcSpec.hs
+index 77702f4d..1495b9b8 100644
+--- a/test/spec/Feature/Query/RpcSpec.hs
++++ b/test/spec/Feature/Query/RpcSpec.hs
+@@ -329,20 +329,18 @@ spec actualPgVersion =
+           `shouldRespondWith`
+             [json|{"id": 2}|]
+ 
+-      it "returns 204, no Content-Type header and no content for void" $
++      it "returns null for void" $
+         post "/rpc/ret_void"
+             [json|{}|]
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [matchHeaderAbsent hContentType]
+-            }
++            [json|null|]
+ 
+       it "returns null for an integer with null value" $
+         post "/rpc/ret_null"
+             [json|{}|]
+           `shouldRespondWith`
+-            [json|null|]
++            "null"
++            { matchHeaders = [matchContentTypeJson] }
+ 
+       context "different types when overloaded" $ do
+         it "returns composite type" $
+@@ -529,10 +527,7 @@ spec actualPgVersion =
+           [("Prefer", "tx=commit")]
+           [json|{"name": "callcounter_count", "value": 1}|]
+         `shouldRespondWith`
+-          ""
+-          { matchStatus = 204
+-          , matchHeaders = [ matchHeaderAbsent hContentType ]
+-          }
++          [json|""|]
+ 
+       -- now the test
+       post "/rpc/callcounter"
+@@ -1079,12 +1074,10 @@ spec actualPgVersion =
+       it "can set the same http header twice" $
+         get "/rpc/set_cookie_twice"
+           `shouldRespondWith`
+-            ""
+-            { matchStatus = 204
+-            , matchHeaders = [ matchHeaderAbsent hContentType
++            "null"
++            { matchHeaders = [ matchContentTypeJson
+                              , "Set-Cookie" <:> "sessionid=38afes7a8; HttpOnly; Path=/"
+-                             , "Set-Cookie" <:> "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly" ]
+-            }
++                             , "Set-Cookie" <:> "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly" ]}
+ 
+       it "can override the Location header on a trigger" $
+         post "/stuff"

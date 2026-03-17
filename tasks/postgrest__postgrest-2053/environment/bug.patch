@@ -1,0 +1,166 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1788c3a2..d36a9c7c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,8 +9,6 @@ This project adheres to [Semantic Versioning](http://semver.org/).
+ 
+ ### Fixed
+ 
+- - #2020, Execute deferred constraint triggers when using `Prefer: tx=rollback` - @wolfgangwalther
+-
+ ## [9.0.0] - 2021-11-25
+ 
+ ### Added
+diff --git a/src/PostgREST/Middleware.hs b/src/PostgREST/Middleware.hs
+index fb64f38c..fba8eddd 100644
+--- a/src/PostgREST/Middleware.hs
++++ b/src/PostgREST/Middleware.hs
+@@ -2,7 +2,6 @@
+ Module      : PostgREST.Middleware
+ Description : Sets CORS policy. Also the PostgreSQL GUCs, role, search_path and pre-request function.
+ -}
+-{-# LANGUAGE BlockArguments  #-}
+ {-# LANGUAGE RecordWildCards #-}
+ module PostgREST.Middleware
+   ( runPgLocals
+@@ -171,9 +170,8 @@ optionalRollback
+   -> ExceptT Error SQL.Transaction Wai.Response
+ optionalRollback AppConfig{..} ApiRequest{..} transaction = do
+   resp <- catchError transaction $ return . errorResponseFor
+-  when (shouldRollback || (configDbTxRollbackAll && not shouldCommit)) $ lift do
+-    SQL.sql "SET CONSTRAINTS ALL IMMEDIATE"
+-    SQL.condemn
++  when (shouldRollback || (configDbTxRollbackAll && not shouldCommit))
++    (lift SQL.condemn)
+   return $ Wai.mapResponseHeaders preferenceApplied resp
+   where
+     shouldCommit =
+diff --git a/test/Feature/RollbackSpec.hs b/test/Feature/RollbackSpec.hs
+index 5ed05b9c..24bdbcd0 100644
+--- a/test/Feature/RollbackSpec.hs
++++ b/test/Feature/RollbackSpec.hs
+@@ -70,35 +70,6 @@ shouldRespondToReads reqHeaders respHeaders = do
+         [json|[{"id":1}]|]
+         { matchHeaders = respHeaders }
+ 
+-shouldRaiseExceptions reqHeaders respHeaders = do
+-  it "raises immediate constraints" $ do
+-    request methodPost "/rpc/raise_constraint"
+-        reqHeaders
+-        ""
+-      `shouldRespondWith`
+-        [json|{
+-          "hint":null,
+-          "details":"Key (col)=(1) already exists.",
+-          "code":"23505",
+-          "message":"duplicate key value violates unique constraint \"deferrable_unique_constraint_col_key\""
+-        }|]
+-        { matchStatus = 409
+-        , matchHeaders = respHeaders }
+-
+-  it "raises deferred constraints" $ do
+-    request methodPost "/rpc/raise_constraint"
+-        reqHeaders
+-        [json|{"deferred": true}|]
+-      `shouldRespondWith`
+-        [json|{
+-          "hint":null,
+-          "details":"Key (col)=(1) already exists.",
+-          "code":"23505",
+-          "message":"duplicate key value violates unique constraint \"deferrable_unique_constraint_col_key\""
+-        }|]
+-        { matchStatus = 409
+-        , matchHeaders = respHeaders }
+-
+ shouldPersistMutations reqHeaders respHeaders = do
+   it "does persist post" $ do
+     request methodPost "/items"
+@@ -207,38 +178,28 @@ allowed = describe "tx-allow-override = true" $ do
+   describe "without Prefer tx" $ do
+     preferDefault `shouldRespondToReads` withoutPreferenceApplied
+     preferDefault `shouldNotPersistMutations` withoutPreferenceApplied
+-    preferDefault `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=commit" $ do
+     preferCommit `shouldRespondToReads` withPreferenceCommitApplied
+     preferCommit `shouldPersistMutations` withPreferenceCommitApplied
+-    -- Exceptions are always without preference applied,
+-    -- because they return before the end of the transaction.
+-    preferCommit `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=rollback" $ do
+     preferRollback `shouldRespondToReads` withPreferenceRollbackApplied
+     preferRollback `shouldNotPersistMutations` withPreferenceRollbackApplied
+-    -- Exceptions are always without preference applied,
+-    -- because they return before the end of the transaction.
+-    preferRollback `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+ disallowed :: SpecWith ((), Application)
+ disallowed = describe "tx-rollback-all = false, tx-allow-override = false" $ do
+   describe "without Prefer tx" $ do
+     preferDefault `shouldRespondToReads` withoutPreferenceApplied
+     preferDefault `shouldPersistMutations` withoutPreferenceApplied
+-    preferDefault `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=commit" $ do
+     preferCommit `shouldRespondToReads` withoutPreferenceApplied
+     preferCommit `shouldPersistMutations` withoutPreferenceApplied
+-    preferCommit `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=rollback" $ do
+     preferRollback `shouldRespondToReads` withoutPreferenceApplied
+     preferRollback `shouldPersistMutations` withoutPreferenceApplied
+-    preferRollback `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+ 
+ forced :: SpecWith ((), Application)
+@@ -246,15 +207,12 @@ forced = describe "tx-rollback-all = true, tx-allow-override = false" $ do
+   describe "without Prefer tx" $ do
+     preferDefault `shouldRespondToReads` withoutPreferenceApplied
+     preferDefault `shouldNotPersistMutations` withoutPreferenceApplied
+-    preferDefault `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=commit" $ do
+     preferCommit `shouldRespondToReads` withoutPreferenceApplied
+     preferCommit `shouldNotPersistMutations` withoutPreferenceApplied
+-    preferCommit `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+   describe "Prefer tx=rollback" $ do
+     preferRollback `shouldRespondToReads` withoutPreferenceApplied
+     preferRollback `shouldNotPersistMutations` withoutPreferenceApplied
+-    preferRollback `shouldRaiseExceptions` withoutPreferenceApplied
+ 
+diff --git a/test/fixtures/privileges.sql b/test/fixtures/privileges.sql
+index b6899e01..b103eeae 100644
+--- a/test/fixtures/privileges.sql
++++ b/test/fixtures/privileges.sql
+@@ -25,7 +25,6 @@ GRANT ALL ON TABLE
+     , complex_items
+     , compound_pk
+     , compound_pk_view
+-    , deferrable_unique_constraint
+     , empty_table
+     , has_count_column
+     , has_fk
+diff --git a/test/fixtures/schema.sql b/test/fixtures/schema.sql
+index bb92f174..0c0c0027 100644
+--- a/test/fixtures/schema.sql
++++ b/test/fixtures/schema.sql
+@@ -2448,17 +2448,3 @@ CREATE TABLE chores (
+ , name text
+ , done bool
+ );
+-
+-CREATE TABLE deferrable_unique_constraint (
+-  col INT UNIQUE DEFERRABLE INITIALLY IMMEDIATE
+-);
+-
+-CREATE FUNCTION raise_constraint(deferred BOOL DEFAULT FALSE) RETURNS void
+-LANGUAGE plpgsql AS $$
+-BEGIN
+-  IF deferred THEN
+-    SET CONSTRAINTS ALL DEFERRED;
+-  END IF;
+-
+-  INSERT INTO deferrable_unique_constraint VALUES (1), (1);
+-END$$;
